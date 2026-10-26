@@ -13,6 +13,9 @@ description: 青简·咫尺 (OneMoreStep / oms) —— macOS 本地 AI Agent 与
 
 ---
 
+
+> 开发分支升级注意：主机和手机同时升级；缺少配对密钥需重新配对。GUI 节点动作必须携带最新 observationId；文件推送等待对端落盘 ACK。当前传输没有应用层端到端加密，BLE/WAN 与完整断点恢复的边界见 [implementation-status](../../docs/implementation-status.md)。
+
 ## 1. 调用方式与架构约定
 
 1. **优先方式**：
@@ -255,9 +258,9 @@ oms gui observe
 oms gui observe --screenshot --som
 
 # 3. 按节点 #ID 或坐标执行动作
-oms gui act click "#3"
-oms gui act long_click "#3"
-oms gui act input_text "#5" --text "要填入的文本内容"
+oms gui act click "#3" --observation "刚才返回的 observationId"
+oms gui act long_click "#3" --observation "刚才返回的 observationId"
+oms gui act input_text "#5" --text "要填入的文本内容" --observation "刚才返回的 observationId"
 oms gui act scroll_down
 oms gui act scroll_up
 oms gui act back
@@ -266,14 +269,14 @@ oms gui act launch_app "com.ss.android.lark"
 oms gui act open_url "https://example.com"
 
 # 4. 【安全铁律】点击“提交 / 发送 / 发布 / 支付 / 删除”等最终动作前，必须加 --confirm
-oms gui act click "#8" --confirm
+oms gui act click "#8" --confirm --observation "刚才返回的 observationId"
 ```
 
 **GUI 自动化四大安全守则**：
 1. **语义树优先（Semantic Tree First）**：常规导航优先用 `oms gui observe`（不带 `--screenshot`）以保持极速低延迟；仅在需要多模态视觉确认时开启 `--screenshot --som` 并用 `read_file` 查看返回的 `screenshotLocalAbsPath`。
 2. **最终动作人工确认（`--confirm`）**：凡涉及外发消息、提交审批、修改账户或删除数据的最后一步点击，**必须**附带 `--confirm`（`requireUserConfirm: true`），由用户在手机弹窗上点按确认放行。
 3. **隐私窗口自动避让**：若 `oms gui observe` 返回 `isSecureWindow: true`（如密码框、银行支付页），严禁继续注入手势或截屏，应请用户在手机上手动完成该步。
-4. **尊重物理急停与触屏让路**：操控期间手机顶部常驻橙色急停胶囊，一旦用户点击急停或手指触碰屏幕，操作会立即中止，不得强行重试循环。
+4. **尊重物理急停与触屏让路**：操控期间手机顶部常驻橙色急停胶囊，一旦用户点击急停或手指触碰屏幕，请求取消当前及后续 GUI 操作（已注入手势不保证撤回），需要手机端显式恢复后重新观察，不得强行重试循环。
 
 ---
 
@@ -318,4 +321,4 @@ oms daemon install-launchagent
 | **全维状态遥测** | `phone_presence_status` | `oms status [--live] \| oms phone status` |
 | **远程系统操控** | `phone_device_control` | `oms phone <find\|say\|volume\|screenshot\|open\|launch\|home\|back\|lock>` |
 | **GUI 语义树观察** | `phone_gui_observe` | `oms gui observe [--screenshot] [--som]` |
-| **GUI 自动化执行** | `phone_gui_action` | `oms gui act <click\|input_text\|...> [#id] [--confirm]` |
+| **GUI 自动化执行** | `phone_gui_action` | `oms gui act <click\|input_text\|...> [#id] --observation <id> [--confirm]` |

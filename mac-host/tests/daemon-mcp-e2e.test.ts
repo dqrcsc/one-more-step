@@ -301,6 +301,7 @@ describe("Modules 06 & 07: OmsDaemon + Inbox + MCP Server End-to-End", () => {
 
     ws.close();
     await daemon.stop();
-    fs.rmSync(tmpHome, { recursive: true, force: true });
+    // Retain this isolated fixture for inspection; never recursively delete user files.
+    console.log(`Retained test fixture: ${tmpHome}`);
   });
 });

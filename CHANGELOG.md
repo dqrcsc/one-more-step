@@ -1,5 +1,14 @@
 # Changelog · 更新日志
 
+
+## Unreleased — 可靠交付与设备会话边界
+
+- 移除旧固定签名/公开 room ID 认证；重新配对撤销旧会话，RPC 和 ACK 绑定来源。
+- 两端流校验、限额与送达确认；收件箱完整附件预检、原子索引、派生视图恢复；面板同源与文件边界限制。
+- GUI observationId、绝对期限、串行执行、失败拒绝的确认流程和持久急停；审批选项与等待期限一致。
+- 升级须同步主机/手机，历史无密钥设备须重新配对；不含端到端加密、BLE 背压和持久化续传。
+- 测试与真机验收边界见 [实现状态](docs/implementation-status.md)。以下历史版本记录不代表开发分支所有承诺已验证。
+
 All notable changes to **青简·咫尺 (OneMoreStep)** are documented in this file.
 
 ## [1.3.5] - 2026-10-26

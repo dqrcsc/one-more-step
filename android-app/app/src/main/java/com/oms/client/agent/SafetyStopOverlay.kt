@@ -8,150 +8,128 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.view.Gravity
+import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
+import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 
-/**
- * Module 05: Hardware-Level Safety Overlay Pill ("🤖 AI 操作中 · 点击急停")
- * & Sensitive Action User Confirmation Gate
- */
-class SafetyStopOverlay(private val context: Context, private val onEmergencyStop: () -> Unit) {
+/** Phone-local stop/resume and fail-closed sensitive-action confirmation. */
+class SafetyStopOverlay(
+    private val context: Context,
+    private val onEmergencyStop: () -> Unit,
+    private val onLocalResume: () -> Unit
+) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private var pillView: TextView? = null
     private var confirmBar: LinearLayout? = null
+    private var pendingConfirmation: CancellableContinuation<Boolean>? = null
+    val isAwaitingConfirmation: Boolean get() = pendingConfirmation?.isActive == true
 
-    fun showActivePill() {
-        if (!Settings.canDrawOverlays(context)) return
-        mainHandler.post {
-            if (pillView != null) return@post
-            val tv = TextView(context).apply {
-                text = "🤖 Mac AI 操作中 · 点击立即停止"
-                setTextColor(Color.WHITE)
-                textSize = 13f
-                setPadding(36, 16, 36, 16)
-                background = GradientDrawable().apply {
-                    setColor(Color.parseColor("#E6FF5722"))
-                    cornerRadius = 48f
-                }
-                setOnClickListener {
-                    hideActivePill()
-                    onEmergencyStop()
-                }
-            }
-            val params = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
-                PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-                y = 24
-            }
-            try {
-                windowManager.addView(tv, params)
-                pillView = tv
-            } catch (_: Throwable) {
-            }
-        }
+    private fun onMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) block() else mainHandler.post(block)
     }
 
-    fun hideActivePill() {
-        mainHandler.post {
-            pillView?.let {
-                try {
-                    windowManager.removeView(it)
-                } catch (_: Throwable) {
-                }
-            }
-            pillView = null
-        }
+    private fun remove(view: View?) {
+        if (view != null) try { windowManager.removeView(view) } catch (_: Exception) { }
     }
 
-    /**
-     * Guardrail #4: Pause before clicking sensitive actions ("提交", "发送", "删除", etc.)
-     * and wait for user's one-tap confirmation on the phone screen.
-     */
+    fun showActivePill(): Boolean = showPill(false)
+    fun showStoppedPill(): Boolean = showPill(true)
+
+    private fun showPill(stopped: Boolean): Boolean {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        hideActivePill()
+        if (!Settings.canDrawOverlays(context)) return false
+        val tv = TextView(context).apply {
+            text = if (stopped) "⏸ AI 已急停 · 点击恢复后请重新观察" else "🤖 Mac AI 操作中 · 点击立即停止"
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            setPadding(36, 16, 36, 16)
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(if (stopped) "#E6334155" else "#E6FF5722"))
+                cornerRadius = 48f
+            }
+            setOnClickListener { if (stopped) onLocalResume() else onEmergencyStop() }
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL; y = 24 }
+        return try { windowManager.addView(tv, params); pillView = tv; true } catch (_: Exception) { false }
+    }
+
+    fun hideActivePill() = onMain { remove(pillView); pillView = null }
+
+    fun cancelConfirmation() = onMain {
+        val continuation = pendingConfirmation
+        pendingConfirmation = null
+        remove(confirmBar)
+        confirmBar = null
+        continuation?.cancel()
+    }
+
     suspend fun awaitUserConfirmForSensitiveAction(actionDesc: String): Boolean =
         suspendCancellableCoroutine { cont ->
-            if (!Settings.canDrawOverlays(context)) {
-                cont.resume(true)
-                return@suspendCancellableCoroutine
+            // The caller's deadline cancels this continuation and removes the UI.
+            cont.invokeOnCancellation {
+                onMain {
+                    if (pendingConfirmation === cont) {
+                        pendingConfirmation = null
+                        remove(confirmBar)
+                        confirmBar = null
+                    }
+                }
             }
-            mainHandler.post {
+            onMain {
+                if (!cont.isActive) return@onMain
+                if (!Settings.canDrawOverlays(context)) {
+                    cont.resume(false)
+                    return@onMain
+                }
+                cancelConfirmation()
+                pendingConfirmation = cont
                 val container = LinearLayout(context).apply {
                     orientation = LinearLayout.HORIZONTAL
                     setPadding(36, 24, 36, 24)
                     background = GradientDrawable().apply {
-                        setColor(Color.parseColor("#F21E293B"))
-                        cornerRadius = 36f
+                        setColor(Color.parseColor("#F21E293B")); cornerRadius = 36f
                     }
                 }
-
-                val labelTv = TextView(context).apply {
+                fun finish(approved: Boolean) {
+                    if (pendingConfirmation !== cont) return
+                    pendingConfirmation = null
+                    remove(container)
+                    confirmBar = null
+                    if (cont.isActive) cont.resume(approved)
+                }
+                container.addView(TextView(context).apply {
                     text = "⚠️ AI 待确认：$actionDesc  "
-                    setTextColor(Color.WHITE)
-                    textSize = 13f
-                }
-
-                val approveBtn = TextView(context).apply {
-                    text = " [✅ 放行] "
-                    setTextColor(Color.parseColor("#4ADE80"))
-                    textSize = 14f
-                    setOnClickListener {
-                        dismissConfirmBar()
-                        if (cont.isActive) cont.resume(true)
-                    }
-                }
-
-                val cancelBtn = TextView(context).apply {
-                    text = " [❌ 拦截] "
-                    setTextColor(Color.parseColor("#F87171"))
-                    textSize = 14f
-                    setOnClickListener {
-                        dismissConfirmBar()
-                        if (cont.isActive) cont.resume(false)
-                    }
-                }
-
-                container.addView(labelTv)
-                container.addView(approveBtn)
-                container.addView(cancelBtn)
-
+                    setTextColor(Color.WHITE); textSize = 13f
+                })
+                container.addView(TextView(context).apply {
+                    text = " [✅ 放行] "; setTextColor(Color.parseColor("#4ADE80")); textSize = 14f
+                    setOnClickListener { finish(true) }
+                })
+                container.addView(TextView(context).apply {
+                    text = " [❌ 拦截] "; setTextColor(Color.parseColor("#F87171")); textSize = 14f
+                    setOnClickListener { finish(false) }
+                })
                 val params = WindowManager.LayoutParams(
-                    WindowManager.LayoutParams.WRAP_CONTENT,
-                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                    PixelFormat.TRANSLUCENT
-                ).apply {
-                    gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-                    y = 140
-                }
-
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
+                ).apply { gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL; y = 140 }
                 try {
+                    if (!cont.isActive) { finish(false); return@onMain }
                     windowManager.addView(container, params)
                     confirmBar = container
-                } catch (_: Throwable) {
-                    if (cont.isActive) cont.resume(false)
-                }
+                } catch (_: Exception) { finish(false) }
             }
         }
-
-    private fun dismissConfirmBar() {
-        mainHandler.post {
-            confirmBar?.let {
-                try {
-                    windowManager.removeView(it)
-                } catch (_: Throwable) {
-                }
-            }
-            confirmBar = null
-        }
-    }
 }

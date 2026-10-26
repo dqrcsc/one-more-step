@@ -135,3 +135,15 @@ describe("Module 01: Shared Protocol & Pairing", () => {
     expect(fourth[2]).toBe(FrameType.STREAM_CHUNK);
   });
 });
+
+test("decoder rejects unsupported versions and oversized frames, then recovers", () => {
+  const decoder = new FrameStreamDecoder(1024);
+  const good = encodeJsonRpcFrame({ jsonrpc: "2.0", method: "test" });
+  const wrongVersion = good.slice(); wrongVersion[1] = 2;
+  expect(() => decoder.push(wrongVersion)).toThrow("version");
+  expect(decoder.push(good)).toHaveLength(1);
+  const oversized = good.slice(0, 8); new DataView(oversized.buffer).setUint32(4, 1025);
+  expect(() => decoder.push(oversized)).toThrow("limit");
+  expect(() => decoder.push(new Uint8Array(2065))).toThrow("buffer");
+  expect(decoder.push(good)).toHaveLength(1);
+});

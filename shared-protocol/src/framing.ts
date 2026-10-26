@@ -153,6 +153,10 @@ export class FrameStreamDecoder {
   public push(chunk: Uint8Array): DecodedFrame[] {
     if (chunk.byteLength === 0) return [];
 
+    if (this.buffer.byteLength + chunk.byteLength > 2 * (this.maxFramePayloadBytes + FRAME_HEADER_BYTES)) {
+      this.reset();
+      throw new Error("OMS decoder buffer exceeds limit");
+    }
     const combined = new Uint8Array(this.buffer.byteLength + chunk.byteLength);
     combined.set(this.buffer, 0);
     combined.set(chunk, this.buffer.byteLength);
@@ -168,16 +172,22 @@ export class FrameStreamDecoder {
       );
       const magic = view.getUint8(0);
       if (magic !== OMS_MAGIC_BYTE) {
+        this.reset();
         throw new Error(
           `OMS Frame magic mismatch: expected 0x${OMS_MAGIC_BYTE.toString(16)}, got 0x${magic.toString(16)}`
         );
       }
       const version = view.getUint8(1);
+      if (version !== OMS_PROTOCOL_VERSION) {
+        this.reset();
+        throw new Error(`Unsupported OMS protocol version: ${version}`);
+      }
       const frameType = view.getUint8(2) as FrameType;
       const flags = view.getUint8(3);
       const payloadLength = view.getUint32(4, false);
 
       if (payloadLength > this.maxFramePayloadBytes) {
+        this.reset();
         throw new Error(`OMS Frame payload exceeds limit: ${payloadLength} bytes`);
       }
 

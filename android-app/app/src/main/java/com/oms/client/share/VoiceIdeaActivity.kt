@@ -180,7 +180,7 @@ class VoiceIdeaActivity : Activity() {
             fileUri = primaryUri,
             extraAudioUri = if (screenshotUri != null && audioFile != null) Uri.fromFile(audioFile) else null
         )
-        Toast.makeText(this, "✅ 已发送至 Mac AI", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "✅ 已加入待发送队列", Toast.LENGTH_SHORT).show()
         finish()
     }
 

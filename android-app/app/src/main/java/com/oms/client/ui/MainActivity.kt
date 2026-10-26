@@ -76,6 +76,7 @@ import com.oms.client.service.OmsCoreForegroundService
 import com.oms.client.transport.OtaCheckResult
 import com.oms.client.xiaomi.XiaomiAdaptationHelper
 import kotlinx.coroutines.delay
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -918,6 +919,7 @@ fun StreamTimelineCard(item: StreamItemModel) {
                     val statusLabel = when (item.syncStatus) {
                         "DELIVERED" -> "✓ 已送达"
                         "QUEUED" -> "⏳ 待发送"
+                        "EXPIRED" -> "审批已过期"
                         "PENDING_APPROVAL" -> "⚠️ 待审批"
                         "APPROVED" -> "✅ 已批准"
                         "REJECTED" -> "❌ 已拒绝"
@@ -1018,37 +1020,38 @@ fun StreamTimelineCard(item: StreamItemModel) {
                     )
                 }
 
-                // Interactive Remote Approval Card Buttons (Scenario 1.2)
                 if (item.itemType == "APPROVAL" && item.syncStatus == "PENDING_APPROVAL") {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = {
-                                app.transportClient.sendApprovalDecision(
-                                    itemId = item.itemId,
-                                    approvalId = item.itemId,
-                                    approved = true,
-                                    selectedOption = "批准继续",
-                                    userComment = null
-                                )
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF16A34A))
-                        ) {
-                            Text("✅ 批准继续", fontSize = 12.sp)
+                    val metadata = remember(item.metadataJson) { runCatching { JSONObject(item.metadataJson ?: "{}") }.getOrDefault(JSONObject()) }
+                    val expiresAtMs = metadata.optLong("expiresAtMs", 0L)
+                    var nowMs by remember(item.itemId) { mutableStateOf(System.currentTimeMillis()) }
+                    LaunchedEffect(item.itemId, expiresAtMs) {
+                        while (nowMs < expiresAtMs) {
+                            delay(1000)
+                            nowMs = System.currentTimeMillis()
                         }
-                        Button(
-                            onClick = {
-                                app.transportClient.sendApprovalDecision(
-                                    itemId = item.itemId,
-                                    approvalId = item.itemId,
-                                    approved = false,
-                                    selectedOption = "拒绝并中止",
-                                    userComment = null
-                                )
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
-                        ) {
-                            Text("❌ 拒绝", fontSize = 12.sp)
+                    }
+                    val expired = expiresAtMs <= nowMs
+                    val options = metadata.optJSONArray("options")
+                    Spacer(modifier = Modifier.height(8.dp))
+                    if (expired) Text("审批已过期，请在 Mac 重新发起", color = Color(0xFFFBBF24), fontSize = 12.sp)
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (options != null) {
+                            for (index in 0 until options.length()) {
+                                val option = options.optString(index)
+                                Button(
+                                    enabled = !expired,
+                                    onClick = {
+                                        app.transportClient.sendApprovalDecision(
+                                            itemId = item.itemId,
+                                            approvalId = metadata.optString("approvalId", item.itemId),
+                                            approved = index == 0,
+                                            selectedOption = option,
+                                            userComment = null
+                                        )
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = if (index == 0) Color(0xFF16A34A) else Color(0xFFDC2626))
+                                ) { Text(option, fontSize = 12.sp) }
+                            }
                         }
                     }
                 }

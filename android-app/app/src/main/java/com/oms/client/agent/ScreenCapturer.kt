@@ -11,6 +11,7 @@ import android.view.Display
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.ByteArrayOutputStream
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
  * Module 05: Silent Screenshot Capturer (Android 11+ API 30+) & Set-of-Mark (SoM) Visual Annotator
@@ -62,7 +63,12 @@ object ScreenCapturer {
                 }
 
                 override fun onFailure(errorCode: Int) {
-                    if (cont.isActive) cont.resume(null)
+                    if (!cont.isActive) return
+                    if (errorCode == AccessibilityService.ERROR_TAKE_SCREENSHOT_SECURE_WINDOW) {
+                        cont.resumeWithException(SecurityException("ERR_SECURE_WINDOW_BLOCKED: Android rejected screenshot of a secure window"))
+                    } else {
+                        cont.resumeWithException(IllegalStateException("ERR_SCREENSHOT_FAILED: Android error $errorCode"))
+                    }
                 }
             }
         )

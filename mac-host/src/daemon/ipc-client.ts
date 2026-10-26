@@ -1,3 +1,4 @@
+import { ipcTimeoutForAction } from "./request-timeouts.js";
 import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
@@ -21,7 +22,7 @@ export class OmsIpcClient {
   public async call<T = any>(
     action: string,
     params: Record<string, any> = {},
-    timeoutMs = 30000
+    timeoutMs = ipcTimeoutForAction(action, params)
   ): Promise<T> {
     await this.ensureDaemonRunning();
 

@@ -157,10 +157,16 @@ object OmsFrameProtocol {
  */
 class OmsFrameStreamDecoder {
     private val buffer = ByteArrayOutputStream()
+    private val maxPayloadBytes = 16 * 1024 * 1024
+
+    private fun validateFrame(condition: Boolean, message: String) {
+        if (!condition) { buffer.reset(); throw IllegalArgumentException(message) }
+    }
 
     @Synchronized
     fun push(chunk: ByteArray): List<OmsFrameProtocol.DecodedFrame> {
         if (chunk.isEmpty()) return emptyList()
+        validateFrame(buffer.size().toLong() + chunk.size <= 2L * (maxPayloadBytes + OmsFrameProtocol.HEADER_BYTES), "OMS decoder buffer exceeds limit")
         buffer.write(chunk)
         var current = buffer.toByteArray()
         val frames = mutableListOf<OmsFrameProtocol.DecodedFrame>()
@@ -168,14 +174,14 @@ class OmsFrameStreamDecoder {
 
         while (current.size - offset >= OmsFrameProtocol.HEADER_BYTES) {
             val magic = current[offset]
-            require(magic == OmsFrameProtocol.MAGIC_BYTE) {
-                "Invalid OMS frame magic byte: 0x%02x".format(magic)
-            }
+            validateFrame(magic == OmsFrameProtocol.MAGIC_BYTE, "Invalid OMS frame magic")
             val version = current[offset + 1].toInt() and 0xFF
+            validateFrame(version == OmsFrameProtocol.PROTOCOL_VERSION.toInt(), "Unsupported OMS protocol version")
             val frameType = current[offset + 2].toInt() and 0xFF
             val flags = current[offset + 3].toInt() and 0xFF
             val payloadLen = ByteBuffer.wrap(current, offset + 4, 4).order(ByteOrder.BIG_ENDIAN).int
 
+            validateFrame(payloadLen in 0..maxPayloadBytes, "OMS frame payload exceeds limit")
             val totalLen = OmsFrameProtocol.HEADER_BYTES + payloadLen
             if (current.size - offset < totalLen) {
                 break

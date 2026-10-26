@@ -1,7 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { InboxSubmitItemParams, IntentTag } from "@oms/shared-protocol";
 import { CompletedFileTransfer } from "../transport/session-manager.js";
+
+const ITEM_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export interface StoredInboxFile {
   fileName: string;
@@ -46,6 +49,7 @@ export class InboxManager {
     fs.mkdirSync(this.inboxRootDir, { recursive: true });
     fs.mkdirSync(path.join(this.inboxRootDir, "pulled_cache"), { recursive: true });
     this.loadExistingIndex();
+    this.writeDerivedViews();
   }
 
   private loadExistingIndex(): void {
@@ -54,7 +58,15 @@ export class InboxManager {
     for (const line of lines) {
       try {
         const item = JSON.parse(line) as StoredInboxItem;
-        this.itemsMap.set(item.itemId, item);
+        if (
+          ITEM_ID_PATTERN.test(item.itemId) &&
+          typeof item.receivedAt === "string" &&
+          /^\d{4}-\d{2}-\d{2}T/.test(item.receivedAt) &&
+          Number.isFinite(item.createdAtMs) &&
+          Array.isArray(item.files)
+        ) {
+          this.itemsMap.set(item.itemId, item);
+        }
       } catch {
         // ignore corrupted line
       }
@@ -68,11 +80,38 @@ export class InboxManager {
     params: InboxSubmitItemParams,
     resolveStream: (streamId: string) => CompletedFileTransfer | undefined
   ): StoredInboxItem {
+    if (!ITEM_ID_PATTERN.test(params.clientItemId)) {
+      throw new Error("clientItemId must be a canonical UUID");
+    }
     // UUIDv7 idempotent deduplication check
     const existing = this.itemsMap.get(params.clientItemId);
     if (existing) {
+      this.writeDerivedViews();
       return existing;
     }
+
+    // Validate every attachment before creating an item or publishing its ID.
+    const attachments = (params.attachments ?? []).map((att) => {
+      const completed = resolveStream(att.streamId);
+      if (!completed || !fs.existsSync(completed.savedAbsPath)) {
+        throw new Error(`Attachment stream is not complete: ${att.streamId}`);
+      }
+      const bytes = fs.readFileSync(completed.savedAbsPath);
+      const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+      const declaredSha = String(att.sha256 || "").toLowerCase();
+      if (
+        completed.header.streamId !== att.streamId ||
+        bytes.byteLength !== att.totalBytes ||
+        bytes.byteLength !== completed.header.totalBytes ||
+        !/^[0-9a-f]{64}$/.test(declaredSha) ||
+        sha256 !== declaredSha ||
+        sha256 !== completed.sha256Actual.toLowerCase() ||
+        sha256 !== completed.header.sha256.toLowerCase()
+      ) {
+        throw new Error(`Attachment size or SHA-256 mismatch: ${att.streamId}`);
+      }
+      return { att, bytes, sha256 };
+    });
 
     const now = new Date();
     const dateFolder = now.toISOString().slice(0, 10); // YYYY-MM-DD
@@ -80,20 +119,27 @@ export class InboxManager {
     fs.mkdirSync(itemDir, { recursive: true });
 
     const storedFiles: StoredInboxFile[] = [];
-    for (const att of params.attachments ?? []) {
-      const completed = resolveStream(att.streamId);
-      if (completed && fs.existsSync(completed.savedAbsPath)) {
-        const safeName = path.basename(att.fileName || "attachment.bin");
-        const destAbsPath = path.join(itemDir, safeName);
-        fs.copyFileSync(completed.savedAbsPath, destAbsPath);
-        storedFiles.push({
-          fileName: safeName,
-          absPath: destAbsPath,
-          mimeType: att.mimeType,
-          sizeBytes: att.totalBytes,
-          sha256: completed.sha256Actual,
-        });
+    const usedNames = new Set(["meta.json"]);
+    for (const { att, bytes, sha256 } of attachments) {
+      const basename = path.basename(att.fileName || "attachment.bin");
+      const safeBase = !basename || basename === "." || basename === ".." ? "attachment.bin" : basename;
+      const extension = path.extname(safeBase);
+      const stem = safeBase.slice(0, safeBase.length - extension.length);
+      let safeName = safeBase;
+      let suffix = 2;
+      while (usedNames.has(safeName.toLowerCase())) {
+        safeName = `${stem}_${suffix++}${extension}`;
       }
+      usedNames.add(safeName.toLowerCase());
+      const destAbsPath = path.join(itemDir, safeName);
+      fs.writeFileSync(destAbsPath, bytes);
+      storedFiles.push({
+        fileName: safeName,
+        absPath: destAbsPath,
+        mimeType: att.mimeType,
+        sizeBytes: att.totalBytes,
+        sha256,
+      });
     }
 
     const stored: StoredInboxItem = {
@@ -109,26 +155,9 @@ export class InboxManager {
       files: storedFiles,
     };
 
-    // Save per-item meta.json
-    fs.writeFileSync(
-      path.join(itemDir, "meta.json"),
-      JSON.stringify(stored, null, 2),
-      "utf8"
-    );
-
-    // Update latest.json snapshot
-    fs.writeFileSync(this.latestJsonPath, JSON.stringify(stored, null, 2), "utf8");
-
-    // Append to chronological index
-    this.itemsMap.set(stored.itemId, stored);
-    fs.appendFileSync(this.indexJsonlPath, JSON.stringify(stored) + "\n", "utf8");
-
-    // Route to specialized staging queues by intentTag
-    if (stored.intentTag === "pkb_vault" || stored.intentTag === "voice_idea") {
-      fs.appendFileSync(this.pkbQueuePath, JSON.stringify(stored) + "\n", "utf8");
-    } else if (stored.intentTag === "ui_bug") {
-      fs.appendFileSync(this.uiBugQueuePath, JSON.stringify(stored) + "\n", "utf8");
-    }
+    const next = new Map(this.itemsMap);
+    next.set(stored.itemId, stored);
+    this.rewriteIndex(next);
 
     return stored;
   }
@@ -170,10 +199,12 @@ export class InboxManager {
 
     const result = filtered.slice(0, limit);
     if (opts.markAsProcessed && result.length > 0) {
+      const next = new Map(this.itemsMap);
       for (const item of result) {
-        item.processed = true;
+        next.set(item.itemId, { ...item, processed: true });
       }
-      this.rewriteIndex();
+      this.rewriteIndex(next);
+      return result.map((item) => this.itemsMap.get(item.itemId)!);
     }
 
     return result;
@@ -186,54 +217,76 @@ export class InboxManager {
   public markProcessed(itemId: string, processed = true): boolean {
     const item = this.itemsMap.get(itemId);
     if (!item) return false;
-    item.processed = processed;
-    this.rewriteIndex();
+    const next = new Map(this.itemsMap);
+    next.set(itemId, { ...item, processed });
+    this.rewriteIndex(next);
     return true;
   }
 
   public updateItemTranscript(itemId: string, voiceTranscript: string): StoredInboxItem | undefined {
     const item = this.itemsMap.get(itemId);
     if (!item) return undefined;
-    item.voiceTranscript = voiceTranscript;
-    if (!item.textContent) {
-      item.textContent = voiceTranscript;
-    }
-    const dateFolder = (item.receivedAt || new Date().toISOString()).slice(0, 10);
-    const metaPath = path.join(this.inboxRootDir, dateFolder, item.itemId, "meta.json");
-    if (fs.existsSync(path.dirname(metaPath))) {
-      fs.writeFileSync(metaPath, JSON.stringify(item, null, 2), "utf8");
-    }
-    fs.writeFileSync(this.latestJsonPath, JSON.stringify(item, null, 2), "utf8");
-    this.rewriteIndex();
-    return item;
+    const updated = { ...item, voiceTranscript, textContent: item.textContent || voiceTranscript };
+    const next = new Map(this.itemsMap);
+    next.set(itemId, updated);
+    this.rewriteIndex(next);
+    return updated;
   }
 
   public deleteItem(itemId: string): boolean {
-    const existed = this.itemsMap.delete(itemId);
+    const next = new Map(this.itemsMap);
+    const existed = next.delete(itemId);
     if (existed) {
-      this.rewriteIndex();
+      this.rewriteIndex(next);
     }
     return existed;
   }
 
   public clearProcessed(): number {
     let removed = 0;
+    const next = new Map(this.itemsMap);
     for (const [id, item] of this.itemsMap.entries()) {
       if (item.processed) {
-        this.itemsMap.delete(id);
+        next.delete(id);
         removed++;
       }
     }
     if (removed > 0) {
-      this.rewriteIndex();
+      this.rewriteIndex(next);
     }
     return removed;
   }
 
-  private rewriteIndex(): void {
-    const lines = Array.from(this.itemsMap.values())
+  private atomicWrite(filePath: string, content: string): void {
+    const tempPath = `${filePath}.${crypto.randomUUID()}.tmp`;
+    fs.writeFileSync(tempPath, content, { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tempPath, filePath);
+  }
+
+  private rewriteIndex(next: Map<string, StoredInboxItem>): void {
+    const lines = Array.from(next.values())
       .map((i) => JSON.stringify(i))
       .join("\n");
-    fs.writeFileSync(this.indexJsonlPath, lines ? lines + "\n" : "", "utf8");
+    // This index is authoritative. Views can be rebuilt after an interrupted write.
+    this.atomicWrite(this.indexJsonlPath, lines ? lines + "\n" : "");
+    this.itemsMap.clear();
+    for (const [id, item] of next) this.itemsMap.set(id, item);
+    this.writeDerivedViews();
+  }
+
+  private writeDerivedViews(): void {
+    const items = Array.from(this.itemsMap.values());
+    const pending = items.filter((item) => !item.processed);
+    const jsonLines = (list: StoredInboxItem[]) => list.map((item) => JSON.stringify(item) + "\n").join("");
+    const latest = items.slice().sort((a, b) => b.createdAtMs - a.createdAtMs)[0] ?? null;
+    this.atomicWrite(this.latestJsonPath, JSON.stringify(latest, null, 2));
+    this.atomicWrite(this.pkbQueuePath, jsonLines(pending.filter((item) => item.intentTag === "pkb_vault" || item.intentTag === "voice_idea")));
+    this.atomicWrite(this.uiBugQueuePath, jsonLines(pending.filter((item) => item.intentTag === "ui_bug")));
+    for (const item of items) {
+      const dateFolder = item.receivedAt.slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateFolder)) continue;
+      const itemDir = path.join(this.inboxRootDir, dateFolder, item.itemId);
+      if (fs.existsSync(itemDir)) this.atomicWrite(path.join(itemDir, "meta.json"), JSON.stringify(item, null, 2));
+    }
   }
 }

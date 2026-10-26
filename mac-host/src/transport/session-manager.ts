@@ -34,7 +34,6 @@ import {
   StreamAckResumeHeader,
   StreamStartHeader,
   TransportTier,
-  verifyEd25519,
 } from "@oms/shared-protocol";
 import { PresenceEngine } from "./presence-engine.js";
 import { BluetoothBridgeServer } from "./bluetooth-bridge-client.js";
@@ -56,6 +55,7 @@ export interface IncomingFileTransfer {
   receivedChunks: Map<number, Uint8Array>;
   receivedBytes: number;
   startedAtMs: number;
+  pipe: ActiveTransportPipe;
 }
 
 export interface CompletedFileTransfer {
@@ -109,6 +109,9 @@ export class PhoneSessionManager extends EventEmitter {
   private lastKnownLanIpsKey = "";
 
   private pipes: Map<TransportTier, ActiveTransportPipe> = new Map();
+  private readonly openPipes = new Set<ActiveTransportPipe>();
+  private pendingBtPipe?: ActiveTransportPipe;
+  private readonly outgoingStreams = new Map<string, { pipe: ActiveTransportPipe; resolve: () => void; reject: (err: Error) => void; timer: Timer }>();
   private activeTier: TransportTier = "DISCONNECTED";
   private phoneStatus: PhoneDeviceStatus | null = null;
   private lastRttMs = 0;
@@ -120,6 +123,7 @@ export class PhoneSessionManager extends EventEmitter {
       resolve: (val: any) => void;
       reject: (err: Error) => void;
       timer: Timer;
+      pipe: ActiveTransportPipe;
     }
   >();
   private readonly incomingStreams = new Map<string, IncomingFileTransfer>();
@@ -327,7 +331,7 @@ export class PhoneSessionManager extends EventEmitter {
         const url = new URL(req.url);
         const clientIp = server.requestIP(req)?.address || "unknown";
         const normalizedIp = clientIp.replace(/^::ffff:/i, "");
-        console.log(`[omsd][http] ${req.method} ${url.pathname}${url.search} from ${clientIp}`);
+        console.log(`[omsd][http] ${req.method} ${url.pathname} from ${clientIp}`);
         const tierParam = url.searchParams.get("tier") === "wan" ? "WAN_WEBRTC" : "LAN_WS";
         if (server.upgrade(req, { data: { tier: tierParam, remoteIp: normalizedIp } })) {
           return undefined;
@@ -573,18 +577,20 @@ export class PhoneSessionManager extends EventEmitter {
           sendRaw: (bytes) => this.btBridge?.sendFrameOverBluetooth(bytes),
           close: () => {},
         };
+        this.pendingBtPipe = btPipe;
         this.onPipeOpened(btPipe);
       });
 
       this.btBridge.on("phoneDisconnected", (info: any) => {
         console.log(`[omsd][ble] phoneDisconnected centralId=${info?.centralId}`);
         this.presence.onBleDisconnected();
-        const existing = this.pipes.get("BT_RFCOMM");
+        const existing = this.pendingBtPipe || this.pipes.get("BT_RFCOMM");
         if (existing) this.onPipeClosed(existing);
+        this.pendingBtPipe = undefined;
       });
 
       this.btBridge.on("frame", (bytes: Uint8Array) => {
-        let btPipe = this.pipes.get("BT_RFCOMM");
+        let btPipe = this.pendingBtPipe || this.pipes.get("BT_RFCOMM");
         if (!btPipe) {
           btPipe = {
             tier: "BT_RFCOMM",
@@ -593,6 +599,7 @@ export class PhoneSessionManager extends EventEmitter {
             sendRaw: (b) => this.btBridge?.sendFrameOverBluetooth(b),
             close: () => {},
           };
+          this.pendingBtPipe = btPipe;
           this.onPipeOpened(btPipe);
         }
         this.onRawBytesReceived(btPipe, bytes);
@@ -800,6 +807,7 @@ export class PhoneSessionManager extends EventEmitter {
   }
 
   private onPipeOpened(pipe: ActiveTransportPipe): void {
+    this.openPipes.add(pipe);
     // Issue mutual auth challenge immediately
     const nonceMacHex = crypto.randomBytes(16).toString("hex");
     pipe.pendingNonceMac = nonceMacHex;
@@ -816,11 +824,42 @@ export class PhoneSessionManager extends EventEmitter {
     pipe.sendRaw(helloFrame);
   }
 
+  private isLivePipe(pipe: ActiveTransportPipe): boolean {
+    return pipe.authenticated && Boolean(pipe.phoneId && this.trustedDevices.has(pipe.phoneId))
+      && this.pipes.get(pipe.tier) === pipe;
+  }
+
   private onPipeClosed(pipe: ActiveTransportPipe): void {
-    if (this.pipes.get(pipe.tier) === pipe) {
-      this.pipes.delete(pipe.tier);
+    pipe.authenticated = false;
+    pipe.pendingNonceMac = undefined;
+    this.openPipes.delete(pipe);
+    if (this.pipes.get(pipe.tier) === pipe) this.pipes.delete(pipe.tier);
+    for (const [id, pending] of this.pendingRpc) {
+      if (pending.pipe !== pipe) continue;
+      clearTimeout(pending.timer);
+      this.pendingRpc.delete(id);
+      pending.reject(new Error("Transport closed; retry the operation"));
+    }
+    for (const [id, pending] of this.outgoingStreams) {
+      if (pending.pipe !== pipe) continue;
+      clearTimeout(pending.timer);
+      this.outgoingStreams.delete(id);
+      pending.reject(new Error("Transport closed before delivery acknowledgement"));
+    }
+    for (const [id, transfer] of this.incomingStreams) {
+      if (transfer.pipe === pipe) this.incomingStreams.delete(id);
     }
     this.recomputeActiveTier();
+  }
+
+  private registerAuthenticatedPipe(pipe: ActiveTransportPipe): void {
+    const previous = this.pipes.get(pipe.tier);
+    if (previous && previous !== pipe) {
+      this.onPipeClosed(previous);
+      previous.close();
+    }
+    this.openPipes.add(pipe);
+    this.pipes.set(pipe.tier, pipe);
   }
 
   /**
@@ -829,7 +868,7 @@ export class PhoneSessionManager extends EventEmitter {
   private recomputeActiveTier(): void {
     let bestTier: TransportTier = "DISCONNECTED";
     for (const [tier, pipe] of this.pipes.entries()) {
-      if (pipe.authenticated && TIER_PRIORITY[tier] > TIER_PRIORITY[bestTier]) {
+      if (this.isLivePipe(pipe) && TIER_PRIORITY[tier] > TIER_PRIORITY[bestTier]) {
         bestTier = tier;
       }
     }
@@ -855,6 +894,7 @@ export class PhoneSessionManager extends EventEmitter {
     }
 
     for (const frame of frames) {
+      try {
       switch (frame.frameType) {
         case FrameType.CONTROL_JSON_RPC: {
           const msg = decodeJsonRpcPayload<JsonRpcMessage>(frame.payload);
@@ -862,24 +902,25 @@ export class PhoneSessionManager extends EventEmitter {
           break;
         }
         case FrameType.STREAM_START: {
-          if (!pipe.authenticated) break;
+          if (!this.isLivePipe(pipe)) break;
           const header = decodeJsonRpcPayload<StreamStartHeader>(frame.payload);
           this.handleStreamStart(pipe, header);
           break;
         }
         case FrameType.STREAM_CHUNK: {
-          if (!pipe.authenticated) break;
+          if (!this.isLivePipe(pipe)) break;
           const chunkObj = decodeStreamChunkPayload(frame.payload);
           this.handleStreamChunk(pipe, chunkObj.streamId, chunkObj.chunkIndex, chunkObj.data);
           break;
         }
         case FrameType.STREAM_ACK_RESUME: {
-          if (!pipe.authenticated) break;
+          if (!this.isLivePipe(pipe)) break;
           const ack = decodeJsonRpcPayload<StreamAckResumeHeader>(frame.payload);
-          this.emit("streamAck", ack);
+          this.handleStreamAck(pipe, ack);
           break;
         }
         case FrameType.PING: {
+          if (!this.isLivePipe(pipe)) break;
           const view = new DataView(
             frame.payload.buffer,
             frame.payload.byteOffset,
@@ -890,6 +931,7 @@ export class PhoneSessionManager extends EventEmitter {
           break;
         }
         case FrameType.PONG: {
+          if (!this.isLivePipe(pipe)) break;
           const view = new DataView(
             frame.payload.buffer,
             frame.payload.byteOffset,
@@ -903,6 +945,9 @@ export class PhoneSessionManager extends EventEmitter {
           break;
         }
       }
+      } catch (err) {
+        this.emit("protocolError", err);
+      }
     }
   }
 
@@ -911,7 +956,7 @@ export class PhoneSessionManager extends EventEmitter {
     if ("result" in msg || "error" in msg) {
       const resp = msg as JsonRpcResponse;
       const pending = this.pendingRpc.get(resp.id);
-      if (pending) {
+      if (pending && this.isLivePipe(pipe) && pending.pipe === pipe) {
         clearTimeout(pending.timer);
         this.pendingRpc.delete(resp.id);
         if (resp.error) {
@@ -938,7 +983,7 @@ export class PhoneSessionManager extends EventEmitter {
       return;
     }
 
-    if (!pipe.authenticated) {
+    if (!this.isLivePipe(pipe)) {
       if (req.id) {
         pipe.sendRaw(
           encodeJsonRpcFrame({
@@ -959,7 +1004,7 @@ export class PhoneSessionManager extends EventEmitter {
         id: req.id,
         ...(resultOrError.error ? { error: resultOrError.error } : { result: resultOrError.result }),
       });
-      this.enqueueFrame(responseFrame, FrameType.CONTROL_JSON_RPC);
+      if (this.isLivePipe(pipe)) pipe.sendRaw(responseFrame);
     });
   }
 
@@ -985,7 +1030,7 @@ export class PhoneSessionManager extends EventEmitter {
       params.phonePubKeyBase64Url
     );
 
-    if (params.pinCode !== this.activePairingCreds.pinCode || params.hmacHex !== expectedHmac) {
+    if (params.pinCode !== this.activePairingCreds.pinCode || !this.equalDigest(expectedHmac, params.hmacHex)) {
       this.activePairingCreds.failedPinAttempts =
         (this.activePairingCreds.failedPinAttempts || 0) + 1;
       if (this.activePairingCreds.failedPinAttempts >= 5) {
@@ -1026,13 +1071,25 @@ export class PhoneSessionManager extends EventEmitter {
       lastSeenMs: Date.now(),
     };
 
+    // Invalidate operations even when re-pairing reuses the physical connection.
+    this.onPipeClosed(pipe);
+    // Re-pairing revokes every old connection, including connections on other tiers.
+    for (const old of [...this.openPipes, ...this.pipes.values()]) {
+      if (old === pipe) continue;
+      this.onPipeClosed(old);
+      old.close();
+    }
+    this.incomingStreams.clear();
+    this.completedStreams.clear();
+    while (this.outQueue.size) this.outQueue.dequeue();
+    this.emit("sessionRevoked");
     // Strictly enforce 1-to-1 pairing: bind exclusively to the newly paired phone
     this.trustedDevices.clear();
     this.trustedDevices.set(trusted.phoneId, trusted);
     pipe.authenticated = true;
     pipe.phoneId = trusted.phoneId;
     pipe.pendingNonceMac = undefined;
-    this.pipes.set(pipe.tier, pipe);
+    this.registerAuthenticatedPipe(pipe);
     if (pipe.tier === "LAN_WS") {
       this.presence.onLanDirectActive(1);
     }
@@ -1085,32 +1142,9 @@ export class PhoneSessionManager extends EventEmitter {
       return;
     }
 
-    const signedEd25519Data = `${challengeNonceMac}:${this.hostIdentity.deviceId}`;
     const hmacPayload = `phone_auth:${challengeNonceMac}:${this.hostIdentity.deviceId}:${params.phoneId}:${params.noncePhoneHex}`;
-
-    const isEd25519Valid = verifyEd25519(
-      trusted.phonePubKeyBase64Url,
-      signedEd25519Data,
-      params.phoneSignatureBase64Url
-    );
-    const isPairSecretHmacValid =
-      Boolean(trusted.pairSecretHex) &&
-      computeAuthHmac(trusted.pairSecretHex!, hmacPayload) === params.phoneSignatureBase64Url;
-    const isLegacyMigrationHmacValid =
-      !trusted.pairSecretHex &&
-      Boolean(trusted.wanRoomId) &&
-      computeAuthHmac(trusted.wanRoomId, hmacPayload) === params.phoneSignatureBase64Url;
-    // Allow already-registered v1.3.4 phone (matching trusted.phoneId in trusted_devices.json) until it upgrades to v1.3.5+ HMAC
-    const isLegacyTrustedDevice =
-      !trusted.pairSecretHex &&
-      params.phoneSignatureBase64Url === "trusted_xiaomi_sig";
-
-    if (
-      !isEd25519Valid &&
-      !isPairSecretHmacValid &&
-      !isLegacyMigrationHmacValid &&
-      !isLegacyTrustedDevice
-    ) {
+    const expected = trusted.pairSecretHex ? computeAuthHmac(trusted.pairSecretHex, hmacPayload) : "";
+    if (!expected || !this.equalDigest(expected, params.phoneSignatureBase64Url)) {
       console.warn(
         `[omsd][auth] signature verification failed for phoneId=${params.phoneId}`
       );
@@ -1125,12 +1159,6 @@ export class PhoneSessionManager extends EventEmitter {
         );
       }
       return;
-    }
-
-    let upgradedPairSecretHex: string | undefined;
-    if (isLegacyMigrationHmacValid && !trusted.pairSecretHex) {
-      upgradedPairSecretHex = crypto.randomBytes(32).toString("hex");
-      trusted.pairSecretHex = upgradedPairSecretHex;
     }
 
     const knownIps = new Set<string>();
@@ -1156,7 +1184,7 @@ export class PhoneSessionManager extends EventEmitter {
     pipe.phoneId = params.phoneId;
     trusted.lastSeenMs = Date.now();
     this.phoneStatus = params.deviceSnapshot;
-    this.pipes.set(pipe.tier, pipe);
+    this.registerAuthenticatedPipe(pipe);
     if (pipe.tier === "LAN_WS") {
       this.presence.onLanDirectActive(1);
     }
@@ -1186,7 +1214,6 @@ export class PhoneSessionManager extends EventEmitter {
             macId: this.hostIdentity.deviceId,
             macSignatureBase64Url: macSig,
             ...(macAuthHmacHex ? { macAuthHmacHex } : {}),
-            ...(upgradedPairSecretHex ? { pairSecretHex: upgradedPairSecretHex } : {}),
           },
         })
       );
@@ -1199,81 +1226,123 @@ export class PhoneSessionManager extends EventEmitter {
     });
   }
 
-  private handleStreamStart(pipe: ActiveTransportPipe, header: StreamStartHeader): void {
-    const existing = this.incomingStreams.get(header.streamId);
-    if (existing) {
-      // Resuming an interrupted stream! Tell sender which chunk we expect next
-      let nextChunk = 0;
-      while (existing.receivedChunks.has(nextChunk)) {
-        nextChunk++;
-      }
-      pipe.sendRaw(
-        encodeStreamAckResumeFrame({
-          streamId: header.streamId,
-          status: "RESUME_REQUEST",
-          nextExpectedChunkIndex: nextChunk,
-        })
-      );
-      return;
-    }
-
-    this.incomingStreams.set(header.streamId, {
-      header,
-      receivedChunks: new Map(),
-      receivedBytes: 0,
-      startedAtMs: Date.now(),
-    });
+  private equalDigest(expected: string, actual: unknown): boolean {
+    return typeof actual === "string" && /^[a-f0-9]{64}$/i.test(actual)
+      && crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(actual, "hex"));
   }
 
-  private handleStreamChunk(
-    pipe: ActiveTransportPipe,
-    streamId: string,
-    chunkIndex: number,
-    data: Uint8Array
-  ): void {
+  private streamError(pipe: ActiveTransportPipe, streamId: string, message: string): void {
     const transfer = this.incomingStreams.get(streamId);
-    if (!transfer) return;
+    if (transfer?.pipe === pipe) this.incomingStreams.delete(streamId);
+    pipe.sendRaw(encodeStreamAckResumeFrame({ streamId, status: "ERROR", nextExpectedChunkIndex: 0, errorMessage: message }));
+  }
 
-    if (!transfer.receivedChunks.has(chunkIndex)) {
-      transfer.receivedChunks.set(chunkIndex, data);
+  private handleStreamStart(pipe: ActiveTransportPipe, header: StreamStartHeader): void {
+    if (!this.isLivePipe(pipe)) return;
+    if (!header || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(header.streamId)
+      || !Number.isSafeInteger(header.totalBytes) || header.totalBytes < 0 || header.totalBytes > 64 * 1024 * 1024
+      || !Number.isSafeInteger(header.chunkSize) || header.chunkSize < 1 || header.chunkSize > 65536
+      || header.totalChunks > 65536
+      || header.totalChunks !== Math.max(1, Math.ceil(header.totalBytes / header.chunkSize))
+      || !/^[a-f0-9]{64}$/i.test(header.sha256) || typeof header.fileName !== "string") {
+      this.streamError(pipe, header?.streamId || "invalid", "Invalid stream header or size limit exceeded");
+      return;
+    }
+    const existing = this.incomingStreams.get(header.streamId);
+    const completed = this.completedStreams.get(header.streamId);
+    if (completed) {
+      if (JSON.stringify(completed.header) !== JSON.stringify(header)) {
+        this.streamError(pipe, header.streamId, "Stream ID already committed with different metadata");
+      } else {
+        pipe.sendRaw(encodeStreamAckResumeFrame({ streamId: header.streamId, status: "COMPLETED", nextExpectedChunkIndex: header.totalChunks }));
+      }
+      return;
+    }
+    if (existing) {
+      if (existing.pipe !== pipe || JSON.stringify(existing.header) !== JSON.stringify(header)) {
+        this.streamError(pipe, header.streamId, "Stream ID belongs to a different transfer");
+        return;
+      }
+      let next = 0;
+      while (existing.receivedChunks.has(next)) next++;
+      pipe.sendRaw(encodeStreamAckResumeFrame({ streamId: header.streamId, status: "RESUME_REQUEST", nextExpectedChunkIndex: next }));
+      return;
+    }
+    // Bound abandoned partial transfers as well as their individual sizes.
+    for (const [id, transfer] of this.incomingStreams) {
+      if (Date.now() - transfer.startedAtMs > 60000) this.incomingStreams.delete(id);
+    }
+    if (this.incomingStreams.size >= 16) {
+      this.streamError(pipe, header.streamId, "Too many active streams");
+      return;
+    }
+    this.incomingStreams.set(header.streamId, { header, pipe, receivedChunks: new Map(), receivedBytes: 0, startedAtMs: Date.now() });
+  }
+
+  private handleStreamChunk(pipe: ActiveTransportPipe, streamId: string, chunkIndex: number, data: Uint8Array): void {
+    const transfer = this.incomingStreams.get(streamId);
+    if (!this.isLivePipe(pipe) || !transfer || transfer.pipe !== pipe) return;
+    const h = transfer.header;
+    const expectedLength = chunkIndex === h.totalChunks - 1 ? h.totalBytes - chunkIndex * h.chunkSize : h.chunkSize;
+    if (!Number.isSafeInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= h.totalChunks || data.byteLength !== expectedLength) {
+      this.streamError(pipe, streamId, "Invalid chunk index or length");
+      return;
+    }
+    const previous = transfer.receivedChunks.get(chunkIndex);
+    if (previous && !Buffer.from(previous).equals(Buffer.from(data))) {
+      this.streamError(pipe, streamId, "Conflicting duplicate chunk");
+      return;
+    }
+    if (!previous) {
+      transfer.receivedChunks.set(chunkIndex, data.slice());
       transfer.receivedBytes += data.byteLength;
     }
-
-    if (transfer.receivedChunks.size >= transfer.header.totalChunks) {
-      // Reassemble & verify SHA-256
-      const totalBuf = new Uint8Array(transfer.receivedBytes);
-      let offset = 0;
-      for (let i = 0; i < transfer.header.totalChunks; i++) {
-        const part = transfer.receivedChunks.get(i);
-        if (!part) return;
-        totalBuf.set(part, offset);
-        offset += part.byteLength;
-      }
-
-      const actualSha256 = crypto.createHash("sha256").update(totalBuf).digest("hex");
-      const safeName = path.basename(transfer.header.fileName || `${streamId}.bin`);
-      const savedAbsPath = path.join(this.streamDownloadDir, `${streamId}_${safeName}`);
-      fs.writeFileSync(savedAbsPath, totalBuf);
-
-      this.incomingStreams.delete(streamId);
-      const completed: CompletedFileTransfer = {
-        header: transfer.header,
-        savedAbsPath,
-        sha256Actual: actualSha256,
-      };
-      this.completedStreams.set(streamId, completed);
-
-      pipe.sendRaw(
-        encodeStreamAckResumeFrame({
-          streamId,
-          status: "COMPLETED",
-          nextExpectedChunkIndex: transfer.header.totalChunks,
-          savedPath: savedAbsPath,
-        })
-      );
-
-      this.emit("streamCompleted", completed);
+    if (transfer.receivedChunks.size !== h.totalChunks) return;
+    const totalBuf = Buffer.concat(Array.from({ length: h.totalChunks }, (_, i) => Buffer.from(transfer.receivedChunks.get(i)!)));
+    const actualSha256 = crypto.createHash("sha256").update(totalBuf).digest("hex");
+    if (totalBuf.byteLength !== h.totalBytes || !this.equalDigest(actualSha256, h.sha256)) {
+      this.streamError(pipe, streamId, "Stream length or SHA-256 mismatch");
+      return;
     }
+    const safeName = path.basename(h.fileName || `${streamId}.bin`);
+    const savedAbsPath = path.join(this.streamDownloadDir, `${streamId}_${safeName}`);
+    try {
+      fs.writeFileSync(savedAbsPath + ".partial", totalBuf);
+      fs.renameSync(savedAbsPath + ".partial", savedAbsPath);
+      const completed: CompletedFileTransfer = { header: h, savedAbsPath, sha256Actual: actualSha256 };
+      this.incomingStreams.delete(streamId);
+      this.completedStreams.set(streamId, completed);
+      pipe.sendRaw(encodeStreamAckResumeFrame({ streamId, status: "COMPLETED", nextExpectedChunkIndex: h.totalChunks, savedPath: savedAbsPath }));
+      this.emit("streamCompleted", completed);
+    } catch (err) {
+      this.streamError(pipe, streamId, `Could not commit stream: ${String(err)}`);
+    }
+  }
+
+  private handleStreamAck(pipe: ActiveTransportPipe, ack: StreamAckResumeHeader): void {
+    const pending = this.outgoingStreams.get(ack.streamId);
+    if (!pending || pending.pipe !== pipe || !this.isLivePipe(pipe)) return;
+    if (ack.status !== "COMPLETED" && ack.status !== "ERROR") return;
+    clearTimeout(pending.timer);
+    this.outgoingStreams.delete(ack.streamId);
+    if (ack.status === "COMPLETED") pending.resolve();
+    else pending.reject(new Error(ack.errorMessage || "Phone could not commit stream"));
+  }
+
+  public waitForCompletedStream(streamId: string, timeoutMs = 15000): Promise<CompletedFileTransfer> {
+    const existing = this.completedStreams.get(streamId);
+    if (existing) return Promise.resolve(existing);
+    return new Promise((resolve, reject) => {
+      const cleanup = () => { clearTimeout(timer); this.off("streamCompleted", onDone); this.off("sessionRevoked", onRevoke); };
+      const onDone = (completed: CompletedFileTransfer) => {
+        if (completed.header.streamId !== streamId) return;
+        cleanup(); resolve(completed);
+      };
+      const onRevoke = () => { cleanup(); reject(new Error("Session revoked")); };
+      const timer = setTimeout(() => { cleanup(); reject(new Error("Timed out waiting for verified stream")); }, timeoutMs);
+      this.on("streamCompleted", onDone);
+      this.on("sessionRevoked", onRevoke);
+    });
   }
 
   /**
@@ -1284,7 +1353,8 @@ export class PhoneSessionManager extends EventEmitter {
     params: Record<string, unknown> = {},
     timeoutMs = 15000
   ): Promise<TResult> {
-    if (this.activeTier === "DISCONNECTED") {
+    const pipe = this.pipes.get(this.activeTier);
+    if (!pipe || !this.isLivePipe(pipe)) {
       const err = new Error(
         "Xiaomi phone is currently disconnected across all tiers (LAN / Bluetooth / WAN)."
       ) as Error & { code?: number };
@@ -1310,8 +1380,10 @@ export class PhoneSessionManager extends EventEmitter {
         reject(err);
       }, timeoutMs);
 
-      this.pendingRpc.set(reqId, { resolve, reject, timer });
-      this.enqueueFrame(frame, FrameType.CONTROL_JSON_RPC);
+      this.pendingRpc.set(reqId, { resolve, reject, timer, pipe });
+      try { pipe.sendRaw(frame); } catch (err) {
+        clearTimeout(timer); this.pendingRpc.delete(reqId); reject(err);
+      }
     });
   }
 
@@ -1324,10 +1396,11 @@ export class PhoneSessionManager extends EventEmitter {
     data: Uint8Array;
     title?: string;
     enableCommuteTts?: boolean;
+    timeoutMs?: number;
   }): Promise<{ streamId: string; sha256: string }> {
-    if (this.activeTier === "DISCONNECTED") {
-      throw new Error("Cannot push stream: Xiaomi phone is disconnected.");
-    }
+    const pipe = this.pipes.get(this.activeTier);
+    if (!pipe || !this.isLivePipe(pipe)) throw new Error("Cannot push stream: Xiaomi phone is disconnected.");
+    if (opts.data.byteLength > 64 * 1024 * 1024) throw new Error("Stream exceeds 64 MiB limit");
     const streamId = generateUuidV7();
     const sha256 = crypto.createHash("sha256").update(opts.data).digest("hex");
     const chunkSize = this.activeTier === "BT_RFCOMM" ? 8192 : 65536;
@@ -1345,18 +1418,23 @@ export class PhoneSessionManager extends EventEmitter {
       enableCommuteTts: opts.enableCommuteTts,
     };
 
-    this.enqueueFrame(encodeStreamStartFrame(startHeader), FrameType.STREAM_START);
-
-    for (let i = 0; i < totalChunks; i++) {
-      const slice = opts.data.subarray(
-        i * chunkSize,
-        Math.min((i + 1) * chunkSize, opts.data.byteLength)
-      );
-      this.enqueueFrame(
-        encodeStreamChunkFrame(streamId, i, slice),
-        FrameType.STREAM_CHUNK
-      );
-    }
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.outgoingStreams.delete(streamId);
+        reject(new Error("Phone delivery acknowledgement timed out; delivery is unconfirmed"));
+      }, opts.timeoutMs ?? 60000);
+      this.outgoingStreams.set(streamId, { pipe, resolve, reject, timer });
+      try {
+        pipe.sendRaw(encodeStreamStartFrame(startHeader));
+        for (let i = 0; i < totalChunks; i++) {
+          if (!this.outgoingStreams.has(streamId)) break;
+          if (!this.isLivePipe(pipe)) throw new Error("Transport changed during stream transfer");
+          pipe.sendRaw(encodeStreamChunkFrame(streamId, i, opts.data.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, opts.data.byteLength))));
+        }
+      } catch (err) {
+        clearTimeout(timer); this.outgoingStreams.delete(streamId); reject(err);
+      }
+    });
 
     return { streamId, sha256 };
   }
@@ -1384,6 +1462,8 @@ export class PhoneSessionManager extends EventEmitter {
   }
 
   public async stop(): Promise<void> {
+    for (const pipe of [...this.openPipes]) this.onPipeClosed(pipe);
+    this.emit("sessionRevoked");
     if (this.housekeepingTimer) {
       clearInterval(this.housekeepingTimer);
       this.housekeepingTimer = null;

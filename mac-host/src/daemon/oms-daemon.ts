@@ -1,3 +1,4 @@
+import { approvalTimeoutSec } from "./request-timeouts.js";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -57,8 +58,12 @@ export class OmsDaemon {
       resolve: (res: ApprovalRespondParams) => void;
       reject: (err: Error) => void;
       timer: Timer;
+      expiresAtMs: number;
+      options: string[];
     }
   >();
+
+  private readonly settledApprovals = new Map<string, { response: ApprovalRespondParams; expiresAtMs: number }>();
 
   constructor(customHomeDir?: string) {
     this.homeDir = customHomeDir || path.join(os.homedir(), ".one_more_step");
@@ -89,6 +94,11 @@ export class OmsDaemon {
     });
 
     this.wireSessionEvents();
+    this.session.on("sessionRevoked", () => {
+      for (const p of this.pendingApprovals.values()) { clearTimeout(p.timer); p.reject(new Error("Pairing session revoked")); }
+      this.pendingApprovals.clear();
+      this.settledApprovals.clear();
+    });
   }
 
   private loadOrInitConfig(): OmsHostConfig {
@@ -213,10 +223,15 @@ export class OmsDaemon {
         try {
           if (req.method === "inbox.submitItem") {
             const params = req.params as InboxSubmitItemParams;
+            const alreadyCommitted = Boolean(this.inbox.getItem(params.clientItemId));
             const stored = this.inbox.storeSubmittedItem(params, (streamId) =>
               this.session.getCompletedStream(streamId)
             );
 
+            if (alreadyCommitted) {
+              reply({ result: { ack: true, savedId: stored.itemId, macPath: stored.files[0]?.absPath ?? this.inbox.inboxRootDir } });
+              return;
+            }
             const textBody = stored.textContent || stored.voiceTranscript || "";
             const imageFile = stored.files.find(
               (f) =>
@@ -256,12 +271,20 @@ export class OmsDaemon {
             });
           } else if (req.method === "approval.respond") {
             const params = req.params as ApprovalRespondParams;
-            const waiter = this.pendingApprovals.get(params.approvalId);
-            if (waiter) {
-              clearTimeout(waiter.timer);
-              this.pendingApprovals.delete(params.approvalId);
-              waiter.resolve(params);
+            const settled = this.settledApprovals.get(params.approvalId);
+            if (settled && Date.now() <= settled.expiresAtMs && settled.response.approved === params.approved
+                && settled.response.selectedOption === params.selectedOption) {
+              reply({ result: { ack: true } });
+              return;
             }
+            const waiter = this.pendingApprovals.get(params.approvalId);
+            if (!waiter || Date.now() > waiter.expiresAtMs) throw new Error("Approval is unknown or expired");
+            const selectedIndex = waiter.options.indexOf(params.selectedOption);
+            if (selectedIndex < 0 || params.approved !== (selectedIndex === 0)) throw new Error("Invalid approval option or decision");
+            clearTimeout(waiter.timer);
+            this.pendingApprovals.delete(params.approvalId);
+            this.settledApprovals.set(params.approvalId, { response: params, expiresAtMs: waiter.expiresAtMs });
+            waiter.resolve(params);
             reply({ result: { ack: true } });
           } else if (req.method === "gui.emergencyStop") {
             this.showMacDesktopNotification(
@@ -611,24 +634,7 @@ export class OmsDaemon {
           compressImage: Boolean(params.compressImage),
         });
 
-        // Wait up to 15s for stream assembly completion if not already completed
-        let completed = this.session.getCompletedStream(pullMeta.streamId);
-        if (!completed) {
-          completed = await new Promise((resolve, reject) => {
-            const timer = setTimeout(
-              () => reject(new Error("Timed out waiting for pulled file stream chunks")),
-              15000
-            );
-            const onDone = (c: any) => {
-              if (c.header.streamId === pullMeta.streamId) {
-                clearTimeout(timer);
-                this.session.off("streamCompleted", onDone);
-                resolve(c);
-              }
-            };
-            this.session.on("streamCompleted", onDone);
-          });
-        }
+        const completed = await this.session.waitForCompletedStream(pullMeta.streamId);
 
         let finalPath = completed!.savedAbsPath;
         if (params.saveToDir) {
@@ -766,35 +772,39 @@ export class OmsDaemon {
       // Tool 9: phone_request_approval (Blocking Human-in-the-Loop Remote Approval)
       case "phone_request_approval": {
         const approvalId = `apr_${generateUuidV7()}`;
-        const timeoutSec = Number(params.timeoutSec ?? 1800);
+        const timeoutSec = approvalTimeoutSec(params.timeoutSec ?? 1800);
         const options = params.options ?? ["批准继续", "拒绝并中止"];
-
-        await this.session.callPhone("notify.requestApproval", {
-          approvalId,
-          title: params.title ?? "需要远程确认",
-          summary: params.summary ?? "",
-          contextText: params.diffOrContext ?? "",
-          options,
-          timeoutSec,
-        });
-
+        if (!Array.isArray(options) || options.length < 2 || options.length > 16
+            || options.some((o: unknown) => typeof o !== "string" || !o.trim()) || new Set(options).size !== options.length) {
+          throw new Error("Approval requires 2 to 16 distinct non-empty options; the first option approves");
+        }
+        const expiresAtMs = Date.now() + timeoutSec * 1000;
+        for (const [id, settled] of this.settledApprovals) {
+          if (settled.expiresAtMs < Date.now()) this.settledApprovals.delete(id);
+        }
+        // Register before dispatch: a fast phone response must not be lost.
         return await new Promise<ApprovalRespondParams>((resolve, reject) => {
           const timer = setTimeout(() => {
             this.pendingApprovals.delete(approvalId);
-            const err = new Error(
-              `Remote approval timed out after ${timeoutSec}s`
-            ) as Error & { code?: number };
+            const err = new Error(`Remote approval timed out after ${timeoutSec}s`) as Error & { code?: number };
             err.code = OmsErrorCode.ERR_APPROVAL_TIMEOUT;
             reject(err);
           }, timeoutSec * 1000);
-
-          this.pendingApprovals.set(approvalId, { resolve, reject, timer });
+          this.pendingApprovals.set(approvalId, { resolve, reject, timer, options, expiresAtMs });
+          this.session.callPhone("notify.requestApproval", {
+            approvalId, title: params.title ?? "需要远程确认", summary: params.summary ?? "",
+            contextText: params.diffOrContext ?? "", options, timeoutSec, expiresAtMs,
+          }).catch((err) => {
+            if (!this.pendingApprovals.has(approvalId)) return;
+            clearTimeout(timer); this.pendingApprovals.delete(approvalId); reject(err);
+          });
         });
       }
 
       // Tool 11: phone_gui_observe
       case "phone_gui_observe": {
         const obs = await this.session.callPhone<{
+          observationId: string;
           packageName: string;
           activityName: string;
           isSecureWindow: boolean;
@@ -809,7 +819,7 @@ export class OmsDaemon {
 
         let screenshotLocalAbsPath: string | undefined;
         if (obs.screenshotStreamId) {
-          const comp = this.session.getCompletedStream(obs.screenshotStreamId);
+          const comp = await this.session.waitForCompletedStream(obs.screenshotStreamId);
           if (comp) {
             screenshotLocalAbsPath = comp.savedAbsPath;
           }
@@ -828,11 +838,13 @@ export class OmsDaemon {
         return await this.session.callPhone("gui.act", {
           action: normalizedAction,
           targetNodeId: params.targetNodeId,
+          observationId: params.observationId,
+          deadlineMs: Date.now() + 60000,
           x: params.x,
           y: params.y,
           text: params.text,
           requireUserConfirm: Boolean(params.requireUserConfirm),
-        });
+        }, 65000);
       }
 
       // OTA APK Update Helper
@@ -886,23 +898,7 @@ export class OmsDaemon {
             throw new Error("手机端未能返回截屏数据流");
           }
 
-          let completed = this.session.getCompletedStream(streamId);
-          if (!completed) {
-            completed = await new Promise((resolve, reject) => {
-              const timer = setTimeout(
-                () => reject(new Error("等待手机截屏数据流超时")),
-                10000
-              );
-              const onDone = (c: any) => {
-                if (c.header.streamId === streamId) {
-                  clearTimeout(timer);
-                  this.session.off("streamCompleted", onDone);
-                  resolve(c);
-                }
-              };
-              this.session.on("streamCompleted", onDone);
-            });
-          }
+          const completed = await this.session.waitForCompletedStream(streamId, 10000);
 
           let inboxItemId: string | undefined;
           let savedAbsPath = completed!.savedAbsPath;
@@ -941,7 +937,9 @@ export class OmsDaemon {
         }
 
         try {
-          const res = await this.session.callPhone<any>("sys.control", params);
+          const res = await this.session.callPhone<any>("sys.control",
+            subAction === "system_action" ? { ...params, deadlineMs: Date.now() + 60000 } : params,
+            subAction === "system_action" ? 65000 : 15000);
           if (res?.status) {
             this.session.setPhoneStatus(res.status);
           } else {

@@ -366,6 +366,7 @@ export const OMS_MCP_TOOLS = [
             "open_url",
           ],
         },
+        observationId: { type: "string", description: "Observation ID from the most recent phone_gui_observe; required for node actions" },
         targetNodeId: {
           type: "string",
           description: "phone_gui_observe 返回的节点短编号，如 '#3'",
@@ -457,6 +458,7 @@ export class OmsMcpServer {
 
         case "tools/call": {
           const toolName = req.params?.name;
+          if (!OMS_MCP_TOOLS.some((tool) => tool.name === toolName)) throw new Error("Unknown MCP tool");
           const toolArgs = req.params?.arguments ?? {};
           const res = await this.ipc.call(toolName, toolArgs);
           return {

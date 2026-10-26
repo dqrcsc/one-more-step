@@ -4,6 +4,22 @@ import type { OmsDaemon } from "../daemon/oms-daemon.js";
 import { PhoneSessionManager } from "../transport/session-manager.js";
 import type { IntentTag } from "@oms/shared-protocol";
 
+function isLoopbackHost(hostname: string): boolean {
+  return PhoneSessionManager.isLoopbackAddress(hostname.replace(/^\[|\]$/g, ""));
+}
+
+function containedFile(root: string, filePath: string): string | null {
+  try {
+    const canonicalRoot = fs.realpathSync(root);
+    const canonicalFile = fs.realpathSync(filePath);
+    const relative = path.relative(canonicalRoot, canonicalFile);
+    if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
+    return fs.statSync(canonicalFile).isFile() ? canonicalFile : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Module 06+: Mac Real-Time Web Inbox & Bidirectional Collaboration Dashboard
  * Served strictly on localhost: http://127.0.0.1:19527/inbox (and /dashboard)
@@ -19,7 +35,16 @@ export async function handleDashboardHttpRequest(
     url.pathname === "/dashboard" ||
     url.pathname.startsWith("/api/inbox");
 
-  if (isDashboardRoute && !PhoneSessionManager.isLoopbackAddress(clientIp)) {
+  const requestHost = req.headers.get("host");
+  let validHost = isLoopbackHost(url.hostname);
+  if (requestHost) {
+    try {
+      validHost = validHost && isLoopbackHost(new URL(`http://${requestHost}`).hostname);
+    } catch {
+      validHost = false;
+    }
+  }
+  if (isDashboardRoute && (!PhoneSessionManager.isLoopbackAddress(clientIp) || !validHost)) {
     return new Response(
       JSON.stringify({
         ok: false,
@@ -83,16 +108,16 @@ export async function handleDashboardHttpRequest(
     if (!item) {
       return new Response("Item not found", { status: 404 });
     }
-    const fileEntry =
-      item.files.find((f) => f.fileName === fileName) || item.files[0];
+    const fileEntry = fileName
+      ? item.files.find((f) => f.fileName === fileName)
+      : item.files[0];
     if (!fileEntry || !fs.existsSync(fileEntry.absPath)) {
       return new Response("Attachment file not found", { status: 404 });
     }
 
     // Security check: ensure file is inside inboxRootDir
-    const resolved = path.resolve(fileEntry.absPath);
-    const rootResolved = path.resolve(daemon.inbox.inboxRootDir);
-    if (!resolved.startsWith(rootResolved)) {
+    const resolved = containedFile(daemon.inbox.inboxRootDir, fileEntry.absPath);
+    if (!resolved) {
       return new Response("Forbidden path", { status: 403 });
     }
 
@@ -105,8 +130,19 @@ export async function handleDashboardHttpRequest(
   }
 
   if (url.pathname === "/api/inbox/action" && req.method === "POST") {
+    const origin = req.headers.get("origin");
+    const fetchSite = req.headers.get("sec-fetch-site");
+    if ((origin && origin !== url.origin) || (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none")) {
+      return Response.json({ ok: false, error: "Forbidden request origin" }, { status: 403 });
+    }
+    if (req.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "application/json") {
+      return Response.json({ ok: false, error: "Content-Type must be application/json" }, { status: 415 });
+    }
     try {
       const body = (await req.json()) as Record<string, any>;
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return Response.json({ ok: false, error: "Expected a JSON object" }, { status: 400 });
+      }
       const action = String(body.action || "");
 
       switch (action) {
@@ -125,28 +161,20 @@ export async function handleDashboardHttpRequest(
           const removedCount = daemon.inbox.clearProcessed();
           return Response.json({ ok: true, removedCount });
         }
-        case "open_preview": {
-          const item = daemon.inbox.getItem(String(body.itemId || ""));
-          const targetPath = body.absPath || item?.files?.[0]?.absPath;
-          if (!targetPath || !fs.existsSync(targetPath)) {
-            return Response.json(
-              { ok: false, error: "文件不存在" },
-              { status: 404 }
-            );
-          }
-          daemon.openFileOnMac(targetPath, false);
-          return Response.json({ ok: true });
-        }
+        case "open_preview":
         case "reveal_in_finder": {
           const item = daemon.inbox.getItem(String(body.itemId || ""));
-          const targetPath = body.absPath || item?.files?.[0]?.absPath;
-          if (!targetPath || !fs.existsSync(targetPath)) {
-            return Response.json(
-              { ok: false, error: "文件不存在" },
-              { status: 404 }
-            );
+          const fileEntry = body.absPath
+            ? item?.files.find((file) => path.resolve(file.absPath) === path.resolve(String(body.absPath)))
+            : item?.files[0];
+          if (!fileEntry) {
+            return Response.json({ ok: false, error: "Attachment is not registered to this item" }, { status: 403 });
           }
-          daemon.openFileOnMac(targetPath, true);
+          const targetPath = containedFile(daemon.inbox.inboxRootDir, fileEntry.absPath);
+          if (!targetPath) {
+            return Response.json({ ok: false, error: "Forbidden attachment path" }, { status: 403 });
+          }
+          daemon.openFileOnMac(targetPath, action === "reveal_in_finder");
           return Response.json({ ok: true });
         }
         case "copy_mac_clipboard": {

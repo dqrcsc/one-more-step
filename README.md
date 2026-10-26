@@ -1,5 +1,8 @@
 # 青简·咫尺 · OneMoreStep
 
+> 当前开发分支的修复、升级要求与未实现能力见 **[实现边界与升级验收](docs/implementation-status.md)**。以下性能数字和硬件行为尚未在本轮真机验证；认证不等于传输加密。
+
+
 <p align="left">
   <img src="./docs/assets/icon-qingjian-zhichi.png" width="108" alt="青简·咫尺 (OneMoreStep) Icon" />
 </p>
@@ -32,8 +35,8 @@
 
 **青简·咫尺 (`OneMoreStep`)** 为此提供了一套**零第三方 IM 依赖、零云端账号绑定、兼容常驻 VPN** 的原生跨端底座：
 - **向上（面向 AI Agent）**：提供标准 **MCP Server（13 Tools + 3 Resources）**、统一 **CLI (`oms`)** 与 **全局 Skill**；
-- **中间（自适应传输与在场感知）**：融合 **局域网高速 WebSocket + 蓝牙近场双模（BLE 感知 + RFCOMM 离线传输）+ 跨网 P2P/WSS**，自动感知你是否在电脑旁（`AT_DESK` / `AWAY`）；
-- **向下（面向小米 Android）**：基于原生 Kotlin + Jetpack Compose 深度适配小米 HyperOS/MIUI，兼具 **100% 确定性的系统级 API 执行器** 与 **带四大硬件级安全护栏的无障碍 GUI 自动化引擎**。
+- **中间（自适应传输与在场感知）**：融合 **局域网 WebSocket + 蓝牙 BLE GATT + 可选 WSS 中继**，自动感知你是否在电脑旁（`AT_DESK` / `AWAY`）；
+- **向下（面向小米 Android）**：基于原生 Kotlin + Jetpack Compose 深度适配小米 HyperOS/MIUI，兼具 **依赖系统权限的原生 API 执行器** 与 **带应用层安全检查的无障碍 GUI 自动化引擎**。
 
 ---
 
@@ -70,23 +73,23 @@
 针对没有开放 API 的第三方 App 场景，内置 `OmsAccessibilityService`：
 - **三步语义剪枝树 (`SemanticTreeExtractor`)**：过滤冗余布局容器、聚合复合卡片文本，为可交互节点分配 `#1, #2` 短编号，单屏仅 `5~10 KB`，AI 无需看大图即可秒级定位。
 - **零弹窗静默截屏与 Set-of-Mark 合成 (`ScreenCapturer`)**：基于 Android 11+ `takeScreenshot` API，自动在截图上绘制带 `#ID` 的红框视觉角标，赋能多模态视觉精准对齐。
-- **四大硬件级安全护栏**：
-  1. **顶部物理急停胶囊 (`SafetyStopOverlay`)**：AI 操控手机期间，屏幕顶部常驻橙色 `🤖 Mac AI 操作中 · 点击立即停止` 胶囊，单击立即熔断所有手势队列；
-  2. **用户触碰即让路**：检测到手指真实触碰屏幕（`TYPE_TOUCH_INTERACTION_START`），立即中止 AI 当前操作；
-  3. **金融与密码页黑名单**：遇到 `FLAG_SECURE` 窗口或银行/支付包名，自动拒绝截屏与自动化注入；
-  4. **敏感动作停顿确认 (`requireUserConfirm`)**：在执行「提交/发送/支付」等最后一步前，可在手机端弹出半透明确认框，由人工点按放行。
+- **四项应用层安全检查**：
+  1. **顶部物理急停胶囊 (`SafetyStopOverlay`)**：AI 操控手机期间，屏幕顶部常驻橙色 `🤖 Mac AI 操作中 · 点击立即停止` 胶囊，点击后持久化停止状态并取消后续 GUI 动作，需在手机上显式恢复；已注入手势无法保证撤回；
+  2. **用户触碰即让路**：通过 `TYPE_TOUCH_INTERACTION_START` 请求取消当前 GUI 动作；OEM 事件覆盖需真机验证，等待确认时允许触碰确认条；
+  3. **金融与密码页黑名单**：按支付包名、活动名和密码字段拒绝操作；截图保留系统 secure-window 错误，不声称能识别所有 `FLAG_SECURE` 窗口；
+  4. **敏感动作停顿确认 (`requireUserConfirm`)**：在执行「提交/发送/支付」等最后一步前，可在手机端弹出半透明确认框，由人工点按放行；没有浮层权限或超时则拒绝，放行后再次检查观察是否有效。
 
 ### 2.4 📡 三级自适应传输与蓝牙空间感知
 - **三级无感热切换**：
-  1. `Tier 1 · LAN_WS`：局域网 WebSocket 高速直连（30~80 MB/s），绑定底层物理网卡并内置 UDP 广播、ARP 邻居单播信标与子网自动发现；
-  2. `Tier 2 · BT_RFCOMM`：macOS 原生 `CoreBluetooth` + Android BLE/RFCOMM，完全无视 Wi-Fi 隔离与手机 VPN，支持带外自动交换局域网 IP 及离线数据传输；
-  3. `Tier 3 · WAN`：跨网 WebRTC DataChannel / 可选 WSS 中继，不占手机 `VpnService` 槽位。
+  1. `Tier 1 · LAN_WS`：局域网 WebSocket 直连（吞吐量需实测），绑定底层物理网卡并内置 UDP 广播、ARP 邻居单播信标与子网自动发现；
+  2. `Tier 2 · BT_RFCOMM`：历史枚举名；Mac 实际使用 `CoreBluetooth` BLE GATT，支持近场 IP 交换；MTU、背压与大文件传输仍需专项验证；
+  3. `Tier 3 · WAN`：实际为可选 WebSocket 中继接入，尚未实现 WebRTC DataChannel/ICE/TURN，不占手机 `VpnService` 槽位。
 - **空间在场引擎 (`PresenceEngine`)**：通过蓝牙 RSSI 滑动窗口与滞回滤波，自动识别 `AT_DESK`（在电脑前）与 `AWAY`（离开工位），实现「坐到电脑前自动同步晨报、离开工位自动将 AI 通知路由至手机」。
 - **小米 HyperOS / MIUI 专属适配 (`XiaomiAdaptationHelper`)**：通过反射自检小米专属 AppOps 权限（`10021` 后台弹出界面、`10008` 锁屏显示），提供一键跳转设置向导。
 
 ### 2.5 🔐 一机一码与局域网严格 1 对 1 安全隔离
-即便在公司公共 Wi-Fi、咖啡厅或多人共用局域网环境下，也确保**只有你绑定的那一台 Mac 能与你的手机交互**：
-- **双向加密挑战-应答认证**：首次通过 6 位配对码（PIN）+ 一次性 Token 绑定时，双方协商生成 256-bit 专属配对密钥 (`pairSecretHex`) 并立即销毁一次性配对凭证。每次重连均执行双向 HMAC-SHA256 / Ed25519 挑战签名校验（Mac 验手机、手机验 Mac），手机端在完成对 Mac 的双向验签前拒绝执行任何传入的控制指令。
+以下机制限制设备身份和本地控制入口，但**当前 HTTP/WS 配对与业务帧没有应用层端到端加密**；不能据此保证公共网络上的保密性：
+- **双向 HMAC 挑战-应答认证**：首次通过 6 位配对码（PIN）+ 一次性 Token 绑定时，Mac 生成 256-bit 专属配对密钥 (`pairSecretHex`) 并立即销毁一次性配对凭证。每次重连均执行双向 HMAC-SHA256 挑战校验（Mac 验手机、手机验 Mac），手机端在完成对 Mac 的双向验签前拒绝执行任何传入的控制指令。
 - **手机端唯一 `macId` 强锁定**：一旦完成配对，手机端的 UDP 信标监听、局域网子网扫描与蓝牙近场发现仅接受 `macId == paired.macId` 的宿主设备；即使你自己的 Mac 休眠或离线，手机也绝不会自动连接或改绑到同一局域网内的其他电脑。
 - **Mac 本地控制台回环隔离 (`127.0.0.1` Only)**：`/inbox` 实时看板与 `/api/inbox/*` 控制接口严格限制仅允许本机回环地址 (`127.0.0.1` / `::1`) 访问，同一局域网内的其他电脑访问一律返回 `403 Forbidden`，杜绝借道 Mac 操控手机。
 - **PIN 码保护的配对解析与防爆破 (`/pair/resolve`)**：`/install` 无线安装页不在 HTML 中明文暴露配对凭证，需输入 Mac 终端显示的 6 位配对码方可解锁，且连续输错 5 次自动销毁配对会话。
@@ -119,7 +122,7 @@ flowchart TB
     subgraph Transport["📡 三级自适应传输层 (8-Byte P0/P2 多路复用帧协议 + Ed25519 鉴权)"]
         T1["Tier 1: LAN WebSocket (局域网高速直连 + UDP/ARP 自动发现)"]
         T2["Tier 2: BLE 信令 + Classic BT RFCOMM (零网络/绕过VPN)"]
-        T3["Tier 3: WAN WebRTC / WSS (跨网远程连接)"]
+        T3["Tier 3: WAN WSS 中继接入 (需部署)"]
     end
 
     subgraph XiaomiPhone["📱 小米 Android 客户端 (Kotlin + Jetpack Compose, MinSDK 30)"]
@@ -234,7 +237,7 @@ oms pair
 ### 第二步：首次信任绑定与常驻 VPN 分流
 
 1. 打开手机上的 **「青简·咫尺 (`OneMoreStep`)」**，在顶部 **「🔐 1 对 1 安全绑定与重连」** 输入框中直接输入 Mac 终端显示的 **6 位配对码**（如 `839201`）或粘贴完整 `oms://pair?v=1&...` 链接，点击 **`[🔐 验证并绑定]`**。
-2. 状态栏变为 **`🟢 局域网高速直连 (Tier 1)`** 即代表 1 对 1 双向加密密钥绑定完成（此后即使在同一局域网有其他电脑运行同款服务，手机也只认你绑定的这台 Mac）。
+2. 状态栏变为 **`🟢 局域网高速直连 (Tier 1)`** 即代表 1 对 1 双向认证完成（不代表业务传输已加密）（此后即使在同一局域网有其他电脑运行同款服务，手机也只认你绑定的这台 Mac）。
 3. **常驻 VPN 用户必配**：打开手机上的代理软件（Clash Meta / Sing-box / NekoBox 等），进入「分应用代理（Per-App Proxy）」，勾选 **`青简·咫尺 (OneMoreStep)` 绕过代理 / 直连**。
 
 ### 第三步：一键开启小米 HyperOS / MIUI 专属权限
@@ -380,9 +383,9 @@ oms approve --title "是否执行生产数据库迁移？" --summary "将新增 
 oms gui observe --screenshot --som
 
 # 按控件编号点击、输入文本或执行导航（--confirm 在执行前弹出人工确认框）
-oms gui act click "#2"
-oms gui act input_text "#5" --text "今日研发日报内容..."
-oms gui act click "#8" --confirm
+oms gui act click "#2" --observation "刚才返回的 observationId"
+oms gui act input_text "#5" --text "今日研发日报内容..." --observation "刚才返回的 observationId"
+oms gui act click "#8" --confirm --observation "刚才返回的 observationId"
 ```
 
 ---
@@ -454,7 +457,7 @@ bun run build:apk
 5. **[05. 模块二：三级自适应传输层与蓝牙空间感知](./docs/05-module-transport-and-presence.md)**：`LAN_WS` ⇄ `BT_RFCOMM` ⇄ `WAN_WEBRTC` 无缝热切换与 `AT_DESK / AWAY` 蓝牙 RSSI 滞回滤波引擎。
 6. **[06. 模块三：Android 免 IM 极速投递、内置时间流与知识库联动](./docs/06-module-android-share-and-stream.md)**：截屏秒传胶囊、Direct Share 置顶目标、1×1 透明焦点窗口剪贴板同步与通勤随身听。
 7. **[07. 模块四：Android 确定性系统能力与小米 HyperOS 深度适配](./docs/07-module-android-system-capabilities.md)**：原生闹钟双保险、日历防冲突读写、受权目录白名单、L1~L3 分级通知/TTS 及小米专属权限向导。
-8. **[08. 模块五：Android 无障碍 GUI 屏幕自动化引擎与安全护栏](./docs/08-module-android-gui-agent.md)**：语义树剪枝算法、Android 11+ 静默截屏与 Set-of-Mark 合成、拟人手势注入与四大硬件级安全护栏。
+8. **[08. 模块五：Android 无障碍 GUI 屏幕自动化引擎与安全护栏](./docs/08-module-android-gui-agent.md)**：语义树剪枝算法、Android 11+ 静默截屏与 Set-of-Mark 合成、拟人手势注入与四项应用层安全检查。
 9. **[09. 模块六：Mac 宿主守护进程 (`omsd`)、本地收件箱与知识库触发器](./docs/09-module-mac-daemon-and-inbox.md)**：单例 `omsd` + Unix Socket 多 Agent 并发架构、`~/.one_more_step/` 规范与在场智能路由。
 10. **[10. 模块七：Mac AI Agent 接口层（13 个 MCP Tools、CLI `oms` 与全局 Skill）](./docs/10-module-mcp-cli-and-skill.md)**：13 个 MCP 工具的 JSON Schema 契约、`oms` CLI 设计与全局 Skill 协同准则。
 11. **[11. 无数据线安装、配对与全功能体验指南](./docs/11-wireless-install-and-experience-guide.md)**：手把手完成无线安装、首次绑定、小米权限开启与 7 大核心场景实操演练。

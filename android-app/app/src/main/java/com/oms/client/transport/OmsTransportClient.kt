@@ -145,7 +145,6 @@ class OmsTransportClient(
     @Volatile
     private var cachedLanHttpClient: OkHttpClient? = null
 
-    private val wanDecoder = OmsFrameStreamDecoder()
     private val btDecoder = OmsFrameStreamDecoder()
 
     private val lanRetryRunnable = Runnable {
@@ -155,6 +154,9 @@ class OmsTransportClient(
 
     private class IncomingPushTransfer(
         val header: JSONObject,
+        val source: FrameSource,
+        val validated: DeliveryPolicy.Header,
+        val createdAtMs: Long = System.currentTimeMillis(),
         val chunks: MutableMap<Int, ByteArray> = ConcurrentHashMap()
     )
 
@@ -162,8 +164,16 @@ class OmsTransportClient(
         val nonceMacHex: String,
         val noncePhoneHex: String,
         val macId: String,
-        val secretKey: String
+        val secretKey: String,
+        val source: FrameSource,
+        val expiresAtMs: Long = System.currentTimeMillis() + 30_000
     )
+
+    private data class FrameSource(val tier: String, val socket: WebSocket?, val gatt: BluetoothGatt?)
+    private data class PendingReply(val source: FrameSource, val result: CompletableDeferred<JSONObject>)
+    private val authenticatedPairings = ConcurrentHashMap<FrameSource, String>()
+    private val pendingReplies = ConcurrentHashMap<String, PendingReply>()
+    private val decidingApprovals = ConcurrentHashMap.newKeySet<String>()
 
     private val incomingTransfers = ConcurrentHashMap<String, IncomingPushTransfer>()
     private val authenticatedWebSockets = ConcurrentHashMap.newKeySet<WebSocket>()
@@ -192,6 +202,17 @@ class OmsTransportClient(
             while (true) {
                 delay(4500L)
                 try {
+                    flushOutboxQueue()
+                    val now = System.currentTimeMillis()
+                    pendingAuthStates.entries.removeIf { it.value.expiresAtMs <= now }
+                    synchronized(incomingTransferLock) {
+                        for ((id, transfer) in incomingTransfers) {
+                            if (transfer.createdAtMs + 60_000 <= now && incomingTransfers.remove(id, transfer)) {
+                                streamAck(id, "ERROR", transfer.source, error = "Stream timed out")
+                            }
+                        }
+                    }
+                    authenticatedPairings.keys.removeIf { !isSourceCurrent(it) }
                     val paired = repo.getPairedMac() ?: continue
                     if (_activeTierFlow.value != "LAN_WS" || lanWebSocket == null) {
                         startBleNearFieldScanner()
@@ -471,7 +492,7 @@ class OmsTransportClient(
 
     private fun isMatchingPairedMacId(candidateMacId: String, pairedMacId: String): Boolean {
         if (candidateMacId.isBlank() || pairedMacId.isBlank()) return false
-        return candidateMacId == pairedMacId || pairedMacId == "mac_host"
+        return candidateMacId == pairedMacId
     }
 
     /**
@@ -735,7 +756,7 @@ class OmsTransportClient(
                 return@launch
             }
             if (_activeTierFlow.value == "LAN_WS" && lanWebSocket != null && isSourceAuthenticated("LAN_WS", lanWebSocket)) {
-                mainHandler.post { onResult(true, "✅ 已处于局域网加密直连状态 (${paired.macName})") }
+                mainHandler.post { onResult(true, "✅ 已处于局域网已认证直连状态 (${paired.macName})") }
                 return@launch
             }
             isConnectingLan.set(false)
@@ -912,13 +933,21 @@ class OmsTransportClient(
                                             wanRelayWssUrl = null,
                                             pairSecretHex = res.optString("pairSecretHex", "")
                                         )
+                                        if (config.macId != macId || config.pairSecretHex.isBlank()) {
+                                            webSocket.close(4003, "Missing pairing secret or wrong Mac")
+                                            if (resultDelivered.compareAndSet(false, true)) mainHandler.post { onResult(false, "配对结果缺少安全密钥，请重新配对") }
+                                            continue
+                                        }
                                         repo.savePairedMac(config)
+                                        authenticatedPairings.clear()
+                                        pendingAuthStates.clear()
+                                        authenticatedPairings[FrameSource("LAN_WS", webSocket, null)] = "${config.macId}:${config.pairSecretHex}"
                                         authenticatedWebSockets.add(webSocket)
                                         lanWebSocket = webSocket
                                         _activeTierFlow.value = "LAN_WS"
                                         flushOutboxQueue()
                                         if (resultDelivered.compareAndSet(false, true)) {
-                                            mainHandler.post { onResult(true, "🔐 已完成 1 对 1 加密绑定：${config.macName} ($targetIp)") }
+                                            mainHandler.post { onResult(true, "🔐 已完成 1 对 1 认证绑定：${config.macName} ($targetIp)") }
                                         }
                                     } else {
                                         val errReason = errObj?.optString("message") ?: "配对码已过期或签名无效"
@@ -1062,14 +1091,18 @@ class OmsTransportClient(
             .build()
         val req = Request.Builder().url(wssUrl).build()
 
+        val socketDecoder = OmsFrameStreamDecoder()
         client.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                wanDecoder.reset()
+                wanWebSocket?.takeIf { it !== webSocket }?.let { old ->
+                    authenticatedWebSockets.remove(old)
+                    old.close(1000, "Replaced")
+                }
                 wanWebSocket = webSocket
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                handleIncomingRawBytes("WAN_WEBRTC", wanDecoder, bytes.toByteArray(), webSocket)
+                handleIncomingRawBytes("WAN_WEBRTC", socketDecoder, bytes.toByteArray(), webSocket)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
@@ -1187,7 +1220,9 @@ class OmsTransportClient(
                             false,
                             object : BluetoothGattCallback() {
                                 override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                                    if (gatt !== activeBleGatt) return
                                     if (newState == BluetoothProfile.STATE_CONNECTED) {
+                                        btDecoder.reset()
                                         gatt.discoverServices()
                                     } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                                         try {
@@ -1202,6 +1237,7 @@ class OmsTransportClient(
                                 }
 
                                 override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                                    if (gatt !== activeBleGatt) return
                                     val svc = gatt.getService(BLE_SERVICE_UUID) ?: return
                                     val infoChar = svc.getCharacteristic(BLE_CHAR_MAC_INFO_UUID)
                                     val pipeChar = svc.getCharacteristic(BLE_CHAR_FRAME_PIPE_UUID)
@@ -1225,6 +1261,7 @@ class OmsTransportClient(
                                     value: ByteArray,
                                     status: Int
                                 ) {
+                                    if (gatt !== activeBleGatt) return
                                     if (characteristic.uuid == BLE_CHAR_MAC_INFO_UUID && value.isNotEmpty()) {
                                         handleBleMacInfoBytes(gatt, bleFramePipeChar, value)
                                     }
@@ -1237,6 +1274,7 @@ class OmsTransportClient(
                                     characteristic: BluetoothGattCharacteristic,
                                     status: Int
                                 ) {
+                                    if (gatt !== activeBleGatt) return
                                     if (characteristic.uuid == BLE_CHAR_MAC_INFO_UUID) {
                                         val valBytes = characteristic.value ?: return
                                         handleBleMacInfoBytes(gatt, bleFramePipeChar, valBytes)
@@ -1249,8 +1287,9 @@ class OmsTransportClient(
                                     characteristic: BluetoothGattCharacteristic,
                                     value: ByteArray
                                 ) {
+                                    if (gatt !== activeBleGatt) return
                                     if (characteristic.uuid == BLE_CHAR_FRAME_PIPE_UUID && value.isNotEmpty()) {
-                                        handleIncomingRawBytes("BT_RFCOMM", btDecoder, value)
+                                        handleIncomingRawBytes("BT_RFCOMM", btDecoder, value, sourceBleGatt = gatt)
                                     }
                                 }
 
@@ -1260,9 +1299,10 @@ class OmsTransportClient(
                                     gatt: BluetoothGatt,
                                     characteristic: BluetoothGattCharacteristic
                                 ) {
+                                    if (gatt !== activeBleGatt) return
                                     if (characteristic.uuid == BLE_CHAR_FRAME_PIPE_UUID) {
                                         val bytes = characteristic.value ?: return
-                                        handleIncomingRawBytes("BT_RFCOMM", btDecoder, bytes)
+                                        handleIncomingRawBytes("BT_RFCOMM", btDecoder, bytes, sourceBleGatt = gatt)
                                     }
                                 }
                             },
@@ -1288,11 +1328,12 @@ class OmsTransportClient(
     }
 
     @SuppressLint("MissingPermission")
-    private fun sendUnauthenticatedHandshakeFrame(frameBytes: ByteArray, sourceWebSocket: WebSocket?): Boolean {
-        if (sourceWebSocket != null) {
-            return sourceWebSocket.send(frameBytes.toByteString())
+    private fun sendUnauthenticatedHandshakeFrame(frameBytes: ByteArray, source: FrameSource): Boolean {
+        if (!isSourceCurrent(source)) return false
+        if (source.socket != null) {
+            return source.socket.send(frameBytes.toByteString())
         }
-        val gatt = activeBleGatt
+        val gatt = source.gatt
         val pipeChar = bleFramePipeChar
         if (gatt != null && pipeChar != null) {
             @Suppress("DEPRECATION")
@@ -1302,24 +1343,55 @@ class OmsTransportClient(
         return false
     }
 
+    private fun captureSource(tier: String, socket: WebSocket?): FrameSource =
+        FrameSource(tier, socket, if (socket == null && tier == "BT_RFCOMM") activeBleGatt else null)
+
+    private fun isSourceCurrent(source: FrameSource): Boolean = when (source.tier) {
+        "LAN_WS" -> source.socket != null && source.socket === lanWebSocket
+        "WAN_WEBRTC" -> source.socket != null && source.socket === wanWebSocket
+        "BT_RFCOMM" -> source.gatt != null && source.gatt === activeBleGatt
+        else -> false
+    }
+
+    private fun sourceAuthenticated(source: FrameSource): Boolean {
+        val paired = repo.getPairedMac() ?: return false
+        return paired.pairSecretHex.isNotBlank() && isSourceCurrent(source) &&
+            isSourceAuthenticated(source.tier, source.socket) && authenticatedPairings[source] == "${paired.macId}:${paired.pairSecretHex}"
+    }
+
+    private fun activeSource(): FrameSource {
+        val candidates = listOf(captureSource("LAN_WS", lanWebSocket),
+            captureSource("BT_RFCOMM", null), captureSource("WAN_WEBRTC", wanWebSocket))
+        return candidates.firstOrNull { sourceAuthenticated(it) }
+            ?: throw IllegalStateException("No authenticated connection")
+    }
+
     @SuppressLint("MissingPermission")
-    fun sendRawFrame(frameBytes: ByteArray): Boolean {
-        val lan = lanWebSocket
-        if (lan != null && authenticatedWebSockets.contains(lan)) {
-            return lan.send(frameBytes.toByteString())
+    private fun sendOnSource(frameBytes: ByteArray, source: FrameSource): Boolean {
+        if (!sourceAuthenticated(source)) return false
+        source.socket?.let { return it.send(frameBytes.toByteString()) }
+        val characteristic = bleFramePipeChar ?: return false
+        @Suppress("DEPRECATION")
+        characteristic.value = frameBytes
+        return source.gatt?.writeCharacteristic(characteristic) == true
+    }
+
+    fun sendRawFrame(frameBytes: ByteArray): Boolean =
+        runCatching { sendOnSource(frameBytes, activeSource()) }.getOrDefault(false)
+
+    private suspend fun requestHost(request: JSONObject, source: FrameSource, timeoutMs: Long = 30_000): JSONObject {
+        val id = request.getString("id")
+        val pending = PendingReply(source, CompletableDeferred())
+        check(pendingReplies.putIfAbsent(id, pending) == null)
+        try {
+            check(sendOnSource(OmsFrameProtocol.encodeJsonRpc(request), source)) { "Connection unavailable" }
+            val response = withTimeoutOrNull(timeoutMs) { pending.result.await() }
+                ?: throw IllegalStateException("Host acknowledgement timed out")
+            response.optJSONObject("error")?.let { throw IllegalStateException(it.optString("message", "Host rejected request")) }
+            return response.optJSONObject("result") ?: throw IllegalStateException("Missing host result")
+        } finally {
+            pendingReplies.remove(id, pending)
         }
-        val gatt = activeBleGatt
-        val pipeChar = bleFramePipeChar
-        if (gatt != null && pipeChar != null && isBleAuthenticated) {
-            @Suppress("DEPRECATION")
-            pipeChar.value = frameBytes
-            return gatt.writeCharacteristic(pipeChar)
-        }
-        val wan = wanWebSocket
-        if (wan != null && authenticatedWebSockets.contains(wan)) {
-            return wan.send(frameBytes.toByteString())
-        }
-        return false
     }
 
     /**
@@ -1337,8 +1409,23 @@ class OmsTransportClient(
         extraAudioUri: Uri? = null
     ): String {
         val itemId = OmsFrameProtocol.generateUuidV7()
-        val metaJson = if (extraAudioUri != null) {
-            JSONObject().put("extraAudioUri", extraAudioUri.toString()).toString()
+        fun persistAttachment(uri: Uri?, suffix: String): Uri? {
+            if (uri == null) return null
+            return try {
+                val loaded = readUriBytesAndMime(uri.toString(), "${itemId}_$suffix")
+                    ?: throw IllegalArgumentException("无法读取共享附件")
+                val target = File(context.filesDir, loaded.third)
+                java.io.FileOutputStream(target).use { it.write(loaded.first); it.fd.sync() }
+                Uri.fromFile(target)
+            } catch (_: Exception) {
+                mainHandler.post { android.widget.Toast.makeText(context, "附件无法保存，条目将保留待发送；请检查权限或重新分享", android.widget.Toast.LENGTH_LONG).show() }
+                uri // Retain the reference and queue the whole item; never silently drop an attachment.
+            }
+        }
+        val durableFile = persistAttachment(fileUri, "file")
+        val durableAudio = persistAttachment(extraAudioUri, "audio")
+        val metaJson = if (durableAudio != null) {
+            JSONObject().put("extraAudioUri", durableAudio.toString()).toString()
         } else {
             null
         }
@@ -1350,7 +1437,7 @@ class OmsTransportClient(
             title = title,
             textContent = textContent,
             voiceTranscript = voiceTranscript,
-            localFileUri = fileUri?.toString(),
+            localFileUri = durableFile?.toString(),
             macSavedPath = null,
             syncStatus = "QUEUED",
             metadataJson = metaJson,
@@ -1365,9 +1452,9 @@ class OmsTransportClient(
         return try {
             val uri = Uri.parse(uriStr)
             val bytes = if (uri.scheme == "file" && uri.path != null) {
-                File(uri.path!!).takeIf { it.exists() }?.readBytes()
+                File(uri.path!!).takeIf { it.exists() }?.inputStream()?.use { DeliveryPolicy.readBounded(it) }
             } else {
-                context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                context.contentResolver.openInputStream(uri)?.use { DeliveryPolicy.readBounded(it) }
             } ?: return null
 
             val pathLower = (uri.path ?: uriStr).lowercase()
@@ -1402,72 +1489,33 @@ class OmsTransportClient(
         if (!isFlushingOutbox.compareAndSet(false, true)) return
         scope.launch {
             try {
-                val queued = repo.listQueuedOutboxItems()
-                for (item in queued) {
+                for (item in repo.listQueuedOutboxItems()) {
                     try {
-                        val attachmentsArr = JSONArray()
-                        val suffix = item.itemId.takeLast(8)
-                        val uriStr = item.localFileUri
-                        if (!uriStr.isNullOrBlank()) {
-                            val loaded = readUriBytesAndMime(uriStr, suffix, "mobile")
-                            if (loaded != null) {
-                                val (bytes, mime, fileName) = loaded
-                                val streamId = streamBinaryBytesToMac(fileName, mime, bytes, item.intentTag)
-                                val sha = OmsFrameProtocol.sha256Hex(bytes)
-                                attachmentsArr.put(
-                                    JSONObject().apply {
-                                        put("streamId", streamId)
-                                        put("fileName", fileName)
-                                        put("mimeType", mime)
-                                        put("totalBytes", bytes.size)
-                                        put("sha256", sha)
-                                    }
-                                )
-                            }
+                        val source = activeSource()
+                        val attachments = JSONArray()
+                        fun attach(uri: String?) {
+                            if (uri.isNullOrBlank()) return
+                            val (bytes, mime, name) = readUriBytesAndMime(uri, item.itemId.takeLast(8))
+                                ?: throw IllegalStateException("Queued attachment is unavailable")
+                            val streamId = streamBinaryBytesToMac(name, mime, bytes, item.intentTag, source)
+                            attachments.put(JSONObject().put("streamId", streamId).put("fileName", name)
+                                .put("mimeType", mime).put("totalBytes", bytes.size)
+                                .put("sha256", OmsFrameProtocol.sha256Hex(bytes)))
                         }
-
-                        val extraAudioStr = try {
-                            item.metadataJson?.let { JSONObject(it).optString("extraAudioUri", "") }
-                        } catch (_: Throwable) {
-                            null
+                        attach(item.localFileUri)
+                        attach(item.metadataJson?.let { JSONObject(it).optString("extraAudioUri", "") })
+                        val request = JSONObject().put("jsonrpc", "2.0")
+                            .put("id", "inbox_${UUID.randomUUID()}").put("method", "inbox.submitItem")
+                            .put("params", JSONObject().put("clientItemId", item.itemId).put("intentTag", item.intentTag)
+                                .put("title", item.title).put("textContent", item.textContent)
+                                .put("voiceTranscript", item.voiceTranscript).put("createdAtMs", item.createdAtMs)
+                                .put("attachments", attachments))
+                        val result = requestHost(request, source)
+                        if (DeliveryPolicy.committedInboxAck(result.optBoolean("ack"), result.optString("savedId"), item.itemId)) {
+                            repo.updateSyncStatus(item.itemId, "DELIVERED", result.optString("macPath"))
                         }
-                        if (!extraAudioStr.isNullOrBlank()) {
-                            val loadedAudio = readUriBytesAndMime(extraAudioStr, "${suffix}_audio", "voice")
-                            if (loadedAudio != null) {
-                                val (bytes, mime, fileName) = loadedAudio
-                                val streamId = streamBinaryBytesToMac(fileName, mime, bytes, item.intentTag)
-                                val sha = OmsFrameProtocol.sha256Hex(bytes)
-                                attachmentsArr.put(
-                                    JSONObject().apply {
-                                        put("streamId", streamId)
-                                        put("fileName", fileName)
-                                        put("mimeType", mime)
-                                        put("totalBytes", bytes.size)
-                                        put("sha256", sha)
-                                    }
-                                )
-                            }
-                        }
-
-                        val req = JSONObject().apply {
-                            put("jsonrpc", "2.0")
-                            put("id", "inbox_${item.itemId}")
-                            put("method", "inbox.submitItem")
-                            put("params", JSONObject().apply {
-                                put("clientItemId", item.itemId)
-                                put("intentTag", item.intentTag)
-                                if (item.title != null) put("title", item.title)
-                                if (item.textContent != null) put("textContent", item.textContent)
-                                if (item.voiceTranscript != null) put("voiceTranscript", item.voiceTranscript)
-                                put("createdAtMs", item.createdAtMs)
-                                if (attachmentsArr.length() > 0) put("attachments", attachmentsArr)
-                            })
-                        }
-
-                        if (sendRawFrame(OmsFrameProtocol.encodeJsonRpc(req))) {
-                            repo.updateSyncStatus(item.itemId, "DELIVERED")
-                        }
-                    } catch (_: Throwable) {
+                    } catch (_: Exception) {
+                        // Keep QUEUED: a send/write/timeout/error is never proof of durable delivery.
                     }
                 }
             } finally {
@@ -1476,28 +1524,34 @@ class OmsTransportClient(
         }
     }
 
-    fun sendApprovalDecision(
-        itemId: String,
-        approvalId: String,
-        approved: Boolean,
-        selectedOption: String,
-        userComment: String?
-    ) {
+    fun sendApprovalDecision(itemId: String, approvalId: String, approved: Boolean,
+                             selectedOption: String, userComment: String?) {
+        if (!decidingApprovals.add(itemId)) return
         scope.launch {
-            val req = JSONObject().apply {
-                put("jsonrpc", "2.0")
-                put("id", "apr_${OmsFrameProtocol.generateUuidV7()}")
-                put("method", "approval.respond")
-                put("params", JSONObject().apply {
-                    put("approvalId", approvalId)
-                    put("approved", approved)
-                    put("selectedOption", selectedOption)
-                    if (!userComment.isNullOrBlank()) put("userComment", userComment)
-                    put("decidedAtMs", System.currentTimeMillis())
-                })
+            try {
+                val item = repo.getStreamItem(itemId) ?: return@launch
+                val metadata = JSONObject(item.metadataJson ?: "{}")
+                val expires = metadata.optLong("expiresAtMs", 0)
+                if (!DeliveryPolicy.approvalCanDispatch(expires, System.currentTimeMillis(), item.syncStatus)) {
+                    if (item.syncStatus == "PENDING_APPROVAL" && expires <= System.currentTimeMillis()) repo.updateSyncStatus(itemId, "EXPIRED")
+                    return@launch
+                }
+                val options = metadata.getJSONArray("options")
+                val index = (0 until options.length()).firstOrNull { options.getString(it) == selectedOption }
+                    ?: throw IllegalArgumentException("Unknown approval option")
+                require(metadata.getString("approvalId") == approvalId && approved == (index == 0))
+                val request = JSONObject().put("jsonrpc", "2.0").put("id", "apr_${UUID.randomUUID()}")
+                    .put("method", "approval.respond").put("params", JSONObject()
+                        .put("approvalId", approvalId).put("approved", approved).put("selectedOption", selectedOption)
+                        .put("userComment", userComment).put("decidedAtMs", System.currentTimeMillis()))
+                val result = requestHost(request, activeSource(), minOf(30_000L, expires - System.currentTimeMillis()).coerceAtLeast(1))
+                check(result.optBoolean("ack")) { "Host did not acknowledge approval" }
+                repo.updateSyncStatus(itemId, if (approved) "APPROVED" else "REJECTED")
+            } catch (_: Exception) {
+                // A retry is permitted only while this persisted approval remains live.
+            } finally {
+                decidingApprovals.remove(itemId)
             }
-            sendRawFrame(OmsFrameProtocol.encodeJsonRpc(req))
-            repo.updateSyncStatus(itemId, if (approved) "APPROVED" else "REJECTED")
         }
     }
 
@@ -1675,10 +1729,12 @@ class OmsTransportClient(
         fileName: String,
         mimeType: String,
         bytes: ByteArray,
-        intentTag: String? = null
+        intentTag: String? = null,
+        source: FrameSource = activeSource()
     ): String {
+        require(bytes.size <= DeliveryPolicy.MAX_BYTES) { "File exceeds 64 MiB" }
         val streamId = OmsFrameProtocol.generateUuidV7()
-        val chunkSize = if (_activeTierFlow.value == "BT_RFCOMM") 8192 else 65536
+        val chunkSize = if (source.tier == "BT_RFCOMM") 8192 else 65536
         val totalChunks = ((bytes.size + chunkSize - 1) / chunkSize).coerceAtLeast(1)
         val sha256 = OmsFrameProtocol.sha256Hex(bytes)
 
@@ -1692,22 +1748,122 @@ class OmsTransportClient(
             put("sha256", sha256)
             if (intentTag != null) put("intentTag", intentTag)
         }
-        sendRawFrame(OmsFrameProtocol.encodeStreamStart(startHeader))
+        check(sendOnSource(OmsFrameProtocol.encodeStreamStart(startHeader), source)) { "Stream start send failed" }
 
         for (i in 0 until totalChunks) {
             val start = i * chunkSize
             val end = (start + chunkSize).coerceAtMost(bytes.size)
             val slice = bytes.copyOfRange(start, end)
-            sendRawFrame(OmsFrameProtocol.encodeStreamChunk(streamId, i, slice))
+            check(sendOnSource(OmsFrameProtocol.encodeStreamChunk(streamId, i, slice), source)) { "Stream chunk send failed" }
         }
         return streamId
+    }
+
+    private val incomingTransferLock = Any()
+
+    private fun streamAck(streamId: String, status: String, source: FrameSource,
+                          chunks: Int = 0, error: String? = null) {
+        val ack = JSONObject().put("streamId", streamId).put("status", status)
+            .put("nextExpectedChunkIndex", chunks)
+        if (error != null) ack.put("errorMessage", error)
+        sendOnSource(OmsFrameProtocol.encodeFrame(OmsFrameProtocol.TYPE_STREAM_ACK_RESUME,
+            ack.toString().toByteArray(Charsets.UTF_8)), source)
+    }
+
+    private fun receiveStreamStart(payload: ByteArray, source: FrameSource) = synchronized(incomingTransferLock) {
+        if (!sourceAuthenticated(source)) return@synchronized
+        var streamId = ""
+        try {
+            val header = JSONObject(String(payload, Charsets.UTF_8))
+            streamId = header.getString("streamId").lowercase()
+            fun integer(name: String): Long {
+                val raw = header.get(name)
+                require(raw is Number && raw.toDouble().isFinite() && raw.toDouble() == raw.toLong().toDouble()) { "Invalid $name" }
+                return raw.toLong()
+            }
+            val chunkSize = integer("chunkSize")
+            val chunks = integer("totalChunks")
+            require(chunkSize in 1..DeliveryPolicy.MAX_CHUNK_SIZE.toLong() && chunks in 1..Int.MAX_VALUE.toLong())
+            val validated = DeliveryPolicy.Header(streamId, integer("totalBytes"), chunkSize.toInt(), chunks.toInt(), header.getString("sha256"))
+            validated.validate()
+            val existingItem = repo.getStreamItem(streamId)
+            if (existingItem != null) {
+                val metadata = JSONObject(existingItem.metadataJson ?: "{}")
+                require(existingItem.direction == "MAC_TO_PHONE" && existingItem.syncStatus == "DELIVERED" &&
+                    metadata.optString("sha256").equals(validated.sha256, true) && metadata.optLong("totalBytes", -1) == validated.totalBytes) { "Stream ID conflicts with committed item" }
+                val file = File(Uri.parse(existingItem.localFileUri ?: "").path ?: "")
+                require(file.isFile && file.length() == validated.totalBytes &&
+                    OmsFrameProtocol.sha256Hex(file.inputStream().use { DeliveryPolicy.readBounded(it) }).equals(validated.sha256, true)) { "Committed file unavailable" }
+                streamAck(streamId, "COMPLETED", source, validated.totalChunks)
+                return@synchronized
+            }
+            val existing = incomingTransfers[streamId]
+            require(existing == null || existing.source == source) { "Stream belongs to another connection" }
+            require(existing == null || existing.validated == validated) { "Stream header changed" }
+            require(existing != null || incomingTransfers.size < DeliveryPolicy.MAX_TRANSFERS) { "Too many concurrent streams" }
+            if (existing == null) incomingTransfers[streamId] = IncomingPushTransfer(header, source, validated)
+        } catch (e: Exception) {
+            if (incomingTransfers[streamId]?.source == source) incomingTransfers.remove(streamId)
+            streamAck(streamId, "ERROR", source, error = e.message ?: "Invalid stream")
+        }
+    }
+
+    private fun receiveStreamChunk(payload: ByteArray, source: FrameSource) = synchronized(incomingTransferLock) {
+        if (!sourceAuthenticated(source) || payload.size < OmsFrameProtocol.STREAM_CHUNK_PREFIX_BYTES) return@synchronized
+        val streamId = OmsFrameProtocol.bytesToUuid(payload.copyOfRange(0, 16))
+        val transfer = incomingTransfers[streamId]
+        if (transfer == null) {
+            if (repo.getStreamItem(streamId)?.syncStatus != "DELIVERED") {
+                streamAck(streamId, "ERROR", source, error = "Missing stream start")
+            }
+            return@synchronized
+        }
+        if (transfer.source != source) {
+            streamAck(streamId, "ERROR", source, error = "Stream belongs to another connection")
+            return@synchronized
+        }
+        try {
+            val index = ByteBuffer.wrap(payload, 16, 4).order(ByteOrder.BIG_ENDIAN).int
+            val bytes = payload.copyOfRange(OmsFrameProtocol.STREAM_CHUNK_PREFIX_BYTES, payload.size)
+            transfer.validated.validateChunk(index, bytes)
+            transfer.chunks[index]?.let { require(it.contentEquals(bytes)) { "Conflicting duplicate chunk" } }
+            transfer.chunks[index] = bytes
+            if (transfer.chunks.size != transfer.validated.totalChunks) return@synchronized
+            val fullBytes = transfer.validated.assemble(transfer.chunks)
+            check(sourceAuthenticated(source)) { "Connection revoked" }
+            val fileName = transfer.header.optString("fileName", "pushed_doc.md")
+                .substringAfterLast('/').substringAfterLast('\\').replace(Regex("[^\\p{L}\\p{N}._ -]"), "_").take(120).ifBlank { "file.bin" }
+            val savedFile = File(context.filesDir, "${streamId}_$fileName")
+            val temporary = File(context.filesDir, "$streamId.part")
+            try {
+                java.io.FileOutputStream(temporary).use { it.write(fullBytes); it.fd.sync() }
+                check(temporary.renameTo(savedFile)) { "Unable to commit stream file" }
+                val enableTts = transfer.header.optBoolean("enableCommuteTts", false)
+                val preview = if (fileName.endsWith(".md") || fileName.endsWith(".txt")) {
+                    String(fullBytes.copyOfRange(0, minOf(fullBytes.size, 256 * 1024)), Charsets.UTF_8)
+                } else "收到 Mac 推送文件：$fileName (${fullBytes.size / 1024} KB)"
+                repo.upsertStreamItem(StreamItemModel(streamId, "MAC_TO_PHONE", if (enableTts) "COMMUTE_READER" else "FILE",
+                    "default_inbox", transfer.header.optString("title", fileName), preview, null,
+                    Uri.fromFile(savedFile).toString(), null, "DELIVERED",
+                    JSONObject().put("enableCommuteTts", enableTts).put("sha256", transfer.validated.sha256)
+                        .put("totalBytes", fullBytes.size).toString(), System.currentTimeMillis()))
+            } finally {
+                if (temporary.exists()) temporary.delete()
+            }
+            incomingTransfers.remove(streamId)
+            streamAck(streamId, "COMPLETED", source, transfer.validated.totalChunks)
+        } catch (e: Exception) {
+            incomingTransfers.remove(streamId)
+            streamAck(streamId, "ERROR", source, error = e.message ?: "Stream commit failed")
+        }
     }
 
     private fun handleIncomingRawBytes(
         tier: String,
         decoder: OmsFrameStreamDecoder,
         raw: ByteArray,
-        sourceWebSocket: WebSocket? = null
+        sourceWebSocket: WebSocket? = null,
+        sourceBleGatt: BluetoothGatt? = null
     ) {
         val frames = try {
             decoder.push(raw)
@@ -1716,34 +1872,38 @@ class OmsTransportClient(
         }
 
         for (frame in frames) {
-            handleDecodedFrame(tier, frame, sourceWebSocket)
+            try { handleDecodedFrame(tier, frame, sourceWebSocket, sourceBleGatt) } catch (_: Exception) { /* malformed frame */ }
         }
     }
 
     private fun handleDecodedFrame(
         tier: String,
         frame: OmsFrameProtocol.DecodedFrame,
-        sourceWebSocket: WebSocket? = null
+        sourceWebSocket: WebSocket? = null,
+        sourceBleGatt: BluetoothGatt? = null
     ) {
+        val source = FrameSource(tier, sourceWebSocket, sourceBleGatt)
         when (frame.frameType) {
             OmsFrameProtocol.TYPE_CONTROL_JSON_RPC -> {
                 val msg = JSONObject(String(frame.payload, Charsets.UTF_8))
                 if (msg.has("method")) {
-                    handleIncomingRpcRequest(tier, msg, sourceWebSocket)
+                    handleIncomingRpcRequest(tier, msg, sourceWebSocket, sourceBleGatt)
                 } else if (msg.optString("id").startsWith("auth_")) {
                     val authId = msg.optString("id")
-                    val pending = pendingAuthStates.remove(authId)
+                    val pending = pendingAuthStates[authId] ?: return
+                    if (pending.source != source || !isSourceCurrent(source) || pending.expiresAtMs <= System.currentTimeMillis()) return
+                    pendingAuthStates.remove(authId, pending)
+                    val paired = repo.getPairedMac() ?: return
+                    if (paired.macId != pending.macId || paired.pairSecretHex != pending.secretKey) return
                     val res = msg.optJSONObject("result")
-                    if (res != null && res.optBoolean("ok") && pending != null) {
+                    if (res != null && res.optBoolean("ok")) {
                         val phoneId = repo.getOrCreatePhoneId()
                         val macAuthHmacHex = res.optString("macAuthHmacHex", "")
-                        val upgradedSecret = res.optString("pairSecretHex", "")
-                        val effectiveSecret = upgradedSecret.ifBlank { pending.secretKey }
                         val expectedMacHmac = OmsFrameProtocol.computeAuthHmac(
-                            effectiveSecret,
+                            pending.secretKey,
                             "mac_ack:${pending.nonceMacHex}:${pending.noncePhoneHex}:${pending.macId}:$phoneId"
                         )
-                        if (macAuthHmacHex.isBlank() || !macAuthHmacHex.equals(expectedMacHmac, ignoreCase = true)) {
+                        if (macAuthHmacHex.isBlank() || !java.security.MessageDigest.isEqual(macAuthHmacHex.lowercase().toByteArray(), expectedMacHmac.lowercase().toByteArray())) {
                             try {
                                 sourceWebSocket?.close(4003, "Mac mutual authentication failed")
                             } catch (_: Throwable) {
@@ -1751,14 +1911,7 @@ class OmsTransportClient(
                             return
                         }
 
-                        if (upgradedSecret.isNotBlank()) {
-                            repo.getPairedMac()?.let { existing ->
-                                if (existing.macId == pending.macId) {
-                                    repo.savePairedMac(existing.copy(pairSecretHex = upgradedSecret))
-                                }
-                            }
-                        }
-
+                        authenticatedPairings[source] = "${pending.macId}:${pending.secretKey}"
                         if (sourceWebSocket != null) {
                             authenticatedWebSockets.add(sourceWebSocket)
                             if (tier == "LAN_WS") {
@@ -1783,69 +1936,16 @@ class OmsTransportClient(
                         } catch (_: Throwable) {
                         }
                     }
-                } else if (msg.optString("id").startsWith("inbox_")) {
-                    if (!isSourceAuthenticated(tier, sourceWebSocket)) return
-                    val itemId = msg.optString("id").removePrefix("inbox_")
-                    val macPath = msg.optJSONObject("result")?.optString("macPath")
-                    repo.updateSyncStatus(itemId, "DELIVERED", macPath)
+                } else {
+                    if (!sourceAuthenticated(source)) return
+                    val pending = pendingReplies[msg.optString("id")] ?: return
+                    if (pending.source == source) pending.result.complete(msg)
                 }
             }
-            OmsFrameProtocol.TYPE_STREAM_START -> {
-                if (!isSourceAuthenticated(tier, sourceWebSocket)) return
-                val header = JSONObject(String(frame.payload, Charsets.UTF_8))
-                val streamId = header.optString("streamId")
-                if (streamId.isNotEmpty()) {
-                    incomingTransfers[streamId] = IncomingPushTransfer(header)
-                }
-            }
-            OmsFrameProtocol.TYPE_STREAM_CHUNK -> {
-                if (!isSourceAuthenticated(tier, sourceWebSocket)) return
-                if (frame.payload.size < OmsFrameProtocol.STREAM_CHUNK_PREFIX_BYTES) return
-                val streamId = OmsFrameProtocol.bytesToUuid(frame.payload.copyOfRange(0, 16))
-                val chunkIdx = ByteBuffer.wrap(frame.payload, 16, 4).order(ByteOrder.BIG_ENDIAN).int
-                val data = frame.payload.copyOfRange(OmsFrameProtocol.STREAM_CHUNK_PREFIX_BYTES, frame.payload.size)
-                val transfer = incomingTransfers[streamId] ?: return
-                transfer.chunks[chunkIdx] = data
-                val totalChunks = transfer.header.optInt("totalChunks", 1)
-                if (transfer.chunks.size >= totalChunks) {
-                    val out = ByteArrayOutputStream()
-                    for (i in 0 until totalChunks) {
-                        transfer.chunks[i]?.let { out.write(it) }
-                    }
-                    val fullBytes = out.toByteArray()
-                    val fileName = transfer.header.optString("fileName", "pushed_doc.md")
-                    val title = transfer.header.optString("title", fileName)
-                    val enableTts = transfer.header.optBoolean("enableCommuteTts", false)
-                    val savedFile = File(context.filesDir, "${streamId}_$fileName")
-                    savedFile.writeBytes(fullBytes)
-                    incomingTransfers.remove(streamId)
-
-                    val textPreview = if (fileName.endsWith(".md") || fileName.endsWith(".txt")) {
-                        String(fullBytes, Charsets.UTF_8)
-                    } else {
-                        "收到 Mac 推送文件：$fileName (${fullBytes.size / 1024} KB)"
-                    }
-
-                    repo.upsertStreamItem(
-                        StreamItemModel(
-                            itemId = streamId,
-                            direction = "MAC_TO_PHONE",
-                            itemType = if (enableTts) "COMMUTE_READER" else "FILE",
-                            intentTag = "default_inbox",
-                            title = title,
-                            textContent = textPreview,
-                            voiceTranscript = null,
-                            localFileUri = Uri.fromFile(savedFile).toString(),
-                            macSavedPath = null,
-                            syncStatus = "DELIVERED",
-                            metadataJson = JSONObject().put("enableCommuteTts", enableTts).toString(),
-                            createdAtMs = System.currentTimeMillis()
-                        )
-                    )
-                }
-            }
+            OmsFrameProtocol.TYPE_STREAM_START -> receiveStreamStart(frame.payload, source)
+            OmsFrameProtocol.TYPE_STREAM_CHUNK -> receiveStreamChunk(frame.payload, source)
             OmsFrameProtocol.TYPE_PING -> {
-                if (!isSourceAuthenticated(tier, sourceWebSocket)) return
+                if (!sourceAuthenticated(source)) return
                 val sentTs = ByteBuffer.wrap(frame.payload).order(ByteOrder.BIG_ENDIAN).long
                 val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
                 val pct = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
@@ -1853,7 +1953,7 @@ class OmsTransportClient(
                 if (sourceWebSocket != null) {
                     sourceWebSocket.send(pongBytes.toByteString())
                 } else {
-                    sendRawFrame(pongBytes)
+                    sendOnSource(pongBytes, source)
                 }
             }
         }
@@ -1862,15 +1962,19 @@ class OmsTransportClient(
     private fun handleIncomingRpcRequest(
         tier: String,
         req: JSONObject,
-        sourceWebSocket: WebSocket? = null
+        sourceWebSocket: WebSocket? = null,
+        sourceBleGatt: BluetoothGatt? = null
     ) {
         val reqId = req.optString("id", "")
         val method = req.optString("method", "")
         val params = req.optJSONObject("params") ?: JSONObject()
+        val source = FrameSource(tier, sourceWebSocket, sourceBleGatt)
+        val pairingAtReceipt = authenticatedPairings[source]
+        val sessionStillValid = { pairingAtReceipt != null && authenticatedPairings[source] == pairingAtReceipt && sourceAuthenticated(source) }
 
         scope.launch {
             try {
-                if (method != "auth.helloChallenge" && !isSourceAuthenticated(tier, sourceWebSocket)) {
+                if (method != "auth.helloChallenge" && !sessionStillValid()) {
                     if (reqId.isNotEmpty()) {
                         val errResp = JSONObject().apply {
                             put("jsonrpc", "2.0")
@@ -1880,7 +1984,7 @@ class OmsTransportClient(
                                 put("message", "Unauthenticated Mac connection")
                             })
                         }
-                        sendUnauthenticatedHandshakeFrame(OmsFrameProtocol.encodeJsonRpc(errResp), sourceWebSocket)
+                        sendUnauthenticatedHandshakeFrame(OmsFrameProtocol.encodeJsonRpc(errResp), source)
                     }
                     try {
                         sourceWebSocket?.close(4001, "Unauthenticated RPC rejected")
@@ -1891,18 +1995,14 @@ class OmsTransportClient(
 
                 val result: JSONObject = when (method) {
                     "auth.helloChallenge" -> {
-                        var paired = repo.getPairedMac()
+                        if (!isSourceCurrent(source)) return@launch
+                        pendingAuthStates.entries.removeIf { it.value.source == source }
+                        authenticatedPairings.remove(source)
+                        sourceWebSocket?.let { authenticatedWebSockets.remove(it) }
+                        if (source.tier == "BT_RFCOMM") isBleAuthenticated = false
+                        val paired = repo.getPairedMac()
                         val challengeMacId = params.optString("macId", "")
-                        val challengeMacPub = params.optString("macPubKeyBase64Url", "")
                         val nonceMacHex = params.optString("nonceMacHex", "")
-                        if (paired != null && paired.macId == "mac_host" && challengeMacId.isNotBlank()) {
-                            // Seamless migration from v1.3.4 legacy placeholder macId
-                            paired = paired.copy(
-                                macId = challengeMacId,
-                                macPubKeyBase64Url = paired.macPubKeyBase64Url.ifBlank { challengeMacPub }
-                            )
-                            repo.savePairedMac(paired)
-                        }
                         if (paired == null || challengeMacId.isBlank() || challengeMacId != paired.macId || nonceMacHex.isBlank()) {
                             try {
                                 sourceWebSocket?.close(4003, "Untrusted Mac ID")
@@ -1912,16 +2012,7 @@ class OmsTransportClient(
                         }
 
                         val phoneId = repo.getOrCreatePhoneId()
-                        val effectiveMacPub = paired.macPubKeyBase64Url.ifBlank { challengeMacPub }
-                        val secretKey = paired.pairSecretHex.ifBlank {
-                            paired.wanRoomId.ifBlank {
-                                if (effectiveMacPub.isNotBlank()) {
-                                    OmsFrameProtocol.deriveWanRoomId(effectiveMacPub, "pub_$phoneId")
-                                } else {
-                                    ""
-                                }
-                            }
-                        }
+                        val secretKey = paired.pairSecretHex
                         if (secretKey.isBlank()) {
                             try {
                                 sourceWebSocket?.close(4003, "Missing pairing secret")
@@ -1931,7 +2022,7 @@ class OmsTransportClient(
                         }
 
                         val noncePhoneHex = OmsFrameProtocol.generateUuidV7().replace("-", "")
-                        val authId = "auth_${System.currentTimeMillis()}"
+                        val authId = "auth_${UUID.randomUUID()}"
                         val sigHex = OmsFrameProtocol.computeAuthHmac(
                             secretKey,
                             "phone_auth:$nonceMacHex:$challengeMacId:$phoneId:$noncePhoneHex"
@@ -1940,7 +2031,8 @@ class OmsTransportClient(
                             nonceMacHex = nonceMacHex,
                             noncePhoneHex = noncePhoneHex,
                             macId = challengeMacId,
-                            secretKey = secretKey
+                            secretKey = secretKey,
+                            source = source
                         )
 
                         val authResp = JSONObject().apply {
@@ -1955,7 +2047,7 @@ class OmsTransportClient(
                             })
                         }
                         val encoded = OmsFrameProtocol.encodeJsonRpc(authResp)
-                        sendUnauthenticatedHandshakeFrame(encoded, sourceWebSocket)
+                        sendUnauthenticatedHandshakeFrame(encoded, source)
                         return@launch
                     }
                     "sys.getStatus" -> collectDeviceSnapshot()
@@ -1965,7 +2057,7 @@ class OmsTransportClient(
                         val src = params.getString("sourceUriOrPath")
                         val compress = params.optBoolean("compressImage", false)
                         val pulled = ScopedStorageExecutor.readAuthorizedFileBytes(context, repo, src, compress)
-                        val streamId = streamBinaryBytesToMac(pulled.fileName, pulled.mimeType, pulled.bytes)
+                        val streamId = streamBinaryBytesToMac(pulled.fileName, pulled.mimeType, pulled.bytes, source = source)
                         JSONObject().apply {
                             put("streamId", streamId)
                             put("fileName", pulled.fileName)
@@ -2074,6 +2166,12 @@ class OmsTransportClient(
                         val summary = params.optString("summary", "")
                         val contextText = params.optString("contextText", "")
                         val options = params.optJSONArray("options") ?: JSONArray(listOf("批准继续", "拒绝并中止"))
+                        val expiresAtMs = params.optLong("expiresAtMs", 0)
+                        require(expiresAtMs > System.currentTimeMillis()) { "Approval has expired or has no expiry" }
+                        require(options.length() >= 2 && options.length() <= 16) { "Invalid approval options" }
+                        val labels = (0 until options.length()).map { options.getString(it) }
+                        require(labels.all { it.isNotBlank() } && labels.distinct().size == labels.size) { "Invalid approval options" }
+                        require(repo.getStreamItem(approvalId) == null) { "Approval already exists" }
 
                         repo.upsertStreamItem(
                             StreamItemModel(
@@ -2090,6 +2188,7 @@ class OmsTransportClient(
                                 metadataJson = JSONObject().apply {
                                     put("approvalId", approvalId)
                                     put("options", options)
+                                    put("expiresAtMs", expiresAtMs)
                                 }.toString(),
                                 createdAtMs = System.currentTimeMillis()
                             )
@@ -2111,20 +2210,20 @@ class OmsTransportClient(
                             includeScreenshot = params.optBoolean("includeScreenshot", false),
                             somAnnotation = params.optBoolean("somAnnotation", true),
                             onSendBinaryStream = { fName, mime, bytes ->
-                                streamBinaryBytesToMac(fName, mime, bytes)
+                                streamBinaryBytesToMac(fName, mime, bytes, source = source)
                             }
                         )
                     }
                     "gui.act" -> {
                         val svc = OmsAccessibilityService.instance
                             ?: throw IllegalStateException("ERR_ACCESSIBILITY_DISABLED: OmsAccessibilityService not enabled")
-                        svc.executeGuiAction(params)
+                        svc.executeGuiAction(params, sessionStillValid)
                     }
                     "gui.abort" -> {
                         OmsAccessibilityService.instance?.abortGuiSession()
                         JSONObject().put("ok", true)
                     }
-                    "sys.control" -> handleSysControlRpc(params)
+                    "sys.control" -> handleSysControlRpc(params, source, sessionStillValid)
                     else -> throw IllegalArgumentException("Unknown RPC method: $method")
                 }
 
@@ -2134,7 +2233,7 @@ class OmsTransportClient(
                         put("id", reqId)
                         put("result", result)
                     }
-                    sendRawFrame(OmsFrameProtocol.encodeJsonRpc(resp))
+                    sendOnSource(OmsFrameProtocol.encodeJsonRpc(resp), source)
                 }
             } catch (e: Throwable) {
                 if (reqId.isNotEmpty()) {
@@ -2154,13 +2253,13 @@ class OmsTransportClient(
                             put("message", msg)
                         })
                     }
-                    sendRawFrame(OmsFrameProtocol.encodeJsonRpc(errResp))
+                    sendOnSource(OmsFrameProtocol.encodeJsonRpc(errResp), source)
                 }
             }
         }
     }
 
-    private suspend fun handleSysControlRpc(params: JSONObject): JSONObject {
+    private suspend fun handleSysControlRpc(params: JSONObject, source: FrameSource, sessionStillValid: () -> Boolean): JSONObject {
         val subAction = params.optString("action", "status").lowercase()
         return when (subAction) {
             "status", "refresh" -> collectDeviceSnapshot()
@@ -2272,7 +2371,7 @@ class OmsTransportClient(
                 val target = params.optString("target", "home").lowercase()
                 val svc = OmsAccessibilityService.instance
                     ?: throw IllegalStateException("ERR_ACCESSIBILITY_DISABLED: 请先在手机上开启青简·咫尺无障碍服务")
-                val ok = svc.performSystemGlobalAction(target)
+                val ok = svc.performSystemGlobalAction(target, params.optLong("deadlineMs", 0L), sessionStillValid)
                 delay(250)
                 JSONObject().apply {
                     put("ok", ok)
@@ -2286,7 +2385,7 @@ class OmsTransportClient(
                 val webpBytes = ScreenCapturer.captureWebpBytes(svc, emptyList(), false)
                     ?: throw IllegalStateException("截屏失败，当前页面可能受隐私保护或屏幕已关闭")
                 val fileName = "screen_${System.currentTimeMillis()}.webp"
-                val streamId = streamBinaryBytesToMac(fileName, "image/webp", webpBytes, "default_inbox")
+                val streamId = streamBinaryBytesToMac(fileName, "image/webp", webpBytes, "default_inbox", source)
                 val sha = OmsFrameProtocol.sha256Hex(webpBytes)
                 JSONObject().apply {
                     put("ok", true)

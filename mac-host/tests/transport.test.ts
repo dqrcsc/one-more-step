@@ -168,7 +168,8 @@ describe("Module 02: Multi-Tier Transport & Presence Engine", () => {
 
     ws.close();
     await manager.stop();
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    // Retain this isolated fixture for inspection; never recursively delete user files.
+    console.log(`Retained test fixture: ${tmpDir}`);
   });
 
   test("LAN Security: rejects trusted_xiaomi_sig bypass, enforces 1-time pairing token, and verifies mutual HMAC", async () => {
@@ -326,6 +327,7 @@ describe("Module 02: Multi-Tier Transport & Presence Engine", () => {
 
     ws2.close();
     await manager.stop();
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    // Retain this isolated fixture for inspection; never recursively delete user files.
+    console.log(`Retained test fixture: ${tmpDir}`);
   });
 });

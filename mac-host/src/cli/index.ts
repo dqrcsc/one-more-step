@@ -433,8 +433,7 @@ async function main() {
           diffOrContext: flags.diff as string,
           options,
           timeoutSec,
-        },
-        (timeoutSec + 5) * 1000
+        }
       );
       console.log(JSON.stringify(res, null, 2));
       break;
@@ -457,6 +456,7 @@ async function main() {
           x: flags.x !== undefined ? Number(flags.x) : undefined,
           y: flags.y !== undefined ? Number(flags.y) : undefined,
           text: (flags.text as string) || (!target?.startsWith("#") ? target : undefined),
+          observationId: flags.observation,
           requireUserConfirm: Boolean(flags.confirm),
         });
         console.log(JSON.stringify(res, null, 2));
@@ -581,7 +581,7 @@ Commands:
   oms notify <text> [--level urgent] [--tts]           Send graded notification (L1-L3) or alarm-stream voice TTS
   oms approve --title <t> --summary <s> [--diff <d>]   Push blocking remote approval card to phone and wait for decision
   oms gui observe [--screenshot] [--som]               Extract compact Accessibility semantic tree (#1, #2) & SoM screenshot
-  oms gui act <click|input_text|...> [#id] [--confirm] Perform GUI automation action on phone with safety guardrails
+  oms gui act <click|input_text|...> [#id] --observation <id> [--confirm] Perform GUI automation action on phone with safety guardrails
   oms ota                                              Push latest APK update to phone over LAN
   oms daemon [status|start|stop|restart|logs]          Manage background omsd daemon
   oms mcp                                              Start stdio MCP server for Codex/Antigravity/OpenCode`);

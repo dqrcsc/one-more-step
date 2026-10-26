@@ -2,16 +2,19 @@ package com.oms.client.agent
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
-import android.content.Intent
 import android.graphics.Path
 import android.graphics.Rect
-import android.net.Uri
 import android.os.Bundle
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import com.oms.client.OmsApplication
-import kotlinx.coroutines.delay
+import android.os.Handler
+import android.os.Looper
+import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlin.coroutines.resume
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.random.Random
@@ -49,37 +52,76 @@ class OmsAccessibilityService : AccessibilityService() {
     var currentActivityName: String = ""
         private set
 
-    @Volatile
-    private var emergencyStopped = false
-
+    private val guiMutex = Mutex()
+    private lateinit var guard: GuiSessionGuard
+    private var activeAction: Job? = null
     private var safetyOverlay: SafetyStopOverlay? = null
+    private val stopPreferences by lazy { getSharedPreferences("gui_safety", MODE_PRIVATE) }
+
+    private fun setStopped(reason: String) {
+        guard.stop()
+        stopPreferences.edit().putBoolean("stopped", true).apply()
+        activeAction?.cancel(CancellationException("ERR_USER_INTERRUPTED: $reason"))
+        safetyOverlay?.cancelConfirmation()
+        safetyOverlay?.showStoppedPill()
+        OmsApplication.instance?.transportClient?.sendEmergencyStopEvent(reason)
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        safetyOverlay = SafetyStopOverlay(this) {
-            emergencyStopped = true
-            OmsApplication.instance?.transportClient?.sendEmergencyStopEvent("floating_pill_clicked")
-        }
+        guard = GuiSessionGuard(stopPreferences.getBoolean("stopped", false))
+        safetyOverlay = SafetyStopOverlay(this,
+            onEmergencyStop = { setStopped("floating_pill_clicked") },
+            onLocalResume = {
+                // Only this phone-local button clears the durable stop latch.
+                guard.resumeOnPhone()
+                stopPreferences.edit().putBoolean("stopped", false).apply()
+                safetyOverlay?.hideActivePill()
+            }
+        )
+        if (guard.stopped) safetyOverlay?.showStoppedPill()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            event.packageName?.toString()?.let { currentPackageName = it }
-            event.className?.toString()?.let { currentActivityName = it }
+        if (event == null || !::guard.isInitialized) return
+        if (event.eventType == AccessibilityEvent.TYPE_TOUCH_INTERACTION_START) {
+            // Confirmation itself requires a physical touch. No action runs while it is
+            // pending; application changes during that wait invalidate the observation.
+            if (activeAction != null && safetyOverlay?.isAwaitingConfirmation != true) {
+                setStopped("touch_interaction")
+            }
+            return
+        }
+        // Our overlays must not invalidate the application snapshot they protect.
+        if (event.packageName?.toString() == packageName) return
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+            event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED ||
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+                guard.invalidateIfWindowChanged(windowIdentity())
+            } else guard.invalidate()
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                event.packageName?.toString()?.let { currentPackageName = it }
+                event.className?.toString()?.let { currentActivityName = it }
+            }
         }
     }
 
-    override fun onInterrupt() {}
+    override fun onInterrupt() {
+        if (::guard.isInitialized) setStopped("accessibility_interrupted")
+    }
 
     override fun onDestroy() {
+        activeAction?.cancel()
+        safetyOverlay?.cancelConfirmation()
         safetyOverlay?.hideActivePill()
-        if (instance === this) {
-            instance = null
-        }
+        if (instance === this) instance = null
         super.onDestroy()
     }
+
+    private fun windowIdentity(roots: List<AccessibilityNodeInfo> = collectApplicationRoots()): String =
+        roots.map { "${it.windowId}:${it.packageName}" }.sorted().joinToString("|") + ":$currentActivityName"
 
     private fun isBlockedFinancialOrPasswordWindow(root: AccessibilityNodeInfo?): Boolean {
         if (BLOCKED_FINANCIAL_PACKAGES.contains(currentPackageName)) return true
@@ -134,15 +176,19 @@ class OmsAccessibilityService : AccessibilityService() {
         includeScreenshot: Boolean,
         somAnnotation: Boolean,
         onSendBinaryStream: (fileName: String, mime: String, bytes: ByteArray) -> String?
-    ): JSONObject {
+    ): JSONObject = withContext(Dispatchers.Main.immediate) { guiMutex.withLock {
         val dm = resources.displayMetrics
         val screenW = dm.widthPixels
         val screenH = dm.heightPixels
         val roots = collectApplicationRoots()
         val primaryRoot = roots.firstOrNull()
+        val observationId = guard.observe(windowIdentity(roots))
 
         if (isBlockedFinancialOrPasswordWindow(primaryRoot)) {
-            return JSONObject().apply {
+            SemanticTreeExtractor.extractCompactTreeFromRoots(emptyList(), screenW, screenH)
+            return@withLock JSONObject().apply {
+                put("observationId", observationId)
+                put("securityPolicy", "payment_or_password_heuristic")
                 put("packageName", currentPackageName)
                 put("activityName", currentActivityName)
                 put("isSecureWindow", true)
@@ -158,15 +204,19 @@ class OmsAccessibilityService : AccessibilityService() {
             nodesArr.put(n.toJson())
         }
 
+        val snapshotRevision = guard.revision
         var screenshotStreamId: String? = null
         if (includeScreenshot) {
-            val webpBytes = ScreenCapturer.captureWebpBytes(this, extractedNodes, somAnnotation)
+            val webpBytes = ScreenCapturer.captureWebpBytes(this@OmsAccessibilityService, extractedNodes, somAnnotation)
             if (webpBytes != null) {
                 screenshotStreamId = onSendBinaryStream("gui_screen.webp", "image/webp", webpBytes)
             }
         }
 
-        return JSONObject().apply {
+        check(guard.revision == snapshotRevision) { "ERR_STALE_OBSERVATION: Screen changed during capture; observe again" }
+        JSONObject().apply {
+            put("observationId", observationId)
+            put("securityPolicy", "heuristic_only_not_flag_secure_detection")
             put("packageName", currentPackageName)
             put("activityName", currentActivityName)
             put("isSecureWindow", false)
@@ -177,20 +227,51 @@ class OmsAccessibilityService : AccessibilityService() {
                 put("screenshotStreamId", screenshotStreamId)
             }
         }
+    } }
+
+    suspend fun executeGuiAction(params: JSONObject, sessionStillValid: () -> Boolean): JSONObject {
+        val deadline = GuiSessionGuard.boundedDeadline(System.currentTimeMillis(), params.optLong("deadlineMs", 0L))
+        return withTimeout((deadline - System.currentTimeMillis()).coerceAtLeast(1L)) {
+            withContext(Dispatchers.Main.immediate) {
+                val queuedRevision = guard.revision
+                guiMutex.withLock {
+                check(guard.revision == queuedRevision) { "ERR_STALE_OBSERVATION: Screen or safety state changed while queued" }
+                activeAction = currentCoroutineContext()[Job]
+                try { executeLocked(params, deadline, sessionStillValid) }
+                finally {
+                    activeAction = null
+                    safetyOverlay?.cancelConfirmation()
+                    if (!guard.stopped) safetyOverlay?.hideActivePill()
+                }
+            } }
+        }
     }
 
-    suspend fun executeGuiAction(params: JSONObject): JSONObject {
-        emergencyStopped = false
-        safetyOverlay?.showActivePill()
+    private suspend fun executeLocked(params: JSONObject, deadline: Long, sessionStillValid: () -> Boolean): JSONObject {
+        val initialWindow = windowIdentity()
+        val initialRevision = guard.revision
+        val targetNodeId = params.optString("targetNodeId", "")
+        val observationId = params.optString("observationId", "").takeIf { it.isNotBlank() }
+        suspend fun checkReady() {
+            currentCoroutineContext().ensureActive()
+            val currentWindow = windowIdentity()
+            check(currentWindow == initialWindow) { "ERR_STALE_OBSERVATION: Window or package changed" }
+            guard.check(System.currentTimeMillis(), deadline, currentWindow, initialRevision,
+                observationId, targetNodeId.isNotBlank(), sessionStillValid())
+            if (isBlockedFinancialOrPasswordWindow(rootInActiveWindow)) {
+                throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password safety policy")
+            }
+        }
+        checkReady()
+        check(safetyOverlay?.showActivePill() == true) { "ERR_SAFETY_OVERLAY_UNAVAILABLE: Enable phone overlay permission" }
 
         val root = rootInActiveWindow
         if (isBlockedFinancialOrPasswordWindow(root)) {
             safetyOverlay?.hideActivePill()
-            throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment or password window is hardware-isolated")
+            throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password safety policy")
         }
 
         val action = params.optString("action", "click").lowercase()
-        val targetNodeId = params.optString("targetNodeId", "")
         val text = params.optString("text", "")
         val requireConfirm = params.optBoolean("requireUserConfirm", false)
 
@@ -200,23 +281,27 @@ class OmsAccessibilityService : AccessibilityService() {
             null
         }
 
+        if (targetNodeId.isNotBlank() && (targetNode == null || !targetNode.refresh())) {
+            throw IllegalStateException("ERR_STALE_OBSERVATION: Target node unavailable; observe again")
+        }
+
         // Guardrail #3 & #4: Check if target node label contains sensitive keywords ("提交", "发送", "删除", etc.)
         val targetLabel = (targetNode?.text?.toString() ?: targetNode?.contentDescription?.toString() ?: "").trim()
         val hitsSensitiveKeyword = SENSITIVE_ACTION_KEYWORDS.any { kw -> targetLabel.contains(kw) }
 
-        if (requireConfirm || (action == "click" && hitsSensitiveKeyword)) {
+        if (requireConfirm || (action in setOf("click", "long_click") && hitsSensitiveKeyword)) {
             val confirmed = safetyOverlay?.awaitUserConfirmForSensitiveAction(
                 if (targetLabel.isNotEmpty()) "点击「$targetLabel」" else "执行 $action"
             ) ?: false
-            if (!confirmed || emergencyStopped) {
+            if (!confirmed) {
                 safetyOverlay?.hideActivePill()
                 throw IllegalStateException("ERR_USER_INTERRUPTED: User declined sensitive GUI action")
             }
         }
 
-        if (emergencyStopped) {
-            safetyOverlay?.hideActivePill()
-            throw IllegalStateException("ERR_USER_INTERRUPTED: Emergency stop triggered")
+        checkReady()
+        if (targetNode != null && !targetNode.refresh()) {
+            throw IllegalStateException("ERR_STALE_OBSERVATION: Target expired while waiting; observe again")
         }
 
         var ok = false
@@ -230,6 +315,7 @@ class OmsAccessibilityService : AccessibilityService() {
                     }
                     ok = targetNode.performAction(semAction)
                     if (!ok) {
+                        checkReady()
                         val b = Rect()
                         targetNode.getBoundsInScreen(b)
                         ok = injectTapGesture(
@@ -248,8 +334,6 @@ class OmsAccessibilityService : AccessibilityService() {
             }
             "input_text" -> {
                 if (targetNode != null) {
-                    targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                    targetNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                     val args = Bundle().apply {
                         putCharSequence(
                             AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
@@ -277,6 +361,7 @@ class OmsAccessibilityService : AccessibilityService() {
             "home" -> ok = performGlobalAction(GLOBAL_ACTION_HOME)
             "recents" -> ok = performGlobalAction(GLOBAL_ACTION_RECENTS)
             "notifications" -> ok = performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+            "quick_settings" -> ok = performGlobalAction(GLOBAL_ACTION_QUICK_SETTINGS)
             "lock_screen", "lock" -> ok = performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
             "launch_app" -> {
                 val res = com.oms.client.capability.AppLauncherHelper.launchApp(this, text)
@@ -291,8 +376,10 @@ class OmsAccessibilityService : AccessibilityService() {
         // Wait 400ms for UI transition to settle and return post-action compact tree
         delay(400)
         val dm = resources.displayMetrics
+        val postRoots = collectApplicationRoots()
+        val postObservationId = guard.observe(windowIdentity(postRoots))
         val postTree = SemanticTreeExtractor.extractCompactTreeFromRoots(
-            collectApplicationRoots(),
+            if (isBlockedFinancialOrPasswordWindow(postRoots.firstOrNull())) emptyList() else postRoots,
             dm.widthPixels,
             dm.heightPixels
         )
@@ -303,36 +390,31 @@ class OmsAccessibilityService : AccessibilityService() {
 
         return JSONObject().apply {
             put("ok", ok)
+            put("observationId", postObservationId)
             put("packageName", currentPackageName)
             put("postActionTree", postArr)
         }
     }
 
     fun abortGuiSession() {
-        emergencyStopped = true
-        safetyOverlay?.hideActivePill()
+        val stop = { if (::guard.isInitialized) setStopped("remote_abort") }
+        if (Looper.myLooper() == Looper.getMainLooper()) stop() else Handler(Looper.getMainLooper()).post(stop)
     }
 
-    fun performSystemGlobalAction(actionName: String): Boolean {
-        return when (actionName.lowercase()) {
-            "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
-            "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
-            "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
-            "notifications" -> performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
-            "quick_settings" -> performGlobalAction(GLOBAL_ACTION_QUICK_SETTINGS)
-            "lock_screen", "lock" -> performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
-            else -> false
-        }
+    suspend fun performSystemGlobalAction(actionName: String, deadlineMs: Long, sessionStillValid: () -> Boolean): Boolean {
+        val result = executeGuiAction(JSONObject().put("action", actionName)
+            .put("deadlineMs", deadlineMs), sessionStillValid)
+        return result.optBoolean("ok")
     }
 
-    private fun injectTapGesture(x: Int, y: Int, durationMs: Long): Boolean {
+    private suspend fun injectTapGesture(x: Int, y: Int, durationMs: Long): Boolean {
         val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
         val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        return dispatchGesture(gesture, null, null)
+        return dispatchAndAwait(gesture)
     }
 
-    private fun injectBezierSwipeGesture(x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Long): Boolean {
+    private suspend fun injectBezierSwipeGesture(x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Long): Boolean {
         val path = Path().apply {
             moveTo(x1.toFloat(), y1.toFloat())
             val ctrlX = (x1 + x2) / 2f + Random.nextInt(-25, 26)
@@ -341,6 +423,20 @@ class OmsAccessibilityService : AccessibilityService() {
         }
         val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        return dispatchGesture(gesture, null, null)
+        return dispatchAndAwait(gesture)
     }
+    private suspend fun dispatchAndAwait(gesture: GestureDescription): Boolean =
+        suspendCancellableCoroutine { continuation ->
+            if (!continuation.isActive) return@suspendCancellableCoroutine
+            val accepted = dispatchGesture(gesture, object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    if (continuation.isActive) continuation.resume(true)
+                }
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    if (continuation.isActive) continuation.resume(false)
+                }
+            }, null)
+            if (!accepted && continuation.isActive) continuation.resume(false)
+        }
+
 }

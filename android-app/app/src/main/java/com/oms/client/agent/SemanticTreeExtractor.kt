@@ -4,7 +4,6 @@ import android.graphics.Rect
 import android.view.accessibility.AccessibilityNodeInfo
 import org.json.JSONArray
 import org.json.JSONObject
-import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
 
 data class ExtractedSemanticNode(
@@ -41,11 +40,11 @@ data class ExtractedSemanticNode(
  * Compresses 500+ raw Android View nodes into 15~45 high-signal interactive nodes (< 6KB JSON).
  */
 object SemanticTreeExtractor {
-    private val nodeRefCache = ConcurrentHashMap<String, WeakReference<AccessibilityNodeInfo>>()
+    private val nodeRefCache = ConcurrentHashMap<String, AccessibilityNodeInfo>()
 
     fun getNodeById(shortId: String): AccessibilityNodeInfo? {
         val normalized = if (shortId.startsWith("#")) shortId else "#$shortId"
-        return nodeRefCache[normalized]?.get()
+        return nodeRefCache[normalized]
     }
 
     fun extractCompactTree(
@@ -122,7 +121,7 @@ object SemanticTreeExtractor {
                     val shortId = "#$nextIndex"
                     nextIndex++
                     val simpleRole = (node.className?.toString() ?: "View").substringAfterLast('.')
-                    nodeRefCache[shortId] = WeakReference(node)
+                    nodeRefCache[shortId] = node
                     result.add(
                         ExtractedSemanticNode(
                             id = shortId,

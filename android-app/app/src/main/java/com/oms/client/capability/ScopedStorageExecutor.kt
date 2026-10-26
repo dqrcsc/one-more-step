@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import com.oms.client.data.StreamRepository
+import com.oms.client.transport.DeliveryPolicy
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -38,11 +39,14 @@ object ScopedStorageExecutor {
         val limit = params.optInt("limit", 10).coerceIn(1, 50)
         val sinceMs = params.optLong("sinceMs", 0L)
 
-        val authorized = repo.getAuthorizedDirs()
+        val authorized = repo.getAuthorizedDirs().map { StoragePathPolicy.normalizeAlias(it) }.toSet()
         if (mediaType == "screenshot" && !authorized.contains("screenshots")) {
             throw SecurityException("ERR_SCOPED_PATH_DENIED: 'screenshots' directory is not authorized")
         }
 
+        if (mediaType == "camera" && "camera" !in authorized) {
+            throw SecurityException("ERR_SCOPED_PATH_DENIED: 'camera' directory is not authorized")
+        }
         val collection = if (mediaType == "video") {
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI
         } else {
@@ -90,6 +94,7 @@ object ScopedStorageExecutor {
                 val id = cursor.getLong(0)
                 val name = cursor.getString(1) ?: "media_$id"
                 val relPath = cursor.getString(2) ?: ""
+                if (!StoragePathPolicy.mediaPathAllowed(relPath, authorized)) continue
                 val mime = cursor.getString(3) ?: "image/jpeg"
                 val size = cursor.getLong(4)
                 val width = cursor.getInt(5)
@@ -120,11 +125,11 @@ object ScopedStorageExecutor {
     }
 
     fun listDir(repo: StreamRepository, params: JSONObject): JSONObject {
-        val dirAlias = params.optString("dirAlias", "download").lowercase()
+        val dirAlias = StoragePathPolicy.normalizeAlias(params.optString("dirAlias", "download"))
         val subPath = params.optString("subPath", "")
         val limit = params.optInt("limit", 50).coerceIn(1, 200)
 
-        if (!repo.getAuthorizedDirs().contains(dirAlias)) {
+        if (!repo.getAuthorizedDirs().map { StoragePathPolicy.normalizeAlias(it) }.contains(dirAlias)) {
             throw SecurityException("ERR_SCOPED_PATH_DENIED: Alias '$dirAlias' is not enabled in allowlist")
         }
 
@@ -133,13 +138,12 @@ object ScopedStorageExecutor {
         val targetDir = if (subPath.isBlank()) baseDir else File(baseDir, subPath)
 
         // Strict canonical path check against `..` path traversal
-        val baseCanonical = baseDir.canonicalPath
-        val targetCanonical = targetDir.canonicalPath
-        if (!targetCanonical.startsWith(baseCanonical)) {
+        if (!StoragePathPolicy.isWithin(baseDir, targetDir)) {
             throw SecurityException("ERR_SCOPED_PATH_DENIED: Path traversal outside '$dirAlias' blocked")
         }
 
         val files = targetDir.listFiles()
+            ?.filter { StoragePathPolicy.isWithin(baseDir, it) }
             ?.sortedByDescending { it.lastModified() }
             ?.take(limit)
             ?: emptyList()
@@ -177,39 +181,50 @@ object ScopedStorageExecutor {
     ): PulledFilePayload {
         if (sourceUriOrPath.startsWith("content://")) {
             val uri = Uri.parse(sourceUriOrPath)
-            val mime = context.contentResolver.getType(uri) ?: "application/octet-stream"
-            val rawBytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                ?: throw IllegalArgumentException("Unable to read URI: $sourceUriOrPath")
-            val finalBytes = if (compressImage && mime.startsWith("image/")) {
-                compressToWebpIfPossible(rawBytes)
-            } else {
-                rawBytes
+            // Only MediaStore can attest a public-media directory; arbitrary providers cannot bypass the allowlist.
+            if (uri.authority != MediaStore.AUTHORITY) {
+                throw SecurityException("ERR_SCOPED_PATH_DENIED: Only authorized MediaStore content URIs are supported")
             }
+            val metadata = context.contentResolver.query(uri,
+                arrayOf(MediaStore.MediaColumns.RELATIVE_PATH, MediaStore.MediaColumns.DISPLAY_NAME,
+                    MediaStore.MediaColumns.MIME_TYPE, MediaStore.MediaColumns.SIZE), null, null, null)?.use { cursor ->
+                if (!cursor.moveToFirst()) null else {
+                    val relativePath = cursor.getString(0) ?: ""
+                    if (!StoragePathPolicy.mediaPathAllowed(relativePath, repo.getAuthorizedDirs())) {
+                        throw SecurityException("ERR_SCOPED_PATH_DENIED: URI directory is not authorized")
+                    }
+                    require(cursor.getLong(3) <= DeliveryPolicy.MAX_BYTES) { "File exceeds 64 MiB" }
+                    Pair(cursor.getString(1) ?: "media.bin", cursor.getString(2) ?: "application/octet-stream")
+                }
+            } ?: throw SecurityException("ERR_SCOPED_PATH_DENIED: URI directory cannot be verified")
+            val rawBytes = context.contentResolver.openInputStream(uri)?.use { DeliveryPolicy.readBounded(it) }
+                ?: throw IllegalArgumentException("Unable to read URI")
+            val compressed = if (compressImage && metadata.second.startsWith("image/")) compressToWebpIfPossible(rawBytes) else null
             return PulledFilePayload(
-                fileName = "media_${uri.lastPathSegment ?: "item"}.${if (compressImage) "webp" else "jpg"}",
-                mimeType = if (compressImage) "image/webp" else mime,
-                bytes = finalBytes
+                fileName = if (compressed != null) metadata.first.substringBeforeLast('.') + ".webp" else metadata.first,
+                mimeType = if (compressed != null) "image/webp" else metadata.second,
+                bytes = compressed ?: rawBytes
             )
         }
 
         // Alias relative path format: e.g. "download/report.pdf"
         val slashIdx = sourceUriOrPath.indexOf('/')
         require(slashIdx > 0) { "Path must be 'content://...' or '<dirAlias>/<relativePath>'" }
-        val alias = sourceUriOrPath.substring(0, slashIdx).lowercase()
+        val alias = StoragePathPolicy.normalizeAlias(sourceUriOrPath.substring(0, slashIdx))
         val rel = sourceUriOrPath.substring(slashIdx + 1)
 
-        if (!repo.getAuthorizedDirs().contains(alias)) {
+        if (!repo.getAuthorizedDirs().map { StoragePathPolicy.normalizeAlias(it) }.contains(alias)) {
             throw SecurityException("ERR_SCOPED_PATH_DENIED: Alias '$alias' is not authorized")
         }
 
         val baseDir = resolveAliasBaseDir(alias)
             ?: throw SecurityException("ERR_SCOPED_PATH_DENIED: Invalid alias '$alias'")
         val file = File(baseDir, rel)
-        if (!file.canonicalPath.startsWith(baseDir.canonicalPath) || !file.isFile) {
+        if (!StoragePathPolicy.isWithin(baseDir, file) || !file.isFile) {
             throw SecurityException("ERR_SCOPED_PATH_DENIED: Invalid or unauthorized file path")
         }
 
-        val rawBytes = file.readBytes()
+        val rawBytes = file.inputStream().use { DeliveryPolicy.readBounded(it) }
         return PulledFilePayload(
             fileName = file.name,
             mimeType = "application/octet-stream",
@@ -217,9 +232,9 @@ object ScopedStorageExecutor {
         )
     }
 
-    private fun compressToWebpIfPossible(rawBytes: ByteArray): ByteArray {
+    private fun compressToWebpIfPossible(rawBytes: ByteArray): ByteArray? {
         return try {
-            val bmp = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size) ?: return rawBytes
+            val bmp = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size) ?: return null
             val out = ByteArrayOutputStream()
             val format = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 Bitmap.CompressFormat.WEBP_LOSSY
@@ -227,10 +242,11 @@ object ScopedStorageExecutor {
                 @Suppress("DEPRECATION")
                 Bitmap.CompressFormat.WEBP
             }
-            bmp.compress(format, 82, out)
-            out.toByteArray()
+            val ok = bmp.compress(format, 82, out)
+            bmp.recycle()
+            if (ok) out.toByteArray() else null
         } catch (_: Throwable) {
-            rawBytes
+            null
         }
     }
 }

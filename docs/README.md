@@ -1,5 +1,7 @@
 # OneMoreStep 项目设计文档库
 
+> 本目录含设计目标，不全是当前能力。当前修复和验收限制以 [实现边界与升级验收](implementation-status.md) 为准。
+
 > **项目定位**：打通 macOS 本地 AI Agent（Codex、Antigravity、OpenCode 等）与小米 Android 手机的双向互操作与跨端协同底座。
 > **技术栈**：macOS 端 `TypeScript (Node.js / Bun)` + `Swift (CoreBluetooth 桥接)` | 手机端 `Android 原生 Kotlin (Jetpack Compose)`。
 

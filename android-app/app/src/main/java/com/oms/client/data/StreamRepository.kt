@@ -168,12 +168,13 @@ class StreamRepository(context: Context) :
             put("metadata_json", item.metadataJson)
             put("created_at_ms", item.createdAtMs)
         }
-        writableDatabase.insertWithOnConflict(
+        val rowId = writableDatabase.insertWithOnConflict(
             "stream_items",
             null,
             cv,
             SQLiteDatabase.CONFLICT_REPLACE
         )
+        check(rowId != -1L) { "Failed to commit stream item" }
         refreshFlow()
     }
 
@@ -185,6 +186,9 @@ class StreamRepository(context: Context) :
         writableDatabase.update("stream_items", cv, "item_id = ?", arrayOf(itemId))
         refreshFlow()
     }
+
+    fun getStreamItem(itemId: String): StreamItemModel? =
+        queryItems("item_id = ?", "created_at_ms DESC", arrayOf(itemId)).firstOrNull()
 
     fun listQueuedOutboxItems(): List<StreamItemModel> {
         return queryItems("direction = 'PHONE_TO_MAC' AND sync_status = 'QUEUED'", "created_at_ms ASC")
@@ -209,13 +213,13 @@ class StreamRepository(context: Context) :
         _itemsFlow.value = queryItems(null, "created_at_ms DESC LIMIT 200")
     }
 
-    private fun queryItems(selection: String?, orderBy: String): List<StreamItemModel> {
+    private fun queryItems(selection: String?, orderBy: String, selectionArgs: Array<String>? = null): List<StreamItemModel> {
         val list = mutableListOf<StreamItemModel>()
         readableDatabase.query(
             "stream_items",
             null,
             selection,
-            null,
+            selectionArgs,
             null,
             null,
             orderBy

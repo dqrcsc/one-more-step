@@ -85,7 +85,7 @@ class ShareReceiverActivity : Activity() {
                 )
                 Toast.makeText(
                     this,
-                    "✅ 已投递至 Mac ($intentTag)",
+                    "✅ 已加入待发送队列 ($intentTag)",
                     Toast.LENGTH_SHORT
                 ).show()
             }
