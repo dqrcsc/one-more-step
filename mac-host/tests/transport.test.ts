@@ -4,6 +4,7 @@ import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import {
+  computeAuthHmac,
   computePairingHmac,
   createEphemeralPairingCredentials,
   decodeJsonRpcPayload,
@@ -166,6 +167,164 @@ describe("Module 02: Multi-Tier Transport & Presence Engine", () => {
     );
 
     ws.close();
+    await manager.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("LAN Security: rejects trusted_xiaomi_sig bypass, enforces 1-time pairing token, and verifies mutual HMAC", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oms-sec-test-"));
+    const macId = generateEd25519Identity("mac");
+    const port = 29537;
+
+    const manager = new PhoneSessionManager({
+      hostIdentity: macId,
+      lanPort: port,
+      streamDownloadDir: tmpDir,
+    });
+
+    const creds = createEphemeralPairingCredentials();
+    manager.setActivePairingCredentials({
+      ...creds,
+      pairingUri: `oms://pair?v=1&id=${macId.deviceId}&pin=${creds.pinCode}&token=${creds.ephemeralToken}`,
+    });
+    await manager.start();
+
+    // 1. Verify /install page does NOT leak PIN or ephemeralToken in HTML
+    const installHtml = await (await fetch(`http://127.0.0.1:${port}/install`)).text();
+    expect(installHtml).not.toContain(creds.ephemeralToken);
+    expect(installHtml).not.toContain(`oms://pair?v=1&id=${macId.deviceId}`);
+
+    // 2. Verify /pair/resolve rejects wrong PIN and resolves right PIN
+    const wrongPinResp = await fetch(`http://127.0.0.1:${port}/pair/resolve?pin=000000`);
+    expect(wrongPinResp.status).toBe(403);
+    const rightPinResp = await fetch(`http://127.0.0.1:${port}/pair/resolve?pin=${creds.pinCode}`);
+    expect(rightPinResp.status).toBe(200);
+    const rightPinJson = (await rightPinResp.json()) as any;
+    expect(rightPinJson.ok).toBe(true);
+    expect(rightPinJson.pairingUri).toContain(creds.ephemeralToken);
+
+    // 3. Verify un-paired rogue client sending "trusted_xiaomi_sig" is strictly rejected
+    const rogueWs = new WebSocket(`ws://127.0.0.1:${port}/?tier=lan`);
+    rogueWs.binaryType = "arraybuffer";
+    const rogueDecoder = new FrameStreamDecoder();
+    const rogueErrorPromise = new Promise<number>((resolve) => {
+      rogueWs.onmessage = (ev) => {
+        const frames = rogueDecoder.push(new Uint8Array(ev.data as ArrayBuffer));
+        for (const f of frames) {
+          const msg = decodeJsonRpcPayload<any>(f.payload);
+          if (msg.method === "auth.helloChallenge") {
+            rogueWs.send(
+              encodeJsonRpcFrame({
+                jsonrpc: "2.0",
+                id: "rogue_auth_1",
+                method: "auth.response",
+                params: {
+                  phoneId: "xiaomi_rogue_device",
+                  noncePhoneHex: "deadbeef",
+                  phoneSignatureBase64Url: "trusted_xiaomi_sig",
+                  deviceSnapshot: {},
+                },
+              })
+            );
+          } else if (msg.id === "rogue_auth_1" && msg.error) {
+            resolve(msg.error.code);
+          }
+        }
+      };
+    });
+    expect(await rogueErrorPromise).toBe(-32012);
+    expect(manager.getTrustedDevices().length).toBe(0);
+    rogueWs.close();
+
+    // 4. Legitimate phone pairs and receives 256-bit pairSecretHex; token is consumed immediately
+    const phoneId = "xiaomi_legit_01";
+    const phonePub = `pub_${phoneId}`;
+    const ws1 = new WebSocket(`ws://127.0.0.1:${port}/?tier=lan`);
+    ws1.binaryType = "arraybuffer";
+    const dec1 = new FrameStreamDecoder();
+    const pairSecretPromise = new Promise<string>((resolve) => {
+      ws1.onmessage = (ev) => {
+        for (const f of dec1.push(new Uint8Array(ev.data as ArrayBuffer))) {
+          const msg = decodeJsonRpcPayload<any>(f.payload);
+          if (msg.method === "auth.helloChallenge") {
+            ws1.send(
+              encodeJsonRpcFrame({
+                jsonrpc: "2.0",
+                id: "pair_legit",
+                method: "pair.request",
+                params: {
+                  phoneId,
+                  phoneModel: "Xiaomi 15",
+                  phoneName: "Legit Phone",
+                  phonePubKeyBase64Url: phonePub,
+                  pinCode: creds.pinCode,
+                  hmacHex: computePairingHmac(creds.ephemeralToken, creds.pinCode, phoneId, phonePub),
+                  timestampMs: Date.now(),
+                },
+              })
+            );
+          } else if (msg.id === "pair_legit" && msg.result?.ok) {
+            resolve(msg.result.pairSecretHex);
+          }
+        }
+      };
+    });
+    const pairSecretHex = await pairSecretPromise;
+    expect(pairSecretHex.length).toBe(64);
+    ws1.close();
+
+    // 5. Verify pairing token is strictly one-time use (cannot be replayed after 1st pairing)
+    const replayPinResp = await fetch(`http://127.0.0.1:${port}/pair/resolve?pin=${creds.pinCode}`);
+    expect(replayPinResp.status).toBe(410);
+
+    // 6. Verify mutual HMAC authentication on reconnect using pairSecretHex
+    const ws2 = new WebSocket(`ws://127.0.0.1:${port}/?tier=lan`);
+    ws2.binaryType = "arraybuffer";
+    const dec2 = new FrameStreamDecoder();
+    const mutualAuthPromise = new Promise<{ ok: boolean; validMacAck: boolean }>((resolve) => {
+      let savedNonceMac = "";
+      const noncePhoneHex = "aabbccddeeff00112233445566778899";
+      ws2.onmessage = (ev) => {
+        for (const f of dec2.push(new Uint8Array(ev.data as ArrayBuffer))) {
+          const msg = decodeJsonRpcPayload<any>(f.payload);
+          if (msg.method === "auth.helloChallenge") {
+            savedNonceMac = msg.params.nonceMacHex;
+            const sig = computeAuthHmac(
+              pairSecretHex,
+              `phone_auth:${savedNonceMac}:${macId.deviceId}:${phoneId}:${noncePhoneHex}`
+            );
+            ws2.send(
+              encodeJsonRpcFrame({
+                jsonrpc: "2.0",
+                id: "auth_reconnect_1",
+                method: "auth.response",
+                params: {
+                  phoneId,
+                  noncePhoneHex,
+                  phoneSignatureBase64Url: sig,
+                  deviceSnapshot: { batteryPct: 88, isCharging: true, lanIps: ["127.0.0.1"], screenLocked: false, permissions: {} },
+                },
+              })
+            );
+          } else if (msg.id === "auth_reconnect_1") {
+            const expectedMacAck = computeAuthHmac(
+              pairSecretHex,
+              `mac_ack:${savedNonceMac}:${noncePhoneHex}:${macId.deviceId}:${phoneId}`
+            );
+            resolve({
+              ok: Boolean(msg.result?.ok),
+              validMacAck: msg.result?.macAuthHmacHex === expectedMacAck,
+            });
+          }
+        }
+      };
+    });
+
+    const mutualRes = await mutualAuthPromise;
+    expect(mutualRes.ok).toBe(true);
+    expect(mutualRes.validMacAck).toBe(true);
+
+    ws2.close();
     await manager.stop();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });

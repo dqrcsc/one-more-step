@@ -412,6 +412,7 @@ fun OneMoreStepMainScreen() {
 
         // 2. Collapsible Pairing Card
         if (showPairSheet) {
+            val currentPaired = app.repository.getPairedMac()
             Spacer(modifier = Modifier.height(8.dp))
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -419,16 +420,24 @@ fun OneMoreStepMainScreen() {
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     Text(
-                        "🔗 绑定或重连 Mac 宿主 (支持自动发现、输入 IP 或粘贴 oms:// 配对链接)",
+                        "🔐 1 对 1 安全绑定与重连 (一机一码双向加密隔离)",
                         color = Color.White,
                         fontWeight = FontWeight.SemiBold,
                         fontSize = 13.sp
                     )
+                    if (currentPaired != null) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            "当前已绑定：${currentPaired.macName} (${currentPaired.macId.takeLast(8)})",
+                            color = Color(0xFF4ADE80),
+                            fontSize = 11.sp
+                        )
+                    }
                     Spacer(modifier = Modifier.height(6.dp))
                     OutlinedTextField(
                         value = pairUriInput,
                         onValueChange = { pairUriInput = it },
-                        placeholder = { Text("可留空自动扫描，或输入 Mac IP / oms://pair...", color = Color.Gray) },
+                        placeholder = { Text("输入 Mac 终端 6 位配对码，或粘贴 oms://pair...", color = Color.Gray) },
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedTextColor = Color.White,
                             unfocusedTextColor = Color.White,
@@ -442,21 +451,24 @@ fun OneMoreStepMainScreen() {
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         OutlinedButton(onClick = {
-                            Toast.makeText(context, "🔍 正在自动扫描局域网 Mac...", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "🔍 正在重连已绑定的 Mac...", Toast.LENGTH_SHORT).show()
                             app.transportClient.reconnectNow { ok, msg ->
                                 Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
                                 if (ok) showPairSheet = false
                             }
                         }) {
-                            Text("🔍 自动扫描连接", color = Color(0xFF38BDF8), fontSize = 12.sp)
+                            Text("🔍 重连已绑Mac", color = Color(0xFF38BDF8), fontSize = 12.sp)
                         }
                         Button(onClick = {
                             app.transportClient.pairWithUri(pairUriInput.trim()) { ok, msg ->
                                 Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
-                                if (ok) showPairSheet = false
+                                if (ok) {
+                                    pairUriInput = ""
+                                    showPairSheet = false
+                                }
                             }
                         }) {
-                            Text("立即验证并绑定", fontSize = 12.sp)
+                            Text("🔐 验证并绑定", fontSize = 12.sp)
                         }
                     }
                 }

@@ -136,6 +136,20 @@ object OmsFrameProtocol {
         val raw = mac.doFinal("$phoneId:$phonePubKeyBase64Url".toByteArray(Charsets.UTF_8))
         return raw.joinToString("") { "%02x".format(it) }
     }
+
+    fun computeAuthHmac(secretKey: String, message: String): String {
+        val mac = Mac.getInstance("HmacSHA256")
+        val keyBytes = secretKey.toByteArray(Charsets.UTF_8)
+        mac.init(SecretKeySpec(keyBytes, "HmacSHA256"))
+        val raw = mac.doFinal(message.toByteArray(Charsets.UTF_8))
+        return raw.joinToString("") { "%02x".format(it) }
+    }
+
+    fun deriveWanRoomId(macPubKeyBase64Url: String, phonePubKeyBase64Url: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest("oms-wan-v1:$macPubKeyBase64Url:$phonePubKeyBase64Url".toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }.take(32)
+    }
 }
 
 /**

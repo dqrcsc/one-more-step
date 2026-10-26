@@ -7,6 +7,7 @@ import { spawn, execFile, ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
   AuthResponseParams,
+  computeAuthHmac,
   computePairingHmac,
   decodeJsonRpcPayload,
   decodeStreamChunkPayload,
@@ -44,6 +45,7 @@ export interface TrustedPhoneDevice {
   phoneName: string;
   phonePubKeyBase64Url: string;
   wanRoomId: string;
+  pairSecretHex?: string;
   pairedAtMs: number;
   lastSeenMs: number;
 }
@@ -93,6 +95,7 @@ export class PhoneSessionManager extends EventEmitter {
     ephemeralToken: string;
     expiresAtMs: number;
     pairingUri?: string;
+    failedPinAttempts?: number;
   } | null = null;
 
   private wsServer: ReturnType<typeof Bun.serve> | null = null;
@@ -119,7 +122,11 @@ export class PhoneSessionManager extends EventEmitter {
   >();
   private readonly incomingStreams = new Map<string, IncomingFileTransfer>();
   private readonly completedStreams = new Map<string, CompletedFileTransfer>();
-  private customHttpHandler?: (req: Request, url: URL) => Promise<Response | null> | Response | null;
+  private customHttpHandler?: (
+    req: Request,
+    url: URL,
+    clientIp: string
+  ) => Promise<Response | null> | Response | null;
   private apkHashCache: { mtimeMs: number; size: number; sha256: string } | null = null;
 
   constructor(opts: {
@@ -128,7 +135,11 @@ export class PhoneSessionManager extends EventEmitter {
     streamDownloadDir: string;
     trustedDevices?: TrustedPhoneDevice[];
     presenceOptions?: ConstructorParameters<typeof PresenceEngine>[0];
-    customHttpHandler?: (req: Request, url: URL) => Promise<Response | null> | Response | null;
+    customHttpHandler?: (
+      req: Request,
+      url: URL,
+      clientIp: string
+    ) => Promise<Response | null> | Response | null;
   }) {
     super();
     this.hostIdentity = opts.hostIdentity;
@@ -144,9 +155,23 @@ export class PhoneSessionManager extends EventEmitter {
   }
 
   public setCustomHttpHandler(
-    handler: (req: Request, url: URL) => Promise<Response | null> | Response | null
+    handler: (
+      req: Request,
+      url: URL,
+      clientIp: string
+    ) => Promise<Response | null> | Response | null
   ): void {
     this.customHttpHandler = handler;
+  }
+
+  public static isLoopbackAddress(ip: string): boolean {
+    const normalized = (ip || "").trim().toLowerCase();
+    return (
+      normalized === "127.0.0.1" ||
+      normalized === "::1" ||
+      normalized === "::ffff:127.0.0.1" ||
+      normalized === "localhost"
+    );
   }
 
   public getApkMetadata(): {
@@ -167,6 +192,7 @@ export class PhoneSessionManager extends EventEmitter {
     const apkDir = path.join(repoRoot, "android-app/app/build/outputs/apk/debug");
     const candidatePaths = [
       path.join(apkDir, "app-debug.apk"),
+      path.join(repoRoot, "OneMoreStep-v1.3.5.apk"),
       path.join(repoRoot, "OneMoreStep-v1.3.4.apk"),
       path.join(os.homedir(), ".one_more_step", "OneMoreStep.apk"),
     ];
@@ -177,19 +203,19 @@ export class PhoneSessionManager extends EventEmitter {
       return {
         available: false,
         apkPath,
-        versionCode: 8,
-        versionName: "1.3.4",
+        versionCode: 9,
+        versionName: "1.3.5",
         sha256: "",
         sizeBytes: 0,
         updatedAtMs: 0,
         updatedAtIso: "",
-        downloadUrl: "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.3.4.apk",
+        downloadUrl: "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.3.5.apk",
       };
     }
 
     const stat = fs.statSync(apkPath);
-    let versionCode = 8;
-    let versionName = "1.3.4";
+    let versionCode = 9;
+    let versionName = "1.3.5";
     if (fs.existsSync(metaPath)) {
       try {
         const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
@@ -304,8 +330,58 @@ export class PhoneSessionManager extends EventEmitter {
         }
 
         if (self.customHttpHandler) {
-          const customResp = await self.customHttpHandler(req, url);
+          const customResp = await self.customHttpHandler(req, url, clientIp);
           if (customResp) return customResp;
+        }
+
+        // PIN-Protected Pairing URI Resolution Endpoint (Max 5 failed attempts before lockout)
+        if (url.pathname === "/pair/resolve") {
+          const creds = self.activePairingCreds;
+          if (!creds || Date.now() > creds.expiresAtMs || !creds.pairingUri) {
+            return Response.json(
+              {
+                ok: false,
+                error: "当前无有效配对会话或已过期，请先在 Mac 终端运行: bun run oms pair",
+              },
+              { status: 410 }
+            );
+          }
+
+          const inputPin = (url.searchParams.get("pin") || "").trim();
+          const expectedBuf = Buffer.from(creds.pinCode, "utf8");
+          const inputBuf = Buffer.from(inputPin, "utf8");
+          const pinMatched =
+            expectedBuf.byteLength === inputBuf.byteLength &&
+            crypto.timingSafeEqual(expectedBuf, inputBuf);
+
+          if (!pinMatched) {
+            creds.failedPinAttempts = (creds.failedPinAttempts || 0) + 1;
+            if (creds.failedPinAttempts >= 5) {
+              self.activePairingCreds = null;
+              return Response.json(
+                {
+                  ok: false,
+                  error:
+                    "配对码连续输错 5 次，配对凭证已自动销毁，请在 Mac 终端重新运行: bun run oms pair",
+                },
+                { status: 429 }
+              );
+            }
+            return Response.json(
+              {
+                ok: false,
+                error: `6 位配对码不正确（剩余尝试次数：${5 - creds.failedPinAttempts}）`,
+              },
+              { status: 403 }
+            );
+          }
+
+          return Response.json({
+            ok: true,
+            macId: self.hostIdentity.deviceId,
+            macName: os.hostname(),
+            pairingUri: creds.pairingUri,
+          });
         }
 
         // APK Version Metadata Endpoint for Smart OTA Update Check
@@ -344,18 +420,20 @@ export class PhoneSessionManager extends EventEmitter {
             });
           }
           return Response.redirect(
-            "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.3.4.apk",
+            "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.3.5.apk",
             302
           );
         }
 
-        // Wireless Mobile Onboarding & One-Tap Pairing Page
+        // Wireless Mobile Onboarding & PIN-Protected Pairing Page
         if (
           url.pathname === "/install" ||
           (url.pathname === "/" && (req.headers.get("accept") || "").includes("text/html"))
         ) {
-          const uriStr = self.activePairingCreds?.pairingUri || "请先在 Mac 终端运行: bun run oms pair";
-          const pinStr = self.activePairingCreds?.pinCode || "------";
+          const isLocalhost = PhoneSessionManager.isLoopbackAddress(clientIp);
+          const hasActivePair = Boolean(
+            self.activePairingCreds && Date.now() < self.activePairingCreds.expiresAtMs
+          );
           const apkMeta = self.getApkMetadata();
           const sizeMb = apkMeta.sizeBytes ? (apkMeta.sizeBytes / 1048576).toFixed(1) : "21.0";
           const html = `<!DOCTYPE html>
@@ -363,7 +441,7 @@ export class PhoneSessionManager extends EventEmitter {
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>OneMoreStep · 小米手机无线安装与配对台</title>
+<title>OneMoreStep · 小米手机无线安装与安全配对台</title>
 <style>
   body { background:#0F172A; color:#F8FAFC; font-family:-apple-system,BlinkMacSystemFont,sans-serif; padding:20px; margin:0; }
   .card { background:#1E293B; border-radius:16px; padding:20px; margin-bottom:16px; border:1px solid #334155; }
@@ -372,25 +450,35 @@ export class PhoneSessionManager extends EventEmitter {
   .btn { display:block; width:100%; box-sizing:border-box; text-align:center; background:#0284C7; color:#fff; font-weight:600; padding:14px; border-radius:12px; text-decoration:none; border:none; font-size:15px; margin-top:12px; cursor:pointer; }
   .btn-green { background:#16A34A; }
   .btn-purple { background:#4F46E5; }
-  code { display:block; background:#0F172A; padding:10px; border-radius:8px; word-break:break-all; font-size:12px; color:#FBBF24; margin-top:8px; }
+  input { width:100%; box-sizing:border-box; background:#0F172A; color:#F8FAFC; border:1px solid #475569; border-radius:10px; padding:12px; font-size:16px; margin-top:8px; letter-spacing:2px; text-align:center; }
+  code { display:none; background:#0F172A; padding:10px; border-radius:8px; word-break:break-all; font-size:12px; color:#FBBF24; margin-top:8px; }
 </style>
 </head>
 <body>
-  <div class="card">
-    <h2>💻 Mac 端实时收件箱与协同看板</h2>
+  ${
+    isLocalhost
+      ? `<div class="card">
+    <h2>💻 Mac 端实时收件箱与协同看板（仅限本机访问）</h2>
     <p>直观查看手机发来的文字、截图大图预览、一键复制或反向推消息到手机：</p>
     <a class="btn btn-purple" href="/inbox">📬 打开 Mac 实时收件箱看板 (/inbox)</a>
-  </div>
+  </div>`
+      : ""
+  }
   <div class="card">
     <h2>第一步：无线下载安装 APK (v${apkMeta.versionName})</h2>
     <p>无需数据线，直接通过当前局域网从 Mac 高速下载安装包（${sizeMb} MB）：</p>
     <a class="btn" href="/OneMoreStep.apk">📥 点击下载 OneMoreStep_v${apkMeta.versionName}.apk</a>
   </div>
   <div class="card">
-    <h2>第二步：一键复制 Mac 配对凭证</h2>
-    <p>当前 6 位配对码：<strong>${pinStr}</strong></p>
-    <code id="pairUri">${uriStr}</code>
-    <button class="btn btn-green" onclick="(function(){var t=document.getElementById('pairUri').innerText;if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(()=>alert('✅ 已复制配对链接！请打开 OneMoreStep 粘贴绑定'));}else{var ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);alert('✅ 已复制配对链接！请打开 OneMoreStep 粘贴绑定');}})()">📋 一键复制配对链接</button>
+    <h2>第二步：1 对 1 安全验证并绑定 Mac</h2>
+    <p>${
+      hasActivePair
+        ? "🔒 已开启一机一码安全隔离。你可以直接在手机 App「绑定Mac」中输入 Mac 终端显示的 6 位配对码，或在下方输入配对码解锁绑定链接："
+        : "⚠️ 当前未开启配对会话，请先在 Mac 终端运行: bun run oms pair"
+    }</p>
+    <input id="pinInput" type="tel" maxlength="6" placeholder="请输入 Mac 终端显示的 6 位配对码" />
+    <code id="pairUri"></code>
+    <button class="btn btn-green" onclick="(async function(){var pin=document.getElementById('pinInput').value.trim();if(!pin){alert('请先输入 Mac 终端显示的 6 位配对码');return;}var r=await fetch('/pair/resolve?pin='+encodeURIComponent(pin));var d=await r.json();if(!d.ok){alert('❌ '+d.error);return;}var el=document.getElementById('pairUri');el.style.display='block';el.innerText=d.pairingUri;if(navigator.clipboard&&navigator.clipboard.writeText){await navigator.clipboard.writeText(d.pairingUri);alert('✅ 已验证配对码并复制加密绑定链接！请打开 OneMoreStep 粘贴绑定');}else{var ta=document.createElement('textarea');ta.value=d.pairingUri;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);alert('✅ 已验证配对码并复制加密绑定链接！请打开 OneMoreStep 粘贴绑定');}})()">🔐 验证配对码并复制绑定链接</button>
   </div>
   <div class="card">
     <h2>第三步：小米 HyperOS 权限开启提醒</h2>
@@ -864,6 +952,11 @@ export class PhoneSessionManager extends EventEmitter {
     );
 
     if (params.pinCode !== this.activePairingCreds.pinCode || params.hmacHex !== expectedHmac) {
+      this.activePairingCreds.failedPinAttempts =
+        (this.activePairingCreds.failedPinAttempts || 0) + 1;
+      if (this.activePairingCreds.failedPinAttempts >= 5) {
+        this.activePairingCreds = null;
+      }
       if (req.id) {
         pipe.sendRaw(
           encodeJsonRpcFrame({
@@ -876,10 +969,14 @@ export class PhoneSessionManager extends EventEmitter {
       return;
     }
 
+    // Consume ephemeral pairing credentials immediately (strictly one-time use)
+    this.activePairingCreds = null;
+
     const wanRoomId = deriveWanRoomId(
       this.hostIdentity.publicKeyBase64Url,
       params.phonePubKeyBase64Url
     );
+    const pairSecretHex = crypto.randomBytes(32).toString("hex");
 
     const trusted: TrustedPhoneDevice = {
       phoneId: params.phoneId,
@@ -887,13 +984,17 @@ export class PhoneSessionManager extends EventEmitter {
       phoneName: params.phoneName || "Xiaomi Phone",
       phonePubKeyBase64Url: params.phonePubKeyBase64Url,
       wanRoomId,
+      pairSecretHex,
       pairedAtMs: Date.now(),
       lastSeenMs: Date.now(),
     };
 
+    // Strictly enforce 1-to-1 pairing: bind exclusively to the newly paired phone
+    this.trustedDevices.clear();
     this.trustedDevices.set(trusted.phoneId, trusted);
     pipe.authenticated = true;
     pipe.phoneId = trusted.phoneId;
+    pipe.pendingNonceMac = undefined;
     this.pipes.set(pipe.tier, pipe);
     if (pipe.tier === "LAN_WS") {
       this.presence.onLanDirectActive(1);
@@ -913,6 +1014,7 @@ export class PhoneSessionManager extends EventEmitter {
       macPubKeyBase64Url: this.hostIdentity.publicKeyBase64Url,
       wanRoomId,
       macSignatureBase64Url: sigMac,
+      pairSecretHex,
     };
 
     if (req.id) {
@@ -928,28 +1030,9 @@ export class PhoneSessionManager extends EventEmitter {
 
   private handleAuthResponse(pipe: ActiveTransportPipe, req: JsonRpcRequest): void {
     const params = req.params as AuthResponseParams;
-    let trusted = this.trustedDevices.get(params.phoneId);
-    if (
-      !trusted &&
-      (pipe.tier === "LAN_WS" || pipe.tier === "BT_RFCOMM") &&
-      params.phoneId &&
-      params.phoneSignatureBase64Url === "trusted_xiaomi_sig"
-    ) {
-      const phonePubKey = `pub_${params.phoneId}`;
-      const wanRoomId = deriveWanRoomId(this.hostIdentity.publicKeyBase64Url, phonePubKey);
-      trusted = {
-        phoneId: params.phoneId,
-        phoneModel: "Xiaomi Phone",
-        phoneName: "Xiaomi",
-        phonePubKeyBase64Url: phonePubKey,
-        wanRoomId,
-        pairedAtMs: Date.now(),
-        lastSeenMs: Date.now(),
-      };
-      this.trustedDevices.set(trusted.phoneId, trusted);
-      this.emit("devicePaired", trusted);
-    }
-    if (!trusted || !pipe.pendingNonceMac) {
+    const trusted = this.trustedDevices.get(params.phoneId);
+    const challengeNonceMac = pipe.pendingNonceMac;
+    if (!trusted || !challengeNonceMac) {
       if (req.id) {
         pipe.sendRaw(
           encodeJsonRpcFrame({
@@ -962,29 +1045,43 @@ export class PhoneSessionManager extends EventEmitter {
       return;
     }
 
-    const signedData = `${pipe.pendingNonceMac}:${this.hostIdentity.deviceId}`;
-    const valid =
-      (trusted.phonePubKeyBase64Url.startsWith("pub_") &&
-        params.phoneSignatureBase64Url === "trusted_xiaomi_sig") ||
-      verifyEd25519(
-        trusted.phonePubKeyBase64Url,
-        signedData,
-        params.phoneSignatureBase64Url
-      );
+    const signedEd25519Data = `${challengeNonceMac}:${this.hostIdentity.deviceId}`;
+    const hmacPayload = `phone_auth:${challengeNonceMac}:${this.hostIdentity.deviceId}:${params.phoneId}:${params.noncePhoneHex}`;
 
-    if (!valid) {
+    const isEd25519Valid = verifyEd25519(
+      trusted.phonePubKeyBase64Url,
+      signedEd25519Data,
+      params.phoneSignatureBase64Url
+    );
+    const isPairSecretHmacValid =
+      Boolean(trusted.pairSecretHex) &&
+      computeAuthHmac(trusted.pairSecretHex!, hmacPayload) === params.phoneSignatureBase64Url;
+    const isLegacyMigrationHmacValid =
+      !trusted.pairSecretHex &&
+      Boolean(trusted.wanRoomId) &&
+      computeAuthHmac(trusted.wanRoomId, hmacPayload) === params.phoneSignatureBase64Url;
+
+    if (!isEd25519Valid && !isPairSecretHmacValid && !isLegacyMigrationHmacValid) {
+      pipe.pendingNonceMac = undefined;
       if (req.id) {
         pipe.sendRaw(
           encodeJsonRpcFrame({
             jsonrpc: "2.0",
             id: req.id,
-            error: { code: -32013, message: "Ed25519 challenge signature verification failed" },
+            error: { code: -32013, message: "Cryptographic challenge signature verification failed" },
           })
         );
       }
       return;
     }
 
+    let upgradedPairSecretHex: string | undefined;
+    if (isLegacyMigrationHmacValid && !trusted.pairSecretHex) {
+      upgradedPairSecretHex = crypto.randomBytes(32).toString("hex");
+      trusted.pairSecretHex = upgradedPairSecretHex;
+    }
+
+    pipe.pendingNonceMac = undefined;
     pipe.authenticated = true;
     pipe.phoneId = params.phoneId;
     trusted.lastSeenMs = Date.now();
@@ -999,6 +1096,12 @@ export class PhoneSessionManager extends EventEmitter {
       this.hostIdentity.privateKeyPem,
       `${params.noncePhoneHex}:${params.phoneId}`
     );
+    const macAuthHmacHex = trusted.pairSecretHex
+      ? computeAuthHmac(
+          trusted.pairSecretHex,
+          `mac_ack:${challengeNonceMac}:${params.noncePhoneHex}:${this.hostIdentity.deviceId}:${params.phoneId}`
+        )
+      : undefined;
 
     if (req.id) {
       pipe.sendRaw(
@@ -1007,7 +1110,10 @@ export class PhoneSessionManager extends EventEmitter {
           id: req.id,
           result: {
             ok: true,
+            macId: this.hostIdentity.deviceId,
             macSignatureBase64Url: macSig,
+            ...(macAuthHmacHex ? { macAuthHmacHex } : {}),
+            ...(upgradedPairSecretHex ? { pairSecretHex: upgradedPairSecretHex } : {}),
           },
         })
       );

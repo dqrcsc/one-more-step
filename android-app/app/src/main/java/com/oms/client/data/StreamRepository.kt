@@ -32,7 +32,8 @@ data class PairedMacConfig(
     val lanPort: Int,
     val macPubKeyBase64Url: String,
     val wanRoomId: String,
-    val wanRelayWssUrl: String?
+    val wanRelayWssUrl: String?,
+    val pairSecretHex: String = ""
 )
 
 /**
@@ -82,20 +83,47 @@ class StreamRepository(context: Context) :
     }
 
     fun savePairedMac(config: PairedMacConfig) {
+        val existingMacId = prefs.getString("mac_id", null)
+        val sameMac = existingMacId != null && existingMacId == config.macId
+        val effectivePubKey = config.macPubKeyBase64Url.ifBlank {
+            if (sameMac) prefs.getString("mac_pub_key", "") ?: "" else ""
+        }
+        val effectiveWanRoom = config.wanRoomId.ifBlank {
+            if (sameMac) prefs.getString("wan_room_id", "") ?: "" else ""
+        }
+        val effectivePairSecret = config.pairSecretHex.ifBlank {
+            if (sameMac) prefs.getString("pair_secret_hex", "") ?: "" else ""
+        }
+        val effectiveRelay = config.wanRelayWssUrl ?: if (sameMac) prefs.getString("wan_relay_url", null) else null
+
         val ipsArr = JSONArray(config.lanIps)
         prefs.edit()
             .putString("mac_id", config.macId)
             .putString("mac_name", config.macName)
             .putString("lan_ips", ipsArr.toString())
             .putInt("lan_port", config.lanPort)
-            .putString("mac_pub_key", config.macPubKeyBase64Url)
-            .putString("wan_room_id", config.wanRoomId)
-            .putString("wan_relay_url", config.wanRelayWssUrl)
+            .putString("mac_pub_key", effectivePubKey)
+            .putString("wan_room_id", effectiveWanRoom)
+            .putString("wan_relay_url", effectiveRelay)
+            .putString("pair_secret_hex", effectivePairSecret)
+            .apply()
+    }
+
+    fun clearPairedMac() {
+        prefs.edit()
+            .remove("mac_id")
+            .remove("mac_name")
+            .remove("lan_ips")
+            .remove("lan_port")
+            .remove("mac_pub_key")
+            .remove("wan_room_id")
+            .remove("wan_relay_url")
+            .remove("pair_secret_hex")
             .apply()
     }
 
     fun getPairedMac(): PairedMacConfig? {
-        val macId = prefs.getString("mac_id", null) ?: return null
+        val macId = prefs.getString("mac_id", null)?.takeIf { it.isNotBlank() } ?: return null
         val ipsJson = prefs.getString("lan_ips", "[]") ?: "[]"
         val arr = JSONArray(ipsJson)
         val ips = mutableListOf<String>()
@@ -109,7 +137,8 @@ class StreamRepository(context: Context) :
             lanPort = prefs.getInt("lan_port", 19527),
             macPubKeyBase64Url = prefs.getString("mac_pub_key", "") ?: "",
             wanRoomId = prefs.getString("wan_room_id", "") ?: "",
-            wanRelayWssUrl = prefs.getString("wan_relay_url", null)
+            wanRelayWssUrl = prefs.getString("wan_relay_url", null),
+            pairSecretHex = prefs.getString("pair_secret_hex", "") ?: ""
         )
     }
 

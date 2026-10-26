@@ -84,6 +84,13 @@
 - **空间在场引擎 (`PresenceEngine`)**：通过蓝牙 RSSI 滑动窗口与滞回滤波，自动识别 `AT_DESK`（在电脑前）与 `AWAY`（离开工位），实现「坐到电脑前自动同步晨报、离开工位自动将 AI 通知路由至手机」。
 - **小米 HyperOS / MIUI 专属适配 (`XiaomiAdaptationHelper`)**：通过反射自检小米专属 AppOps 权限（`10021` 后台弹出界面、`10008` 锁屏显示），提供一键跳转设置向导。
 
+### 2.5 🔐 一机一码与局域网严格 1 对 1 安全隔离
+即便在公司公共 Wi-Fi、咖啡厅或多人共用局域网环境下，也确保**只有你绑定的那一台 Mac 能与你的手机交互**：
+- **双向加密挑战-应答认证**：首次通过 6 位配对码（PIN）+ 一次性 Token 绑定时，双方协商生成 256-bit 专属配对密钥 (`pairSecretHex`) 并立即销毁一次性配对凭证。每次重连均执行双向 HMAC-SHA256 / Ed25519 挑战签名校验（Mac 验手机、手机验 Mac），手机端在完成对 Mac 的双向验签前拒绝执行任何传入的控制指令。
+- **手机端唯一 `macId` 强锁定**：一旦完成配对，手机端的 UDP 信标监听、局域网子网扫描与蓝牙近场发现仅接受 `macId == paired.macId` 的宿主设备；即使你自己的 Mac 休眠或离线，手机也绝不会自动连接或改绑到同一局域网内的其他电脑。
+- **Mac 本地控制台回环隔离 (`127.0.0.1` Only)**：`/inbox` 实时看板与 `/api/inbox/*` 控制接口严格限制仅允许本机回环地址 (`127.0.0.1` / `::1`) 访问，同一局域网内的其他电脑访问一律返回 `403 Forbidden`，杜绝借道 Mac 操控手机。
+- **PIN 码保护的配对解析与防爆破 (`/pair/resolve`)**：`/install` 无线安装页不在 HTML 中明文暴露配对凭证，需输入 Mac 终端显示的 6 位配对码方可解锁，且连续输错 5 次自动销毁配对会话。
+
 ---
 
 ## 3. 系统架构与工程结构
@@ -170,7 +177,7 @@ one_more_step/
 
 | 核心构件 | 路径 / 获取方式 | 说明 |
 | :--- | :--- | :--- |
-| **Android 安装包 (APK)** | [GitHub Releases (`OneMoreStep-v1.3.4.apk`)](https://github.com/dqrcsc/one-more-step/releases/latest) 或 `bun run build:apk` | 原生 Kotlin + Jetpack Compose 客户端 |
+| **Android 安装包 (APK)** | [GitHub Releases (`OneMoreStep-v1.3.5.apk`)](https://github.com/dqrcsc/one-more-step/releases/latest) 或 `bun run build:apk` | 原生 Kotlin + Jetpack Compose 客户端 |
 | **macOS 蓝牙桥接器** | [`mac-host/bluetooth-bridge/main.swift`](./mac-host/bluetooth-bridge/main.swift) | 基于 Swift `CoreBluetooth` 的蓝牙近场通信助手（首次启动或 `bun run setup` 自动编译） |
 | **Mac 守护进程 (`omsd`)** | [`mac-host/src/daemon/main.ts`](./mac-host/src/daemon/main.ts) | 管理多通道会话、本地收件箱、离线语音转写、Web 控制台与多 Agent IPC |
 | **MCP Server (`oms mcp`)** | [`mac-host/src/mcp/server.ts`](./mac-host/src/mcp/server.ts) | 面向 AI Agent 暴露 13 个标准工具与 3 个动态资源 |
@@ -217,7 +224,7 @@ oms pair
 - **方式 A（推荐 · 手机浏览器无线直装）**：
   1. 确保手机与 Mac 处于同一 Wi-Fi（若手机开着 VPN，请开启「绕过局域网」或暂停 VPN 10 秒）；
   2. 用手机浏览器访问终端显示的 `http://192.168.x.x:19527/install`；
-  3. 点击页面上的 **`[📥 点击下载 OneMoreStep.apk]`** 完成安装（若本地未编译 APK，将自动引导下载最新 GitHub Release 安装包），随后点击 **`[📋 一键复制配对链接]`**。
+  3. 点击页面上的 **`[📥 点击下载 OneMoreStep.apk]`** 完成安装（若本地未编译 APK，将自动引导下载最新 GitHub Release 安装包）。
 - **方式 B（备选 · 通过有线/无线 ADB 安装）**：
   > 通过 ADB 安装的 APK 会被系统直接视为受信任应用，**可自动免除 Android 13/14/15 开启无障碍服务时的「受限制的设置」解锁步骤**：
   ```bash
@@ -226,8 +233,8 @@ oms pair
 
 ### 第二步：首次信任绑定与常驻 VPN 分流
 
-1. 打开手机上的 **「青简·咫尺 (`OneMoreStep`)」**，在顶部 **「🔗 绑定 Mac 宿主」** 输入框中粘贴刚才复制的 `oms://pair?v=1&...` 链接（或留空直接点击按钮触发局域网自动发现），点击 **`[立即验证并绑定]`**。
-2. 状态栏变为 **`🟢 局域网高速直连 (Tier 1)`** 即代表永久 `Ed25519` 双向密钥绑定完成。
+1. 打开手机上的 **「青简·咫尺 (`OneMoreStep`)」**，在顶部 **「🔐 1 对 1 安全绑定与重连」** 输入框中直接输入 Mac 终端显示的 **6 位配对码**（如 `839201`）或粘贴完整 `oms://pair?v=1&...` 链接，点击 **`[🔐 验证并绑定]`**。
+2. 状态栏变为 **`🟢 局域网高速直连 (Tier 1)`** 即代表 1 对 1 双向加密密钥绑定完成（此后即使在同一局域网有其他电脑运行同款服务，手机也只认你绑定的这台 Mac）。
 3. **常驻 VPN 用户必配**：打开手机上的代理软件（Clash Meta / Sing-box / NekoBox 等），进入「分应用代理（Per-App Proxy）」，勾选 **`青简·咫尺 (OneMoreStep)` 绕过代理 / 直连**。
 
 ### 第三步：一键开启小米 HyperOS / MIUI 专属权限

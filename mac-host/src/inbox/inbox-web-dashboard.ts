@@ -1,17 +1,41 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { OmsDaemon } from "../daemon/oms-daemon.js";
+import { PhoneSessionManager } from "../transport/session-manager.js";
 import type { IntentTag } from "@oms/shared-protocol";
 
 /**
  * Module 06+: Mac Real-Time Web Inbox & Bidirectional Collaboration Dashboard
- * Served at http://127.0.0.1:19527/inbox (and /dashboard)
+ * Served strictly on localhost: http://127.0.0.1:19527/inbox (and /dashboard)
  */
 export async function handleDashboardHttpRequest(
   daemon: OmsDaemon,
   req: Request,
-  url: URL
+  url: URL,
+  clientIp = "127.0.0.1"
 ): Promise<Response | null> {
+  const isDashboardRoute =
+    url.pathname === "/inbox" ||
+    url.pathname === "/dashboard" ||
+    url.pathname.startsWith("/api/inbox");
+
+  if (isDashboardRoute && !PhoneSessionManager.isLoopbackAddress(clientIp)) {
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error:
+          "Forbidden: Mac Inbox Dashboard and Control API are strictly restricted to localhost (127.0.0.1 / ::1).",
+      }),
+      {
+        status: 403,
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store",
+        },
+      }
+    );
+  }
+
   if (url.pathname === "/inbox" || url.pathname === "/dashboard") {
     return new Response(renderDashboardHtml(), {
       headers: {

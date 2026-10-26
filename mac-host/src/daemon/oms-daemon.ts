@@ -84,7 +84,8 @@ export class OmsDaemon {
       lanPort: this.config.lanPort,
       streamDownloadDir: path.join(this.homeDir, "inbox", "pulled_cache"),
       trustedDevices: trusted,
-      customHttpHandler: (req, url) => handleDashboardHttpRequest(this, req, url),
+      customHttpHandler: (req, url, clientIp) =>
+        handleDashboardHttpRequest(this, req, url, clientIp),
     });
 
     this.wireSessionEvents();
@@ -190,7 +191,7 @@ export class OmsDaemon {
     fs.writeFileSync(
       this.trustedDevicesPath,
       JSON.stringify(this.session.getTrustedDevices(), null, 2),
-      "utf8"
+      { encoding: "utf8", mode: 0o600 }
     );
   }
 

@@ -158,7 +158,28 @@ class OmsTransportClient(
         val chunks: MutableMap<Int, ByteArray> = ConcurrentHashMap()
     )
 
+    private data class PendingAuthState(
+        val nonceMacHex: String,
+        val noncePhoneHex: String,
+        val macId: String,
+        val secretKey: String
+    )
+
     private val incomingTransfers = ConcurrentHashMap<String, IncomingPushTransfer>()
+    private val authenticatedWebSockets = ConcurrentHashMap.newKeySet<WebSocket>()
+    private val pendingAuthStates = ConcurrentHashMap<String, PendingAuthState>()
+    @Volatile
+    private var isBleAuthenticated: Boolean = false
+
+    private fun isSourceAuthenticated(tier: String, sourceWebSocket: WebSocket?): Boolean {
+        if (sourceWebSocket != null) {
+            return authenticatedWebSockets.contains(sourceWebSocket)
+        }
+        if (tier == "BT_RFCOMM") {
+            return isBleAuthenticated
+        }
+        return false
+    }
 
     init {
         registerWifiNetworkCallback()
@@ -171,10 +192,10 @@ class OmsTransportClient(
             while (true) {
                 delay(4500L)
                 try {
+                    val paired = repo.getPairedMac() ?: continue
                     if (_activeTierFlow.value != "LAN_WS" || lanWebSocket == null) {
                         startBleNearFieldScanner()
-                        val paired = repo.getPairedMac()
-                        connectLanIfPossible(paired?.lanIps ?: emptyList(), paired?.lanPort ?: 19527)
+                        connectLanIfPossible(paired.lanIps, paired.lanPort)
                     }
                 } catch (_: Throwable) {
                 }
@@ -197,11 +218,15 @@ class OmsTransportClient(
                     val str = String(pkt.data, 0, pkt.length, Charsets.UTF_8)
                     if (str.contains("OMS_MAC_BEACON") || str.contains("OneMoreStep")) {
                         try {
+                            val existing = repo.getPairedMac() ?: continue
                             val json = JSONObject(str)
                             val macId = json.optString("macId")
-                            val macName = json.optString("macName", "MacBook Pro")
+                            // Strict 1-to-1 isolation: ignore beacons from any other Mac on the LAN
+                            if (macId.isBlank() || macId != existing.macId) continue
+
+                            val macName = json.optString("macName", existing.macName)
                             val macPub = json.optString("macPubKeyBase64Url", "")
-                            val port = json.optInt("lanPort", 19527)
+                            val port = json.optInt("lanPort", existing.lanPort)
                             val senderIp = pkt.address?.hostAddress
                             val ips = mutableListOf<String>()
                             if (!senderIp.isNullOrBlank() && !senderIp.startsWith("198.18.")) {
@@ -217,15 +242,11 @@ class OmsTransportClient(
                                 }
                             }
                             if (ips.isNotEmpty()) {
-                                val existing = repo.getPairedMac()
-                                val updated = PairedMacConfig(
-                                    macId = macId.ifBlank { existing?.macId ?: "mac_host" },
+                                val updated = existing.copy(
                                     macName = macName,
                                     lanIps = ips,
                                     lanPort = port,
-                                    macPubKeyBase64Url = macPub.ifBlank { existing?.macPubKeyBase64Url ?: "" },
-                                    wanRoomId = existing?.wanRoomId ?: "",
-                                    wanRelayWssUrl = existing?.wanRelayWssUrl
+                                    macPubKeyBase64Url = macPub.ifBlank { existing.macPubKeyBase64Url }
                                 )
                                 repo.savePairedMac(updated)
                                 if (_activeTierFlow.value != "LAN_WS" || lanWebSocket == null) {
@@ -447,26 +468,28 @@ class OmsTransportClient(
     }
 
     /**
-     * Automatically discover Mac Host on LAN when DHCP IP changes (e.g. 192.168.1.77 -> 192.168.1.100).
-     * 1. Priority Direct HTTP Probe (no concurrency flood)
-     * 2. Fast UDP Broadcast Probe (< 250ms)
-     * 3. Batched TCP Subnet Scan (32 IPs per batch to prevent Dispatchers.IO LIFO starvation & ARP queue overflow)
+     * Automatically discover the ALREADY PAIRED Mac Host on LAN when DHCP IP changes (e.g. 192.168.1.77 -> 192.168.1.100).
+     * Strictly enforces 1-to-1 device binding: only accepts responses where `macId == targetMacId`.
+     * Never binds to or overwrites config with an unknown Mac on the same LAN.
      */
     private suspend fun discoverMacOnLan(
         port: Int = 19527,
         expectedMacId: String? = null
     ): PairedMacConfig? = coroutineScope {
-        val phoneIps = getLocalPhoneWifiIpv4s()
         val paired = repo.getPairedMac()
+        val targetMacId = expectedMacId?.takeIf { it.isNotBlank() }
+            ?: paired?.macId?.takeIf { it.isNotBlank() }
+            ?: return@coroutineScope null
+        val phoneIps = getLocalPhoneWifiIpv4s()
 
         // 1. Priority Direct Probe first (0 contention, immediate response!)
         val priorityIps = LinkedHashSet<String>()
         paired?.lanIps?.forEach { if (it.isNotBlank() && !it.startsWith("198.18.")) priorityIps.add(it) }
         for (pip in priorityIps) {
             val cfg = probeMacHttpInfo(pip, port, timeoutMs = 650, checkTcpFirst = false)
-            if (cfg != null && (expectedMacId == null || cfg.macId == expectedMacId)) {
+            if (cfg != null && cfg.macId == targetMacId) {
                 repo.savePairedMac(cfg)
-                return@coroutineScope cfg
+                return@coroutineScope repo.getPairedMac() ?: cfg
             }
         }
 
@@ -503,7 +526,7 @@ class OmsTransportClient(
                 if (json.optString("service").contains("OneMoreStep")) {
                     val senderIp = recvPkt.address?.hostAddress
                     val macId = json.optString("macId")
-                    if (expectedMacId == null || expectedMacId == macId) {
+                    if (macId == targetMacId) {
                         val ips = mutableListOf<String>()
                         if (!senderIp.isNullOrBlank()) ips.add(senderIp)
                         val arr = json.optJSONArray("lanIps")
@@ -515,16 +538,17 @@ class OmsTransportClient(
                         }
                         if (ips.isNotEmpty()) {
                             val found = PairedMacConfig(
-                                macId = macId.ifBlank { paired?.macId ?: "mac_host" },
+                                macId = targetMacId,
                                 macName = json.optString("macName", paired?.macName ?: "MacBook Pro"),
                                 lanIps = ips,
                                 lanPort = json.optInt("lanPort", port),
                                 macPubKeyBase64Url = json.optString("macPubKeyBase64Url", paired?.macPubKeyBase64Url ?: ""),
                                 wanRoomId = paired?.wanRoomId ?: "",
-                                wanRelayWssUrl = paired?.wanRelayWssUrl
+                                wanRelayWssUrl = paired?.wanRelayWssUrl,
+                                pairSecretHex = paired?.pairSecretHex ?: ""
                             )
                             repo.savePairedMac(found)
-                            return@coroutineScope found
+                            return@coroutineScope repo.getPairedMac() ?: found
                         }
                     }
                 }
@@ -563,53 +587,164 @@ class OmsTransportClient(
             val results = batch.map { ip ->
                 async(Dispatchers.IO) {
                     val cfg = probeMacHttpInfo(ip, port, timeoutMs = 240, checkTcpFirst = true)
-                    if (cfg != null && (expectedMacId == null || cfg.macId == expectedMacId)) cfg else null
+                    if (cfg != null && cfg.macId == targetMacId) cfg else null
                 }
             }.awaitAll()
             val hit = results.firstOrNull { it != null }
             if (hit != null) {
                 repo.savePairedMac(hit)
-                return@coroutineScope hit
+                return@coroutineScope repo.getPairedMac() ?: hit
             }
         }
 
         null
     }
 
+    /**
+     * Resolve full `oms://pair?...` URI from a 6-digit PIN code shown on the user's Mac terminal.
+     * Queries candidate Macs on the LAN via `GET /pair/resolve?pin=XXXXXX`.
+     */
+    private suspend fun resolvePairingUriByPinOnLan(
+        pinCode: String,
+        customIp: String = "",
+        port: Int = 19527
+    ): Pair<String?, String> = coroutineScope {
+        val candidateIps = LinkedHashSet<String>()
+        if (customIp.isNotBlank()) {
+            candidateIps.add(customIp)
+        } else {
+            val paired = repo.getPairedMac()
+            paired?.lanIps?.forEach { if (it.isNotBlank() && !it.startsWith("198.18.")) candidateIps.add(it) }
+            val phoneIps = getLocalPhoneWifiIpv4s()
+            // Fast UDP broadcast to collect any active Mac IPs on LAN
+            try {
+                DatagramSocket().use { udpSocket ->
+                    findNonVpnWifiNetwork()?.bindSocket(udpSocket)
+                    udpSocket.broadcast = true
+                    udpSocket.soTimeout = 300
+                    val payload = "OMS_DISCOVER_V1".toByteArray(Charsets.UTF_8)
+                    val broadcastTargets = mutableSetOf("255.255.255.255")
+                    for (pip in phoneIps + candidateIps) {
+                        val parts = pip.split(".")
+                        if (parts.size == 4) {
+                            val p0 = parts[0]
+                            val p1 = parts[1]
+                            val p2 = parts[2].toIntOrNull() ?: continue
+                            broadcastTargets.add("$p0.$p1.$p2.255")
+                            broadcastTargets.add("$p0.$p1.${p2 or 1}.255")
+                        }
+                    }
+                    for (bcast in broadcastTargets) {
+                        try {
+                            val pkt = DatagramPacket(payload, payload.size, InetAddress.getByName(bcast), port)
+                            udpSocket.send(pkt)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                    val buf = ByteArray(1024)
+                    val recvPkt = DatagramPacket(buf, buf.size)
+                    udpSocket.receive(recvPkt)
+                    recvPkt.address?.hostAddress?.takeIf { it.isNotBlank() }?.let { candidateIps.add(it) }
+                }
+            } catch (_: Throwable) {
+            }
+
+            if (candidateIps.isEmpty()) {
+                val prefixes = LinkedHashSet<String>()
+                for (ip in phoneIps) {
+                    val parts = ip.split(".")
+                    if (parts.size == 4) {
+                        val p2 = parts[2].toIntOrNull() ?: continue
+                        prefixes.add("${parts[0]}.${parts[1]}.$p2")
+                    }
+                }
+                val scanIps = prefixes.flatMap { prefix -> (1..254).map { "$prefix.$it" } }
+                for (batch in scanIps.chunked(32)) {
+                    val hits = batch.map { ip ->
+                        async(Dispatchers.IO) {
+                            probeMacHttpInfo(ip, port, timeoutMs = 220, checkTcpFirst = true)?.lanIps?.firstOrNull()
+                        }
+                    }.awaitAll().filterNotNull()
+                    candidateIps.addAll(hits)
+                    if (candidateIps.isNotEmpty()) break
+                }
+            }
+        }
+
+        if (candidateIps.isEmpty()) {
+            return@coroutineScope Pair(null, "未在当前局域网发现运行中的 Mac，请确认手机与 Mac 在同一 Wi-Fi")
+        }
+
+        val client = buildLanOkHttpClient().newBuilder()
+            .connectTimeout(1500, TimeUnit.MILLISECONDS)
+            .readTimeout(1500, TimeUnit.MILLISECONDS)
+            .build()
+
+        var lastError = "6 位配对码验证失败，请先在 Mac 终端运行: bun run oms pair"
+        for (ip in candidateIps) {
+            try {
+                val req = Request.Builder()
+                    .url("http://$ip:$port/pair/resolve?pin=${Uri.encode(pinCode)}")
+                    .get()
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    val bodyStr = resp.body?.string() ?: "{}"
+                    val json = JSONObject(bodyStr)
+                    if (resp.isSuccessful && json.optBoolean("ok")) {
+                        val uri = json.optString("pairingUri")
+                        if (uri.startsWith("oms://")) {
+                            return@coroutineScope Pair(uri, "")
+                        }
+                    } else if (json.has("error")) {
+                        lastError = json.optString("error", lastError)
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        Pair(null, lastError)
+    }
+
     fun startAutoConnect() {
+        val paired = repo.getPairedMac() ?: return
         startBleNearFieldScanner()
-        val paired = repo.getPairedMac()
-        connectLanIfPossible(paired?.lanIps ?: emptyList(), paired?.lanPort ?: 19527)
-        paired?.wanRelayWssUrl?.takeIf { it.isNotBlank() }?.let { connectWanRelay(it) }
+        connectLanIfPossible(paired.lanIps, paired.lanPort)
+        paired.wanRelayWssUrl?.takeIf { it.isNotBlank() }?.let { connectWanRelay(it) }
     }
 
     /**
-     * Manual one-tap reconnect & LAN auto-discovery triggered from UI
+     * Manual one-tap reconnect & LAN auto-discovery triggered from UI (strictly restricted to already-paired Mac)
      */
     fun reconnectNow(onResult: (Boolean, String) -> Unit) {
         scope.launch {
-            if (_activeTierFlow.value == "LAN_WS" && lanWebSocket != null) {
-                mainHandler.post { onResult(true, "✅ 已处于局域网高速直连状态") }
+            val paired = repo.getPairedMac()
+            if (paired == null) {
+                mainHandler.post {
+                    onResult(false, "🔒 尚未绑定 Mac，请先点击「绑定Mac」输入 6 位配对码或粘贴 oms:// 配对链接")
+                }
+                return@launch
+            }
+            if (_activeTierFlow.value == "LAN_WS" && lanWebSocket != null && isSourceAuthenticated("LAN_WS", lanWebSocket)) {
+                mainHandler.post { onResult(true, "✅ 已处于局域网加密直连状态 (${paired.macName})") }
                 return@launch
             }
             isConnectingLan.set(false)
-            val paired = repo.getPairedMac()
-            val port = paired?.lanPort ?: 19527
-            val discovered = discoverMacOnLan(port, paired?.macId) ?: discoverMacOnLan(port, null)
+            val port = paired.lanPort
+            val discovered = discoverMacOnLan(port, paired.macId)
             if (discovered != null) {
                 connectLanIfPossible(discovered.lanIps, discovered.lanPort)
                 mainHandler.post {
                     onResult(
                         true,
-                        "🟢 已自动发现并连接 ${discovered.macName} (${discovered.lanIps.first()})"
+                        "🟢 已找到已绑定的 ${discovered.macName} (${discovered.lanIps.first()})，正在双向加密握手..."
                     )
                 }
             } else {
-                connectLanIfPossible(paired?.lanIps ?: emptyList(), port)
+                connectLanIfPossible(paired.lanIps, port)
                 mainHandler.post {
                     onResult(
                         false,
-                        "⚠️ 未在当前局域网扫描到 Mac (端口 $port)，请确认手机与 Mac 在同一 Wi-Fi"
+                        "⚠️ 未在当前局域网找到你绑定的 Mac (${paired.macName})，请确认同一 Wi-Fi"
                     )
                 }
             }
@@ -617,38 +752,70 @@ class OmsTransportClient(
     }
 
     /**
-     * Pair with Mac using scanned `oms://pair?...` URI, raw IP address, or auto-discovery if blank
+     * Pair with Mac using `oms://pair?...` URI or 6-digit PIN code (`123456` / `IP:123456`).
+     * Strictly requires cryptographic PIN + HMAC verification before binding to any new Mac.
      */
     fun pairWithUri(pairingUri: String, onResult: (Boolean, String) -> Unit) {
         scope.launch {
             try {
-                val trimmed = pairingUri.trim()
-                if (trimmed.isBlank() || !trimmed.startsWith("oms://")) {
-                    // Support direct IP input (e.g. "192.168.1.100" or "192.168.1.100:19527") or auto-scan
-                    val customHostPort = trimmed.removePrefix("http://").removePrefix("ws://").substringBefore("/")
-                    val customIp = customHostPort.substringBefore(":").trim()
-                    val customPort = customHostPort.substringAfter(":", "19527").toIntOrNull() ?: 19527
-                    val found = if (customIp.isNotBlank()) {
-                        probeMacHttpInfo(customIp, customPort, 1200) ?: discoverMacOnLan(customPort, null)
-                    } else {
-                        discoverMacOnLan(19527, null)
-                    }
-                    if (found != null) {
-                        repo.savePairedMac(found)
-                        isConnectingLan.set(false)
-                        connectLanIfPossible(found.lanIps, found.lanPort)
-                        mainHandler.post {
-                            onResult(true, "✅ 已自动发现并绑定 ${found.macName} (${found.lanIps.first()})")
-                        }
-                    } else {
-                        mainHandler.post {
-                            onResult(false, "未在局域网找到 Mac，请确认同一 Wi-Fi 或输入完整配对链接")
-                        }
+                var effectiveUriStr = pairingUri.trim()
+                if (effectiveUriStr.isBlank()) {
+                    mainHandler.post {
+                        onResult(false, "🔒 安全保护：请输入 Mac 终端显示的 6 位配对码，或粘贴 oms://pair 配对链接")
                     }
                     return@launch
                 }
 
-                val uri = Uri.parse(trimmed)
+                if (!effectiveUriStr.startsWith("oms://")) {
+                    val cleaned = effectiveUriStr.removePrefix("http://").removePrefix("ws://").substringBefore("/")
+                    val sixDigitPinRegex = Regex("^\\d{6}$")
+                    val ipAndPinRegex = Regex("^([0-9.]+)(?::(\\d{2,5}))?:(\\d{6})$")
+
+                    if (sixDigitPinRegex.matches(cleaned)) {
+                        val (resolvedUri, errMsg) = resolvePairingUriByPinOnLan(cleaned)
+                        if (resolvedUri == null) {
+                            mainHandler.post { onResult(false, "❌ $errMsg") }
+                            return@launch
+                        }
+                        effectiveUriStr = resolvedUri
+                    } else if (ipAndPinRegex.matches(cleaned)) {
+                        val match = ipAndPinRegex.find(cleaned)!!
+                        val hostIp = match.groupValues[1]
+                        val hostPort = match.groupValues[2].toIntOrNull() ?: 19527
+                        val pin = match.groupValues[3]
+                        val (resolvedUri, errMsg) = resolvePairingUriByPinOnLan(pin, hostIp, hostPort)
+                        if (resolvedUri == null) {
+                            mainHandler.post { onResult(false, "❌ $errMsg") }
+                            return@launch
+                        }
+                        effectiveUriStr = resolvedUri
+                    } else {
+                        // Raw IP input without PIN: ONLY allowed if it matches the ALREADY paired Mac's macId!
+                        val existing = repo.getPairedMac()
+                        val customIp = cleaned.substringBefore(":").trim()
+                        val customPort = cleaned.substringAfter(":", "19527").toIntOrNull() ?: 19527
+                        val probed = if (customIp.isNotBlank()) probeMacHttpInfo(customIp, customPort, 1200) else null
+                        if (existing != null && probed != null && probed.macId == existing.macId) {
+                            val updated = existing.copy(lanIps = probed.lanIps, lanPort = probed.lanPort)
+                            repo.savePairedMac(updated)
+                            isConnectingLan.set(false)
+                            connectLanIfPossible(updated.lanIps, updated.lanPort)
+                            mainHandler.post {
+                                onResult(true, "✅ 已更新已绑定 Mac (${updated.macName}) 的 IP 地址并重连")
+                            }
+                        } else {
+                            mainHandler.post {
+                                onResult(
+                                    false,
+                                    "🔒 首次绑定或更换电脑，请输入 Mac 终端显示的 6 位配对码（如 123456）或粘贴 oms://pair 链接"
+                                )
+                            }
+                        }
+                        return@launch
+                    }
+                }
+
+                val uri = Uri.parse(effectiveUriStr)
                 val macId = uri.getQueryParameter("id") ?: throw IllegalArgumentException("Missing id")
                 val macName = uri.getQueryParameter("name") ?: "MacBook Pro"
                 val uriIps = (uri.getQueryParameter("ip") ?: "")
@@ -659,14 +826,20 @@ class OmsTransportClient(
                 val macPub = uri.getQueryParameter("pk") ?: ""
                 val pinCode = uri.getQueryParameter("pin") ?: ""
                 val token = uri.getQueryParameter("token") ?: ""
+                if (pinCode.isBlank() || token.isBlank()) {
+                    throw IllegalArgumentException("配对链接缺少安全 PIN 或一次性 Token")
+                }
 
-                // Verify which IP is actually reachable; if Mac IP changed since URI was generated, auto-discover!
-                var targetIp = uriIps.firstOrNull { probeMacHttpInfo(it, port, 500) != null }
+                // Verify which IP is actually reachable for this exact macId
+                var targetIp = uriIps.firstOrNull {
+                    val info = probeMacHttpInfo(it, port, 500)
+                    info != null && info.macId == macId
+                }
                 if (targetIp == null) {
-                    val discovered = discoverMacOnLan(port, macId) ?: discoverMacOnLan(port, null)
+                    val discovered = discoverMacOnLan(port, macId)
                     targetIp = discovered?.lanIps?.firstOrNull() ?: uriIps.firstOrNull()
                 }
-                if (targetIp.isNullOrBlank()) throw IllegalArgumentException("No reachable LAN IP found")
+                if (targetIp.isNullOrBlank()) throw IllegalArgumentException("未在局域网找到目标 Mac ($macName)")
                 val effectiveIps = listOf(targetIp) + uriIps.filter { it != targetIp }
 
                 val phoneId = repo.getOrCreatePhoneId()
@@ -708,6 +881,7 @@ class OmsTransportClient(
                                     webSocket.send(OmsFrameProtocol.encodeJsonRpc(pairReq).toByteString())
                                 } else if (msg.optString("id") == "pair_req_1") {
                                     val res = msg.optJSONObject("result")
+                                    val errObj = msg.optJSONObject("error")
                                     if (res != null && res.optBoolean("ok")) {
                                         val config = PairedMacConfig(
                                             macId = res.optString("macId", macId),
@@ -716,32 +890,27 @@ class OmsTransportClient(
                                             lanPort = port,
                                             macPubKeyBase64Url = res.optString("macPubKeyBase64Url", macPub),
                                             wanRoomId = res.optString("wanRoomId", ""),
-                                            wanRelayWssUrl = null
+                                            wanRelayWssUrl = null,
+                                            pairSecretHex = res.optString("pairSecretHex", "")
                                         )
                                         repo.savePairedMac(config)
+                                        authenticatedWebSockets.add(webSocket)
                                         lanWebSocket = webSocket
                                         _activeTierFlow.value = "LAN_WS"
                                         flushOutboxQueue()
                                         if (resultDelivered.compareAndSet(false, true)) {
-                                            mainHandler.post { onResult(true, "成功绑定 ${config.macName} ($targetIp)") }
+                                            mainHandler.post { onResult(true, "🔐 已完成 1 对 1 加密绑定：${config.macName} ($targetIp)") }
                                         }
                                     } else {
-                                        // If PIN expired on Mac, fall back to direct local LAN auth!
-                                        val fallbackConfig = PairedMacConfig(
-                                            macId = macId,
-                                            macName = macName,
-                                            lanIps = effectiveIps,
-                                            lanPort = port,
-                                            macPubKeyBase64Url = macPub,
-                                            wanRoomId = "",
-                                            wanRelayWssUrl = null
-                                        )
-                                        repo.savePairedMac(fallbackConfig)
-                                        webSocket.close(1000, "Fallback to auth")
-                                        isConnectingLan.set(false)
-                                        connectLanIfPossible(effectiveIps, port)
+                                        val errReason = errObj?.optString("message") ?: "配对码已过期或签名无效"
+                                        try {
+                                            webSocket.close(4003, "Pairing rejected")
+                                        } catch (_: Throwable) {
+                                        }
                                         if (resultDelivered.compareAndSet(false, true)) {
-                                            mainHandler.post { onResult(true, "已更新 Mac 地址 ($targetIp) 并自动重连") }
+                                            mainHandler.post {
+                                                onResult(false, "❌ 配对验证被拒绝 ($errReason)，请在 Mac 终端重新运行: bun run oms pair")
+                                            }
                                         }
                                     }
                                 } else {
@@ -754,6 +923,7 @@ class OmsTransportClient(
                     }
 
                     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                        authenticatedWebSockets.remove(webSocket)
                         if (lanWebSocket === webSocket) {
                             lanWebSocket = null
                             recomputeFallbackTier()
@@ -762,6 +932,7 @@ class OmsTransportClient(
                     }
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                        authenticatedWebSockets.remove(webSocket)
                         if (lanWebSocket === webSocket) {
                             lanWebSocket = null
                             recomputeFallbackTier()
@@ -772,38 +943,37 @@ class OmsTransportClient(
                     }
                 })
             } catch (e: Throwable) {
-                mainHandler.post { onResult(false, "解析配对码失败: ${e.message}") }
+                mainHandler.post { onResult(false, "解析配对凭证失败: ${e.message}") }
             }
         }
     }
 
     fun connectLanIfPossible(ips: List<String>, port: Int) {
-        if (_activeTierFlow.value == "LAN_WS" && lanWebSocket != null) return
+        if (_activeTierFlow.value == "LAN_WS" && lanWebSocket != null && isSourceAuthenticated("LAN_WS", lanWebSocket)) return
+        val paired = repo.getPairedMac() ?: return
         if (!isConnectingLan.compareAndSet(false, true)) return
 
         scope.launch {
             try {
-                val paired = repo.getPairedMac()
-                val candidateIps = (ips + (paired?.lanIps ?: emptyList()))
+                val candidateIps = (ips + paired.lanIps)
                     .map { it.trim() }
                     .filter { it.isNotBlank() && !it.startsWith("198.18.") }
                     .distinct()
 
-                // 1. Test priority & saved IPs first (fast direct HTTP GET, no concurrency storm)
+                // 1. Test priority & saved IPs first — MUST match paired.macId!
                 var reachableConfig: PairedMacConfig? = null
                 for (candidate in candidateIps) {
                     val info = probeMacHttpInfo(candidate, port, timeoutMs = 600, checkTcpFirst = false)
-                    if (info != null) {
+                    if (info != null && info.macId == paired.macId) {
                         reachableConfig = info
                         repo.savePairedMac(info)
                         break
                     }
                 }
 
-                // 2. If saved IPs are unreachable (e.g. Mac DHCP IP changed), auto-discover on LAN!
+                // 2. If saved IPs are unreachable (e.g. Mac DHCP IP changed), discover ONLY paired.macId on LAN!
                 if (reachableConfig == null) {
-                    reachableConfig = discoverMacOnLan(port, paired?.macId)
-                        ?: discoverMacOnLan(port, null)
+                    reachableConfig = discoverMacOnLan(port, paired.macId)
                 }
 
                 val targetIp = reachableConfig?.lanIps?.firstOrNull() ?: candidateIps.firstOrNull()
@@ -823,13 +993,14 @@ class OmsTransportClient(
                         isConnectingLan.set(false)
                         val prev = lanWebSocket
                         if (prev != null && prev !== webSocket) {
+                            authenticatedWebSockets.remove(prev)
                             try {
                                 prev.close(1000, "Replaced")
                             } catch (_: Throwable) {
                             }
                         }
                         lanWebSocket = webSocket
-                        _activeTierFlow.value = "LAN_WS"
+                        // Wait for mutual auth.helloChallenge <-> auth.response before marking LAN_WS active
                     }
 
                     override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
@@ -838,6 +1009,7 @@ class OmsTransportClient(
 
                     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                         isConnectingLan.set(false)
+                        authenticatedWebSockets.remove(webSocket)
                         if (lanWebSocket === webSocket) {
                             lanWebSocket = null
                             recomputeFallbackTier()
@@ -847,6 +1019,7 @@ class OmsTransportClient(
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                         isConnectingLan.set(false)
+                        authenticatedWebSockets.remove(webSocket)
                         if (lanWebSocket === webSocket) {
                             lanWebSocket = null
                             recomputeFallbackTier()
@@ -862,6 +1035,8 @@ class OmsTransportClient(
     }
 
     fun connectWanRelay(wssUrl: String) {
+        val paired = repo.getPairedMac() ?: return
+        if (paired.macId.isBlank()) return
         val client = OkHttpClient.Builder()
             .connectTimeout(5, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -872,17 +1047,14 @@ class OmsTransportClient(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 wanDecoder.reset()
                 wanWebSocket = webSocket
-                if (_activeTierFlow.value == "DISCONNECTED") {
-                    _activeTierFlow.value = "WAN_WEBRTC"
-                }
-                flushOutboxQueue()
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                handleIncomingRawBytes("WAN_WEBRTC", wanDecoder, bytes.toByteArray())
+                handleIncomingRawBytes("WAN_WEBRTC", wanDecoder, bytes.toByteArray(), webSocket)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                authenticatedWebSockets.remove(webSocket)
                 if (wanWebSocket === webSocket) {
                     wanWebSocket = null
                     recomputeFallbackTier()
@@ -890,6 +1062,7 @@ class OmsTransportClient(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                authenticatedWebSockets.remove(webSocket)
                 if (wanWebSocket === webSocket) {
                     wanWebSocket = null
                     recomputeFallbackTier()
@@ -905,10 +1078,26 @@ class OmsTransportClient(
         valBytes: ByteArray
     ) {
         try {
+            val existing = repo.getPairedMac()
             val info = JSONObject(String(valBytes, Charsets.UTF_8))
             val macId = info.optString("macId")
+            // Strict 1-to-1 isolation: disconnect immediately if BLE peripheral is not the paired Mac
+            if (existing == null || macId.isBlank() || macId != existing.macId) {
+                try {
+                    gatt.disconnect()
+                    gatt.close()
+                } catch (_: Throwable) {
+                }
+                if (activeBleGatt === gatt) {
+                    activeBleGatt = null
+                    bleFramePipeChar = null
+                    isBleAuthenticated = false
+                }
+                return
+            }
+
             val ipsArr = info.optJSONArray("lanIps")
-            val port = info.optInt("lanPort", 19527)
+            val port = info.optInt("lanPort", existing.lanPort)
             val ips = mutableListOf<String>()
             if (ipsArr != null) {
                 for (i in 0 until ipsArr.length()) {
@@ -919,16 +1108,10 @@ class OmsTransportClient(
                 }
             }
             if (ips.isNotEmpty()) {
-                val existing = repo.getPairedMac()
                 repo.savePairedMac(
-                    PairedMacConfig(
-                        macId = macId.ifBlank { existing?.macId ?: "mac_host" },
-                        macName = existing?.macName ?: "MacBook Pro",
+                    existing.copy(
                         lanIps = ips,
-                        lanPort = port,
-                        macPubKeyBase64Url = existing?.macPubKeyBase64Url ?: "",
-                        wanRoomId = existing?.wanRoomId ?: "",
-                        wanRelayWssUrl = existing?.wanRelayWssUrl
+                        lanPort = port
                     )
                 )
                 isConnectingLan.set(false)
@@ -943,10 +1126,6 @@ class OmsTransportClient(
                     @Suppress("DEPRECATION")
                     gatt.writeDescriptor(cccd)
                 }
-                if (_activeTierFlow.value == "DISCONNECTED") {
-                    _activeTierFlow.value = "BT_RFCOMM"
-                    flushOutboxQueue()
-                }
             }
         } catch (_: Throwable) {
         }
@@ -955,6 +1134,7 @@ class OmsTransportClient(
     @SuppressLint("MissingPermission")
     private fun startBleNearFieldScanner() {
         try {
+            if (repo.getPairedMac() == null) return
             if (activeBleGatt != null) return
             val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: return
             val adapter: BluetoothAdapter = bm.adapter ?: return
@@ -996,6 +1176,7 @@ class OmsTransportClient(
                                         }
                                         activeBleGatt = null
                                         bleFramePipeChar = null
+                                        isBleAuthenticated = false
                                         recomputeFallbackTier()
                                     }
                                 }
@@ -1007,11 +1188,12 @@ class OmsTransportClient(
                                     bleFramePipeChar = pipeChar
                                     if (infoChar != null) {
                                         gatt.readCharacteristic(infoChar)
-                                    } else if (pipeChar != null) {
-                                        gatt.setCharacteristicNotification(pipeChar, true)
-                                        if (_activeTierFlow.value == "DISCONNECTED") {
-                                            _activeTierFlow.value = "BT_RFCOMM"
-                                            flushOutboxQueue()
+                                    } else {
+                                        // Missing Mac identity characteristic: disconnect untrusted peripheral
+                                        try {
+                                            gatt.disconnect()
+                                            gatt.close()
+                                        } catch (_: Throwable) {
                                         }
                                     }
                                 }
@@ -1075,19 +1257,20 @@ class OmsTransportClient(
     }
 
     private fun recomputeFallbackTier() {
+        val lan = lanWebSocket
+        val wan = wanWebSocket
         _activeTierFlow.value = when {
-            lanWebSocket != null -> "LAN_WS"
-            bleFramePipeChar != null -> "BT_RFCOMM"
-            wanWebSocket != null -> "WAN_WEBRTC"
+            lan != null && authenticatedWebSockets.contains(lan) -> "LAN_WS"
+            bleFramePipeChar != null && isBleAuthenticated -> "BT_RFCOMM"
+            wan != null && authenticatedWebSockets.contains(wan) -> "WAN_WEBRTC"
             else -> "DISCONNECTED"
         }
     }
 
     @SuppressLint("MissingPermission")
-    fun sendRawFrame(frameBytes: ByteArray): Boolean {
-        val lan = lanWebSocket
-        if (lan != null) {
-            return lan.send(frameBytes.toByteString())
+    private fun sendUnauthenticatedHandshakeFrame(frameBytes: ByteArray, sourceWebSocket: WebSocket?): Boolean {
+        if (sourceWebSocket != null) {
+            return sourceWebSocket.send(frameBytes.toByteString())
         }
         val gatt = activeBleGatt
         val pipeChar = bleFramePipeChar
@@ -1096,8 +1279,24 @@ class OmsTransportClient(
             pipeChar.value = frameBytes
             return gatt.writeCharacteristic(pipeChar)
         }
+        return false
+    }
+
+    @SuppressLint("MissingPermission")
+    fun sendRawFrame(frameBytes: ByteArray): Boolean {
+        val lan = lanWebSocket
+        if (lan != null && authenticatedWebSockets.contains(lan)) {
+            return lan.send(frameBytes.toByteString())
+        }
+        val gatt = activeBleGatt
+        val pipeChar = bleFramePipeChar
+        if (gatt != null && pipeChar != null && isBleAuthenticated) {
+            @Suppress("DEPRECATION")
+            pipeChar.value = frameBytes
+            return gatt.writeCharacteristic(pipeChar)
+        }
         val wan = wanWebSocket
-        if (wan != null) {
+        if (wan != null && authenticatedWebSockets.contains(wan)) {
             return wan.send(frameBytes.toByteString())
         }
         return false
@@ -1317,10 +1516,28 @@ class OmsTransportClient(
         scope.launch {
             val (localVerName, localVerCode, localSha) = getInstalledApkInfo()
             var paired = repo.getPairedMac()
-            val port = paired?.lanPort ?: 19527
-            var ip = paired?.lanIps?.firstOrNull { probeMacHttpInfo(it, port, 500) != null }
+            if (paired == null) {
+                mainHandler.post {
+                    onResult(
+                        OtaCheckResult(
+                            ok = false,
+                            hasUpdate = false,
+                            localVersionName = localVerName,
+                            localVersionCode = localVerCode,
+                            localSha256 = localSha,
+                            message = "🔒 尚未绑定 Mac，请先完成 1 对 1 安全配对"
+                        )
+                    )
+                }
+                return@launch
+            }
+            val port = paired.lanPort
+            var ip = paired.lanIps.firstOrNull {
+                val info = probeMacHttpInfo(it, port, 500)
+                info != null && info.macId == paired!!.macId
+            }
             if (ip == null) {
-                val discovered = discoverMacOnLan(port, paired?.macId) ?: discoverMacOnLan(port, null)
+                val discovered = discoverMacOnLan(port, paired.macId)
                 if (discovered != null) {
                     paired = discovered
                     ip = discovered.lanIps.firstOrNull()
@@ -1492,23 +1709,69 @@ class OmsTransportClient(
             OmsFrameProtocol.TYPE_CONTROL_JSON_RPC -> {
                 val msg = JSONObject(String(frame.payload, Charsets.UTF_8))
                 if (msg.has("method")) {
-                    handleIncomingRpcRequest(msg, sourceWebSocket)
+                    handleIncomingRpcRequest(tier, msg, sourceWebSocket)
                 } else if (msg.optString("id").startsWith("auth_")) {
+                    val authId = msg.optString("id")
+                    val pending = pendingAuthStates.remove(authId)
                     val res = msg.optJSONObject("result")
-                    if (res != null && res.optBoolean("ok")) {
-                        if (tier == "LAN_WS" && sourceWebSocket != null) {
-                            lanWebSocket = sourceWebSocket
-                            _activeTierFlow.value = "LAN_WS"
+                    if (res != null && res.optBoolean("ok") && pending != null) {
+                        val phoneId = repo.getOrCreatePhoneId()
+                        val macAuthHmacHex = res.optString("macAuthHmacHex", "")
+                        val upgradedSecret = res.optString("pairSecretHex", "")
+                        val effectiveSecret = upgradedSecret.ifBlank { pending.secretKey }
+                        val expectedMacHmac = OmsFrameProtocol.computeAuthHmac(
+                            effectiveSecret,
+                            "mac_ack:${pending.nonceMacHex}:${pending.noncePhoneHex}:${pending.macId}:$phoneId"
+                        )
+                        if (macAuthHmacHex.isBlank() || !macAuthHmacHex.equals(expectedMacHmac, ignoreCase = true)) {
+                            try {
+                                sourceWebSocket?.close(4003, "Mac mutual authentication failed")
+                            } catch (_: Throwable) {
+                            }
+                            return
+                        }
+
+                        if (upgradedSecret.isNotBlank()) {
+                            repo.getPairedMac()?.let { existing ->
+                                if (existing.macId == pending.macId) {
+                                    repo.savePairedMac(existing.copy(pairSecretHex = upgradedSecret))
+                                }
+                            }
+                        }
+
+                        if (sourceWebSocket != null) {
+                            authenticatedWebSockets.add(sourceWebSocket)
+                            if (tier == "LAN_WS") {
+                                lanWebSocket = sourceWebSocket
+                                _activeTierFlow.value = "LAN_WS"
+                            } else if (tier == "WAN_WEBRTC") {
+                                wanWebSocket = sourceWebSocket
+                                if (_activeTierFlow.value == "DISCONNECTED") {
+                                    _activeTierFlow.value = "WAN_WEBRTC"
+                                }
+                            }
+                        } else if (tier == "BT_RFCOMM") {
+                            isBleAuthenticated = true
+                            if (_activeTierFlow.value == "DISCONNECTED") {
+                                _activeTierFlow.value = "BT_RFCOMM"
+                            }
                         }
                         flushOutboxQueue()
+                    } else {
+                        try {
+                            sourceWebSocket?.close(4003, "Auth rejected by Mac")
+                        } catch (_: Throwable) {
+                        }
                     }
                 } else if (msg.optString("id").startsWith("inbox_")) {
+                    if (!isSourceAuthenticated(tier, sourceWebSocket)) return
                     val itemId = msg.optString("id").removePrefix("inbox_")
                     val macPath = msg.optJSONObject("result")?.optString("macPath")
                     repo.updateSyncStatus(itemId, "DELIVERED", macPath)
                 }
             }
             OmsFrameProtocol.TYPE_STREAM_START -> {
+                if (!isSourceAuthenticated(tier, sourceWebSocket)) return
                 val header = JSONObject(String(frame.payload, Charsets.UTF_8))
                 val streamId = header.optString("streamId")
                 if (streamId.isNotEmpty()) {
@@ -1516,6 +1779,7 @@ class OmsTransportClient(
                 }
             }
             OmsFrameProtocol.TYPE_STREAM_CHUNK -> {
+                if (!isSourceAuthenticated(tier, sourceWebSocket)) return
                 if (frame.payload.size < OmsFrameProtocol.STREAM_CHUNK_PREFIX_BYTES) return
                 val streamId = OmsFrameProtocol.bytesToUuid(frame.payload.copyOfRange(0, 16))
                 val chunkIdx = ByteBuffer.wrap(frame.payload, 16, 4).order(ByteOrder.BIG_ENDIAN).int
@@ -1561,6 +1825,7 @@ class OmsTransportClient(
                 }
             }
             OmsFrameProtocol.TYPE_PING -> {
+                if (!isSourceAuthenticated(tier, sourceWebSocket)) return
                 val sentTs = ByteBuffer.wrap(frame.payload).order(ByteOrder.BIG_ENDIAN).long
                 val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
                 val pct = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
@@ -1574,35 +1839,93 @@ class OmsTransportClient(
         }
     }
 
-    private fun handleIncomingRpcRequest(req: JSONObject, sourceWebSocket: WebSocket? = null) {
+    private fun handleIncomingRpcRequest(
+        tier: String,
+        req: JSONObject,
+        sourceWebSocket: WebSocket? = null
+    ) {
         val reqId = req.optString("id", "")
         val method = req.optString("method", "")
         val params = req.optJSONObject("params") ?: JSONObject()
 
         scope.launch {
             try {
+                if (method != "auth.helloChallenge" && !isSourceAuthenticated(tier, sourceWebSocket)) {
+                    if (reqId.isNotEmpty()) {
+                        val errResp = JSONObject().apply {
+                            put("jsonrpc", "2.0")
+                            put("id", reqId)
+                            put("error", JSONObject().apply {
+                                put("code", -32000)
+                                put("message", "Unauthenticated Mac connection")
+                            })
+                        }
+                        sendUnauthenticatedHandshakeFrame(OmsFrameProtocol.encodeJsonRpc(errResp), sourceWebSocket)
+                    }
+                    try {
+                        sourceWebSocket?.close(4001, "Unauthenticated RPC rejected")
+                    } catch (_: Throwable) {
+                    }
+                    return@launch
+                }
+
                 val result: JSONObject = when (method) {
                     "auth.helloChallenge" -> {
+                        val paired = repo.getPairedMac()
+                        val challengeMacId = params.optString("macId", "")
+                        val nonceMacHex = params.optString("nonceMacHex", "")
+                        if (paired == null || challengeMacId.isBlank() || challengeMacId != paired.macId || nonceMacHex.isBlank()) {
+                            try {
+                                sourceWebSocket?.close(4003, "Untrusted Mac ID")
+                            } catch (_: Throwable) {
+                            }
+                            return@launch
+                        }
+
                         val phoneId = repo.getOrCreatePhoneId()
+                        val secretKey = paired.pairSecretHex.ifBlank {
+                            paired.wanRoomId.ifBlank {
+                                if (paired.macPubKeyBase64Url.isNotBlank()) {
+                                    OmsFrameProtocol.deriveWanRoomId(paired.macPubKeyBase64Url, "pub_$phoneId")
+                                } else {
+                                    ""
+                                }
+                            }
+                        }
+                        if (secretKey.isBlank()) {
+                            try {
+                                sourceWebSocket?.close(4003, "Missing pairing secret")
+                            } catch (_: Throwable) {
+                            }
+                            return@launch
+                        }
+
+                        val noncePhoneHex = OmsFrameProtocol.generateUuidV7().replace("-", "")
+                        val authId = "auth_${System.currentTimeMillis()}"
+                        val sigHex = OmsFrameProtocol.computeAuthHmac(
+                            secretKey,
+                            "phone_auth:$nonceMacHex:$challengeMacId:$phoneId:$noncePhoneHex"
+                        )
+                        pendingAuthStates[authId] = PendingAuthState(
+                            nonceMacHex = nonceMacHex,
+                            noncePhoneHex = noncePhoneHex,
+                            macId = challengeMacId,
+                            secretKey = secretKey
+                        )
+
                         val authResp = JSONObject().apply {
                             put("jsonrpc", "2.0")
-                            put("id", "auth_${System.currentTimeMillis()}")
+                            put("id", authId)
                             put("method", "auth.response")
                             put("params", JSONObject().apply {
                                 put("phoneId", phoneId)
-                                put("noncePhoneHex", OmsFrameProtocol.generateUuidV7().replace("-", ""))
-                                put("phoneSignatureBase64Url", "trusted_xiaomi_sig")
+                                put("noncePhoneHex", noncePhoneHex)
+                                put("phoneSignatureBase64Url", sigHex)
                                 put("deviceSnapshot", collectDeviceSnapshot())
                             })
                         }
                         val encoded = OmsFrameProtocol.encodeJsonRpc(authResp)
-                        if (sourceWebSocket != null) {
-                            sourceWebSocket.send(encoded.toByteString())
-                        } else {
-                            sendRawFrame(encoded)
-                        }
-                        delay(60)
-                        flushOutboxQueue()
+                        sendUnauthenticatedHandshakeFrame(encoded, sourceWebSocket)
                         return@launch
                     }
                     "sys.getStatus" -> collectDeviceSnapshot()

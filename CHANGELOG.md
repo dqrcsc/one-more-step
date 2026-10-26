@@ -2,6 +2,22 @@
 
 All notable changes to **青简·咫尺 (OneMoreStep)** are documented in this file.
 
+## [1.3.5] - 2026-10-26
+
+### Security (一机一码与局域网严格 1 对 1 安全加固)
+- **Mac 端 `/inbox` 与控制 API 严格锁死本机回环 (`127.0.0.1` / `::1`)**：
+  - `/inbox`、`/dashboard`、`/api/inbox`、`/api/inbox/file` 与 `/api/inbox/action` 增加客户端来源 IP 校验（`PhoneSessionManager.isLoopbackAddress`），彻底阻断同一局域网其他电脑通过 HTTP 访问收件箱或借道 Mac 操控手机（返回 `403 Forbidden`）。
+- **双向 HMAC-SHA256 / Ed25519 挑战-应答认证与指令拦截**：
+  - 彻底移除开发期 `"trusted_xiaomi_sig"` 调试签名放行逻辑；
+  - 首次配对 (`pair.request`) 成功后协商生成 256-bit 专属配对密钥 (`pairSecretHex`) 并立即销毁一次性配对凭证；
+  - 每次重连执行双向挑战签名校验（手机验 Mac `macAuthHmacHex`，Mac 验手机 `phoneSignatureBase64Url`），手机端在完成对 Mac 的双向验签前拒绝执行任何传入的 RPC 控制指令或接收文件流。
+- **手机端唯一 `macId` 严格锁定（杜绝局域网自动改绑）**：
+  - 手机端 UDP 广播监听、局域网子网扫描 (`discoverMacOnLan`)、BLE 近场发现与 OTA 更新检查均严格核对 `macId == paired.macId`，彻底移除 `discoverMacOnLan(port, null)` 任意匹配回退逻辑，即使已绑定的 Mac 休眠或离线，手机也绝不会自动连上同一局域网的其他电脑。
+- **PIN 码保护的配对解析与防暴力破解 (`/pair/resolve`)**：
+  - `/install` 网页不再向局域网明文暴露 `ephemeralToken` 与 `oms://pair` 链接，需输入 Mac 终端显示的 6 位配对码方可解锁（或直接在手机 App 输入 6 位配对码完成绑定），连续输错 5 次自动销毁配对会话。
+
+---
+
 ## [1.3.4] - 2026-10-26
 
 ### Added

@@ -119,6 +119,7 @@ export interface PairResponseResult {
   macPubKeyBase64Url: string;
   wanRoomId: string;
   macSignatureBase64Url: string;
+  pairSecretHex?: string;
 }
 
 export interface HelloChallengeParams {
@@ -136,7 +137,10 @@ export interface AuthResponseParams {
 
 export interface AuthAckResult {
   ok: boolean;
+  macId?: string;
   macSignatureBase64Url: string;
+  macAuthHmacHex?: string;
+  pairSecretHex?: string;
 }
 
 /**

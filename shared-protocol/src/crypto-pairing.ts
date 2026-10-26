@@ -121,6 +121,16 @@ export function computePairingHmac(
 }
 
 /**
+ * Compute HMAC-SHA256 for mutual challenge-response authentication (Phone <-> Mac)
+ */
+export function computeAuthHmac(secretKey: string, message: string): string {
+  return crypto
+    .createHmac("sha256", secretKey)
+    .update(message, "utf8")
+    .digest("hex");
+}
+
+/**
  * Derive a deterministic shared WAN signaling room ID from Mac and Phone public keys
  */
 export function deriveWanRoomId(

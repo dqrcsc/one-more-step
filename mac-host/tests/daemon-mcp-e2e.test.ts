@@ -18,6 +18,7 @@ import {
 } from "@oms/shared-protocol";
 import { OmsDaemon } from "../src/daemon/oms-daemon.js";
 import { OmsMcpServer } from "../src/mcp/server.js";
+import { handleDashboardHttpRequest } from "../src/inbox/inbox-web-dashboard.js";
 
 describe("Modules 06 & 07: OmsDaemon + Inbox + MCP Server End-to-End", () => {
   test("Full E2E lifecycle: MCP tools/list, Pairing, Screenshot/PKB Inbox, Remote Approval, Alarm & GUI RPC", async () => {
@@ -276,6 +277,27 @@ describe("Modules 06 & 07: OmsDaemon + Inbox + MCP Server End-to-End", () => {
     const apkVerJson = (await apkVerResp.json()) as any;
     expect(typeof apkVerJson.versionCode).toBe("number");
     expect(typeof apkVerJson.sha256).toBe("string");
+
+    // 8. Verify LAN isolation: non-loopback IPs (e.g. another computer on the same LAN) are blocked with 403 Forbidden
+    const lanAttackerInboxResp = await handleDashboardHttpRequest(
+      daemon,
+      new Request(`http://192.168.1.50:${customPort}/inbox`),
+      new URL(`http://192.168.1.50:${customPort}/inbox`),
+      "192.168.1.99"
+    );
+    expect(lanAttackerInboxResp?.status).toBe(403);
+
+    const lanAttackerControlResp = await handleDashboardHttpRequest(
+      daemon,
+      new Request(`http://192.168.1.50:${customPort}/api/inbox/action`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "phone_control", params: { action: "wake_and_unlock" } }),
+      }),
+      new URL(`http://192.168.1.50:${customPort}/api/inbox/action`),
+      "10.60.110.88"
+    );
+    expect(lanAttackerControlResp?.status).toBe(403);
 
     ws.close();
     await daemon.stop();
