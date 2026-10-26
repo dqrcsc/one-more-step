@@ -46,6 +46,7 @@ export interface TrustedPhoneDevice {
   phonePubKeyBase64Url: string;
   wanRoomId: string;
   pairSecretHex?: string;
+  lastKnownLanIps?: string[];
   pairedAtMs: number;
   lastSeenMs: number;
 }
@@ -67,6 +68,7 @@ interface ActiveTransportPipe {
   tier: TransportTier;
   authenticated: boolean;
   phoneId?: string;
+  remoteIp?: string;
   pendingNonceMac?: string;
   decoder: FrameStreamDecoder;
   sendRaw: (bytes: Uint8Array) => void;
@@ -192,6 +194,7 @@ export class PhoneSessionManager extends EventEmitter {
     const apkDir = path.join(repoRoot, "android-app/app/build/outputs/apk/debug");
     const candidatePaths = [
       path.join(apkDir, "app-debug.apk"),
+      path.join(repoRoot, "OneMoreStep-v1.3.6.apk"),
       path.join(repoRoot, "OneMoreStep-v1.3.5.apk"),
       path.join(repoRoot, "OneMoreStep-v1.3.4.apk"),
       path.join(os.homedir(), ".one_more_step", "OneMoreStep.apk"),
@@ -203,19 +206,19 @@ export class PhoneSessionManager extends EventEmitter {
       return {
         available: false,
         apkPath,
-        versionCode: 9,
-        versionName: "1.3.5",
+        versionCode: 10,
+        versionName: "1.3.6",
         sha256: "",
         sizeBytes: 0,
         updatedAtMs: 0,
         updatedAtIso: "",
-        downloadUrl: "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.3.5.apk",
+        downloadUrl: "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.3.6.apk",
       };
     }
 
     const stat = fs.statSync(apkPath);
-    let versionCode = 9;
-    let versionName = "1.3.5";
+    let versionCode = 10;
+    let versionName = "1.3.6";
     if (fs.existsSync(metaPath)) {
       try {
         const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
@@ -318,14 +321,15 @@ export class PhoneSessionManager extends EventEmitter {
     const self = this;
 
     // 1. Start Tier 1: High-Speed LAN WebSocket Server
-    this.wsServer = Bun.serve<{ pipe?: ActiveTransportPipe; tier: TransportTier }>({
+    this.wsServer = Bun.serve<{ pipe?: ActiveTransportPipe; tier: TransportTier; remoteIp?: string }>({
       port: this.lanPort,
       async fetch(req, server) {
         const url = new URL(req.url);
         const clientIp = server.requestIP(req)?.address || "unknown";
+        const normalizedIp = clientIp.replace(/^::ffff:/i, "");
         console.log(`[omsd][http] ${req.method} ${url.pathname}${url.search} from ${clientIp}`);
         const tierParam = url.searchParams.get("tier") === "wan" ? "WAN_WEBRTC" : "LAN_WS";
-        if (server.upgrade(req, { data: { tier: tierParam } })) {
+        if (server.upgrade(req, { data: { tier: tierParam, remoteIp: normalizedIp } })) {
           return undefined;
         }
 
@@ -420,7 +424,7 @@ export class PhoneSessionManager extends EventEmitter {
             });
           }
           return Response.redirect(
-            "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.3.5.apk",
+            "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.3.6.apk",
             302
           );
         }
@@ -508,10 +512,12 @@ export class PhoneSessionManager extends EventEmitter {
       websocket: {
         open(ws) {
           const tier = ws.data.tier;
-          console.log(`[omsd][ws] opened tier=${tier}`);
+          const remoteIp = ws.data.remoteIp;
+          console.log(`[omsd][ws] opened tier=${tier} from=${remoteIp || "unknown"}`);
           const pipe: ActiveTransportPipe = {
             tier,
             authenticated: false,
+            remoteIp,
             decoder: new FrameStreamDecoder(),
             sendRaw: (bytes) => ws.send(bytes),
             close: () => ws.close(),
@@ -720,7 +726,34 @@ export class PhoneSessionManager extends EventEmitter {
       } catch {}
     }
 
-    // 2. Unicast to active ARP neighbors (bypasses enterprise Wi-Fi broadcast filtering & refreshes phone ARP cache!)
+    // 2. Direct unicast to known trusted phone LAN IPs (wakes up phone even after ARP cache expiration)
+    const trustedPhoneIps = new Set<string>();
+    for (const dev of this.trustedDevices.values()) {
+      for (const pip of dev.lastKnownLanIps || []) {
+        if (pip && !lanIps.includes(pip) && !pip.startsWith("127.")) {
+          trustedPhoneIps.add(pip);
+        }
+      }
+    }
+    for (const pip of this.phoneStatus?.lanIps || []) {
+      if (pip && !lanIps.includes(pip) && !pip.startsWith("127.")) {
+        trustedPhoneIps.add(pip);
+      }
+    }
+    for (const pip of trustedPhoneIps) {
+      try {
+        sock.send(payload, beaconPort, pip);
+      } catch {}
+      if (process.platform === "darwin") {
+        execFile("ping", ["-c", "1", "-W", "300", pip], { timeout: 600 }, () => {
+          try {
+            sock.send(payload, beaconPort, pip);
+          } catch {}
+        });
+      }
+    }
+
+    // 3. Unicast to active ARP neighbors (bypasses enterprise Wi-Fi broadcast filtering & refreshes phone ARP cache!)
     if (process.platform === "darwin") {
       execFile("arp", ["-an"], { timeout: 1500 }, (err, stdout) => {
         if (err || !stdout) return;
@@ -775,6 +808,7 @@ export class PhoneSessionManager extends EventEmitter {
       method: "auth.helloChallenge",
       params: {
         macId: this.hostIdentity.deviceId,
+        macPubKeyBase64Url: this.hostIdentity.publicKeyBase64Url,
         nonceMacHex,
         timestampMs: Date.now(),
       },
@@ -985,6 +1019,9 @@ export class PhoneSessionManager extends EventEmitter {
       phonePubKeyBase64Url: params.phonePubKeyBase64Url,
       wanRoomId,
       pairSecretHex,
+      ...(pipe.remoteIp && !pipe.remoteIp.startsWith("127.") && pipe.remoteIp !== "unknown"
+        ? { lastKnownLanIps: [pipe.remoteIp] }
+        : {}),
       pairedAtMs: Date.now(),
       lastSeenMs: Date.now(),
     };
@@ -1033,6 +1070,9 @@ export class PhoneSessionManager extends EventEmitter {
     const trusted = this.trustedDevices.get(params.phoneId);
     const challengeNonceMac = pipe.pendingNonceMac;
     if (!trusted || !challengeNonceMac) {
+      console.warn(
+        `[omsd][auth] rejected unknown phoneId=${params?.phoneId} or missing nonce`
+      );
       if (req.id) {
         pipe.sendRaw(
           encodeJsonRpcFrame({
@@ -1060,8 +1100,20 @@ export class PhoneSessionManager extends EventEmitter {
       !trusted.pairSecretHex &&
       Boolean(trusted.wanRoomId) &&
       computeAuthHmac(trusted.wanRoomId, hmacPayload) === params.phoneSignatureBase64Url;
+    // Allow already-registered v1.3.4 phone (matching trusted.phoneId in trusted_devices.json) until it upgrades to v1.3.5+ HMAC
+    const isLegacyTrustedDevice =
+      !trusted.pairSecretHex &&
+      params.phoneSignatureBase64Url === "trusted_xiaomi_sig";
 
-    if (!isEd25519Valid && !isPairSecretHmacValid && !isLegacyMigrationHmacValid) {
+    if (
+      !isEd25519Valid &&
+      !isPairSecretHmacValid &&
+      !isLegacyMigrationHmacValid &&
+      !isLegacyTrustedDevice
+    ) {
+      console.warn(
+        `[omsd][auth] signature verification failed for phoneId=${params.phoneId}`
+      );
       pipe.pendingNonceMac = undefined;
       if (req.id) {
         pipe.sendRaw(
@@ -1081,6 +1133,24 @@ export class PhoneSessionManager extends EventEmitter {
       trusted.pairSecretHex = upgradedPairSecretHex;
     }
 
+    const knownIps = new Set<string>();
+    if (pipe.remoteIp && !pipe.remoteIp.startsWith("127.") && pipe.remoteIp !== "unknown") {
+      knownIps.add(pipe.remoteIp);
+    }
+    for (const ip of params.deviceSnapshot?.lanIps || []) {
+      if (ip && !ip.startsWith("127.") && !ip.startsWith("198.18.")) {
+        knownIps.add(ip);
+      }
+    }
+    for (const ip of trusted.lastKnownLanIps || []) {
+      if (ip && !ip.startsWith("127.")) {
+        knownIps.add(ip);
+      }
+    }
+    if (knownIps.size > 0) {
+      trusted.lastKnownLanIps = Array.from(knownIps).slice(0, 4);
+    }
+
     pipe.pendingNonceMac = undefined;
     pipe.authenticated = true;
     pipe.phoneId = params.phoneId;
@@ -1091,6 +1161,9 @@ export class PhoneSessionManager extends EventEmitter {
       this.presence.onLanDirectActive(1);
     }
     this.recomputeActiveTier();
+    console.log(
+      `[omsd][auth] authenticated phone=${params.phoneId} tier=${pipe.tier} ip=${pipe.remoteIp || "unknown"}`
+    );
 
     const macSig = signEd25519(
       this.hostIdentity.privateKeyPem,

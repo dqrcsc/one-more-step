@@ -124,6 +124,7 @@ export interface PairResponseResult {
 
 export interface HelloChallengeParams {
   macId: string;
+  macPubKeyBase64Url?: string;
   nonceMacHex: string;
   timestampMs: number;
 }
