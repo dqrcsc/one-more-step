@@ -11,7 +11,10 @@ internal class GuiSessionGuard(initiallyStopped: Boolean = false) {
     private var observationId: String? = null
     private var observedWindow: String? = null
 
-    fun invalidate() {
+    private var invalidationReason: String = "observation replaced"
+
+    fun invalidate(reason: String = "observation replaced") {
+        invalidationReason = reason
         revision++
         observationId = null
         observedWindow = null
@@ -42,7 +45,7 @@ internal class GuiSessionGuard(initiallyStopped: Boolean = false) {
         check(sessionAuthorized) { "ERR_SESSION_REVOKED: Originating connection is no longer authorized" }
         check(!stopped) { "ERR_USER_INTERRUPTED: Resume GUI access on the phone first" }
         check(now < deadline) { "ERR_GUI_DEADLINE: Action expired" }
-        check(revision == expectedRevision) { "ERR_STALE_OBSERVATION: Screen changed; observe again" }
+        check(revision == expectedRevision) { "ERR_STALE_OBSERVATION: Screen changed ($invalidationReason); observe again" }
         if (requiresObservation || !suppliedObservation.isNullOrBlank()) {
             check(!suppliedObservation.isNullOrBlank() && suppliedObservation == observationId && window == observedWindow) {
                 "ERR_STALE_OBSERVATION: Missing or outdated observationId; observe again"

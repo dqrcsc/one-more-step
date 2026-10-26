@@ -441,7 +441,7 @@ export class OmsMcpServer {
               },
               serverInfo: {
                 name: "one-more-step-mcp",
-                version: "1.3.8",
+                version: "1.3.9",
               },
             },
           };

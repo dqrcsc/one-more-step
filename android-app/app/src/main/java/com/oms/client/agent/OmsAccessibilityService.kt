@@ -55,6 +55,7 @@ class OmsAccessibilityService : AccessibilityService() {
         private set
 
     private val guiMutex = Mutex()
+    private val windowTracker = GuiWindowTracker()
     private lateinit var guard: GuiSessionGuard
     private var activeAction: Job? = null
     private var safetyOverlay: SafetyStopOverlay? = null
@@ -119,18 +120,21 @@ class OmsAccessibilityService : AccessibilityService() {
             }
             return
         }
-        // Our overlays must not invalidate the application snapshot they protect.
-        if (event.packageName?.toString() == packageName) return
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-            event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED ||
-            event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
-            if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
-                guard.invalidateIfWindowChanged(windowIdentity())
-            } else guard.invalidate()
-            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-                event.packageName?.toString()?.let { currentPackageName = it }
-                event.className?.toString()?.let { currentActivityName = it }
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+            if (windowTracker.windowsChanged(applicationWindows(collectApplicationRoots()))) {
+                guard.invalidate("application windows changed")
             }
+        } else if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+                event.windowId in applicationWindows(collectApplicationRoots())) {
+                event.packageName?.toString()?.let { currentPackageName = it }
+                event.className?.toString()?.takeUnless {
+                    it.startsWith("android.widget.") || it.startsWith("android.view.") || it.startsWith("android.inputmethodservice.")
+                }?.let { currentActivityName = it }
+            }
+            if (!windowTracker.belongsToApplication(event.windowId, event.packageName?.toString())) return
+            guard.invalidate("event=${event.eventType}, window=${event.windowId}, package=${event.packageName}, class=${event.className}")
         }
     }
 
@@ -146,8 +150,11 @@ class OmsAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
+    private fun applicationWindows(roots: List<AccessibilityNodeInfo>): Map<Int, String> =
+        roots.associate { it.windowId to it.packageName.toString() }
+
     private fun windowIdentity(roots: List<AccessibilityNodeInfo> = collectApplicationRoots()): String =
-        roots.map { "${it.windowId}:${it.packageName}" }.sorted().joinToString("|") + ":$currentActivityName"
+        GuiWindowTracker.identityOf(applicationWindows(roots))
 
     private fun isBlockedFinancialOrPasswordWindow(root: AccessibilityNodeInfo?): Boolean {
         if (BLOCKED_FINANCIAL_PACKAGES.contains(currentPackageName)) return true
@@ -168,9 +175,13 @@ class OmsAccessibilityService : AccessibilityService() {
      */
     private fun collectApplicationRoots(): List<AccessibilityNodeInfo> {
         val roots = mutableListOf<AccessibilityNodeInfo>()
+        var hasWindowInventory = false
+        var applicationWindowIds: Set<Int> = emptySet()
         try {
             val allWindows = windows
             if (!allWindows.isNullOrEmpty()) {
+                hasWindowInventory = true
+                applicationWindowIds = allWindows.filter { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }.map { it.id }.toSet()
                 val appWindows = allWindows
                     .filter { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }
                     .sortedByDescending { w ->
@@ -189,7 +200,8 @@ class OmsAccessibilityService : AccessibilityService() {
         } catch (_: Throwable) {
         }
         val activeRoot = rootInActiveWindow
-        if (activeRoot != null && roots.none { it == activeRoot }) {
+        if (activeRoot != null && (!hasWindowInventory || activeRoot.windowId in applicationWindowIds)
+            && roots.none { it.windowId == activeRoot.windowId }) {
             roots.add(activeRoot)
         }
         roots.firstOrNull()?.packageName?.toString()?.takeIf { it.isNotBlank() }?.let {
@@ -208,6 +220,7 @@ class OmsAccessibilityService : AccessibilityService() {
         val screenH = dm.heightPixels
         val roots = collectApplicationRoots()
         val primaryRoot = roots.firstOrNull()
+        windowTracker.track(applicationWindows(roots))
         val observationId = guard.observe(windowIdentity(roots))
 
         if (isBlockedFinancialOrPasswordWindow(primaryRoot)) {
@@ -274,7 +287,9 @@ class OmsAccessibilityService : AccessibilityService() {
     }
 
     private suspend fun executeLocked(params: JSONObject, deadline: Long, sessionStillValid: () -> Boolean): JSONObject {
-        val initialWindow = windowIdentity()
+        val initialRoots = collectApplicationRoots()
+        windowTracker.track(applicationWindows(initialRoots))
+        val initialWindow = windowIdentity(initialRoots)
         val initialRevision = guard.revision
         val targetNodeId = params.optString("targetNodeId", "")
         val observationId = params.optString("observationId", "").takeIf { it.isNotBlank() }
@@ -403,6 +418,7 @@ class OmsAccessibilityService : AccessibilityService() {
         delay(400)
         val dm = resources.displayMetrics
         val postRoots = collectApplicationRoots()
+        windowTracker.track(applicationWindows(postRoots))
         val postObservationId = guard.observe(windowIdentity(postRoots))
         val postTree = SemanticTreeExtractor.extractCompactTreeFromRoots(
             if (isBlockedFinancialOrPasswordWindow(postRoots.firstOrNull())) emptyList() else postRoots,
