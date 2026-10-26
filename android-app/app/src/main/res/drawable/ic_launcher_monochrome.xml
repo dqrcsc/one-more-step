@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:scaleX="0.82"
+        android:scaleY="0.82">
+
+        <!-- Woven Cords -->
+        <path
+            android:pathData="M 24 45 L 45 45 C 53 45, 55 33, 63 33 L 84 33 M 24 73 L 45 73 C 53 73, 55 61, 63 61 L 84 61"
+            android:strokeWidth="2.8"
+            android:strokeLineCap="round"
+            android:strokeColor="#FFFFFFFF"
+            android:fillColor="#00000000" />
+
+        <!-- Left Slip Outline -->
+        <path
+            android:pathData="M 29.5 35 L 40.5 35 A 4.5 4.5 0 0 1 45 39.5 L 45 78.5 A 4.5 4.5 0 0 1 40.5 83 L 29.5 83 A 4.5 4.5 0 0 1 25 78.5 L 25 39.5 A 4.5 4.5 0 0 1 29.5 35 Z"
+            android:fillColor="#FFFFFFFF" />
+
+        <!-- Right Slip Outline -->
+        <path
+            android:pathData="M 67.5 23 L 78.5 23 A 4.5 4.5 0 0 1 83 27.5 L 83 66.5 A 4.5 4.5 0 0 1 78.5 71 L 67.5 71 A 4.5 4.5 0 0 1 63 66.5 L 63 27.5 A 4.5 4.5 0 0 1 67.5 23 Z"
+            android:fillColor="#FFFFFFFF" />
+
+        <!-- Center Star Spark -->
+        <path
+            android:pathData="M 54 42.5 Q 54 52 63.5 52 Q 54 52 54 61.5 Q 54 52 44.5 52 Q 54 52 54 42.5 Z"
+            android:fillColor="#FFFFFFFF" />
+    </group>
+</vector>

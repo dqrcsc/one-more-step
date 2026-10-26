@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Status Bar & Quick Settings Tile Monochrome Brand Icon ("青简·咫尺") -->
+    <!-- Left Bamboo Slip (Phone) -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M4.5,6.5 h4 a1.5,1.5 0 0,1 1.5,1.5 v11 a1.5,1.5 0 0,1 -1.5,1.5 h-4 a1.5,1.5 0 0,1 -1.5,-1.5 v-11 a1.5,1.5 0 0,1 1.5,-1.5 z M5.8,9.5 v7 h1.4 v-7 z" />
+    <!-- Right Bamboo Slip (Mac AI - Stepped Up "One More Step") -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M15.5,3.5 h4 a1.5,1.5 0 0,1 1.5,1.5 v11 a1.5,1.5 0 0,1 -1.5,1.5 h-4 a1.5,1.5 0 0,1 -1.5,-1.5 v-11 a1.5,1.5 0 0,1 1.5,-1.5 z M16.8,6.5 v7 h1.4 v-7 z" />
+    <!-- Woven Cords & Center Spark ("咫尺") -->
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M9.5,9.5 C11.5,9.5 12.5,6.5 14.5,6.5 M9.5,17.5 C11.5,17.5 12.5,14.5 14.5,14.5" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,9.2 Q12,12 14.8,12 Q12,12 12,14.8 Q12,12 9.2,12 Q12,12 12,9.2 Z" />
+</vector>

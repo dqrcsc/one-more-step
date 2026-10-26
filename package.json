@@ -1,0 +1,55 @@
+{
+  "name": "one-more-step",
+  "version": "1.3.4",
+  "private": true,
+  "description": "青简·咫尺 (OneMoreStep) — Bidirectional interoperability bridge between macOS local AI Agents (Codex, Antigravity, OpenCode, Claude Code) and Xiaomi Android devices (HyperOS / MIUI).",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dqrcsc/one-more-step.git"
+  },
+  "homepage": "https://github.com/dqrcsc/one-more-step#readme",
+  "bugs": {
+    "url": "https://github.com/dqrcsc/one-more-step/issues"
+  },
+  "keywords": [
+    "one-more-step",
+    "oms",
+    "mcp",
+    "ai-agent",
+    "xiaomi",
+    "hyperos",
+    "miui",
+    "android",
+    "macos",
+    "codex",
+    "antigravity",
+    "claude-code",
+    "opencode",
+    "bluetooth",
+    "accessibility"
+  ],
+  "workspaces": [
+    "shared-protocol",
+    "mac-host"
+  ],
+  "scripts": {
+    "setup": "bun run scripts/setup.ts",
+    "build": "bun run --filter '*' build",
+    "typecheck": "bun run --filter '*' build",
+    "build:bt": "cd mac-host && bun run build:bt",
+    "build:apk": "cd android-app && ./gradlew assembleDebug",
+    "test": "bun test",
+    "oms": "bun run mac-host/src/cli/index.ts",
+    "omsd": "bun run mac-host/src/daemon/main.ts",
+    "mcp": "bun run mac-host/src/mcp/server.ts"
+  },
+  "engines": {
+    "bun": ">=1.1.0",
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.8.2"
+  }
+}

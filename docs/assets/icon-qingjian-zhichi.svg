@@ -1,0 +1,158 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="1024" height="1024">
+  <defs>
+    <!-- Deep Oriental Ink-Jade Background Gradient -->
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="108" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#050D1A"/>
+      <stop offset="50%" stop-color="#0A1E2E"/>
+      <stop offset="100%" stop-color="#093035"/>
+    </linearGradient>
+
+    <!-- Ambient Center Jade-Cyan Glow -->
+    <radialGradient id="ambientGlow" cx="54" cy="52" r="44" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#14B8A6" stop-opacity="0.32"/>
+      <stop offset="52%" stop-color="#0284C7" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#050D1A" stop-opacity="0.0"/>
+    </radialGradient>
+
+    <!-- Left Bamboo Slip: Sky-Cerulean Jade (Phone / Instant Capture) -->
+    <linearGradient id="leftSlipGrad" x1="25" y1="35" x2="45" y2="83" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7DD3FC"/>
+      <stop offset="40%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#0369A1"/>
+    </linearGradient>
+
+    <!-- Right Bamboo Slip: Celadon Emerald Jade (Mac AI / PKB "青简") -->
+    <linearGradient id="rightSlipGrad" x1="63" y1="23" x2="83" y2="71" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#A7F3D0"/>
+      <stop offset="42%" stop-color="#2DD4BF"/>
+      <stop offset="100%" stop-color="#0F766E"/>
+    </linearGradient>
+
+    <!-- Golden-Amber Woven Cord Bridge ("韦编·咫尺" Upper Bridge) -->
+    <linearGradient id="goldCordGrad" x1="43" y1="45" x2="65" y2="33" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="30%" stop-color="#FBBF24"/>
+      <stop offset="70%" stop-color="#FEF08A"/>
+      <stop offset="100%" stop-color="#2DD4BF"/>
+    </linearGradient>
+
+    <!-- Cyan-Jade Woven Cord Bridge ("韦编·咫尺" Lower Bridge) -->
+    <linearGradient id="cyanCordGrad" x1="43" y1="73" x2="65" y2="61" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="50%" stop-color="#67E8F9"/>
+      <stop offset="100%" stop-color="#2DD4BF"/>
+    </linearGradient>
+
+    <!-- Unclipped UserSpace Drop Shadows -->
+    <filter id="slipShadow" filterUnits="userSpaceOnUse" x="0" y="0" width="108" height="108">
+      <feDropShadow dx="0" dy="3.5" stdDeviation="3.2" flood-color="#020617" flood-opacity="0.7"/>
+    </filter>
+    <filter id="goldGlow" filterUnits="userSpaceOnUse" x="0" y="0" width="108" height="108">
+      <feDropShadow dx="0" dy="0.8" stdDeviation="2.2" flood-color="#F59E0B" flood-opacity="0.8"/>
+    </filter>
+  </defs>
+
+  <!-- 1. Squircle Icon Base -->
+  <rect x="0" y="0" width="108" height="108" rx="24" fill="url(#bgGrad)"/>
+  <circle cx="54" cy="52" r="44" fill="url(#ambientGlow)"/>
+
+  <!-- 2. Near-Field "咫尺" Sonar & Caliper Rings -->
+  <circle cx="54" cy="52" r="39" fill="none" stroke="#2DD4BF" stroke-opacity="0.11" stroke-width="0.75" stroke-dasharray="2.5 3"/>
+  <circle cx="54" cy="52" r="30" fill="none" stroke="#38BDF8" stroke-opacity="0.15" stroke-width="0.8"/>
+  <circle cx="54" cy="52" r="21" fill="none" stroke="#5EEAD4" stroke-opacity="0.18" stroke-width="0.7" stroke-dasharray="1.8 2.2"/>
+
+  <!-- 3. Woven Bamboo Cords Behind/Between Slips (韦编双弦 · 咫尺飞桥) -->
+  <!-- Lower Woven Cord S-Bridge (y=73 on left slip -> y=61 on right slip) -->
+  <path d="M 24 73 L 45 73 C 53 73, 55 61, 63 61 L 84 61"
+        fill="none" stroke="url(#cyanCordGrad)" stroke-width="2.4" stroke-linecap="round" opacity="0.9"/>
+
+  <!-- Upper Woven Cord S-Bridge (y=45 on left slip -> y=33 on right slip) -->
+  <g filter="url(#goldGlow)">
+    <path d="M 24 45 L 45 45 C 53 45, 55 33, 63 33 L 84 33"
+          fill="none" stroke="url(#goldCordGrad)" stroke-width="2.8" stroke-linecap="round"/>
+  </g>
+
+  <!-- 4. LEFT BAMBOO SLIP (手机端 · 采撷青简: x=25..45, y=35..83) -->
+  <g filter="url(#slipShadow)">
+    <!-- Notched Bamboo Slip Path (with authentic 契口 side notches at y=45 and y=73) -->
+    <path d="M 29.5 35
+             L 40.5 35
+             A 4.5 4.5 0 0 1 45 39.5
+             L 45 43.2 L 43.4 45 L 45 46.8
+             L 45 71.2 L 43.4 73 L 45 74.8
+             L 45 78.5
+             A 4.5 4.5 0 0 1 40.5 83
+             L 29.5 83
+             A 4.5 4.5 0 0 1 25 78.5
+             L 25 74.8 L 26.6 73 L 25 71.2
+             L 25 46.8 L 26.6 45 L 25 43.2
+             L 25 39.5
+             A 4.5 4.5 0 0 1 29.5 35 Z"
+          fill="url(#leftSlipGrad)" stroke="#BAE6FD" stroke-width="0.85" stroke-opacity="0.75"/>
+
+    <!-- Woven Binding Straps across Left Slip (韦编束带) -->
+    <line x1="26.2" y1="45" x2="43.8" y2="45" stroke="#0284C7" stroke-width="1.8" stroke-opacity="0.65"/>
+    <line x1="26.2" y1="45" x2="43.8" y2="45" stroke="#E0F2FE" stroke-width="0.7" stroke-opacity="0.7"/>
+    <line x1="26.2" y1="73" x2="43.8" y2="73" stroke="#0284C7" stroke-width="1.8" stroke-opacity="0.65"/>
+    <line x1="26.2" y1="73" x2="43.8" y2="73" stroke="#E0F2FE" stroke-width="0.7" stroke-opacity="0.7"/>
+
+    <!-- Top Hole / Sensor Dot -->
+    <circle cx="35" cy="39.8" r="1.3" fill="#F0F9FF" fill-opacity="0.9"/>
+
+    <!-- Vertical Bamboo Calligraphy / Context Columns (竖排墨迹) -->
+    <line x1="31.8" y1="49.5" x2="31.8" y2="59.5" stroke="#F0F9FF" stroke-width="2.0" stroke-linecap="round" stroke-opacity="0.92"/>
+    <line x1="31.8" y1="63.5" x2="31.8" y2="68.5" stroke="#F0F9FF" stroke-width="2.0" stroke-linecap="round" stroke-opacity="0.75"/>
+    <line x1="38.2" y1="49.5" x2="38.2" y2="55.5" stroke="#E0F2FE" stroke-width="2.0" stroke-linecap="round" stroke-opacity="0.80"/>
+    <line x1="38.2" y1="59.5" x2="38.2" y2="68.5" stroke="#E0F2FE" stroke-width="2.0" stroke-linecap="round" stroke-opacity="0.65"/>
+  </g>
+
+  <!-- 5. RIGHT BAMBOO SLIP (Mac AI端 · 智库青简: Stepped UP 12dp "One More Step", x=63..83, y=23..71) -->
+  <g filter="url(#slipShadow)">
+    <!-- Notched Bamboo Slip Path (with authentic 契口 side notches at y=33 and y=61) -->
+    <path d="M 67.5 23
+             L 78.5 23
+             A 4.5 4.5 0 0 1 83 27.5
+             L 83 31.2 L 81.4 33 L 83 34.8
+             L 83 59.2 L 81.4 61 L 83 62.8
+             L 83 66.5
+             A 4.5 4.5 0 0 1 78.5 71
+             L 67.5 71
+             A 4.5 4.5 0 0 1 63 66.5
+             L 63 62.8 L 64.6 61 L 63 59.2
+             L 63 34.8 L 64.6 33 L 63 31.2
+             L 63 27.5
+             A 4.5 4.5 0 0 1 67.5 23 Z"
+          fill="url(#rightSlipGrad)" stroke="#D1FAE5" stroke-width="0.95" stroke-opacity="0.85"/>
+
+    <!-- Woven Binding Straps across Right Slip (韦编束带) -->
+    <line x1="64.2" y1="33" x2="81.8" y2="33" stroke="#0F766E" stroke-width="1.8" stroke-opacity="0.65"/>
+    <line x1="64.2" y1="33" x2="81.8" y2="33" stroke="#ECFDF5" stroke-width="0.7" stroke-opacity="0.8"/>
+    <line x1="64.2" y1="61" x2="81.8" y2="61" stroke="#0F766E" stroke-width="1.8" stroke-opacity="0.65"/>
+    <line x1="64.2" y1="61" x2="81.8" y2="61" stroke="#ECFDF5" stroke-width="0.7" stroke-opacity="0.8"/>
+
+    <!-- Top AI Presence Halo Dot -->
+    <circle cx="73" cy="27.8" r="1.4" fill="#FEF08A"/>
+
+    <!-- Vertical Knowledge Graph / AI Semantic Nodes inside Right Slip -->
+    <line x1="69.8" y1="37.5" x2="69.8" y2="56.5" stroke="#ECFDF5" stroke-width="2.0" stroke-linecap="round" stroke-opacity="0.95"/>
+    <line x1="76.2" y1="37.5" x2="76.2" y2="45.5" stroke="#D1FAE5" stroke-width="2.0" stroke-linecap="round" stroke-opacity="0.85"/>
+    <line x1="76.2" y1="49.5" x2="76.2" y2="56.5" stroke="#D1FAE5" stroke-width="2.0" stroke-linecap="round" stroke-opacity="0.75"/>
+    <circle cx="69.8" cy="42" r="1.7" fill="#FEF08A"/>
+    <circle cx="76.2" cy="50" r="1.7" fill="#FEF08A"/>
+    <line x1="69.8" y1="42" x2="76.2" y2="50" stroke="#FEF08A" stroke-width="1.2" stroke-opacity="0.85"/>
+  </g>
+
+  <!-- 6. CENTER "咫尺灵光" (Near-Field Resonance Spark & Stepping Arrow in the Gap x=54, y=52) -->
+  <g filter="url(#goldGlow)">
+    <!-- Radiant 4-Pointed Star Spark at (54, 52) -->
+    <path d="M 54 42.5 Q 54 52 63.5 52 Q 54 52 54 61.5 Q 54 52 44.5 52 Q 54 52 54 42.5 Z"
+          fill="#FBBF24"/>
+    <path d="M 54 45.2 Q 54 52 60.8 52 Q 54 52 54 58.8 Q 54 52 47.2 52 Q 54 52 54 45.2 Z"
+          fill="#FEF9C3"/>
+    <circle cx="54" cy="52" r="2.2" fill="#FFFFFF"/>
+  </g>
+
+  <!-- 7. "咫尺" Caliper Scale Ruler at Bottom (Measuring the "One More Step" Distance) -->
+  <path d="M 35 89 L 73 89 M 35 86.8 L 35 91.2 M 54 87.5 L 54 90.5 M 73 86.8 L 73 91.2"
+        stroke="#5EEAD4" stroke-opacity="0.45" stroke-width="1.2" stroke-linecap="round"/>
+</svg>

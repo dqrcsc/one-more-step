@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Scale inside Adaptive Icon 66dp Safe Zone -->
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:scaleX="0.82"
+        android:scaleY="0.82">
+
+        <!-- 1. Woven Bamboo Cords Behind/Between Slips (韦编双弦 · 咫尺飞桥) -->
+        <!-- Lower Woven Cord S-Bridge -->
+        <path
+            android:pathData="M 24 73 L 45 73 C 53 73, 55 61, 63 61 L 84 61"
+            android:strokeWidth="2.5"
+            android:strokeLineCap="round"
+            android:fillColor="#00000000">
+            <aapt:attr name="android:strokeColor">
+                <gradient
+                    android:startX="43"
+                    android:startY="73"
+                    android:endX="65"
+                    android:endY="61"
+                    android:type="linear">
+                    <item android:offset="0.0" android:color="#FF38BDF8" />
+                    <item android:offset="0.5" android:color="#FF67E8F9" />
+                    <item android:offset="1.0" android:color="#FF2DD4BF" />
+                </gradient>
+            </aapt:attr>
+        </path>
+
+        <!-- Upper Woven Cord S-Bridge -->
+        <path
+            android:pathData="M 24 45 L 45 45 C 53 45, 55 33, 63 33 L 84 33"
+            android:strokeWidth="2.9"
+            android:strokeLineCap="round"
+            android:fillColor="#00000000">
+            <aapt:attr name="android:strokeColor">
+                <gradient
+                    android:startX="43"
+                    android:startY="45"
+                    android:endX="65"
+                    android:endY="33"
+                    android:type="linear">
+                    <item android:offset="0.0" android:color="#FF38BDF8" />
+                    <item android:offset="0.3" android:color="#FFFBBF24" />
+                    <item android:offset="0.7" android:color="#FFFEF08A" />
+                    <item android:offset="1.0" android:color="#FF2DD4BF" />
+                </gradient>
+            </aapt:attr>
+        </path>
+
+        <!-- 2. LEFT BAMBOO SLIP (手机端 · 采撷青简) -->
+        <!-- Drop Shadow -->
+        <path
+            android:pathData="M 29.5 37.5 L 40.5 37.5 A 4.5 4.5 0 0 1 45 42 L 45 81 A 4.5 4.5 0 0 1 40.5 85.5 L 29.5 85.5 A 4.5 4.5 0 0 1 25 81 L 25 42 A 4.5 4.5 0 0 1 29.5 37.5 Z"
+            android:fillColor="#66020617" />
+
+        <!-- Notched Bamboo Slip Body -->
+        <path
+            android:pathData="M 29.5 35 L 40.5 35 A 4.5 4.5 0 0 1 45 39.5 L 45 43.2 L 43.4 45 L 45 46.8 L 45 71.2 L 43.4 73 L 45 74.8 L 45 78.5 A 4.5 4.5 0 0 1 40.5 83 L 29.5 83 A 4.5 4.5 0 0 1 25 78.5 L 25 74.8 L 26.6 73 L 25 71.2 L 25 46.8 L 26.6 45 L 25 43.2 L 25 39.5 A 4.5 4.5 0 0 1 29.5 35 Z"
+            android:strokeWidth="0.85"
+            android:strokeColor="#BFBAE6FD">
+            <aapt:attr name="android:fillColor">
+                <gradient
+                    android:startX="25"
+                    android:startY="35"
+                    android:endX="45"
+                    android:endY="83"
+                    android:type="linear">
+                    <item android:offset="0.0" android:color="#FF7DD3FC" />
+                    <item android:offset="0.4" android:color="#FF38BDF8" />
+                    <item android:offset="1.0" android:color="#FF0369A1" />
+                </gradient>
+            </aapt:attr>
+        </path>
+
+        <!-- Woven Binding Straps on Left Slip -->
+        <path
+            android:pathData="M 26.2 45 L 43.8 45 M 26.2 73 L 43.8 73"
+            android:strokeWidth="1.2"
+            android:strokeColor="#B3E0F2FE" />
+        <!-- Top Dot -->
+        <path
+            android:pathData="M 35,38.5 A 1.3,1.3 0 1,1 34.99,38.5 Z"
+            android:fillColor="#E6F0F9FF" />
+        <!-- Vertical Bamboo Calligraphy / Context Columns -->
+        <path
+            android:pathData="M 31.8 49.5 L 31.8 59.5 M 31.8 63.5 L 31.8 68.5 M 38.2 49.5 L 38.2 55.5 M 38.2 59.5 L 38.2 68.5"
+            android:strokeWidth="2.0"
+            android:strokeLineCap="round"
+            android:strokeColor="#E6F0F9FF" />
+
+        <!-- 3. RIGHT BAMBOO SLIP (Mac AI端 · 智库青简: Stepped UP "One More Step") -->
+        <!-- Drop Shadow -->
+        <path
+            android:pathData="M 67.5 25.5 L 78.5 25.5 A 4.5 4.5 0 0 1 83 30 L 83 69 A 4.5 4.5 0 0 1 78.5 73.5 L 67.5 73.5 A 4.5 4.5 0 0 1 63 69 L 63 30 A 4.5 4.5 0 0 1 67.5 25.5 Z"
+            android:fillColor="#66020617" />
+
+        <!-- Notched Bamboo Slip Body -->
+        <path
+            android:pathData="M 67.5 23 L 78.5 23 A 4.5 4.5 0 0 1 83 27.5 L 83 31.2 L 81.4 33 L 83 34.8 L 83 59.2 L 81.4 61 L 83 62.8 L 83 66.5 A 4.5 4.5 0 0 1 78.5 71 L 67.5 71 A 4.5 4.5 0 0 1 63 66.5 L 63 62.8 L 64.6 61 L 63 59.2 L 63 34.8 L 64.6 33 L 63 31.2 L 63 27.5 A 4.5 4.5 0 0 1 67.5 23 Z"
+            android:strokeWidth="0.95"
+            android:strokeColor="#D9D1FAE5">
+            <aapt:attr name="android:fillColor">
+                <gradient
+                    android:startX="63"
+                    android:startY="23"
+                    android:endX="83"
+                    android:endY="71"
+                    android:type="linear">
+                    <item android:offset="0.0" android:color="#FFA7F3D0" />
+                    <item android:offset="0.42" android:color="#FF2DD4BF" />
+                    <item android:offset="1.0" android:color="#FF0F766E" />
+                </gradient>
+            </aapt:attr>
+        </path>
+
+        <!-- Woven Binding Straps on Right Slip -->
+        <path
+            android:pathData="M 64.2 33 L 81.8 33 M 64.2 61 L 81.8 61"
+            android:strokeWidth="1.2"
+            android:strokeColor="#CCECFDF5" />
+        <!-- Top AI Halo Dot -->
+        <path
+            android:pathData="M 73,26.4 A 1.4,1.4 0 1,1 72.99,26.4 Z"
+            android:fillColor="#FFFEF08A" />
+        <!-- Vertical Knowledge Graph / AI Nodes inside Right Slip -->
+        <path
+            android:pathData="M 69.8 37.5 L 69.8 56.5 M 76.2 37.5 L 76.2 45.5 M 76.2 49.5 L 76.2 56.5"
+            android:strokeWidth="2.0"
+            android:strokeLineCap="round"
+            android:strokeColor="#EBECFDF5" />
+        <path
+            android:pathData="M 69.8 42 L 76.2 50"
+            android:strokeWidth="1.3"
+            android:strokeColor="#FFFEF08A" />
+        <path
+            android:pathData="M 69.8,40.2 A 1.8,1.8 0 1,1 69.79,40.2 Z M 76.2,48.2 A 1.8,1.8 0 1,1 76.19,48.2 Z"
+            android:fillColor="#FFFEF08A" />
+
+        <!-- 4. CENTER "咫尺灵光" 4-Pointed Star Spark at (54, 52) -->
+        <path
+            android:pathData="M 54 42.5 Q 54 52 63.5 52 Q 54 52 54 61.5 Q 54 52 44.5 52 Q 54 52 54 42.5 Z"
+            android:fillColor="#FFFBBF24" />
+        <path
+            android:pathData="M 54 45.2 Q 54 52 60.8 52 Q 54 52 54 58.8 Q 54 52 47.2 52 Q 54 52 54 45.2 Z"
+            android:fillColor="#FFFEF9C3" />
+        <path
+            android:pathData="M 54,49.8 A 2.2,2.2 0 1,1 53.99,49.8 Z"
+            android:fillColor="#FFFFFFFF" />
+
+        <!-- 5. "咫尺" Caliper Scale Ruler at Bottom -->
+        <path
+            android:pathData="M 35 89 L 73 89 M 35 86.8 L 35 91.2 M 54 87.5 L 54 90.5 M 73 86.8 L 73 91.2"
+            android:strokeWidth="1.3"
+            android:strokeLineCap="round"
+            android:strokeColor="#805EEAD4" />
+    </group>
+</vector>

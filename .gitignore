@@ -1,0 +1,31 @@
+# Dependencies & build outputs
+node_modules/
+dist/
+build/
+.gradle/
+.idea/
+.kotlin/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Local environment & Android SDK config
+local.properties
+.env
+.env.*
+!.env.example
+
+# Compiled binaries & packages (published via GitHub Releases or built on demand)
+*.apk
+*.aab
+*.ap_
+*.dex
+*.keystore
+*.jks
+mac-host/bin/
+
+# OS & tool artifacts
+.DS_Store
+**/.DS_Store
+*.log
+*.tsbuildinfo
