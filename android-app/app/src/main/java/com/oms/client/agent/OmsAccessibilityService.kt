@@ -1,5 +1,7 @@
 package com.oms.client.agent
 
+import android.app.Notification
+import com.oms.client.otp.OtpExtractor
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
@@ -85,6 +87,30 @@ class OmsAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null || !::guard.isInitialized) return
+        if (event.eventType == AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) {
+            val pkg = event.packageName?.toString() ?: return
+            if (pkg == packageName) return
+            try {
+                val notif = event.parcelableData as? Notification
+                if (notif != null) {
+                    val extras = notif.extras
+                    val title = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()
+                    val bigText = extras?.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()
+                    val text = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString()
+                    val body = bigText ?: text ?: event.text.joinToString(" ")
+                    if (body.isNotBlank()) {
+                        OtpExtractor.onCandidateTextReceived(body, title, pkg)
+                    }
+                } else {
+                    val eventTxt = event.text.joinToString(" ").trim()
+                    if (eventTxt.isNotEmpty()) {
+                        OtpExtractor.onCandidateTextReceived(eventTxt, null, pkg)
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+            return
+        }
         if (event.eventType == AccessibilityEvent.TYPE_TOUCH_INTERACTION_START) {
             // Confirmation itself requires a physical touch. No action runs while it is
             // pending; application changes during that wait invalidate the observation.

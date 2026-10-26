@@ -153,6 +153,14 @@ class StreamRepository(context: Context) :
         prefs.edit().putStringSet("authorized_dirs", current).apply()
     }
 
+    fun isAutoSyncOtpEnabled(): Boolean {
+        return prefs.getBoolean("auto_sync_otp", true)
+    }
+
+    fun setAutoSyncOtpEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("auto_sync_otp", enabled).apply()
+    }
+
     fun upsertStreamItem(item: StreamItemModel) {
         val cv = ContentValues().apply {
             put("item_id", item.itemId)

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { InboxSubmitItemParams, IntentTag } from "@oms/shared-protocol";
+import { extractOtpFromText, InboxSubmitItemParams, IntentTag } from "@oms/shared-protocol";
 import { CompletedFileTransfer } from "../transport/session-manager.js";
 
 const ITEM_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -23,6 +23,8 @@ export interface StoredInboxItem {
   textContent?: string;
   voiceTranscript?: string;
   sourceApp?: string;
+  otpCode?: string;
+  otpSender?: string;
   processed: boolean;
   files: StoredInboxFile[];
 }
@@ -142,15 +144,28 @@ export class InboxManager {
       });
     }
 
+    const extractedOtp =
+      !params.otpCode && params.textContent
+        ? extractOtpFromText(
+            params.textContent,
+            params.otpSender || params.title || params.sourceApp
+          )
+        : null;
+
+    const otpCode = params.otpCode || extractedOtp?.code;
+    const otpSender = params.otpSender || extractedOtp?.sender;
+
     const stored: StoredInboxItem = {
       itemId: params.clientItemId,
       receivedAt: now.toISOString(),
       createdAtMs: params.createdAtMs || Date.now(),
-      intentTag: params.intentTag || "default_inbox",
+      intentTag: params.intentTag || (otpCode ? "sms_otp" : "default_inbox"),
       title: params.title,
       textContent: params.textContent,
       voiceTranscript: params.voiceTranscript,
       sourceApp: params.sourceApp,
+      ...(otpCode ? { otpCode } : {}),
+      ...(otpSender ? { otpSender } : {}),
       processed: false,
       files: storedFiles,
     };
@@ -186,6 +201,8 @@ export class InboxManager {
           item.title,
           item.textContent,
           item.voiceTranscript,
+          item.otpCode,
+          item.otpSender,
           item.intentTag,
           ...item.files.map((f) => f.fileName),
         ]

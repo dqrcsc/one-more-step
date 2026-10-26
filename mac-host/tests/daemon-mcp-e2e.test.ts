@@ -278,6 +278,41 @@ describe("Modules 06 & 07: OmsDaemon + Inbox + MCP Server End-to-End", () => {
     expect(typeof apkVerJson.versionCode).toBe("number");
     expect(typeof apkVerJson.sha256).toBe("string");
 
+    // 7b. Simulate real-time SMS / App OTP synchronization (#sms_otp)
+    const otpItemId = generateUuidV7();
+    ws.send(
+      encodeJsonRpcFrame({
+        jsonrpc: "2.0",
+        id: "sub_otp_1",
+        method: "inbox.submitItem",
+        params: {
+          clientItemId: otpItemId,
+          intentTag: "sms_otp",
+          title: "🔑 【阿里云】验证码: 839201",
+          textContent: "【阿里云】您的登录验证码为 839201，请在5分钟内使用，切勿泄露。",
+          otpCode: "839201",
+          otpSender: "阿里云",
+          sourceApp: "com.android.mms",
+          createdAtMs: Date.now(),
+        },
+      })
+    );
+    await new Promise((r) => setTimeout(r, 40));
+
+    const otpToolCall = await mcp.handleRpcRequest({
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/call",
+      params: {
+        name: "phone_inbox_latest",
+        arguments: { tag: "sms_otp", limit: 3 },
+      },
+    });
+    const otpData = JSON.parse(otpToolCall.result.content[0].text);
+    expect(otpData.count).toBe(1);
+    expect(otpData.items[0].otpCode).toBe("839201");
+    expect(otpData.items[0].otpSender).toBe("阿里云");
+
     // 8. Verify LAN isolation: non-loopback IPs (e.g. another computer on the same LAN) are blocked with 403 Forbidden
     const lanAttackerInboxResp = await handleDashboardHttpRequest(
       daemon,

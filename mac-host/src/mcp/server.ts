@@ -10,15 +10,15 @@ export const OMS_MCP_TOOLS = [
   {
     name: "phone_inbox_latest",
     description:
-      "获取用户刚刚从小米手机主动投递到 Mac 的最新图片、截图、文档、链接或语音闪念。支持按意图标签过滤 (default_inbox | pkb_vault | voice_idea | ui_bug)。",
+      "获取用户刚刚从小米手机主动投递或自动同步到 Mac 的最新验证码 (sms_otp)、图片、截图、文档、链接或语音闪念。支持按意图标签过滤 (default_inbox | pkb_vault | voice_idea | ui_bug | sms_otp)。",
     inputSchema: {
       type: "object",
       properties: {
         tag: {
           type: "string",
-          enum: ["all", "default_inbox", "pkb_vault", "voice_idea", "ui_bug"],
+          enum: ["all", "default_inbox", "pkb_vault", "voice_idea", "ui_bug", "sms_otp"],
           default: "all",
-          description: "按投递意图标签过滤",
+          description: "按投递意图标签过滤 (sms_otp 为手机实时同步的验证码)",
         },
         limit: {
           type: "number",
@@ -441,7 +441,7 @@ export class OmsMcpServer {
               },
               serverInfo: {
                 name: "one-more-step-mcp",
-                version: "1.3.4",
+                version: "1.3.8",
               },
             },
           };

@@ -198,6 +198,7 @@ export class PhoneSessionManager extends EventEmitter {
     const apkDir = path.join(repoRoot, "android-app/app/build/outputs/apk/debug");
     const candidatePaths = [
       path.join(apkDir, "app-debug.apk"),
+      path.join(repoRoot, "OneMoreStep-v1.3.7.apk"),
       path.join(repoRoot, "OneMoreStep-v1.3.6.apk"),
       path.join(repoRoot, "OneMoreStep-v1.3.5.apk"),
       path.join(repoRoot, "OneMoreStep-v1.3.4.apk"),
@@ -210,19 +211,19 @@ export class PhoneSessionManager extends EventEmitter {
       return {
         available: false,
         apkPath,
-        versionCode: 10,
-        versionName: "1.3.6",
+        versionCode: 11,
+        versionName: "1.3.7",
         sha256: "",
         sizeBytes: 0,
         updatedAtMs: 0,
         updatedAtIso: "",
-        downloadUrl: "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.3.6.apk",
+        downloadUrl: "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.3.7.apk",
       };
     }
 
     const stat = fs.statSync(apkPath);
-    let versionCode = 10;
-    let versionName = "1.3.6";
+    let versionCode = 11;
+    let versionName = "1.3.7";
     if (fs.existsSync(metaPath)) {
       try {
         const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));

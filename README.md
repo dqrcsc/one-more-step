@@ -51,6 +51,8 @@
 - **控制中心快捷磁贴 (`OmsQuickTileService`)**：
   - **单击磁贴**：通过 1×1 透明焦点窗口突破 Android 10+ 后台剪贴板读取限制，1 秒将手机剪贴板同步至 Mac；
   - **长按磁贴**：呼出「💡 我有一个想法」语音闪念框，说完即刻投递至 Mac `#voice_idea` 队列。
+- **手机验证码锁屏实时同步 Mac (`OmsNotificationListenerService` + `OmsSmsBroadcastReceiver`)**：
+  - 无需拿起并解锁手机，手机收到短信或微信/飞书/邮箱验证码瞬间，自动剔除尾号与金额干扰、提取 4~8 位纯验证码推送至 Mac 桌面通知，并将**纯数字验证码**自动写入 Mac 剪贴板（电脑网页直接 `⌘V` 粘贴）。
 - **手机原生语音录制 + Mac SenseVoice 离线自动转写**：
   - 手机底部输入栏支持点击 **`🎙️语音`** 直接录制 `.m4a` 语音消息，Mac `omsd` 收到音频附件后自动调用本地 `local-asr`（SenseVoiceSmall 离线模型）转写为文字并自动写入 Mac 剪贴板（可直接 `⌘V`）。
 - **Mac 实时收件箱与协同 Web 看板 (`/inbox`)**：内置深色主题本地 Web 控制台，支持图文流实时预览、手机全维遥测监控与远程快捷控制、一键在 Finder 定位文件、按标签/关键词过滤及反向推送消息。
@@ -180,7 +182,7 @@ one_more_step/
 
 | 核心构件 | 路径 / 获取方式 | 说明 |
 | :--- | :--- | :--- |
-| **Android 安装包 (APK)** | [GitHub Releases (`OneMoreStep-v1.3.5.apk`)](https://github.com/dqrcsc/one-more-step/releases/latest) 或 `bun run build:apk` | 原生 Kotlin + Jetpack Compose 客户端 |
+| **Android 安装包 (APK)** | [GitHub Releases (`OneMoreStep-v1.3.7.apk`)](https://github.com/dqrcsc/one-more-step/releases/latest) 或 `bun run build:apk` | 原生 Kotlin + Jetpack Compose 客户端 |
 | **macOS 蓝牙桥接器** | [`mac-host/bluetooth-bridge/main.swift`](./mac-host/bluetooth-bridge/main.swift) | 基于 Swift `CoreBluetooth` 的蓝牙近场通信助手（首次启动或 `bun run setup` 自动编译） |
 | **Mac 守护进程 (`omsd`)** | [`mac-host/src/daemon/main.ts`](./mac-host/src/daemon/main.ts) | 管理多通道会话、本地收件箱、离线语音转写、Web 控制台与多 Agent IPC |
 | **MCP Server (`oms mcp`)** | [`mac-host/src/mcp/server.ts`](./mac-host/src/mcp/server.ts) | 面向 AI Agent 暴露 13 个标准工具与 3 个动态资源 |

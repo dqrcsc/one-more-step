@@ -176,10 +176,28 @@ async function main() {
     case "prefs": {
       const autoCopy = parseBoolFlag(flags["auto-copy"]);
       const autoPreview = parseBoolFlag(flags["auto-preview"]);
+      const autoOtp = parseBoolFlag(flags["auto-otp"]);
       const res = await ipc.call("daemon.prefs", {
         autoCopyTextToClipboard: autoCopy,
         autoPreviewImageOnMac: autoPreview,
+        autoSyncOtpToMac: autoOtp,
       });
+      console.log(JSON.stringify(res, null, 2));
+      break;
+    }
+
+    case "otp": {
+      const res = await ipc.call("phone_inbox_latest", {
+        tag: "sms_otp",
+        limit: flags.limit ? Number(flags.limit) : 3,
+        onlyUnprocessed: Boolean(flags.unprocessed),
+        markAsProcessed: Boolean(flags.ack),
+      });
+      if (flags.copy && res?.items?.[0]?.otpCode && process.env.OMS_DISABLE_OSASCRIPT !== "1") {
+        try {
+          execFileSync("pbcopy", { input: String(res.items[0].otpCode) });
+        } catch {}
+      }
       console.log(JSON.stringify(res, null, 2));
       break;
     }
@@ -569,7 +587,8 @@ Commands:
                                                        Inspect rich phone telemetry or remotely control phone from Mac
   oms pair [--json]                                    Generate pairing URI, 6-digit PIN & wireless install URL (/install)
   oms web                                              Open Mac real-time Inbox & Stream Web Dashboard (/inbox)
-  oms prefs [--auto-copy true|false] [--auto-preview]  View or update Mac auto-clipboard & auto-image-preview preferences
+  oms otp [--limit N] [--copy] [--ack]                 Query latest synced verification codes (OTP) from phone
+  oms prefs [--auto-otp] [--auto-copy] [--auto-preview] View or update Mac auto-OTP, auto-clipboard & auto-image-preview preferences
   oms inbox [latest] [--tag <tag>] [--unprocessed]     Query items sent from phone (--ack to mark read, --q <keyword>)
   oms inbox show <id> | ack <id> | transcribe <id>     Inspect item, mark processed, or run SenseVoice offline ASR
   oms media [recent] [--type screenshot|camera]        List recent screenshots/photos/videos on phone (--since <min>)

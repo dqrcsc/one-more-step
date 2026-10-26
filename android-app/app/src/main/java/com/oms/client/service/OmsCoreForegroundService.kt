@@ -12,6 +12,7 @@ import androidx.core.app.NotificationCompat
 import com.oms.client.OmsApplication
 import com.oms.client.R
 import com.oms.client.capability.NotificationExecutor
+import com.oms.client.otp.SmsContentObserver
 import com.oms.client.share.ClipboardCatcherActivity
 import com.oms.client.share.ScreenshotPillController
 import com.oms.client.share.VoiceIdeaActivity
@@ -24,7 +25,8 @@ import kotlinx.coroutines.launch
 
 /**
  * Module 04: Persistent Foreground Keep-Alive Service for Xiaomi HyperOS / MIUI
- * Maintains multi-tier connection (LAN / Bluetooth / WAN) and watches MediaStore screenshots.
+ * Maintains multi-tier connection (LAN / Bluetooth / WAN), watches MediaStore screenshots,
+ * and monitors SMS inbox changes for real-time OTP sync.
  */
 class OmsCoreForegroundService : Service() {
     companion object {
@@ -33,6 +35,7 @@ class OmsCoreForegroundService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var screenshotWatcher: ScreenshotPillController? = null
+    private var smsObserver: SmsContentObserver? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -40,6 +43,9 @@ class OmsCoreForegroundService : Service() {
         safeStartForeground("正在连接 Mac...")
 
         screenshotWatcher = ScreenshotPillController(this).also {
+            it.startWatching()
+        }
+        smsObserver = SmsContentObserver(this).also {
             it.startWatching()
         }
 
@@ -134,6 +140,7 @@ class OmsCoreForegroundService : Service() {
     override fun onDestroy() {
         serviceScope.cancel()
         screenshotWatcher?.stopWatching()
+        smsObserver?.stopWatching()
         super.onDestroy()
     }
 

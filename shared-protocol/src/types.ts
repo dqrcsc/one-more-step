@@ -36,7 +36,7 @@ export enum OmsErrorCode {
 
 export type TransportTier = "LAN_WS" | "BT_RFCOMM" | "WAN_WEBRTC" | "DISCONNECTED";
 export type PresenceState = "AT_DESK" | "AWAY";
-export type IntentTag = "default_inbox" | "pkb_vault" | "voice_idea" | "ui_bug";
+export type IntentTag = "default_inbox" | "pkb_vault" | "voice_idea" | "ui_bug" | "sms_otp";
 export type NotificationLevel = "silent" | "normal" | "urgent";
 
 export interface JsonRpcRequest<TParams = unknown> {
@@ -150,9 +150,12 @@ export interface AuthAckResult {
 export interface PhonePermissionStatus {
   xiaomiBackgroundPopupAllowed: boolean; // OpCode 10021
   xiaomiLockScreenDisplayAllowed: boolean; // OpCode 10008
+  xiaomiNotificationSmsAllowed?: boolean; // OpCode 10018 (MIUI/HyperOS 读取通知类/验证码短信)
   batteryOptimizationIgnored: boolean;
   overlayAllowed: boolean;
   accessibilityEnabled: boolean;
+  notificationListenerEnabled?: boolean; // 通知使用权 (实时监听短信/App验证码通知)
+  smsReadGranted?: boolean; // RECEIVE_SMS & READ_SMS 权限
   calendarGranted: boolean;
   mediaReadGranted: boolean;
   recordAudioGranted?: boolean;
@@ -249,6 +252,8 @@ export interface InboxSubmitItemParams {
   textContent?: string;
   voiceTranscript?: string;
   sourceApp?: string;
+  otpCode?: string;
+  otpSender?: string;
   createdAtMs: number;
   attachments?: Array<{
     streamId: string;

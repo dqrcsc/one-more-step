@@ -72,6 +72,8 @@ import com.oms.client.R
 import com.oms.client.capability.NotificationExecutor
 import com.oms.client.capability.VoiceRecorderHelper
 import com.oms.client.data.StreamItemModel
+import com.oms.client.otp.OtpExtractor
+import com.oms.client.otp.OtpMatch
 import com.oms.client.service.OmsCoreForegroundService
 import com.oms.client.transport.OtaCheckResult
 import com.oms.client.xiaomi.XiaomiAdaptationHelper
@@ -120,7 +122,9 @@ class MainActivity : ComponentActivity() {
         val perms = mutableListOf(
             Manifest.permission.READ_CALENDAR,
             Manifest.permission.WRITE_CALENDAR,
-            Manifest.permission.RECORD_AUDIO
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.RECEIVE_SMS,
+            Manifest.permission.READ_SMS
         )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             perms.add(Manifest.permission.BLUETOOTH_SCAN)
@@ -762,7 +766,11 @@ fun OneMoreStepMainScreen() {
 
 @Composable
 fun XiaomiPermissionWizardCard(context: Context) {
+    val app = OmsApplication.instance
     var refreshTick by remember { mutableStateOf(0) }
+    var autoOtpEnabled by remember {
+        mutableStateOf(app?.repository?.isAutoSyncOtpEnabled() ?: true)
+    }
     val health = remember(refreshTick) { XiaomiAdaptationHelper.inspectAll(context) }
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -810,10 +818,69 @@ fun XiaomiPermissionWizardCard(context: Context) {
                 onClick = { XiaomiAdaptationHelper.openXiaomiPermissionEditor(context) }
             )
             XiaomiCheckRow(
-                label = "6. 小米应用「自启动」开关",
+                label = "6. 通知使用权 (锁屏实时同步短信/微信/飞书验证码至 Mac)",
+                ok = health.notificationListenerEnabled,
+                onClick = { XiaomiAdaptationHelper.openNotificationListenerSettings(context) }
+            )
+            XiaomiCheckRow(
+                label = "7. 短信与小米「通知类短信」(OpCode 10018 · 穿透锁屏脱敏)",
+                ok = health.smsReadGranted && health.notificationSmsAllowed,
+                onClick = { XiaomiAdaptationHelper.openXiaomiPermissionEditor(context) }
+            )
+            XiaomiCheckRow(
+                label = "8. 小米应用「自启动」开关",
                 ok = true,
                 onClick = { XiaomiAdaptationHelper.openXiaomiAutostartSettings(context) }
             )
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (autoOtpEnabled) "🔑 验证码实时同步 Mac：已开启" else "🔑 验证码实时同步 Mac：已暂停",
+                    color = if (autoOtpEnabled) Color(0xFF4ADE80) else Color(0xFF94A3B8),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f)
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(
+                        onClick = {
+                            val next = !autoOtpEnabled
+                            autoOtpEnabled = next
+                            app?.repository?.setAutoSyncOtpEnabled(next)
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                        modifier = Modifier.height(28.dp)
+                    ) {
+                        Text(if (autoOtpEnabled) "暂停同步" else "开启同步", color = Color.White, fontSize = 11.sp)
+                    }
+                    Button(
+                        onClick = {
+                            val demoCode = (100000..999999).random().toString()
+                            app?.transportClient?.submitOtpToMacOrQueue(
+                                OtpMatch(
+                                    code = demoCode,
+                                    sender = "青简测试",
+                                    fullText = "【青简测试】您的登录验证码为 $demoCode，5分钟内有效，切勿泄露。",
+                                    sourceApp = "com.oms.client"
+                                )
+                            )
+                            Toast.makeText(
+                                context,
+                                "🚀 已向 Mac 推送测试验证码 $demoCode (可直接 ⌘V)",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                        modifier = Modifier.height(28.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF16A34A))
+                    ) {
+                        Text("⚡ 测试验证码", fontSize = 11.sp)
+                    }
+                }
+            }
         }
     }
 }
@@ -1108,6 +1175,30 @@ fun StreamTimelineCard(item: StreamItemModel) {
                                 onClick = { NotificationExecutor.stopSpeaking() }
                             ) {
                                 Text("⏹停止", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                            }
+                        }
+                        val otpCode = remember(item.metadataJson, item.intentTag, item.textContent) {
+                            try {
+                                item.metadataJson?.let { JSONObject(it).optString("otpCode", "") }
+                                    ?.takeIf { it.isNotBlank() }
+                            } catch (_: Throwable) {
+                                null
+                            } ?: if (item.intentTag == "sms_otp") {
+                                OtpExtractor.extractOtp(item.textContent, item.title)?.code
+                            } else {
+                                null
+                            }
+                        }
+                        if (!otpCode.isNullOrBlank()) {
+                            TextButton(
+                                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                                onClick = {
+                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    cm.setPrimaryClip(ClipData.newPlainText("OMS_OTP", otpCode))
+                                    Toast.makeText(context, "🔑 已复制验证码: $otpCode", Toast.LENGTH_SHORT).show()
+                                }
+                            ) {
+                                Text("🔑复制验证码($otpCode)", color = Color(0xFF4ADE80), fontSize = 11.sp)
                             }
                         }
                         val copyable = item.textContent ?: item.voiceTranscript ?: item.macSavedPath

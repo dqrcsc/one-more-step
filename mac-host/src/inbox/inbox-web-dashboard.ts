@@ -186,6 +186,7 @@ export async function handleDashboardHttpRequest(
           const updated = daemon.updateHostPreferences({
             autoCopyTextToClipboard: body.autoCopyTextToClipboard,
             autoPreviewImageOnMac: body.autoPreviewImageOnMac,
+            autoSyncOtpToMac: body.autoSyncOtpToMac,
           });
           return Response.json({ ok: true, preferences: updated });
         }
@@ -631,6 +632,10 @@ function renderDashboardHtml(): string {
       <div class="status-line" id="statusLine">正在同步连接状态...</div>
     </div>
     <div class="toggles-box">
+      <label class="toggle-label" title="手机收到短信/应用验证码时，实时弹出 Mac 通知并将纯数字验证码写入 Mac 剪贴板">
+        <input type="checkbox" id="chkAutoOtp" onchange="savePrefs()"/>
+        🔑 验证码实时通知 & 复制
+      </label>
       <label class="toggle-label" title="手机发来文字或语音转写时，自动复制进 Mac 系统剪贴板，直接 Cmd+V 即可粘贴">
         <input type="checkbox" id="chkAutoCopy" onchange="savePrefs()"/>
         📋 收到文字自动进 Mac 剪贴板
@@ -697,6 +702,7 @@ function renderDashboardHtml(): string {
   <div class="filter-bar">
     <div class="tabs" id="tagTabs">
       <button class="tab active" data-tag="all" onclick="setTag('all')">全部</button>
+      <button class="tab" data-tag="sms_otp" onclick="setTag('sms_otp')">🔑 验证码</button>
       <button class="tab" data-tag="default_inbox" onclick="setTag('default_inbox')">📥 默认Inbox</button>
       <button class="tab" data-tag="pkb_vault" onclick="setTag('pkb_vault')">📚 存知识库</button>
       <button class="tab" data-tag="voice_idea" onclick="setTag('voice_idea')">💡 我有想法</button>
@@ -781,10 +787,12 @@ async function callAction(payload) {
 }
 
 async function savePrefs() {
+  const autoSyncOtpToMac = document.getElementById('chkAutoOtp').checked;
   const autoCopyTextToClipboard = document.getElementById('chkAutoCopy').checked;
   const autoPreviewImageOnMac = document.getElementById('chkAutoPreview').checked;
   await callAction({
     action: 'update_preferences',
+    autoSyncOtpToMac,
     autoCopyTextToClipboard,
     autoPreviewImageOnMac
   });
@@ -1006,12 +1014,14 @@ function renderDevicePanel(st) {
   ].map(t => '<div class="stat-tile"><div class="stat-label">' + t.label + '</div><div class="stat-value">' + t.value + '</div></div>').join('');
 
   const p = ps.permissions || {};
+  const otpReady = Boolean(p.notificationListenerEnabled || (p.smsReadGranted && p.xiaomiNotificationSmsAllowed !== false));
   const perms = [
     ['后台弹出', p.xiaomiBackgroundPopupAllowed],
     ['锁屏显示', p.xiaomiLockScreenDisplayAllowed],
     ['电池无限制', p.batteryOptimizationIgnored],
     ['悬浮窗', p.overlayAllowed],
     ['无障碍GUI', p.accessibilityEnabled],
+    ['验证码同步', otpReady],
     ['日历读写', p.calendarGranted],
     ['相册读取', p.mediaReadGranted],
     ['麦克风录音', p.recordAudioGranted !== false]
@@ -1057,25 +1067,28 @@ async function fetchInbox() {
     renderDevicePanel(st);
 
     if (data.preferences && !window.__prefsLoaded) {
+      document.getElementById('chkAutoOtp').checked = data.preferences.autoSyncOtpToMac !== false;
       document.getElementById('chkAutoCopy').checked = data.preferences.autoCopyTextToClipboard !== false;
       document.getElementById('chkAutoPreview').checked = data.preferences.autoPreviewImageOnMac !== false;
       window.__prefsLoaded = true;
     }
 
     const items = data.items || [];
-    const sig = JSON.stringify(items.map(i => i.itemId + ':' + i.processed + ':' + (i.voiceTranscript || ''))) + '|' + items.length;
+    const sig = JSON.stringify(items.map(i => i.itemId + ':' + i.processed + ':' + (i.voiceTranscript || '') + ':' + (i.otpCode || ''))) + '|' + items.length;
     if (sig === lastRenderSignature) return;
     lastRenderSignature = sig;
 
     const container = document.getElementById('itemsContainer');
     if (items.length === 0) {
-      container.innerHTML = '<div class="empty-state">📭 当前筛选条件下暂无手机投递记录<br/><span style="font-size:12px;">在小米手机上发送消息、语音、截屏或分享文件后，这里会自动实时显示</span></div>';
+      container.innerHTML = '<div class="empty-state">📭 当前筛选条件下暂无手机投递记录<br/><span style="font-size:12px;">在小米手机上发送消息、语音、截屏、分享文件或收到验证码后，这里会自动实时显示</span></div>';
       return;
     }
 
     container.innerHTML = items.map(item => {
       const timeStr = new Date(item.createdAtMs).toLocaleString('zh-CN', { hour12: false });
       const contentToCopy = item.textContent || item.voiceTranscript || item.title || '';
+      const otpCode = item.otpCode || '';
+      const otpSender = item.otpSender || '';
       const firstFilePath = (item.files && item.files[0]) ? item.files[0].absPath : '';
       const aiPrompt = firstFilePath
         ? ('请查看我从手机投递的文件 "' + firstFilePath + '"' + (contentToCopy ? ('，附言：' + contentToCopy) : ''))
@@ -1099,6 +1112,16 @@ async function fetchInbox() {
         '</div>';
       }).join('');
 
+      const otpBannerHtml = otpCode
+        ? ('<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;background:rgba(22,163,74,0.14);border:1px solid rgba(74,222,128,0.45);border-radius:10px;padding:10px 14px;margin-bottom:10px;">' +
+            '<div style="display:flex;align-items:center;gap:10px;">' +
+              '<span style="font-size:18px;font-weight:800;color:#4ADE80;letter-spacing:1.5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">🔑 ' + escapeHtml(otpCode) + '</span>' +
+              (otpSender ? ('<span class="badge" style="color:#FBBF24;border-color:rgba(251,191,36,0.4);">【' + escapeHtml(otpSender) + '】</span>') : '') +
+            '</div>' +
+            '<button class="btn btn-green" onclick="copyText(' + JSON.stringify(otpCode).replace(/"/g, '&quot;') + ', \\'验证码 ' + escapeHtml(otpCode) + '\\')">🔑 复制纯验证码 (' + escapeHtml(otpCode) + ')</button>' +
+          '</div>')
+        : '';
+
       return '<div class="item-card ' + (item.processed ? '' : 'unprocessed') + '">' +
         '<div class="item-header">' +
           '<div class="item-meta">' +
@@ -1107,13 +1130,15 @@ async function fetchInbox() {
             '<span>' + (item.processed ? '✅ 已处理' : '🔵 未处理') + '</span>' +
           '</div>' +
           '<div class="action-row" style="margin:0;">' +
-            (contentToCopy ? '<button class="btn btn-secondary" onclick="copyText(' + JSON.stringify(contentToCopy).replace(/"/g, '&quot;') + ', \\'正文内容\\')">📋 复制内容</button>' : '') +
+            (otpCode ? '<button class="btn btn-green" onclick="copyText(' + JSON.stringify(otpCode).replace(/"/g, '&quot;') + ', \\'验证码 ' + escapeHtml(otpCode) + '\\')">🔑 复制验证码</button>' : '') +
+            (contentToCopy ? '<button class="btn btn-secondary" onclick="copyText(' + JSON.stringify(contentToCopy).replace(/"/g, '&quot;') + ', \\'正文内容\\')">📋 复制全文</button>' : '') +
             '<button class="btn btn-secondary" onclick="copyText(' + JSON.stringify(aiPrompt).replace(/"/g, '&quot;') + ', \\'AI 提示词\\')">🤖 复制 AI 提示词</button>' +
             '<button class="btn btn-secondary" onclick="markItem(\\'' + item.itemId + '\\', ' + (!item.processed) + ')">' + (item.processed ? '设为未读' : '✓ 标为已处理') + '</button>' +
             '<button class="btn btn-danger" onclick="deleteItem(\\'' + item.itemId + '\\')">🗑️</button>' +
           '</div>' +
         '</div>' +
         (item.title ? '<div class="item-title">' + escapeHtml(item.title) + '</div>' : '') +
+        otpBannerHtml +
         (item.textContent ? '<div class="item-text">' + escapeHtml(item.textContent) + '</div>' : '') +
         (item.voiceTranscript ? '<div class="item-voice">🎙️ 语音附言: ' + escapeHtml(item.voiceTranscript) + '</div>' : '') +
         (filesHtml ? '<div class="attachments-grid">' + filesHtml + '</div>' : '') +
