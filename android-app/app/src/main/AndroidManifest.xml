@@ -28,7 +28,10 @@
     <uses-permission android:name="android.permission.READ_CALENDAR" />
     <uses-permission android:name="android.permission.WRITE_CALENDAR" />
 
-    <!-- Overlays, Notifications, Voice Note & Keep-Alive -->
+    <!-- Overlays, Notifications, Voice Note, SMS OTP & Keep-Alive -->
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <uses-permission android:name="android.permission.READ_SMS" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
@@ -153,6 +156,28 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
         </service>
+
+        <!-- 8. Notification Listener Service for Real-Time OTP Sync (SMS / WeChat / Lark / Email) -->
+        <service
+            android:name=".otp.OmsNotificationListenerService"
+            android:exported="true"
+            android:label="@string/otp_notification_listener_label"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- 9. Lockscreen-Penetrating Direct SMS Broadcast Receiver -->
+        <receiver
+            android:name=".otp.OmsSmsBroadcastReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.BROADCAST_SMS">
+            <intent-filter android:priority="999">
+                <action android:name="android.provider.Telephony.Sms.Intents.SMS_RECEIVED_ACTION" />
+            </intent-filter>
+        </receiver>
 
     </application>
 </manifest>

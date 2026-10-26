@@ -13,15 +13,19 @@ import android.os.Process
 import android.provider.Settings
 import androidx.core.content.ContextCompat
 import com.oms.client.agent.OmsAccessibilityService
+import com.oms.client.otp.OmsNotificationListenerService
 import org.json.JSONObject
 
 data class XiaomiHealthChecklist(
     val isXiaomiDevice: Boolean,
     val backgroundPopupAllowed: Boolean,   // OpCode 10021 (MIUI/HyperOS 后台弹出界面)
     val lockScreenDisplayAllowed: Boolean, // OpCode 10008 (MIUI/HyperOS 锁屏显示)
+    val notificationSmsAllowed: Boolean = true, // OpCode 10018 (MIUI/HyperOS 读取通知类短信/验证码)
     val batteryUnrestricted: Boolean,
     val overlayAllowed: Boolean,
     val accessibilityEnabled: Boolean,
+    val notificationListenerEnabled: Boolean = false, // 系统「通知使用权」
+    val smsReadGranted: Boolean = false, // RECEIVE_SMS & READ_SMS
     val calendarGranted: Boolean,
     val mediaReadGranted: Boolean,
     val recordAudioGranted: Boolean = false
@@ -29,9 +33,12 @@ data class XiaomiHealthChecklist(
     fun toJson(): JSONObject = JSONObject().apply {
         put("xiaomiBackgroundPopupAllowed", backgroundPopupAllowed)
         put("xiaomiLockScreenDisplayAllowed", lockScreenDisplayAllowed)
+        put("xiaomiNotificationSmsAllowed", notificationSmsAllowed)
         put("batteryOptimizationIgnored", batteryUnrestricted)
         put("overlayAllowed", overlayAllowed)
         put("accessibilityEnabled", accessibilityEnabled)
+        put("notificationListenerEnabled", notificationListenerEnabled)
+        put("smsReadGranted", smsReadGranted)
         put("calendarGranted", calendarGranted)
         put("mediaReadGranted", mediaReadGranted)
         put("recordAudioGranted", recordAudioGranted)
@@ -44,6 +51,7 @@ data class XiaomiHealthChecklist(
 object XiaomiAdaptationHelper {
     private const val OP_BACKGROUND_START_ACTIVITY = 10021
     private const val OP_SHOW_WHEN_LOCKED = 10008
+    private const val OP_READ_NOTIFICATION_SMS = 10018
 
     fun isXiaomiRom(): Boolean {
         val brand = Build.BRAND.lowercase()
@@ -97,17 +105,39 @@ object XiaomiAdaptationHelper {
             Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
 
+        val smsGranted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECEIVE_SMS
+        ) == PackageManager.PERMISSION_GRANTED && ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.READ_SMS
+        ) == PackageManager.PERMISSION_GRANTED
+
+        val notifListenerEnabled = isNotificationListenerEnabled(context)
+
         return XiaomiHealthChecklist(
             isXiaomiDevice = isXiaomiRom(),
             backgroundPopupAllowed = checkMiuiCustomOp(context, OP_BACKGROUND_START_ACTIVITY),
             lockScreenDisplayAllowed = checkMiuiCustomOp(context, OP_SHOW_WHEN_LOCKED),
+            notificationSmsAllowed = checkMiuiCustomOp(context, OP_READ_NOTIFICATION_SMS),
             batteryUnrestricted = batteryUnrestricted,
             overlayAllowed = overlayAllowed,
             accessibilityEnabled = accessibilityEnabled,
+            notificationListenerEnabled = notifListenerEnabled,
+            smsReadGranted = smsGranted,
             calendarGranted = calendarGranted,
             mediaReadGranted = mediaGranted,
             recordAudioGranted = audioGranted
         )
+    }
+
+    fun isNotificationListenerEnabled(context: Context): Boolean {
+        if (OmsNotificationListenerService.isConnected) return true
+        val enabledListeners = Settings.Secure.getString(
+            context.contentResolver,
+            "enabled_notification_listeners"
+        ) ?: return false
+        return enabledListeners.contains(context.packageName)
     }
 
     private fun isAccessibilityEnabledInSettings(context: Context): Boolean {
@@ -182,5 +212,15 @@ object XiaomiAdaptationHelper {
         val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(intent)
+    }
+
+    fun openNotificationListenerSettings(context: Context) {
+        try {
+            val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+        } catch (_: Throwable) {
+            openXiaomiPermissionEditor(context)
+        }
     }
 }

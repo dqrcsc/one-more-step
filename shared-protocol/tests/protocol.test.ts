@@ -8,6 +8,7 @@ import {
   encodeJsonRpcFrame,
   encodeStreamChunkFrame,
   encodeStreamStartFrame,
+  extractOtpFromText,
   FrameStreamDecoder,
   FrameType,
   generateEd25519Identity,
@@ -133,5 +134,44 @@ describe("Module 01: Shared Protocol & Pairing", () => {
     expect(second[2]).toBe(FrameType.STREAM_START);
     expect(third[2]).toBe(FrameType.STREAM_CHUNK);
     expect(fourth[2]).toBe(FrameType.STREAM_CHUNK);
+  });
+
+  test("OTP extraction accurately extracts codes and filters out interfering numbers", () => {
+    const aliyun = extractOtpFromText(
+      "【阿里云】验证码 839201，您正在进行登录操作，切勿将验证码泄露于他人，5分钟内有效。"
+    );
+    expect(aliyun?.code).toBe("839201");
+    expect(aliyun?.sender).toBe("阿里云");
+
+    const bank = extractOtpFromText(
+      "【招商银行】您尾号1234的账户正在发生人民币5000.00元消费，动态码为 654321，请勿泄露。"
+    );
+    expect(bank?.code).toBe("654321");
+    expect(bank?.sender).toBe("招商银行");
+
+    const railway = extractOtpFromText(
+      "【12306】您的登录校验码是 492018，请于3分钟内输入。"
+    );
+    expect(railway?.code).toBe("492018");
+    expect(railway?.sender).toBe("12306");
+
+    const github = extractOtpFromText(
+      "[GitHub] Your verification code is 719304. Do not share it."
+    );
+    expect(github?.code).toBe("719304");
+    expect(github?.sender).toBe("GitHub");
+
+    const google = extractOtpFromText(
+      "882910 is your Google verification code.",
+      "Google"
+    );
+    expect(google?.code).toBe("882910");
+    expect(google?.sender).toBe("Google");
+
+    // Non-OTP promotional SMS should return null
+    const promo = extractOtpFromText(
+      "【京东】双11大促开启，尾号8848用户专享满300减50优惠券，退订回T"
+    );
+    expect(promo).toBeNull();
   });
 });

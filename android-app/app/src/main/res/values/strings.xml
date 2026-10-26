@@ -4,4 +4,5 @@
     <string name="tile_label">青简·发Mac</string>
     <string name="accessibility_service_label">青简·咫尺 (OneMoreStep) 屏幕协同</string>
     <string name="accessibility_service_description">供电脑端本地 AI (Codex / Antigravity / OpenCode) 在授权下提取紧凑控件语义树与辅助操作手机界面，顶部悬浮胶囊支持随时一键急停。</string>
+    <string name="otp_notification_listener_label">青简·咫尺 · 手机验证码实时同步</string>
 </resources>

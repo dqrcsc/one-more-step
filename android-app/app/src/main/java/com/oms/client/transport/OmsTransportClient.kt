@@ -50,6 +50,8 @@ import com.oms.client.capability.ScopedStorageExecutor
 import com.oms.client.data.PairedMacConfig
 import com.oms.client.data.StreamItemModel
 import com.oms.client.data.StreamRepository
+import com.oms.client.otp.OtpExtractor
+import com.oms.client.otp.OtpMatch
 import com.oms.client.share.ClipboardCatcherActivity
 import com.oms.client.xiaomi.XiaomiAdaptationHelper
 import kotlinx.coroutines.CompletableDeferred
@@ -1337,11 +1339,14 @@ class OmsTransportClient(
         extraAudioUri: Uri? = null
     ): String {
         val itemId = OmsFrameProtocol.generateUuidV7()
-        val metaJson = if (extraAudioUri != null) {
-            JSONObject().put("extraAudioUri", extraAudioUri.toString()).toString()
-        } else {
-            null
+        val metaObj = JSONObject()
+        if (extraAudioUri != null) {
+            metaObj.put("extraAudioUri", extraAudioUri.toString())
         }
+        if (!sourceApp.isNullOrBlank()) {
+            metaObj.put("sourceApp", sourceApp)
+        }
+        val metaJson = if (metaObj.length() > 0) metaObj.toString() else null
         val item = StreamItemModel(
             itemId = itemId,
             direction = "PHONE_TO_MAC",
@@ -1355,6 +1360,36 @@ class OmsTransportClient(
             syncStatus = "QUEUED",
             metadataJson = metaJson,
             createdAtMs = System.currentTimeMillis()
+        )
+        repo.upsertStreamItem(item)
+        flushOutboxQueue()
+        return itemId
+    }
+
+    /**
+     * Real-time dispatch of extracted SMS / App verification code (OTP) to Mac Notification & Clipboard.
+     */
+    fun submitOtpToMacOrQueue(match: OtpMatch): String {
+        val itemId = OmsFrameProtocol.generateUuidV7()
+        val senderPrefix = match.sender?.let { "【$it】" } ?: ""
+        val metaJson = JSONObject().apply {
+            put("otpCode", match.code)
+            if (!match.sender.isNullOrBlank()) put("otpSender", match.sender)
+            if (!match.sourceApp.isNullOrBlank()) put("sourceApp", match.sourceApp)
+        }.toString()
+        val item = StreamItemModel(
+            itemId = itemId,
+            direction = "PHONE_TO_MAC",
+            itemType = "OTP",
+            intentTag = "sms_otp",
+            title = "🔑 ${senderPrefix}验证码: ${match.code}",
+            textContent = match.fullText,
+            voiceTranscript = null,
+            localFileUri = null,
+            macSavedPath = null,
+            syncStatus = "QUEUED",
+            metadataJson = metaJson,
+            createdAtMs = match.capturedAtMs
         )
         repo.upsertStreamItem(item)
         flushOutboxQueue()
@@ -1426,11 +1461,12 @@ class OmsTransportClient(
                             }
                         }
 
-                        val extraAudioStr = try {
-                            item.metadataJson?.let { JSONObject(it).optString("extraAudioUri", "") }
+                        val metaObj = try {
+                            item.metadataJson?.takeIf { it.isNotBlank() }?.let { JSONObject(it) }
                         } catch (_: Throwable) {
                             null
                         }
+                        val extraAudioStr = metaObj?.optString("extraAudioUri", "")
                         if (!extraAudioStr.isNullOrBlank()) {
                             val loadedAudio = readUriBytesAndMime(extraAudioStr, "${suffix}_audio", "voice")
                             if (loadedAudio != null) {
@@ -1449,6 +1485,10 @@ class OmsTransportClient(
                             }
                         }
 
+                        val otpCode = metaObj?.optString("otpCode", "")?.takeIf { it.isNotBlank() }
+                        val otpSender = metaObj?.optString("otpSender", "")?.takeIf { it.isNotBlank() }
+                        val sourceApp = metaObj?.optString("sourceApp", "")?.takeIf { it.isNotBlank() }
+
                         val req = JSONObject().apply {
                             put("jsonrpc", "2.0")
                             put("id", "inbox_${item.itemId}")
@@ -1459,6 +1499,9 @@ class OmsTransportClient(
                                 if (item.title != null) put("title", item.title)
                                 if (item.textContent != null) put("textContent", item.textContent)
                                 if (item.voiceTranscript != null) put("voiceTranscript", item.voiceTranscript)
+                                if (otpCode != null) put("otpCode", otpCode)
+                                if (otpSender != null) put("otpSender", otpSender)
+                                if (sourceApp != null) put("sourceApp", sourceApp)
                                 put("createdAtMs", item.createdAtMs)
                                 if (attachmentsArr.length() > 0) put("attachments", attachmentsArr)
                             })
@@ -2002,8 +2045,18 @@ class OmsTransportClient(
                             }
                             text = withTimeoutOrNull(2500L) { focusDef.await() } ?: ""
                         }
+                        val includeOtp = params.optBoolean("includeRecentOtp", false)
+                        val latestOtp = OtpExtractor.latestCapturedOtp
                         JSONObject().apply {
                             put("text", text)
+                            if (includeOtp && latestOtp != null) {
+                                put("recentOtp", JSONObject().apply {
+                                    put("code", latestOtp.code)
+                                    if (!latestOtp.sender.isNullOrBlank()) put("sender", latestOtp.sender)
+                                    put("fullText", latestOtp.fullText)
+                                    put("capturedAtMs", latestOtp.capturedAtMs)
+                                })
+                            }
                             put("updatedAtMs", System.currentTimeMillis())
                         }
                     }

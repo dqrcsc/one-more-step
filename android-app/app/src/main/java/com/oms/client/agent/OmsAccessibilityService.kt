@@ -2,6 +2,7 @@ package com.oms.client.agent
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.app.Notification
 import android.content.Intent
 import android.graphics.Path
 import android.graphics.Rect
@@ -11,6 +12,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import com.oms.client.OmsApplication
+import com.oms.client.otp.OtpExtractor
 import kotlinx.coroutines.delay
 import org.json.JSONArray
 import org.json.JSONObject
@@ -68,6 +70,28 @@ class OmsAccessibilityService : AccessibilityService() {
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             event.packageName?.toString()?.let { currentPackageName = it }
             event.className?.toString()?.let { currentActivityName = it }
+        } else if (event.eventType == AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) {
+            val pkg = event.packageName?.toString() ?: return
+            if (pkg == packageName) return
+            try {
+                val notif = event.parcelableData as? Notification
+                if (notif != null) {
+                    val extras = notif.extras
+                    val title = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()
+                    val bigText = extras?.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()
+                    val text = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString()
+                    val body = bigText ?: text ?: event.text.joinToString(" ")
+                    if (body.isNotBlank()) {
+                        OtpExtractor.onCandidateTextReceived(body, title, pkg)
+                    }
+                } else {
+                    val eventTxt = event.text.joinToString(" ").trim()
+                    if (eventTxt.isNotEmpty()) {
+                        OtpExtractor.onCandidateTextReceived(eventTxt, null, pkg)
+                    }
+                }
+            } catch (_: Throwable) {
+            }
         }
     }
 

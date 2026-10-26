@@ -36,8 +36,12 @@ description: 青简·咫尺 (OneMoreStep / oms) —— macOS 本地 AI Agent 与
 # 查看最近 N 条手机投递记录（默认 5 条）
 oms inbox --limit 5
 
-# 按意图标签过滤：all | default_inbox | pkb_vault | voice_idea | ui_bug
+# 按意图标签过滤：all | sms_otp | default_inbox | pkb_vault | voice_idea | ui_bug
 oms inbox --tag ui_bug --unprocessed
+
+# 查看手机实时同步过来的最新验证码（加 --copy 自动将纯数字验证码写入 Mac 剪贴板）
+oms otp
+oms otp --copy
 
 # 按关键词搜索投递标题、正文、语音附言或文件名
 oms inbox --q "白板"
@@ -105,10 +109,16 @@ EOF
 
 ---
 
-## 4. 📋 双向剪贴板与验证码同步 (`oms clip`)
+## 4. 📋 双向剪贴板与手机验证码实时同步 (`oms otp` & `oms clip`)
+
+手机收到短信或微信/飞书/邮箱验证码时（即使手机锁屏息屏），会自动提取 4~8 位纯验证码推送至 Mac 桌面通知并自动写入 Mac 剪贴板（可直接 `⌘V` 粘贴）。
 
 ```bash
-# 读取小米手机当前剪贴板内容（加 --otp 可同时提取最近 5 分钟白名单验证码）
+# 查询最近同步到 Mac 的手机验证码记录（含 otpCode、otpSender 与完整短信原文）
+oms otp
+oms otp --copy
+
+# 读取小米手机当前剪贴板内容（加 --otp 可同时附带最近捕获的验证码）
 oms clip get
 oms clip get --otp
 

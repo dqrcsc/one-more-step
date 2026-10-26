@@ -28,6 +28,7 @@ export interface OmsHostConfig {
   enableBluetoothBridge: boolean;
   autoCopyTextToClipboard?: boolean;
   autoPreviewImageOnMac?: boolean;
+  autoSyncOtpToMac?: boolean;
   dingtalk: DingTalkConfig;
 }
 
@@ -98,6 +99,7 @@ export class OmsDaemon {
         return {
           autoCopyTextToClipboard: true,
           autoPreviewImageOnMac: true,
+          autoSyncOtpToMac: true,
           ...parsed,
         };
       } catch {
@@ -109,6 +111,7 @@ export class OmsDaemon {
       enableBluetoothBridge: true,
       autoCopyTextToClipboard: true,
       autoPreviewImageOnMac: true,
+      autoSyncOtpToMac: true,
       dingtalk: { enabled: false },
     };
     fs.writeFileSync(this.configPath, JSON.stringify(defaultCfg, null, 2), "utf8");
@@ -118,25 +121,32 @@ export class OmsDaemon {
   public getHostPreferences(): {
     autoCopyTextToClipboard: boolean;
     autoPreviewImageOnMac: boolean;
+    autoSyncOtpToMac: boolean;
   } {
     return {
       autoCopyTextToClipboard: this.config.autoCopyTextToClipboard !== false,
       autoPreviewImageOnMac: this.config.autoPreviewImageOnMac !== false,
+      autoSyncOtpToMac: this.config.autoSyncOtpToMac !== false,
     };
   }
 
   public updateHostPreferences(prefs: {
     autoCopyTextToClipboard?: boolean;
     autoPreviewImageOnMac?: boolean;
+    autoSyncOtpToMac?: boolean;
   }): {
     autoCopyTextToClipboard: boolean;
     autoPreviewImageOnMac: boolean;
+    autoSyncOtpToMac: boolean;
   } {
     if (typeof prefs.autoCopyTextToClipboard === "boolean") {
       this.config.autoCopyTextToClipboard = prefs.autoCopyTextToClipboard;
     }
     if (typeof prefs.autoPreviewImageOnMac === "boolean") {
       this.config.autoPreviewImageOnMac = prefs.autoPreviewImageOnMac;
+    }
+    if (typeof prefs.autoSyncOtpToMac === "boolean") {
+      this.config.autoSyncOtpToMac = prefs.autoSyncOtpToMac;
     }
     fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), "utf8");
     return this.getHostPreferences();
@@ -230,27 +240,51 @@ export class OmsDaemon {
             );
 
             let actionHint = "";
-            if (textBody && this.config.autoCopyTextToClipboard !== false) {
-              this.copyTextToMacClipboard(textBody);
-              actionHint = " · 已复制可 ⌘V";
-            }
-            if (imageFile && this.config.autoPreviewImageOnMac !== false) {
-              this.openFileOnMac(imageFile.absPath, false);
-              actionHint = actionHint ? `${actionHint} & 已打开预览` : " · 已打开图片预览";
-            }
-            if (audioFile && !stored.voiceTranscript) {
-              actionHint = actionHint ? `${actionHint} · 正在离线转写语音` : " · 正在离线转写语音";
-              void this.transcribeInboxItem(stored.itemId).catch(() => {});
-            }
+            if (stored.intentTag === "sms_otp" || stored.otpCode) {
+              const otpCode = stored.otpCode || textBody.trim();
+              const isFreshOtp =
+                Math.abs(Date.now() - (stored.createdAtMs || Date.now())) < 5 * 60 * 1000;
+              if (this.config.autoSyncOtpToMac !== false) {
+                let copiedOtp = false;
+                if (isFreshOtp && otpCode && this.config.autoCopyTextToClipboard !== false) {
+                  this.copyTextToMacClipboard(otpCode);
+                  copiedOtp = true;
+                }
+                const senderBadge = stored.otpSender ? `【${stored.otpSender}】` : "手机";
+                const subtitle = copiedOtp
+                  ? `已复制纯验证码 ${otpCode} · 直接 ⌘V 粘贴`
+                  : `来自小米手机验证码同步`;
+                this.showMacDesktopNotification(
+                  `🔑 ${senderBadge}验证码: ${otpCode}`,
+                  textBody || stored.title || `验证码: ${otpCode}`,
+                  subtitle,
+                  "Glass"
+                );
+              }
+            } else {
+              if (textBody && this.config.autoCopyTextToClipboard !== false) {
+                this.copyTextToMacClipboard(textBody);
+                actionHint = " · 已复制可 ⌘V";
+              }
+              if (imageFile && this.config.autoPreviewImageOnMac !== false) {
+                this.openFileOnMac(imageFile.absPath, false);
+                actionHint = actionHint ? `${actionHint} & 已打开预览` : " · 已打开图片预览";
+              }
+              if (audioFile && !stored.voiceTranscript) {
+                actionHint = actionHint ? `${actionHint} · 正在离线转写语音` : " · 正在离线转写语音";
+                void this.transcribeInboxItem(stored.itemId).catch(() => {});
+              }
 
-            this.showMacDesktopNotification(
-              `📱 收到小米手机投递 (#${stored.intentTag})${actionHint}`,
-              textBody || stored.title || `新文件 (${stored.files[0]?.fileName || "附件"}) 已存入 Inbox`
-            );
+              this.showMacDesktopNotification(
+                `📱 收到小米手机投递 (#${stored.intentTag})${actionHint}`,
+                textBody || stored.title || `新文件 (${stored.files[0]?.fileName || "附件"}) 已存入 Inbox`
+              );
+            }
             reply({
               result: {
                 ack: true,
                 savedId: stored.itemId,
+                otpCode: stored.otpCode,
                 macPath: stored.files[0]?.absPath ?? this.inbox.inboxRootDir,
               },
             });
@@ -284,14 +318,29 @@ export class OmsDaemon {
     );
   }
 
-  private showMacDesktopNotification(title: string, message: string): void {
+  private showMacDesktopNotification(
+    title: string,
+    message: string,
+    subtitle?: string,
+    soundName?: string
+  ): void {
     if (process.env.OMS_DISABLE_OSASCRIPT === "1") return;
-    const safeTitle = title.replace(/"/g, '\\"');
-    const safeMsg = message.replace(/"/g, '\\"').slice(0, 160);
-    execFile("osascript", [
-      "-e",
-      `display notification "${safeMsg}" with title "${safeTitle}"`,
-    ]);
+    const safeTitle = title.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const safeMsg = message.replace(/\\/g, "\\\\").replace(/"/g, '\\"').slice(0, 180);
+    const safeSub = subtitle
+      ? subtitle.replace(/\\/g, "\\\\").replace(/"/g, '\\"').slice(0, 100)
+      : "";
+    let script = `display notification "${safeMsg}" with title "${safeTitle}"`;
+    if (safeSub) {
+      script += ` subtitle "${safeSub}"`;
+    }
+    if (soundName) {
+      const safeSound = soundName.replace(/[^A-Za-z0-9_-]/g, "");
+      if (safeSound) {
+        script += ` sound name "${safeSound}"`;
+      }
+    }
+    execFile("osascript", ["-e", script]);
   }
 
   public async transcribeAudioFileWithLocalAsr(audioAbsPath: string): Promise<string | null> {
@@ -577,11 +626,13 @@ export class OmsDaemon {
       case "daemon.prefs": {
         if (
           typeof params.autoCopyTextToClipboard === "boolean" ||
-          typeof params.autoPreviewImageOnMac === "boolean"
+          typeof params.autoPreviewImageOnMac === "boolean" ||
+          typeof params.autoSyncOtpToMac === "boolean"
         ) {
           return this.updateHostPreferences({
             autoCopyTextToClipboard: params.autoCopyTextToClipboard,
             autoPreviewImageOnMac: params.autoPreviewImageOnMac,
+            autoSyncOtpToMac: params.autoSyncOtpToMac,
           });
         }
         return this.getHostPreferences();
@@ -689,9 +740,24 @@ export class OmsDaemon {
             showToast: true,
           });
         } else {
-          return await this.session.callPhone("clipboard.get", {
+          const clipRes = await this.session.callPhone<Record<string, any>>("clipboard.get", {
             includeRecentOtp: Boolean(params.includeRecentOtp),
           });
+          if (params.includeRecentOtp && !clipRes?.recentOtp) {
+            const latestOtp = this.inbox.queryLatest({ tag: "sms_otp", limit: 1 })[0];
+            if (latestOtp && latestOtp.otpCode) {
+              return {
+                ...clipRes,
+                recentOtp: {
+                  code: latestOtp.otpCode,
+                  sender: latestOtp.otpSender,
+                  fullText: latestOtp.textContent,
+                  createdAtMs: latestOtp.createdAtMs,
+                },
+              };
+            }
+          }
+          return clipRes;
         }
       }
 

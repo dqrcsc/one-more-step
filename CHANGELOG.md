@@ -2,6 +2,25 @@
 
 All notable changes to **青简·咫尺 (OneMoreStep)** are documented in this file.
 
+## [1.3.7] - 2026-10-26
+
+### Added
+- **手机验证码（短信 / 微信 / 飞书 / 邮箱）锁屏实时同步 Mac 桌面通知与剪贴板 (`#sms_otp`)**：
+  - **Android 四通道穿透捕获引擎 (`com.oms.client.otp`)**：融合 `OmsNotificationListenerService`（全渠道通知栏监听，支持 `MessagingStyle`）、`OmsSmsBroadcastReceiver`（直接解析底层 `SMS_RECEIVED` PDU 穿透锁屏脱敏）、`SmsContentObserver`（监听 `content://sms` 写入）与 `OmsAccessibilityService`（无障碍通知事件兜底），内置 25 秒幂等去重；
+  - **高精度抗干扰验证码提取 (`OtpExtractor` & `extractOtpFromText`)**：内置语义关键词门控与干扰数字掩码（自动过滤尾号、账号、金额、时间期限、手机号与品牌数字名），精准提取 4~8 位验证码与短信签名（如 `【阿里云】`、`【招商银行】`）；
+  - **Mac 剪贴板与通知分离体验**：收到验证码时，Mac 剪贴板**仅写入提取出的纯验证码数字**（网页输入框直接 `⌘V` 粘贴），Mac 桌面通知高亮展示 `🔑 【签名】验证码: 839201` 与完整短信原文；
+  - **小米专属权限自检与一键测试**：在 `XiaomiAdaptationHelper` 与手机端「小米权限」向导中新增「通知使用权」与「短信及小米通知类短信 (`OpCode 10018`)」自检跳转，并提供 `[⚡ 测试验证码]` 一键联调按钮；
+  - **CLI 与 Web 看板升级**：新增 `oms otp [--copy]` 命令，`/inbox` 看板新增 `🔑 验证码` 筛选页与一键复制纯验证码按钮。
+
+---
+
+## [1.3.6] - 2026-10-26
+
+### Fixed
+- **无缝版本迁移与重连优化**：修复 `v1.3.4 -> v1.3.6` 升级后的鉴权密钥持久化（`savePairedMac` 保留已有 `pairSecretHex` 与公钥），移除后台高频 508-IP ARP 子网扫描风暴，仅在用户手动触发重连或首次绑定时执行子网扫描。
+
+---
+
 ## [1.3.5] - 2026-10-26
 
 ### Security (一机一码与局域网严格 1 对 1 安全加固)
