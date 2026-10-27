@@ -283,7 +283,12 @@ class OmsTransportClient(
                 val buf = ByteArray(2048)
                 while (true) {
                     val pkt = DatagramPacket(buf, buf.size)
-                    sock.receive(pkt)
+                    try {
+                        sock.receive(pkt)
+                    } catch (_: Throwable) {
+                        delay(500L)
+                        continue
+                    }
                     val str = String(pkt.data, 0, pkt.length, Charsets.UTF_8)
                     if (str.contains("OMS_MAC_BEACON") || str.contains("OneMoreStep")) {
                         try {
@@ -379,6 +384,17 @@ class OmsTransportClient(
     private fun findNonVpnWifiNetwork(): Network? {
         try {
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val targetPrefixes = repo.getPairedMac()?.lanIps
+                ?.mapNotNull { ip ->
+                    val parts = ip.split(".")
+                    if (parts.size == 4) "${parts[0]}.${parts[1]}." else null
+                }
+                ?.toSet()
+                ?: emptySet()
+            val activeNet = try { cm.activeNetwork } catch (_: Throwable) { null }
+            var subnetMatchedWifi: Network? = null
+            var activeMatchedWifi: Network? = null
+            var ipv4Wifi: Network? = null
             var fallbackWifi: Network? = null
             for (net in cm.allNetworks) {
                 val caps = cm.getNetworkCapabilities(net) ?: continue
@@ -386,14 +402,25 @@ class OmsTransportClient(
                     caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
                 ) {
                     val lp = cm.getLinkProperties(net)
-                    val hasIpv4 = lp?.linkAddresses?.any { it.address is Inet4Address && !it.address.isLoopbackAddress } == true
-                    if (hasIpv4) {
-                        return net
+                    val ipv4s = lp?.linkAddresses
+                        ?.mapNotNull { (it.address as? Inet4Address)?.takeIf { a -> !a.isLoopbackAddress }?.hostAddress }
+                        ?: emptyList()
+                    if (ipv4s.isNotEmpty()) {
+                        if (targetPrefixes.isNotEmpty() && ipv4s.any { ip -> targetPrefixes.any { p -> ip.startsWith(p) } }) {
+                            subnetMatchedWifi = net
+                            break
+                        }
+                        if (net == activeNet && activeMatchedWifi == null) {
+                            activeMatchedWifi = net
+                        }
+                        if (ipv4Wifi == null) {
+                            ipv4Wifi = net
+                        }
                     }
                     if (fallbackWifi == null) fallbackWifi = net
                 }
             }
-            return fallbackWifi
+            return subnetMatchedWifi ?: activeMatchedWifi ?: ipv4Wifi ?: fallbackWifi
         } catch (_: Throwable) {
         }
         return null
@@ -406,7 +433,7 @@ class OmsTransportClient(
             return existing
         }
         val builder = OkHttpClient.Builder()
-            .connectTimeout(2500, TimeUnit.MILLISECONDS)
+            .connectTimeout(5000, TimeUnit.MILLISECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .pingInterval(10, TimeUnit.SECONDS)
 
@@ -578,11 +605,11 @@ class OmsTransportClient(
             ?: return@coroutineScope null
         val phoneIps = getLocalPhoneWifiIpv4s()
 
-        // 1. Priority Direct Probe first (0 contention, generous 1200ms timeout for Wi-Fi wake/ARP!)
+        // 1. Priority Direct Probe first (0 contention, generous 2500ms timeout for Wi-Fi wake/ARP!)
         val priorityIps = LinkedHashSet<String>()
         paired?.lanIps?.forEach { if (it.isNotBlank() && !it.startsWith("198.18.")) priorityIps.add(it) }
         for (pip in priorityIps) {
-            val cfg = probeMacHttpInfo(pip, port, timeoutMs = 1200, checkTcpFirst = false)
+            val cfg = probeMacHttpInfo(pip, port, timeoutMs = 2500, checkTcpFirst = false)
             if (cfg != null && isMatchingPairedMacId(cfg.macId, targetMacId)) {
                 repo.updatePairedMacDiscovery(cfg)
                 return@coroutineScope repo.getPairedMac() ?: cfg
@@ -666,6 +693,7 @@ class OmsTransportClient(
                 val p1 = parts[1]
                 val p2 = parts[2].toIntOrNull() ?: continue
                 prefixes.add("$p0.$p1.$p2")
+                prefixes.add("$p0.$p1.${p2 xor 1}")
             }
         }
         if (prefixes.isEmpty()) {
@@ -673,10 +701,13 @@ class OmsTransportClient(
         }
 
         val scanIps = mutableListOf<String>()
+        for (pip in priorityIps) {
+            if (!scanIps.contains(pip)) scanIps.add(pip)
+        }
         for (prefix in prefixes) {
             for (host in 1..254) {
                 val candidate = "$prefix.$host"
-                if (!priorityIps.contains(candidate) && !scanIps.contains(candidate)) {
+                if (!scanIps.contains(candidate)) {
                     scanIps.add(candidate)
                 }
             }
@@ -803,29 +834,27 @@ class OmsTransportClient(
                     .filter { it.isNotBlank() && !it.startsWith("198.18.") }
                     .distinct()
 
-                // 1. Test priority & saved IPs first — MUST match paired.macId!
                 var reachableConfig: PairedMacConfig? = null
-                for (candidate in candidateIps) {
-                    val info = probeMacHttpInfo(candidate, port, timeoutMs = 1200, checkTcpFirst = false)
-                    if (info != null && isMatchingPairedMacId(info.macId, paired.macId)) {
-                        reachableConfig = info
-                        repo.updatePairedMacDiscovery(info)
-                        break
+                if (candidateIps.size > 1) {
+                    for (candidate in candidateIps) {
+                        val info = probeMacHttpInfo(candidate, port, timeoutMs = 2000, checkTcpFirst = false)
+                        if (info != null && isMatchingPairedMacId(info.macId, paired.macId)) {
+                            reachableConfig = info
+                            repo.updatePairedMacDiscovery(info)
+                            break
+                        }
                     }
-                }
-
-                // 2. If saved IPs are unreachable (e.g. Mac DHCP IP changed), probe via UDP broadcast (no background TCP scan flood!)
-                if (reachableConfig == null) {
+                } else if (candidateIps.isEmpty()) {
                     reachableConfig = discoverMacOnLan(port, paired.macId, allowSubnetScan = false)
                 }
 
-                if (reachableConfig == null && generation == lanGeneration.get()) {
-                    traceConnection(if (findNonVpnWifiNetwork() == null) ConnectionDiagnostics.Event.WIFI_UNAVAILABLE
-                        else ConnectionDiagnostics.Event.MAC_UNREACHABLE, attempt = generation)
-                }
                 val targetIp = reachableConfig?.lanIps?.firstOrNull() ?: candidateIps.firstOrNull()
                 val targetPort = reachableConfig?.lanPort ?: port
                 if (targetIp.isNullOrBlank()) {
+                    if (generation == lanGeneration.get()) {
+                        traceConnection(if (findNonVpnWifiNetwork() == null) ConnectionDiagnostics.Event.WIFI_UNAVAILABLE
+                            else ConnectionDiagnostics.Event.MAC_UNREACHABLE, attempt = generation)
+                    }
                     isConnectingLan.set(false)
                     scheduleLanReconnect(3500L)
                     return@launch
@@ -907,6 +936,16 @@ class OmsTransportClient(
                     else ConnectionDiagnostics.networkFailure(t), tier, generation)
                 reportPairing(pairing, false)
                 if (tier == "LAN_WS" && pairing == null && generation == lanGeneration.get()) {
+                    if (!didOpen) {
+                        preferDefaultSocketFactory = !preferDefaultSocketFactory
+                        cachedLanHttpClient = null
+                        val paired = repo.getPairedMac()
+                        if (paired != null) {
+                            scope.launch {
+                                discoverMacOnLan(paired.lanPort, paired.macId, allowSubnetScan = false)
+                            }
+                        }
+                    }
                     isConnectingLan.set(false)
                     scheduleLanReconnect(3000L)
                 }
@@ -1538,7 +1577,7 @@ class OmsTransportClient(
             }
             val port = paired.lanPort
             var ip = paired.lanIps.firstOrNull {
-                val info = probeMacHttpInfo(it, port, 500)
+                val info = probeMacHttpInfo(it, port, 2500)
                 info != null && info.macId == paired!!.macId
             }
             if (ip == null) {
