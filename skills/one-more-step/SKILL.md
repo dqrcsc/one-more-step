@@ -18,6 +18,8 @@ description: 青简·咫尺 (OneMoreStep / oms) —— macOS 本地 AI Agent 与
 
 ## 1. 调用方式与架构约定
 
+v1.4.1 起，手机首页“连接诊断 → 复制诊断”离线可用，Mac 的 `oms status` 包含 `connectionDiagnostics`，最近 200 条事件保存在 `~/.one_more_step/logs/connections.jsonl`。离线时 `phoneStatus` 可能是旧快照，务必核对更新时间；先保留诊断，再决定是否重启。连接超时不等于 AP 隔离，安全校验失败不等于密钥丢失，不应直接让用户重新配对。v1.4.0 → v1.4.1 不改变 v2 配对。
+
 1. **优先方式**：
    - 若当前会话已挂载 `one-more-step` MCP Server，可直接调用 13 个 `phone_*` MCP 工具；
    - 若未挂载 MCP Server 或在终端工作流中，直接在 Shell 中运行全局命令 `oms <subcommand>`。
