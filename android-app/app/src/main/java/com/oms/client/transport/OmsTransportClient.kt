@@ -177,6 +177,12 @@ class OmsTransportClient(
     private val isBleWriting = AtomicBoolean(false)
     @Volatile
     private var blePayloadLimit = 180
+    @Volatile
+    private var activeBleScanCallback: ScanCallback? = null
+    @Volatile
+    private var lastBleScanStartMs = 0L
+    @Volatile
+    private var bleConnectStartedAtMs = 0L
     private var watchdogTickCount = 0L
 
     private val lanRetryRunnable = Runnable {
@@ -252,16 +258,23 @@ class OmsTransportClient(
                     for ((id, transfer) in expiredTransfers) streamAck(id, "ERROR", transfer.source, error = "Stream timed out")
                     val paired = repo.getPairedMac()?.takeIf { isV2Pairing(it) } ?: continue
                     val lanSource = captureSource("LAN_WS", lanWebSocket)
-                    if (_activeTierFlow.value == "LAN_WS" && lanWebSocket != null && sourceAuthenticated(lanSource)) {
-                        watchdogTickCount++
-                        if (watchdogTickCount % 2L == 0L) {
+                    val btSource = captureSource("BT_RFCOMM", null)
+                    watchdogTickCount++
+                    if (watchdogTickCount % 2L == 0L) {
+                        val heartbeatTarget = when {
+                            _activeTierFlow.value == "LAN_WS" && lanWebSocket != null && sourceAuthenticated(lanSource) -> lanSource
+                            sourceAuthenticated(btSource) -> btSource
+                            else -> null
+                        }
+                        if (heartbeatTarget != null) {
                             val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
                             val pct = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
                             val pongBytes = OmsFrameProtocol.encodePong(System.currentTimeMillis(), pct, bm.isCharging)
-                            sendOnSource(pongBytes, lanSource)
+                            sendOnSource(pongBytes, heartbeatTarget)
                         }
-                    } else {
-                        if (_activeTierFlow.value == "DISCONNECTED") {
+                    }
+                    if (_activeTierFlow.value != "LAN_WS" || lanWebSocket == null || !sourceAuthenticated(lanSource)) {
+                        if (!sourceAuthenticated(btSource)) {
                             startBleNearFieldScanner()
                         }
                         connectLanIfPossible(paired.lanIps, paired.lanPort)
@@ -754,6 +767,9 @@ class OmsTransportClient(
                 mainHandler.post { onResult(true, "✅ 已处于局域网 v2 加密连接状态 (${paired.macName})") }
                 return@launch
             }
+            if (!isSourceAuthenticated("BT_RFCOMM", null)) {
+                startBleNearFieldScanner(forceRestart = true)
+            }
             isConnectingLan.set(false)
             val port = paired.lanPort
             val discovered = discoverMacOnLan(port, paired.macId, allowSubnetScan = true)
@@ -768,10 +784,17 @@ class OmsTransportClient(
             } else {
                 connectLanIfPossible(paired.lanIps, port)
                 mainHandler.post {
-                    onResult(
-                        false,
-                        "⚠️ 未在当前局域网找到你绑定的 Mac (${paired.macName})，请确认同一 Wi-Fi"
-                    )
+                    if (isSourceAuthenticated("BT_RFCOMM", null)) {
+                        onResult(
+                            true,
+                            "🔵 局域网当前不可达，已通过近场蓝牙 (Tier 2) 保持加密连接"
+                        )
+                    } else {
+                        onResult(
+                            false,
+                            "⚠️ 局域网暂不可达 (${paired.macName})，已同时启动近场蓝牙扫描重连..."
+                        )
+                    }
                 }
             }
         }
@@ -829,14 +852,23 @@ class OmsTransportClient(
 
         scope.launch {
             try {
-                val candidateIps = (ips + paired.lanIps)
+                val phonePrefixes = getLocalPhoneWifiIpv4s().mapNotNull { ip ->
+                    val parts = ip.split(".")
+                    if (parts.size == 4) "${parts[0]}.${parts[1]}." else null
+                }.toSet()
+                val rawCandidates = (ips + paired.lanIps)
                     .map { it.trim() }
                     .filter { it.isNotBlank() && !it.startsWith("198.18.") }
                     .distinct()
+                val subnetMatched = rawCandidates.filter { cand -> phonePrefixes.any { p -> cand.startsWith(p) } }
+                val subnetUnmatched = rawCandidates.filterNot { cand -> phonePrefixes.any { p -> cand.startsWith(p) } }
+                val candidateIps = subnetMatched + subnetUnmatched
 
                 var reachableConfig: PairedMacConfig? = null
-                if (candidateIps.size > 1) {
-                    for (candidate in candidateIps) {
+                if (candidateIps.isEmpty() || (phonePrefixes.isNotEmpty() && subnetMatched.isEmpty())) {
+                    reachableConfig = discoverMacOnLan(port, paired.macId, allowSubnetScan = false)
+                } else if (subnetMatched.size > 1) {
+                    for (candidate in subnetMatched) {
                         val info = probeMacHttpInfo(candidate, port, timeoutMs = 2000, checkTcpFirst = false)
                         if (info != null && isMatchingPairedMacId(info.macId, paired.macId)) {
                             reachableConfig = info
@@ -844,8 +876,6 @@ class OmsTransportClient(
                             break
                         }
                     }
-                } else if (candidateIps.isEmpty()) {
-                    reachableConfig = discoverMacOnLan(port, paired.macId, allowSubnetScan = false)
                 }
 
                 val targetIp = reachableConfig?.lanIps?.firstOrNull() ?: candidateIps.firstOrNull()
@@ -936,6 +966,9 @@ class OmsTransportClient(
                     else ConnectionDiagnostics.networkFailure(t), tier, generation)
                 reportPairing(pairing, false)
                 if (tier == "LAN_WS" && pairing == null && generation == lanGeneration.get()) {
+                    if (!isSourceAuthenticated("BT_RFCOMM", null)) {
+                        startBleNearFieldScanner()
+                    }
                     if (!didOpen) {
                         preferDefaultSocketFactory = !preferDefaultSocketFactory
                         cachedLanHttpClient = null
@@ -1009,15 +1042,53 @@ class OmsTransportClient(
     }
 
     @SuppressLint("MissingPermission")
-    private fun startBleNearFieldScanner() {
+    private fun stopBleNearFieldScan() {
+        val cb = activeBleScanCallback
+        activeBleScanCallback = null
+        isBleScanning.set(false)
+        if (cb != null) {
+            try {
+                val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+                bm?.adapter?.bluetoothLeScanner?.stopScan(cb)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startBleNearFieldScanner(forceRestart: Boolean = false) {
         try {
             if (!isV2Pairing(repo.getPairedMac())) return
-            if (activeBleGatt != null) return
+            val existingGatt = activeBleGatt
+            if (existingGatt != null) {
+                val btSource = FrameSource("BT_RFCOMM", null, existingGatt)
+                val nowElapsed = SystemClock.elapsedRealtime()
+                if (!sourceAuthenticated(btSource) && bleConnectStartedAtMs > 0L && nowElapsed - bleConnectStartedAtMs > 15_000L) {
+                    closeSecureSource(btSource, "Stale BLE connection attempt timed out")
+                } else {
+                    return
+                }
+            }
             val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: return
             val adapter: BluetoothAdapter = bm.adapter ?: return
-            if (!adapter.isEnabled) return
+            if (!adapter.isEnabled) {
+                isBleScanning.set(false)
+                return
+            }
             val scanner = adapter.bluetoothLeScanner ?: return
+            val now = SystemClock.elapsedRealtime()
+            if (isBleScanning.get()) {
+                if (forceRestart || now - lastBleScanStartMs > 10_000L) {
+                    stopBleNearFieldScan()
+                } else {
+                    return
+                }
+            }
+            if (!forceRestart && lastBleScanStartMs > 0L && now - lastBleScanStartMs < 7_000L) {
+                return
+            }
             if (!isBleScanning.compareAndSet(false, true)) return
+            lastBleScanStartMs = now
 
             val filter = ScanFilter.Builder()
                 .setServiceUuid(ParcelUuid(BLE_SERVICE_UUID))
@@ -1026,19 +1097,19 @@ class OmsTransportClient(
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build()
 
-            scanner.startScan(listOf(filter), settings, object : ScanCallback() {
+            val scanCallback = object : ScanCallback() {
                 override fun onScanFailed(errorCode: Int) {
+                    if (activeBleScanCallback === this) {
+                        activeBleScanCallback = null
+                    }
                     isBleScanning.set(false)
                 }
 
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
                     val device = result.device ?: return
                     if (activeBleGatt == null) {
-                        try {
-                            scanner.stopScan(this)
-                        } catch (_: Throwable) {
-                        }
-                        isBleScanning.set(false)
+                        stopBleNearFieldScan()
+                        bleConnectStartedAtMs = SystemClock.elapsedRealtime()
                         activeBleGatt = device.connectGatt(
                             context,
                             false,
@@ -1049,13 +1120,17 @@ class OmsTransportClient(
                                         closeSecureSource(FrameSource("BT_RFCOMM", null, gatt), "Bluetooth connection failed")
                                         return
                                     }
-                                     if (newState == BluetoothProfile.STATE_CONNECTED) {
+                                    if (newState == BluetoothProfile.STATE_CONNECTED) {
                                         btDecoder.reset()
                                         bleWriteQueue.clear()
                                         isBleWriting.set(false)
                                         blePayloadLimit = 180
+                                        bleConnectStartedAtMs = SystemClock.elapsedRealtime()
                                         val paired = repo.getPairedMac()?.takeIf { isV2Pairing(it) }
-                                        if (paired == null) { gatt.disconnect(); return }
+                                        if (paired == null) {
+                                            closeSecureSource(FrameSource("BT_RFCOMM", null, gatt), "Not paired")
+                                            return
+                                        }
                                         beginSecureSource(FrameSource("BT_RFCOMM", null, gatt), paired)
                                         if (!gatt.requestMtu(512)) {
                                             gatt.discoverServices()
@@ -1089,19 +1164,22 @@ class OmsTransportClient(
 
                                 override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
                                     if (gatt !== activeBleGatt) return
-                                    val svc = gatt.getService(BLE_SERVICE_UUID) ?: return
+                                    if (status != BluetoothGatt.GATT_SUCCESS) {
+                                        closeSecureSource(FrameSource("BT_RFCOMM", null, gatt), "BLE service discovery failed")
+                                        return
+                                    }
+                                    val svc = gatt.getService(BLE_SERVICE_UUID)
+                                    if (svc == null) {
+                                        closeSecureSource(FrameSource("BT_RFCOMM", null, gatt), "Missing OMS BLE service")
+                                        return
+                                    }
                                     val infoChar = svc.getCharacteristic(BLE_CHAR_MAC_INFO_UUID)
                                     val pipeChar = svc.getCharacteristic(BLE_CHAR_FRAME_PIPE_UUID)
                                     bleFramePipeChar = pipeChar
-                                    if (infoChar != null) {
+                                    if (infoChar != null && pipeChar != null) {
                                         gatt.readCharacteristic(infoChar)
                                     } else {
-                                        // Missing Mac identity characteristic: disconnect untrusted peripheral
-                                        try {
-                                            gatt.disconnect()
-                                            gatt.close()
-                                        } catch (_: Throwable) {
-                                        }
+                                        closeSecureSource(FrameSource("BT_RFCOMM", null, gatt), "Missing Mac identity characteristic")
                                     }
                                 }
 
@@ -1161,8 +1239,16 @@ class OmsTransportClient(
                         )
                     }
                 }
-            })
+            }
+            activeBleScanCallback = scanCallback
+            scanner.startScan(listOf(filter), settings, scanCallback)
+            mainHandler.postDelayed({
+                if (activeBleScanCallback === scanCallback && isBleScanning.get()) {
+                    stopBleNearFieldScan()
+                }
+            }, 9500L)
         } catch (_: Throwable) {
+            activeBleScanCallback = null
             isBleScanning.set(false)
         }
     }
@@ -1281,6 +1367,7 @@ class OmsTransportClient(
             if (source.gatt != null && source.gatt === activeBleGatt) {
                 activeBleGatt = null
                 bleFramePipeChar = null
+                bleConnectStartedAtMs = 0L
                 bleWriteQueue.clear()
                 isBleWriting.set(false)
             }
@@ -1311,6 +1398,13 @@ class OmsTransportClient(
         if (source.gatt != null) runCatching { source.gatt.disconnect(); source.gatt.close() }
         runCatching { source.socket?.close(4003, reason.take(100)) }
         recomputeFallbackTier()
+        if (_activeTierFlow.value == "DISCONNECTED") {
+            mainHandler.postDelayed({
+                if (_activeTierFlow.value == "DISCONNECTED" && !isSourceAuthenticated("BT_RFCOMM", null)) {
+                    startBleNearFieldScanner()
+                }
+            }, 1500L)
+        }
     }
 
     fun sendRawFrame(frameBytes: ByteArray): Boolean =

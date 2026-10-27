@@ -117,7 +117,12 @@ class StreamRepository(context: Context) :
     fun updatePairedMacDiscovery(discovered: PairedMacConfig) {
         val current = getPairedMac() ?: return
         if (current.macId != discovered.macId) return
-        savePairedMac(current.copy(lanIps = discovered.lanIps, lanPort = discovered.lanPort))
+        val mergedIps = (discovered.lanIps + current.lanIps)
+            .map { it.trim() }
+            .filter { it.isNotBlank() && !it.startsWith("198.18.") && !it.startsWith("127.") }
+            .distinct()
+            .take(6)
+        savePairedMac(current.copy(lanIps = mergedIps.ifEmpty { discovered.lanIps }, lanPort = discovered.lanPort))
     }
 
     @Synchronized
