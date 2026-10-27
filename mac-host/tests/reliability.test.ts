@@ -3,7 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { generateEd25519Identity, generateUuidV7, FrameStreamDecoder, FrameType, decodeJsonRpcPayload, encodeStreamAckResumeFrame, computePairingHmac, createEphemeralPairingCredentials, computeAuthHmac } from "@oms/shared-protocol";
+import { generateEd25519Identity, generateUuidV7, FrameStreamDecoder, FrameType, decodeJsonRpcPayload, encodeStreamAckResumeFrame } from "@oms/shared-protocol";
+import { secureMemoryPhone } from "./secure-phone-helper.js";
 import { PhoneSessionManager } from "../src/transport/session-manager.js";
 import { OmsDaemon } from "../src/daemon/oms-daemon.js";
 import { approvalTimeoutSec, ipcTimeoutForAction } from "../src/daemon/request-timeouts.js";
@@ -12,15 +13,11 @@ function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "oms-reliability-"));
   const identity = generateEd25519Identity("mac");
   const phone = generateEd25519Identity("phone");
-  const trusted = { phoneId: phone.deviceId, phoneModel: "test", phoneName: "test", phonePubKeyBase64Url: phone.publicKeyBase64Url, wanRoomId: "public", pairSecretHex: "ab".repeat(32), pairedAtMs: Date.now(), lastSeenMs: Date.now() };
+  const trusted = { phoneId: phone.deviceId, phoneModel: "test", phoneName: "test", phonePubKeyBase64Url: phone.publicKeyBase64Url, wanRoomId: "public", pairSecretHex: "ab".repeat(32), pairingVersion: 2, pairedAtMs: Date.now(), lastSeenMs: Date.now() };
   const manager = new PhoneSessionManager({ hostIdentity: identity, lanPort: 0, streamDownloadDir: root, trustedDevices: [trusted] });
   const raw = manager as any;
-  const messages: any[] = [];
-  const pipe: any = { tier: "LAN_WS", authenticated: true, phoneId: phone.deviceId, decoder: new FrameStreamDecoder(), sendRaw: (bytes: Uint8Array) => {
-    for (const f of new FrameStreamDecoder().push(bytes)) messages.push({ frameType: f.frameType, value: f.frameType === FrameType.STREAM_CHUNK ? undefined : decodeJsonRpcPayload(f.payload) });
-  }, close: () => {} };
-  raw.pipes.set(pipe.tier, pipe); raw.openPipes.add(pipe); raw.recomputeActiveTier();
-  return { manager, raw, pipe, messages, identity, phone, trusted, root };
+  const simulated = secureMemoryPhone(raw, { phoneId: phone.deviceId, macId: identity.deviceId, pskHex: trusted.pairSecretHex, mode: "auth" });
+  return { manager, raw, ...simulated, identity, phone, trusted, root };
 }
 function header(data: Uint8Array) {
   return { streamId: generateUuidV7(), fileName: "test.txt", mimeType: "text/plain", totalBytes: data.length, chunkSize: 4, totalChunks: Math.max(1, Math.ceil(data.length / 4)), sha256: crypto.createHash("sha256").update(data).digest("hex") };
@@ -40,19 +37,15 @@ test("RPC ignores unauthenticated and other-pipe replies, accepts issuing pipe",
   await f.manager.stop();
 });
 
-test("legacy static and public-room signatures cannot authenticate; pair-secret HMAC can", async () => {
+test("legacy trust and static/public-room handshakes cannot authenticate; v2 session can", async () => {
   const f = fixture();
-  const record = f.raw.trustedDevices.get(f.phone.deviceId);
-  delete record.pairSecretHex;
-  for (const signature of ["trusted_xiaomi_sig", computeAuthHmac(record.wanRoomId, `phone_auth:nonce:${f.identity.deviceId}:${f.phone.deviceId}:phone-nonce`)]) {
-    const pipe = { ...f.pipe, authenticated: false, pendingNonceMac: "nonce" };
-    f.raw.handleAuthResponse(pipe, { id: "auth", params: { phoneId: f.phone.deviceId, noncePhoneHex: "phone-nonce", phoneSignatureBase64Url: signature } });
-    expect(pipe.authenticated).toBe(false);
-  }
-  record.pairSecretHex = "ab".repeat(32);
-  const pipe = { ...f.pipe, authenticated: false, pendingNonceMac: "nonce" };
-  f.raw.handleAuthResponse(pipe, { id: "auth", params: { phoneId: f.phone.deviceId, noncePhoneHex: "phone-nonce", phoneSignatureBase64Url: computeAuthHmac(record.pairSecretHex, `phone_auth:nonce:${f.identity.deviceId}:${f.phone.deviceId}:phone-nonce`), deviceSnapshot: {} } });
-  expect(pipe.authenticated).toBe(true);
+  f.raw.trustedDevices.get(f.phone.deviceId).pairingVersion = undefined;
+  expect(() => secureMemoryPhone(f.raw, { phoneId: f.phone.deviceId, macId: f.identity.deviceId, pskHex: f.trusted.pairSecretHex, mode: "auth" })).toThrow();
+  expect(f.raw.pipes.get("LAN_WS")).toBe(f.pipe);
+  f.raw.trustedDevices.get(f.phone.deviceId).pairingVersion = 2;
+  const valid = secureMemoryPhone(f.raw, { phoneId: f.phone.deviceId, macId: f.identity.deviceId, pskHex: f.trusted.pairSecretHex, mode: "auth" });
+  expect(valid.pipe.authenticated).toBe(true);
+  expect(f.pipe.authenticated).toBe(false);
   await f.manager.stop();
 });
 
@@ -60,11 +53,11 @@ test("re-pair revokes old pipes and pending calls", async () => {
   const f = fixture(); let oldClosed = false;
   f.pipe.close = () => { oldClosed = true; };
   const pending = f.manager.callPhone("status", {}, 1000).catch(e => e.message);
-  const creds = createEphemeralPairingCredentials(); f.manager.setActivePairingCredentials(creds);
+  const creds = { ephemeralToken: "cd".repeat(32), expiresAtMs: Date.now() + 60000 }; f.manager.setActivePairingCredentials(creds);
   const newPhone = generateEd25519Identity("new");
-  const newPipe = { ...f.pipe, authenticated: false, tier: "WAN_WEBRTC", close: () => {} };
-  f.raw.onPipeOpened(newPipe);
-  f.raw.handlePairRequest(newPipe, { id: "pair", params: { phoneId: newPhone.deviceId, phonePubKeyBase64Url: newPhone.publicKeyBase64Url, pinCode: creds.pinCode, hmacHex: computePairingHmac(creds.ephemeralToken, creds.pinCode, newPhone.deviceId, newPhone.publicKeyBase64Url) } });
+  const replacement = secureMemoryPhone(f.raw, { phoneId: newPhone.deviceId, macId: f.identity.deviceId, pskHex: creds.ephemeralToken, tier: "WAN_WEBRTC", autoFinish: false });
+  expect(oldClosed).toBe(false);
+  replacement.finish();
   expect(oldClosed).toBe(true); expect(f.pipe.authenticated).toBe(false);
   expect(await pending).toContain("Transport closed");
   let received = false; f.manager.on("phoneRequest", () => { received = true; });
@@ -103,9 +96,9 @@ test("outbound delivery requires matching source ACK and rejects errors or timeo
   const result = f.manager.pushStreamToPhone({ fileName: "a", mimeType: "x", data, timeoutMs: 1000 }).then(v => { done = true; return v; });
   const id = f.messages.find(m => m.frameType === FrameType.STREAM_START).value.streamId;
   const ack = { streamId: id, status: "COMPLETED", nextExpectedChunkIndex: 1 };
-  f.raw.onRawBytesReceived({ ...f.pipe }, encodeStreamAckResumeFrame(ack as any));
+  f.raw.handleStreamAck({ ...f.pipe }, ack);
   await Promise.resolve(); expect(done).toBe(false);
-  f.raw.onRawBytesReceived(f.pipe, encodeStreamAckResumeFrame(ack as any));
+  f.send(encodeStreamAckResumeFrame(ack as any));
   expect((await result).streamId).toBe(id);
   const failure = f.manager.pushStreamToPhone({ fileName: "a", mimeType: "x", data, timeoutMs: 1000 });
   const failedId = f.messages.filter(m => m.frameType === FrameType.STREAM_START).at(-1).value.streamId;
@@ -144,15 +137,16 @@ test("approval deadlines align across CLI/MCP IPC and reject invalid timeout", (
   for (const n of [0, -1, NaN, Infinity, 3601, 1.5]) expect(() => approvalTimeoutSec(n)).toThrow();
 });
 
-test("same-connection re-pair also revokes old RPC and stream ACK waiters", async () => {
+test("same-connection re-pair is rejected and revokes RPC/stream waiters without changing trust", async () => {
   const f = fixture();
   const rpc = f.manager.callPhone("old", {}, 1000).catch(e => e.message);
   const stream = f.manager.pushStreamToPhone({ fileName: "old", mimeType: "x", data: new Uint8Array([1]), timeoutMs: 1000 }).catch(e => e.message);
-  const creds = createEphemeralPairingCredentials(); f.manager.setActivePairingCredentials(creds);
-  f.raw.handlePairRequest(f.pipe, { id: "pair", params: { phoneId: f.phone.deviceId, phonePubKeyBase64Url: f.phone.publicKeyBase64Url, pinCode: creds.pinCode, hmacHex: computePairingHmac(creds.ephemeralToken, creds.pinCode, f.phone.deviceId, f.phone.publicKeyBase64Url) } });
+  const previous = f.manager.getTrustedDevices();
+  f.send((await import("@oms/shared-protocol")).encodeJsonRpcFrame({ jsonrpc: "2.0", id: "secure_start", method: "secure.start", params: {} }));
   expect(await rpc).toContain("Transport closed"); expect(await stream).toContain("Transport closed");
   expect(f.raw.pendingRpc.size).toBe(0); expect(f.raw.outgoingStreams.size).toBe(0);
-  expect(f.pipe.authenticated).toBe(true);
+  expect(f.pipe.authenticated).toBe(false);
+  expect(f.manager.getTrustedDevices()).toEqual(previous);
   await f.manager.stop();
 });
 

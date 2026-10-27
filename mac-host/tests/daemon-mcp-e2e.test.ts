@@ -1,15 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { connectSecurePhone } from "./secure-phone-helper.js";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import {
-  computePairingHmac,
   decodeJsonRpcPayload,
   encodeJsonRpcFrame,
   encodeStreamChunkFrame,
   encodeStreamStartFrame,
-  FrameStreamDecoder,
   FrameType,
   generateEd25519Identity,
   generateUuidV7,
@@ -24,7 +23,7 @@ describe("Modules 06 & 07: OmsDaemon + Inbox + MCP Server End-to-End", () => {
   test("Full E2E lifecycle: MCP tools/list, Pairing, Screenshot/PKB Inbox, Remote Approval, Alarm & GUI RPC", async () => {
     process.env.OMS_DISABLE_OSASCRIPT = "1";
     const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "oms-e2e-home-"));
-    const customPort = 29627;
+    let customPort = 0;
 
     fs.mkdirSync(tmpHome, { recursive: true });
     fs.writeFileSync(
@@ -39,6 +38,7 @@ describe("Modules 06 & 07: OmsDaemon + Inbox + MCP Server End-to-End", () => {
 
     const daemon = new OmsDaemon(tmpHome);
     await daemon.start({ startTransport: true });
+    customPort = (daemon.session as any).wsServer.port;
 
     const mcp = new OmsMcpServer(tmpHome);
 
@@ -55,45 +55,12 @@ describe("Modules 06 & 07: OmsDaemon + Inbox + MCP Server End-to-End", () => {
     const parsedUri = parsePairingUri(pairInfo.pairingUri);
     const phoneIdentity = generateEd25519Identity("xiaomi");
 
-    const ws = new WebSocket(`ws://127.0.0.1:${customPort}/?tier=lan`);
-    ws.binaryType = "arraybuffer";
-    const decoder = new FrameStreamDecoder();
-
-    let pairedDone!: () => void;
-    const pairedPromise = new Promise<void>((r) => (pairedDone = r));
-
-    ws.onmessage = (ev) => {
-      const frames = decoder.push(new Uint8Array(ev.data as ArrayBuffer));
-      for (const f of frames) {
-        if (f.frameType !== FrameType.CONTROL_JSON_RPC) continue;
+    const ws = await connectSecurePhone(`ws://127.0.0.1:${customPort}/?tier=lan`, {
+      phoneId: phoneIdentity.deviceId, macId: parsedUri.id, pskHex: parsedUri.ephemeralToken,
+      onFrame(f, ws) {
+        if (f.frameType !== FrameType.CONTROL_JSON_RPC) return;
         const msg = decodeJsonRpcPayload<JsonRpcMessage>(f.payload);
-
-        if ("method" in msg && msg.method === "auth.helloChallenge") {
-          const hmacHex = computePairingHmac(
-            parsedUri.ephemeralToken,
-            parsedUri.pinCode,
-            phoneIdentity.deviceId,
-            phoneIdentity.publicKeyBase64Url
-          );
-          ws.send(
-            encodeJsonRpcFrame({
-              jsonrpc: "2.0",
-              id: "pair_e2e",
-              method: "pair.request",
-              params: {
-                phoneId: phoneIdentity.deviceId,
-                phoneModel: "Xiaomi 15",
-                phoneName: "Xiaomi",
-                phonePubKeyBase64Url: phoneIdentity.publicKeyBase64Url,
-                pinCode: parsedUri.pinCode,
-                hmacHex,
-                timestampMs: Date.now(),
-              },
-            })
-          );
-        } else if ("id" in msg && msg.id === "pair_e2e") {
-          pairedDone();
-        } else if ("method" in msg && msg.method === "notify.requestApproval") {
+        if ("method" in msg && msg.method === "notify.requestApproval") {
           const params = msg.params as { approvalId: string };
           // Reply to RPC immediately, then simulate user tapping "批准继续" on phone 50ms later
           ws.send(
@@ -146,10 +113,8 @@ describe("Modules 06 & 07: OmsDaemon + Inbox + MCP Server End-to-End", () => {
             })
           );
         }
-      }
-    };
-
-    await pairedPromise;
+      },
+    });
 
     // 3. Simulate Xiaomi phone submitting a Screenshot + Voice Note (#ui_bug)
     const streamId = generateUuidV7();

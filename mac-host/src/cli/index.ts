@@ -143,11 +143,11 @@ async function main() {
       console.log("==============================================================");
       console.log("🔗 OneMoreStep · 小米手机无线安装与绑定凭证 (10分钟内有效)");
       console.log("==============================================================");
-      console.log(`📲 【无数据线安装 & 一键复制配对台】(手机浏览器打开):`);
+      console.log(`📲 【无数据线 APK 下载页】(仅提供安装，不提供配对凭据):`);
       console.log(`   👉 ${res.wirelessInstallUrl}\n`);
       console.log(`📬 【Mac 实时收件箱看板】(电脑浏览器打开):`);
       console.log(`   👉 ${res.dashboardUrl}\n`);
-      console.log(`📌 6位配对码 (PIN):  ${res.pinCode}`);
+      console.log("🔐 安全 v2：旧版 PIN/链接不可用。请通过自己控制的可信途径将下方完整 URI 输入手机，不要经旧 OMS 明文通道传递。");
       console.log(`🌐 本机局域网地址:   ${res.lanIps.join(", ")} : ${res.lanPort}`);
       console.log(`🔑 完整配对 URI:\n   ${res.pairingUri}`);
       console.log("==============================================================");

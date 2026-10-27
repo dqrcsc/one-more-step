@@ -425,7 +425,7 @@ fun OneMoreStepMainScreen() {
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     Text(
-                        "🔐 1 对 1 安全绑定与重连 (一机一码双向加密隔离)",
+                        "🔐 v2 加密配对与重连",
                         color = Color.White,
                         fontWeight = FontWeight.SemiBold,
                         fontSize = 13.sp
@@ -433,7 +433,7 @@ fun OneMoreStepMainScreen() {
                     if (currentPaired != null) {
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            "当前已绑定：${currentPaired.macName} (${currentPaired.macId.takeLast(8)})",
+                            if (currentPaired.pairingVersion == 2) "当前 v2 绑定：${currentPaired.macName} (${currentPaired.macId.takeLast(8)})" else "旧绑定需重新配对：${currentPaired.macName}（数据保留）",
                             color = Color(0xFF4ADE80),
                             fontSize = 11.sp
                         )
@@ -442,7 +442,7 @@ fun OneMoreStepMainScreen() {
                     OutlinedTextField(
                         value = pairUriInput,
                         onValueChange = { pairUriInput = it },
-                        placeholder = { Text("输入 Mac 终端 6 位配对码，或粘贴 oms://pair...", color = Color.Gray) },
+                        placeholder = { Text("粘贴从 Mac 本地取得的完整 v2 oms://pair... 链接", color = Color.Gray) },
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedTextColor = Color.White,
                             unfocusedTextColor = Color.White,

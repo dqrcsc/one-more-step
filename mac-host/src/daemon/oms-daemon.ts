@@ -7,7 +7,7 @@ import { execFile, execFileSync, spawn } from "node:child_process";
 import {
   ApprovalRespondParams,
   buildPairingUri,
-  createEphemeralPairingCredentials,
+  secureRandomHex,
   Ed25519Identity,
   generateEd25519Identity,
   generateUuidV7,
@@ -207,21 +207,26 @@ export class OmsDaemon {
     }
   }
 
-  private saveTrustedDevices(): void {
-    fs.writeFileSync(
-      this.trustedDevicesPath,
-      JSON.stringify(this.session.getTrustedDevices(), null, 2),
-      { encoding: "utf8", mode: 0o600 }
-    );
+  private saveTrustedDevices(devices: TrustedPhoneDevice[]): void {
+    const tempPath = `${this.trustedDevicesPath}.${generateUuidV7()}.tmp`;
+    let descriptor: number | undefined;
+    try {
+      descriptor = fs.openSync(tempPath, "wx", 0o600);
+      fs.writeFileSync(descriptor, JSON.stringify(devices, null, 2), "utf8");
+      fs.fsyncSync(descriptor);
+      fs.closeSync(descriptor);
+      descriptor = undefined;
+      fs.renameSync(tempPath, this.trustedDevicesPath);
+    } catch (err) {
+      if (descriptor !== undefined) fs.closeSync(descriptor);
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      throw err;
+    }
   }
 
   private wireSessionEvents(): void {
-    this.session.on("devicePaired", () => {
-      this.saveTrustedDevices();
-    });
-
-    this.session.on("phoneAuthenticated", () => {
-      this.saveTrustedDevices();
+    this.session.on("trustStore", (devices: TrustedPhoneDevice[]) => {
+      this.saveTrustedDevices(devices);
     });
 
     this.session.on(
@@ -556,24 +561,27 @@ export class OmsDaemon {
   ): Promise<any> {
     switch (action) {
       case "daemon.pair": {
-        const creds = createEphemeralPairingCredentials(10 * 60 * 1000);
+        const creds = { ephemeralToken: secureRandomHex(), expiresAtMs: Date.now() + 10 * 60 * 1000 };
         const ips = PhoneSessionManager.getLocalLanIps();
         const uri = buildPairingUri({
-          v: 1,
+          v: 2,
           id: this.identity.deviceId,
           name: os.hostname(),
           ips,
           port: this.config.lanPort,
           btUuid: OMS_BLE_SERVICE_SHORT_UUID,
           pubKeyBase64Url: this.identity.publicKeyBase64Url,
-          pinCode: creds.pinCode,
+          pinCode: "",
           ephemeralToken: creds.ephemeralToken,
           expiresAtMs: creds.expiresAtMs,
         });
-        this.session.setActivePairingCredentials({ ...creds, pairingUri: uri });
+        const secureUri = new URL(uri);
+        secureUri.searchParams.delete("pin");
+        const pairingUri = secureUri.toString();
+        this.session.setActivePairingCredentials({ ...creds, pairingUri });
         return {
-          pairingUri: uri,
-          pinCode: creds.pinCode,
+          pairingUri,
+          pairingVersion: 2,
           lanIps: ips,
           lanPort: this.config.lanPort,
           wirelessInstallUrl: `http://${ips[0]}:${this.config.lanPort}/install`,
@@ -594,12 +602,14 @@ export class OmsDaemon {
           bleConnected: presenceSnap.bleConnected,
           rssiEmaDbm: presenceSnap.rssiEma,
           activeTransportTier: this.session.getActiveTier(),
+          ...this.session.getSecurityStatus(),
           lastRttMs: this.session.getLastRttMs(),
           lanPort: this.config.lanPort,
           dashboardUrl: `http://127.0.0.1:${this.config.lanPort}/inbox`,
           trustedDevices: this.session.getTrustedDevices().map((d) => ({
             phoneId: d.phoneId,
             phoneModel: d.phoneModel,
+            pairingVersion: d.pairingVersion ?? 1,
             lastSeenIso: new Date(d.lastSeenMs).toISOString(),
           })),
           phoneStatus: this.session.getPhoneStatus(),

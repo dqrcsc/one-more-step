@@ -33,7 +33,8 @@ data class PairedMacConfig(
     val macPubKeyBase64Url: String,
     val wanRoomId: String,
     val wanRelayWssUrl: String?,
-    val pairSecretHex: String = ""
+    val pairSecretHex: String = "",
+    val pairingVersion: Int = 0
 )
 
 /**
@@ -82,6 +83,7 @@ class StreamRepository(context: Context) :
         return id
     }
 
+    @Synchronized
     fun savePairedMac(config: PairedMacConfig) {
         val existingMacId = prefs.getString("mac_id", null)
         val sameMac = existingMacId != null && existingMacId == config.macId
@@ -106,9 +108,19 @@ class StreamRepository(context: Context) :
             .putString("wan_room_id", effectiveWanRoom)
             .putString("wan_relay_url", effectiveRelay)
             .putString("pair_secret_hex", effectivePairSecret)
-            .apply()
+            .putInt("pairing_version", config.pairingVersion)
+            .commit().also { check(it) { "Unable to persist pairing configuration" } }
     }
 
+    /** Discovery may refresh routing, never restore a stale pairing credential or security version. */
+    @Synchronized
+    fun updatePairedMacDiscovery(discovered: PairedMacConfig) {
+        val current = getPairedMac() ?: return
+        if (current.macId != discovered.macId) return
+        savePairedMac(current.copy(lanIps = discovered.lanIps, lanPort = discovered.lanPort))
+    }
+
+    @Synchronized
     fun clearPairedMac() {
         prefs.edit()
             .remove("mac_id")
@@ -119,9 +131,11 @@ class StreamRepository(context: Context) :
             .remove("wan_room_id")
             .remove("wan_relay_url")
             .remove("pair_secret_hex")
+            .remove("pairing_version")
             .apply()
     }
 
+    @Synchronized
     fun getPairedMac(): PairedMacConfig? {
         val macId = prefs.getString("mac_id", null)?.takeIf { it.isNotBlank() } ?: return null
         val ipsJson = prefs.getString("lan_ips", "[]") ?: "[]"
@@ -138,7 +152,8 @@ class StreamRepository(context: Context) :
             macPubKeyBase64Url = prefs.getString("mac_pub_key", "") ?: "",
             wanRoomId = prefs.getString("wan_room_id", "") ?: "",
             wanRelayWssUrl = prefs.getString("wan_relay_url", null),
-            pairSecretHex = prefs.getString("pair_secret_hex", "") ?: ""
+            pairSecretHex = prefs.getString("pair_secret_hex", "") ?: "",
+            pairingVersion = prefs.getInt("pairing_version", 0)
         )
     }
 

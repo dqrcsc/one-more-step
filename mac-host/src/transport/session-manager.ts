@@ -6,13 +6,11 @@ import dgram from "node:dgram";
 import { spawn, execFile, ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
-  AuthResponseParams,
-  computeAuthHmac,
-  computePairingHmac,
   decodeJsonRpcPayload,
   decodeStreamChunkPayload,
   deriveWanRoomId,
   Ed25519Identity,
+  encodeFrame,
   encodeJsonRpcFrame,
   encodePingFrame,
   encodePongFrame,
@@ -26,14 +24,17 @@ import {
   JsonRpcRequest,
   JsonRpcResponse,
   OmsErrorCode,
-  PairRequestParams,
-  PairResponseResult,
   PhoneDeviceStatus,
   PriorityFrameQueue,
-  signEd25519,
   StreamAckResumeHeader,
   StreamStartHeader,
   TransportTier,
+  SecureHello,
+  SecureStart,
+  SecureSession,
+  generateSecureEphemeral,
+  secureRandomHex,
+  establishSecureSession,
 } from "@oms/shared-protocol";
 import { PresenceEngine } from "./presence-engine.js";
 import { BluetoothBridgeServer } from "./bluetooth-bridge-client.js";
@@ -45,6 +46,7 @@ export interface TrustedPhoneDevice {
   phonePubKeyBase64Url: string;
   wanRoomId: string;
   pairSecretHex?: string;
+  pairingVersion?: number;
   lastKnownLanIps?: string[];
   pairedAtMs: number;
   lastSeenMs: number;
@@ -69,10 +71,32 @@ interface ActiveTransportPipe {
   authenticated: boolean;
   phoneId?: string;
   remoteIp?: string;
-  pendingNonceMac?: string;
+  closed?: boolean;
+  secure?: {
+    phase: "hello" | "finish" | "ready";
+    hello: SecureHello;
+    ephemeral: ReturnType<typeof generateSecureEphemeral>;
+    timer: Timer;
+    receivedHandshakeBytes: number;
+    start?: SecureStart;
+    startJson?: string;
+    session?: SecureSession;
+    pairSecretHex?: string;
+    macProofHex?: string;
+    pairingCredentials?: PairingCredentials;
+    finishJson?: string;
+    finishResult?: { ok: true; pairingVersion: 2; macId: string; wanRoomId: string };
+  };
   decoder: FrameStreamDecoder;
-  sendRaw: (bytes: Uint8Array) => void;
+  sendRaw: (bytes: Uint8Array) => boolean | number;
   close: () => void;
+}
+
+interface PairingCredentials {
+  ephemeralToken: string;
+  expiresAtMs: number;
+  pairingUri?: string;
+  reservedBy?: ActiveTransportPipe;
 }
 
 const TIER_PRIORITY: Record<TransportTier, number> = {
@@ -92,13 +116,8 @@ export class PhoneSessionManager extends EventEmitter {
   private readonly lanPort: number;
   private readonly streamDownloadDir: string;
   private trustedDevices: Map<string, TrustedPhoneDevice> = new Map();
-  private activePairingCreds: {
-    pinCode: string;
-    ephemeralToken: string;
-    expiresAtMs: number;
-    pairingUri?: string;
-    failedPinAttempts?: number;
-  } | null = null;
+  private trustPersistenceUncertain = false;
+  private activePairingCreds: PairingCredentials | null = null;
 
   private wsServer: ReturnType<typeof Bun.serve> | null = null;
   private btBridge: BluetoothBridgeServer | null = null;
@@ -258,17 +277,24 @@ export class PhoneSessionManager extends EventEmitter {
     };
   }
 
-  public setActivePairingCredentials(creds: {
-    pinCode: string;
-    ephemeralToken: string;
-    expiresAtMs: number;
-    pairingUri?: string;
-  }): void {
-    this.activePairingCreds = creds;
+  public setActivePairingCredentials(creds: { ephemeralToken: string; expiresAtMs: number; pairingUri?: string }): void {
+    if (!/^[0-9a-f]{64}$/.test(creds.ephemeralToken) || !Number.isFinite(creds.expiresAtMs)) {
+      throw new Error("Secure v2 pairing requires a 256-bit token");
+    }
+    const reserved = this.activePairingCreds?.reservedBy;
+    if (reserved) this.failPipe(reserved, "Pairing credentials were replaced; start pairing again");
+    this.activePairingCreds = { ...creds };
   }
 
   public getTrustedDevices(): TrustedPhoneDevice[] {
     return Array.from(this.trustedDevices.values());
+  }
+
+  public getSecurityStatus(): { secureProtocolVersion: 2; requiresRePair: boolean } {
+    return {
+      secureProtocolVersion: 2,
+      requiresRePair: this.trustPersistenceUncertain || this.getTrustedDevices().some((device) => device.pairingVersion !== 2),
+    };
   }
 
   public getActiveTier(): TransportTier {
@@ -343,54 +369,8 @@ export class PhoneSessionManager extends EventEmitter {
           if (customResp) return customResp;
         }
 
-        // PIN-Protected Pairing URI Resolution Endpoint (Max 5 failed attempts before lockout)
         if (url.pathname === "/pair/resolve") {
-          const creds = self.activePairingCreds;
-          if (!creds || Date.now() > creds.expiresAtMs || !creds.pairingUri) {
-            return Response.json(
-              {
-                ok: false,
-                error: "当前无有效配对会话或已过期，请先在 Mac 终端运行: bun run oms pair",
-              },
-              { status: 410 }
-            );
-          }
-
-          const inputPin = (url.searchParams.get("pin") || "").trim();
-          const expectedBuf = Buffer.from(creds.pinCode, "utf8");
-          const inputBuf = Buffer.from(inputPin, "utf8");
-          const pinMatched =
-            expectedBuf.byteLength === inputBuf.byteLength &&
-            crypto.timingSafeEqual(expectedBuf, inputBuf);
-
-          if (!pinMatched) {
-            creds.failedPinAttempts = (creds.failedPinAttempts || 0) + 1;
-            if (creds.failedPinAttempts >= 5) {
-              self.activePairingCreds = null;
-              return Response.json(
-                {
-                  ok: false,
-                  error:
-                    "配对码连续输错 5 次，配对凭证已自动销毁，请在 Mac 终端重新运行: bun run oms pair",
-                },
-                { status: 429 }
-              );
-            }
-            return Response.json(
-              {
-                ok: false,
-                error: `6 位配对码不正确（剩余尝试次数：${5 - creds.failedPinAttempts}）`,
-              },
-              { status: 403 }
-            );
-          }
-
-          return Response.json({
-            ok: true,
-            macId: self.hostIdentity.deviceId,
-            macName: os.hostname(),
-            pairingUri: creds.pairingUri,
-          });
+          return Response.json({ ok: false, error: "HTTP PIN pairing was removed. Use a new local oms pair v2 URI through a trusted channel." }, { status: 410 });
         }
 
         // APK Version Metadata Endpoint for Smart OTA Update Check
@@ -440,9 +420,6 @@ export class PhoneSessionManager extends EventEmitter {
           (url.pathname === "/" && (req.headers.get("accept") || "").includes("text/html"))
         ) {
           const isLocalhost = PhoneSessionManager.isLoopbackAddress(clientIp);
-          const hasActivePair = Boolean(
-            self.activePairingCreds && Date.now() < self.activePairingCreds.expiresAtMs
-          );
           const apkMeta = self.getApkMetadata();
           const sizeMb = apkMeta.sizeBytes ? (apkMeta.sizeBytes / 1048576).toFixed(1) : "21.0";
           const html = `<!DOCTYPE html>
@@ -479,15 +456,8 @@ export class PhoneSessionManager extends EventEmitter {
     <a class="btn" href="/OneMoreStep.apk">📥 点击下载 OneMoreStep_v${apkMeta.versionName}.apk</a>
   </div>
   <div class="card">
-    <h2>第二步：1 对 1 安全验证并绑定 Mac</h2>
-    <p>${
-      hasActivePair
-        ? "🔒 已开启一机一码安全隔离。你可以直接在手机 App「绑定Mac」中输入 Mac 终端显示的 6 位配对码，或在下方输入配对码解锁绑定链接："
-        : "⚠️ 当前未开启配对会话，请先在 Mac 终端运行: bun run oms pair"
-    }</p>
-    <input id="pinInput" type="tel" maxlength="6" placeholder="请输入 Mac 终端显示的 6 位配对码" />
-    <code id="pairUri"></code>
-    <button class="btn btn-green" onclick="(async function(){var pin=document.getElementById('pinInput').value.trim();if(!pin){alert('请先输入 Mac 终端显示的 6 位配对码');return;}var r=await fetch('/pair/resolve?pin='+encodeURIComponent(pin));var d=await r.json();if(!d.ok){alert('❌ '+d.error);return;}var el=document.getElementById('pairUri');el.style.display='block';el.innerText=d.pairingUri;if(navigator.clipboard&&navigator.clipboard.writeText){await navigator.clipboard.writeText(d.pairingUri);alert('✅ 已验证配对码并复制加密绑定链接！请打开 OneMoreStep 粘贴绑定');}else{var ta=document.createElement('textarea');ta.value=d.pairingUri;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);alert('✅ 已验证配对码并复制加密绑定链接！请打开 OneMoreStep 粘贴绑定');}})()">🔐 验证配对码并复制绑定链接</button>
+    <h2>第二步：安全 v2 配对</h2>
+    <p>在 Mac 本地终端运行 oms pair，使用你控制的可信途径将完整 v2 配对链接输入手机。安装网页不提供 PIN 换取链接，也不展示配对凭据。旧版手机需升级后重新配对。</p>
   </div>
   <div class="card">
     <h2>第三步：小米 HyperOS 权限开启提醒</h2>
@@ -575,9 +545,11 @@ export class PhoneSessionManager extends EventEmitter {
           tier: "BT_RFCOMM",
           authenticated: false,
           decoder: new FrameStreamDecoder(),
-          sendRaw: (bytes) => this.btBridge?.sendFrameOverBluetooth(bytes),
+            sendRaw: (bytes) => this.btBridge?.sendFrameOverBluetooth(bytes) ?? false,
           close: () => {},
         };
+        const previousBt = this.pendingBtPipe;
+        if (previousBt) this.onPipeClosed(previousBt);
         this.pendingBtPipe = btPipe;
         this.onPipeOpened(btPipe);
       });
@@ -597,7 +569,7 @@ export class PhoneSessionManager extends EventEmitter {
             tier: "BT_RFCOMM",
             authenticated: false,
             decoder: new FrameStreamDecoder(),
-            sendRaw: (b) => this.btBridge?.sendFrameOverBluetooth(b),
+            sendRaw: (b) => this.btBridge?.sendFrameOverBluetooth(b) ?? false,
             close: () => {},
           };
           this.pendingBtPipe = btPipe;
@@ -788,7 +760,9 @@ export class PhoneSessionManager extends EventEmitter {
         authenticated: false,
         decoder: new FrameStreamDecoder(),
         sendRaw: (bytes) => {
-          if (ws.readyState === WebSocket.OPEN) ws.send(bytes);
+          if (ws.readyState !== WebSocket.OPEN) throw new Error("WAN socket is not open");
+          ws.send(bytes);
+          return true;
         },
         close: () => ws.close(),
       };
@@ -808,31 +782,64 @@ export class PhoneSessionManager extends EventEmitter {
   }
 
   private onPipeOpened(pipe: ActiveTransportPipe): void {
+    if (this.openPipes.has(pipe)) return;
+    pipe.closed = false;
+    pipe.authenticated = false;
     this.openPipes.add(pipe);
-    // Issue mutual auth challenge immediately
-    const nonceMacHex = crypto.randomBytes(16).toString("hex");
-    pipe.pendingNonceMac = nonceMacHex;
-    const helloFrame = encodeJsonRpcFrame({
-      jsonrpc: "2.0",
-      method: "auth.helloChallenge",
-      params: {
-        macId: this.hostIdentity.deviceId,
-        macPubKeyBase64Url: this.hostIdentity.publicKeyBase64Url,
-        nonceMacHex,
-        timestampMs: Date.now(),
-      },
-    });
-    pipe.sendRaw(helloFrame);
+    const ephemeral = generateSecureEphemeral();
+    const hello: SecureHello = { v: 2, macId: this.hostIdentity.deviceId, nonceMacHex: secureRandomHex(), publicKeyHex: ephemeral.publicKeyHex };
+    const timer = setTimeout(() => this.failPipe(pipe, "Secure handshake timed out; reconnect or re-pair"), 30000);
+    timer.unref?.();
+    pipe.secure = { phase: "hello", hello, ephemeral, timer, receivedHandshakeBytes: 0 };
+    try {
+      this.writeRaw(pipe, encodeJsonRpcFrame({ jsonrpc: "2.0", method: "secure.hello", params: hello }));
+    } catch {
+      this.failPipe(pipe, "Could not send secure handshake");
+    }
+  }
+
+  private writeRaw(pipe: ActiveTransportPipe, bytes: Uint8Array): void {
+    if (pipe.closed) throw new Error("Transport is closed");
+    const result = pipe.sendRaw(bytes);
+    // Bun -1 means queued under backpressure; 0 means dropped.
+    if (result !== true && result !== -1 && !(typeof result === "number" && result > 0)) {
+      throw new Error("Transport rejected encrypted data; reconnect required");
+    }
+  }
+
+  private sendSecure(pipe: ActiveTransportPipe, inner: Uint8Array): void {
+    const secure = pipe.secure;
+    if (pipe.closed || !secure?.session || secure.phase === "hello") throw new Error("Secure session is not confirmed");
+    try {
+      this.writeRaw(pipe, secure.session.seal(inner));
+    } catch (err) {
+      this.failPipe(pipe, "Encrypted send failed; reconnect or re-pair");
+      throw err;
+    }
+  }
+
+  private failPipe(pipe: ActiveTransportPipe, message: string): void {
+    if (pipe.closed) return;
+    this.onPipeClosed(pipe);
+    try { pipe.close(); } catch {}
+    this.emit("protocolError", new Error(message));
   }
 
   private isLivePipe(pipe: ActiveTransportPipe): boolean {
-    return pipe.authenticated && Boolean(pipe.phoneId && this.trustedDevices.has(pipe.phoneId))
+    return !pipe.closed && pipe.secure?.phase === "ready" && pipe.authenticated
+      && Boolean(pipe.phoneId && this.trustedDevices.get(pipe.phoneId)?.pairingVersion === 2)
       && this.pipes.get(pipe.tier) === pipe;
   }
 
   private onPipeClosed(pipe: ActiveTransportPipe): void {
     pipe.authenticated = false;
-    pipe.pendingNonceMac = undefined;
+    pipe.closed = true;
+    if (pipe.secure) {
+      clearTimeout(pipe.secure.timer);
+      pipe.secure.session?.destroy();
+      if (pipe.secure.pairingCredentials?.reservedBy === pipe) pipe.secure.pairingCredentials.reservedBy = undefined;
+      pipe.secure = undefined;
+    }
     this.openPipes.delete(pipe);
     if (this.pipes.get(pipe.tier) === pipe) this.pipes.delete(pipe.tier);
     for (const [id, pending] of this.pendingRpc) {
@@ -886,344 +893,222 @@ export class PhoneSessionManager extends EventEmitter {
   }
 
   private onRawBytesReceived(pipe: ActiveTransportPipe, chunk: Uint8Array): void {
-    let frames;
+    if (pipe.closed || !this.openPipes.has(pipe)) return;
     try {
-      frames = pipe.decoder.push(chunk);
-    } catch (err) {
-      this.emit("protocolError", err);
+      if (pipe.secure && pipe.secure.phase !== "ready") {
+        pipe.secure.receivedHandshakeBytes += chunk.byteLength;
+        if (pipe.secure.receivedHandshakeBytes > 65536) throw new Error("Handshake byte budget exceeded");
+      }
+      for (const outer of pipe.decoder.push(chunk)) {
+        if (pipe.closed) break;
+        const secure = pipe.secure;
+        if (!secure || outer.flags !== 0) throw new Error("Invalid secure connection state");
+        if (outer.frameType === FrameType.SECURE_RECORD) {
+          if (!secure.session || secure.phase === "hello") throw new Error("Encrypted record before key agreement");
+          const record = encodeFrame(outer.frameType, outer.payload, outer.flags);
+          const innerBytes = secure.session.open(record);
+          const decoded = new FrameStreamDecoder().push(innerBytes);
+          if (decoded.length !== 1) throw new Error("Expected one authenticated inner frame");
+          const frame = decoded[0];
+          if (secure.phase === "finish") {
+            if (frame.frameType !== FrameType.CONTROL_JSON_RPC) throw new Error("Expected encrypted key confirmation");
+            this.handleSecureFinish(pipe, decodeJsonRpcPayload<JsonRpcRequest>(frame.payload));
+          } else {
+            this.dispatchBusinessFrame(pipe, frame);
+          }
+        } else {
+          if (secure.phase === "ready" || outer.frameType !== FrameType.CONTROL_JSON_RPC || outer.payload.byteLength > 4096) {
+            throw new Error("Plaintext business traffic is forbidden; upgrade and re-pair");
+          }
+          const req = decodeJsonRpcPayload<JsonRpcRequest>(outer.payload);
+          if (req.method !== "secure.start" || req.id !== "secure_start") throw new Error("Secure v2 handshake required; upgrade and re-pair");
+          this.handleSecureStart(pipe, req);
+        }
+      }
+    } catch {
+      this.failPipe(pipe, "Secure protocol validation failed; upgrade/reconnect or re-pair");
+    }
+  }
+
+  private handleSecureStart(pipe: ActiveTransportPipe, req: JsonRpcRequest): void {
+    const secure = pipe.secure;
+    if (!secure || pipe.closed) throw new Error("Connection has no handshake");
+    const start = req.params as SecureStart;
+    const startJson = JSON.stringify(start);
+    if (secure.phase === "finish") {
+      if (startJson !== secure.startJson) throw new Error("Handshake context cannot change");
+      this.writeRaw(pipe, encodeJsonRpcFrame({ jsonrpc: "2.0", id: "secure_start", result: { v: 2, proofHex: secure.macProofHex } }));
       return;
     }
+    if (secure.phase !== "hello" || !start || (start.mode !== "pair" && start.mode !== "auth")) throw new Error("Invalid handshake mode");
+    let psk: string;
+    let credentials: PairingCredentials | undefined;
+    if (start.mode === "pair") {
+      const active = this.activePairingCreds;
+      if (!active || Date.now() >= active.expiresAtMs || (active.reservedBy && active.reservedBy !== pipe)) throw new Error("Pairing token unavailable");
+      credentials = active;
+      psk = active.ephemeralToken;
+    } else {
+      const trusted = this.trustedDevices.get(start.phoneId);
+      if (this.trustPersistenceUncertain || trusted?.pairingVersion !== 2 || !trusted.pairSecretHex) throw new Error("Pairing must be replaced with secure v2");
+      psk = trusted.pairSecretHex;
+    }
+    const established = establishSecureSession("mac", secure.hello, start, psk, secure.ephemeral.privateKeyHex);
+    if (credentials) credentials.reservedBy = pipe;
+    secure.phase = "finish";
+    secure.start = start;
+    secure.startJson = startJson;
+    secure.session = established.session;
+    secure.pairSecretHex = established.pairSecretHex;
+    secure.macProofHex = established.macProofHex;
+    secure.pairingCredentials = credentials;
+    this.writeRaw(pipe, encodeJsonRpcFrame({ jsonrpc: "2.0", id: "secure_start", result: { v: 2, proofHex: established.macProofHex } }));
+  }
 
-    for (const frame of frames) {
+  private validateFinish(params: unknown): { phoneName: string; phoneModel: string; deviceSnapshot: PhoneDeviceStatus } {
+    if (!params || typeof params !== "object" || Array.isArray(params) || Buffer.byteLength(JSON.stringify(params)) > 32768) throw new Error("Invalid finish metadata");
+    const p = params as Record<string, unknown>;
+    for (const key of ["phoneName", "phoneModel"]) {
+      if (typeof p[key] !== "string" || (p[key] as string).length > 256) throw new Error("Invalid phone metadata");
+    }
+    const status = p.deviceSnapshot as Record<string, unknown>;
+    if (!status || typeof status !== "object" || Array.isArray(status)
+      || typeof status.batteryPct !== "number" || !Number.isFinite(status.batteryPct) || status.batteryPct < 0 || status.batteryPct > 100
+      || typeof status.isCharging !== "boolean" || typeof status.screenLocked !== "boolean"
+      || !Array.isArray(status.lanIps) || status.lanIps.length > 16 || status.lanIps.some((ip) => typeof ip !== "string" || ip.length > 128)
+      || !status.permissions || typeof status.permissions !== "object" || Array.isArray(status.permissions)
+      || Object.values(status.permissions).some((v) => typeof v !== "boolean")) throw new Error("Invalid encrypted device snapshot");
+    for (const [key, value] of Object.entries(status)) {
+      if (["permissions", "lanIps"].includes(key)) continue;
+      if (typeof value === "string" && value.length <= 1024) continue;
+      if (typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) continue;
+      throw new Error("Invalid device snapshot field");
+    }
+    return p as unknown as { phoneName: string; phoneModel: string; deviceSnapshot: PhoneDeviceStatus };
+  }
+
+  private handleSecureFinish(pipe: ActiveTransportPipe, req: JsonRpcRequest): void {
+    const secure = pipe.secure;
+    if (!secure?.start || !secure.session || req.method !== "secure.finish" || req.id !== "secure_finish") throw new Error("Expected secure.finish");
+    const finishJson = JSON.stringify(req.params);
+    if (secure.phase === "ready") {
+      if (finishJson !== secure.finishJson || !this.isLivePipe(pipe)) throw new Error("Finish metadata changed");
+      this.sendSecure(pipe, encodeJsonRpcFrame({ jsonrpc: "2.0", id: "secure_finish", result: secure.finishResult }));
+      return;
+    }
+    if (secure.phase !== "finish") throw new Error("Handshake not ready for confirmation");
+    const { phoneName, phoneModel, deviceSnapshot } = this.validateFinish(req.params);
+    const start = secure.start;
+    const previousTrust = this.getTrustedDevices();
+    const existing = this.trustedDevices.get(start.phoneId);
+    const credentials = secure.pairingCredentials;
+    if (start.mode === "pair" && (!credentials || this.activePairingCreds !== credentials || credentials.reservedBy !== pipe || Date.now() >= credentials.expiresAtMs)) throw new Error("Pairing token expired or replaced");
+    if (start.mode === "auth" && (existing?.pairingVersion !== 2 || !existing.pairSecretHex)) throw new Error("Pairing was revoked");
+    const wanRoomId = existing && start.mode === "auth" ? existing.wanRoomId : deriveWanRoomId(this.hostIdentity.publicKeyBase64Url, start.phoneId);
+    const trusted: TrustedPhoneDevice = {
+      phoneId: start.phoneId, phoneName, phoneModel, phonePubKeyBase64Url: "", wanRoomId,
+      pairingVersion: 2,
+      pairSecretHex: start.mode === "pair" ? secure.pairSecretHex : existing!.pairSecretHex,
+      pairedAtMs: start.mode === "pair" ? Date.now() : existing!.pairedAtMs,
+      lastSeenMs: Date.now(),
+      lastKnownLanIps: [...new Set([...(pipe.remoteIp && !pipe.remoteIp.startsWith("127.") ? [pipe.remoteIp] : []), ...deviceSnapshot.lanIps])].slice(0, 4),
+    };
+    const nextTrust = start.mode === "pair" ? [trusted] : previousTrust.map((old) => old.phoneId === trusted.phoneId ? trusted : old);
+    // Persist before acknowledging. A failed ACK rolls back the saved candidate when possible.
+    this.emit("trustStore", nextTrust);
+    const result = { ok: true as const, pairingVersion: 2 as const, macId: this.hostIdentity.deviceId, wanRoomId };
+    try {
+      this.sendSecure(pipe, encodeJsonRpcFrame({ jsonrpc: "2.0", id: "secure_finish", result }));
+    } catch (err) {
       try {
-      switch (frame.frameType) {
-        case FrameType.CONTROL_JSON_RPC: {
-          const msg = decodeJsonRpcPayload<JsonRpcMessage>(frame.payload);
-          this.handleJsonRpcMessage(pipe, msg);
-          break;
-        }
-        case FrameType.STREAM_START: {
-          if (!this.isLivePipe(pipe)) break;
-          const header = decodeJsonRpcPayload<StreamStartHeader>(frame.payload);
-          this.handleStreamStart(pipe, header);
-          break;
-        }
-        case FrameType.STREAM_CHUNK: {
-          if (!this.isLivePipe(pipe)) break;
-          const chunkObj = decodeStreamChunkPayload(frame.payload);
-          this.handleStreamChunk(pipe, chunkObj.streamId, chunkObj.chunkIndex, chunkObj.data);
-          break;
-        }
-        case FrameType.STREAM_ACK_RESUME: {
-          if (!this.isLivePipe(pipe)) break;
-          const ack = decodeJsonRpcPayload<StreamAckResumeHeader>(frame.payload);
-          this.handleStreamAck(pipe, ack);
-          break;
-        }
-        case FrameType.PING: {
-          if (!this.isLivePipe(pipe)) break;
-          const view = new DataView(
-            frame.payload.buffer,
-            frame.payload.byteOffset,
-            frame.payload.byteLength
-          );
-          const sentTs = Number(view.getBigUint64(0, false));
-          pipe.sendRaw(encodePongFrame(sentTs, 100, true));
-          break;
-        }
-        case FrameType.PONG: {
-          if (!this.isLivePipe(pipe)) break;
-          const view = new DataView(
-            frame.payload.buffer,
-            frame.payload.byteOffset,
-            frame.payload.byteLength
-          );
-          const sentTs = Number(view.getBigUint64(0, false));
-          this.lastRttMs = Math.max(1, Date.now() - sentTs);
-          if (pipe.tier === "LAN_WS") {
-            this.presence.onLanDirectActive(this.lastRttMs);
-          }
-          break;
-        }
+        this.emit("trustStore", previousTrust);
+      } catch {
+        this.trustPersistenceUncertain = true;
+        for (const old of [...this.openPipes]) this.failPipe(old, "Pairing persistence rollback failed; explicit re-pair is required");
+        this.emit("protocolError", new Error("Pairing persistence rollback failed; explicit re-pair is required"));
       }
-      } catch (err) {
-        this.emit("protocolError", err);
+      throw err;
+    }
+    if (start.mode === "pair") {
+      this.activePairingCreds = null;
+      for (const old of [...this.openPipes]) {
+        if (old === pipe) continue;
+        this.onPipeClosed(old);
+        try { old.close(); } catch {}
       }
+      this.incomingStreams.clear();
+      this.completedStreams.clear();
+      while (this.outQueue.size) this.outQueue.dequeue();
+      this.emit("sessionRevoked");
+    }
+    this.trustedDevices.clear();
+    for (const record of nextTrust) this.trustedDevices.set(record.phoneId, record);
+    this.trustPersistenceUncertain = false;
+    clearTimeout(secure.timer);
+    secure.phase = "ready";
+    secure.finishJson = finishJson;
+    secure.finishResult = result;
+    pipe.authenticated = true;
+    pipe.phoneId = start.phoneId;
+    this.phoneStatus = { ...deviceSnapshot, secureProtocolVersion: 2 };
+    this.registerAuthenticatedPipe(pipe);
+    if (pipe.tier === "LAN_WS") this.presence.onLanDirectActive(1);
+    this.recomputeActiveTier();
+    if (start.mode === "pair") this.emit("devicePaired", trusted);
+    this.emit("phoneAuthenticated", { phoneId: start.phoneId, tier: pipe.tier, status: this.phoneStatus });
+  }
+
+  private dispatchBusinessFrame(pipe: ActiveTransportPipe, frame: ReturnType<FrameStreamDecoder["push"]>[number]): void {
+    if (!this.isLivePipe(pipe)) throw new Error("Inactive encrypted pipe");
+    switch (frame.frameType) {
+      case FrameType.CONTROL_JSON_RPC: {
+        const msg = decodeJsonRpcPayload<JsonRpcMessage>(frame.payload);
+        if ("method" in msg && msg.method === "secure.finish") this.handleSecureFinish(pipe, msg);
+        else this.handleJsonRpcMessage(pipe, msg);
+        break;
+      }
+      case FrameType.STREAM_START: this.handleStreamStart(pipe, decodeJsonRpcPayload(frame.payload)); break;
+      case FrameType.STREAM_CHUNK: {
+        const chunk = decodeStreamChunkPayload(frame.payload);
+        this.handleStreamChunk(pipe, chunk.streamId, chunk.chunkIndex, chunk.data);
+        break;
+      }
+      case FrameType.STREAM_ACK_RESUME: this.handleStreamAck(pipe, decodeJsonRpcPayload(frame.payload)); break;
+      case FrameType.PING: {
+        if (frame.payload.byteLength !== 8) throw new Error("Invalid ping");
+        const sentTs = Number(new DataView(frame.payload.buffer, frame.payload.byteOffset, frame.payload.byteLength).getBigUint64(0, false));
+        this.sendSecure(pipe, encodePongFrame(sentTs, 100, true));
+        break;
+      }
+      case FrameType.PONG: {
+        if (frame.payload.byteLength !== 10) throw new Error("Invalid pong");
+        const sentTs = Number(new DataView(frame.payload.buffer, frame.payload.byteOffset, frame.payload.byteLength).getBigUint64(0, false));
+        this.lastRttMs = Math.max(1, Date.now() - sentTs);
+        if (pipe.tier === "LAN_WS") this.presence.onLanDirectActive(this.lastRttMs);
+        break;
+      }
+      default: throw new Error("Unsupported authenticated frame");
     }
   }
 
   private handleJsonRpcMessage(pipe: ActiveTransportPipe, msg: JsonRpcMessage): void {
-    // 1. Check if it is a JSON-RPC Response to a request sent by Mac
+    if (!this.isLivePipe(pipe)) return;
     if ("result" in msg || "error" in msg) {
       const resp = msg as JsonRpcResponse;
       const pending = this.pendingRpc.get(resp.id);
-      if (pending && this.isLivePipe(pipe) && pending.pipe === pipe) {
+      if (pending && pending.pipe === pipe) {
         clearTimeout(pending.timer);
         this.pendingRpc.delete(resp.id);
-        if (resp.error) {
-          const err = new Error(resp.error.message) as Error & { code?: number };
-          err.code = resp.error.code;
-          pending.reject(err);
-        } else {
-          pending.resolve(resp.result);
-        }
+        if (resp.error) pending.reject(Object.assign(new Error(resp.error.message), { code: resp.error.code }));
+        else pending.resolve(resp.result);
       }
       return;
     }
-
-    // 2. Otherwise it is a Request or Notification from Phone -> Mac
     const req = msg as JsonRpcRequest;
-
-    // Allow `pair.request` and `auth.response` before authentication
-    if (req.method === "pair.request") {
-      this.handlePairRequest(pipe, req);
-      return;
-    }
-    if (req.method === "auth.response") {
-      this.handleAuthResponse(pipe, req);
-      return;
-    }
-
-    if (!this.isLivePipe(pipe)) {
-      if (req.id) {
-        pipe.sendRaw(
-          encodeJsonRpcFrame({
-            jsonrpc: "2.0",
-            id: req.id,
-            error: { code: -32000, message: "Unauthenticated transport pipe" },
-          })
-        );
-      }
-      return;
-    }
-
-    // Authenticated Phone -> Mac RPC calls (e.g. inbox.submitItem, approval.respond, gui.emergencyStop)
+    if (!req || typeof req.method !== "string" || ["pair.request", "auth.response", "secure.start", "secure.hello"].includes(req.method)) throw new Error("Legacy or unexpected handshake message");
     this.emit("phoneRequest", req, (resultOrError: { result?: unknown; error?: { code: number; message: string } }) => {
-      if (!req.id) return;
-      const responseFrame = encodeJsonRpcFrame({
-        jsonrpc: "2.0",
-        id: req.id,
-        ...(resultOrError.error ? { error: resultOrError.error } : { result: resultOrError.result }),
-      });
-      if (this.isLivePipe(pipe)) pipe.sendRaw(responseFrame);
-    });
-  }
-
-  private handlePairRequest(pipe: ActiveTransportPipe, req: JsonRpcRequest): void {
-    const params = req.params as PairRequestParams;
-    if (!this.activePairingCreds || Date.now() > this.activePairingCreds.expiresAtMs) {
-      if (req.id) {
-        pipe.sendRaw(
-          encodeJsonRpcFrame({
-            jsonrpc: "2.0",
-            id: req.id,
-            error: { code: -32010, message: "Pairing session expired or not active on Mac" },
-          })
-        );
-      }
-      return;
-    }
-
-    const expectedHmac = computePairingHmac(
-      this.activePairingCreds.ephemeralToken,
-      this.activePairingCreds.pinCode,
-      params.phoneId,
-      params.phonePubKeyBase64Url
-    );
-
-    if (params.pinCode !== this.activePairingCreds.pinCode || !this.equalDigest(expectedHmac, params.hmacHex)) {
-      this.activePairingCreds.failedPinAttempts =
-        (this.activePairingCreds.failedPinAttempts || 0) + 1;
-      if (this.activePairingCreds.failedPinAttempts >= 5) {
-        this.activePairingCreds = null;
-      }
-      if (req.id) {
-        pipe.sendRaw(
-          encodeJsonRpcFrame({
-            jsonrpc: "2.0",
-            id: req.id,
-            error: { code: -32011, message: "Invalid pairing PIN or HMAC signature" },
-          })
-        );
-      }
-      return;
-    }
-
-    // Consume ephemeral pairing credentials immediately (strictly one-time use)
-    this.activePairingCreds = null;
-
-    const wanRoomId = deriveWanRoomId(
-      this.hostIdentity.publicKeyBase64Url,
-      params.phonePubKeyBase64Url
-    );
-    const pairSecretHex = crypto.randomBytes(32).toString("hex");
-
-    const trusted: TrustedPhoneDevice = {
-      phoneId: params.phoneId,
-      phoneModel: params.phoneModel || "Xiaomi",
-      phoneName: params.phoneName || "Xiaomi Phone",
-      phonePubKeyBase64Url: params.phonePubKeyBase64Url,
-      wanRoomId,
-      pairSecretHex,
-      ...(pipe.remoteIp && !pipe.remoteIp.startsWith("127.") && pipe.remoteIp !== "unknown"
-        ? { lastKnownLanIps: [pipe.remoteIp] }
-        : {}),
-      pairedAtMs: Date.now(),
-      lastSeenMs: Date.now(),
-    };
-
-    // Invalidate operations even when re-pairing reuses the physical connection.
-    this.onPipeClosed(pipe);
-    // Re-pairing revokes every old connection, including connections on other tiers.
-    for (const old of [...this.openPipes, ...this.pipes.values()]) {
-      if (old === pipe) continue;
-      this.onPipeClosed(old);
-      old.close();
-    }
-    this.incomingStreams.clear();
-    this.completedStreams.clear();
-    while (this.outQueue.size) this.outQueue.dequeue();
-    this.emit("sessionRevoked");
-    // Strictly enforce 1-to-1 pairing: bind exclusively to the newly paired phone
-    this.trustedDevices.clear();
-    this.trustedDevices.set(trusted.phoneId, trusted);
-    pipe.authenticated = true;
-    pipe.phoneId = trusted.phoneId;
-    pipe.pendingNonceMac = undefined;
-    this.registerAuthenticatedPipe(pipe);
-    if (pipe.tier === "LAN_WS") {
-      this.presence.onLanDirectActive(1);
-    }
-    this.recomputeActiveTier();
-    this.emit("devicePaired", trusted);
-
-    const sigMac = signEd25519(
-      this.hostIdentity.privateKeyPem,
-      `${params.phoneId}:${wanRoomId}`
-    );
-
-    const result: PairResponseResult = {
-      ok: true,
-      macId: this.hostIdentity.deviceId,
-      macName: os.hostname(),
-      macPubKeyBase64Url: this.hostIdentity.publicKeyBase64Url,
-      wanRoomId,
-      macSignatureBase64Url: sigMac,
-      pairSecretHex,
-    };
-
-    if (req.id) {
-      pipe.sendRaw(
-        encodeJsonRpcFrame({
-          jsonrpc: "2.0",
-          id: req.id,
-          result,
-        })
-      );
-    }
-  }
-
-  private handleAuthResponse(pipe: ActiveTransportPipe, req: JsonRpcRequest): void {
-    const params = req.params as AuthResponseParams;
-    const trusted = this.trustedDevices.get(params.phoneId);
-    const challengeNonceMac = pipe.pendingNonceMac;
-    if (!trusted || !challengeNonceMac) {
-      console.warn(
-        `[omsd][auth] rejected unknown phoneId=${params?.phoneId} or missing nonce`
-      );
-      if (req.id) {
-        pipe.sendRaw(
-          encodeJsonRpcFrame({
-            jsonrpc: "2.0",
-            id: req.id,
-            error: { code: -32012, message: "Unknown device ID or missing challenge nonce" },
-          })
-        );
-      }
-      return;
-    }
-
-    const hmacPayload = `phone_auth:${challengeNonceMac}:${this.hostIdentity.deviceId}:${params.phoneId}:${params.noncePhoneHex}`;
-    const expected = trusted.pairSecretHex ? computeAuthHmac(trusted.pairSecretHex, hmacPayload) : "";
-    if (!expected || !this.equalDigest(expected, params.phoneSignatureBase64Url)) {
-      console.warn(
-        `[omsd][auth] signature verification failed for phoneId=${params.phoneId}`
-      );
-      pipe.pendingNonceMac = undefined;
-      if (req.id) {
-        pipe.sendRaw(
-          encodeJsonRpcFrame({
-            jsonrpc: "2.0",
-            id: req.id,
-            error: { code: -32013, message: "Cryptographic challenge signature verification failed" },
-          })
-        );
-      }
-      return;
-    }
-
-    const knownIps = new Set<string>();
-    if (pipe.remoteIp && !pipe.remoteIp.startsWith("127.") && pipe.remoteIp !== "unknown") {
-      knownIps.add(pipe.remoteIp);
-    }
-    for (const ip of params.deviceSnapshot?.lanIps || []) {
-      if (ip && !ip.startsWith("127.") && !ip.startsWith("198.18.")) {
-        knownIps.add(ip);
-      }
-    }
-    for (const ip of trusted.lastKnownLanIps || []) {
-      if (ip && !ip.startsWith("127.")) {
-        knownIps.add(ip);
-      }
-    }
-    if (knownIps.size > 0) {
-      trusted.lastKnownLanIps = Array.from(knownIps).slice(0, 4);
-    }
-
-    pipe.pendingNonceMac = undefined;
-    pipe.authenticated = true;
-    pipe.phoneId = params.phoneId;
-    trusted.lastSeenMs = Date.now();
-    this.phoneStatus = params.deviceSnapshot;
-    this.registerAuthenticatedPipe(pipe);
-    if (pipe.tier === "LAN_WS") {
-      this.presence.onLanDirectActive(1);
-    }
-    this.recomputeActiveTier();
-    console.log(
-      `[omsd][auth] authenticated phone=${params.phoneId} tier=${pipe.tier} ip=${pipe.remoteIp || "unknown"}`
-    );
-
-    const macSig = signEd25519(
-      this.hostIdentity.privateKeyPem,
-      `${params.noncePhoneHex}:${params.phoneId}`
-    );
-    const macAuthHmacHex = trusted.pairSecretHex
-      ? computeAuthHmac(
-          trusted.pairSecretHex,
-          `mac_ack:${challengeNonceMac}:${params.noncePhoneHex}:${this.hostIdentity.deviceId}:${params.phoneId}`
-        )
-      : undefined;
-
-    if (req.id) {
-      pipe.sendRaw(
-        encodeJsonRpcFrame({
-          jsonrpc: "2.0",
-          id: req.id,
-          result: {
-            ok: true,
-            macId: this.hostIdentity.deviceId,
-            macSignatureBase64Url: macSig,
-            ...(macAuthHmacHex ? { macAuthHmacHex } : {}),
-          },
-        })
-      );
-    }
-
-    this.emit("phoneAuthenticated", {
-      phoneId: params.phoneId,
-      tier: pipe.tier,
-      status: params.deviceSnapshot,
+      if (!req.id || !this.isLivePipe(pipe)) return;
+      this.sendSecure(pipe, encodeJsonRpcFrame({ jsonrpc: "2.0", id: req.id, ...(resultOrError.error ? { error: resultOrError.error } : { result: resultOrError.result }) }));
     });
   }
 
@@ -1235,7 +1120,7 @@ export class PhoneSessionManager extends EventEmitter {
   private streamError(pipe: ActiveTransportPipe, streamId: string, message: string): void {
     const transfer = this.incomingStreams.get(streamId);
     if (transfer?.pipe === pipe) this.incomingStreams.delete(streamId);
-    pipe.sendRaw(encodeStreamAckResumeFrame({ streamId, status: "ERROR", nextExpectedChunkIndex: 0, errorMessage: message }));
+    this.sendSecure(pipe, encodeStreamAckResumeFrame({ streamId, status: "ERROR", nextExpectedChunkIndex: 0, errorMessage: message }));
   }
 
   private handleStreamStart(pipe: ActiveTransportPipe, header: StreamStartHeader): void {
@@ -1255,7 +1140,7 @@ export class PhoneSessionManager extends EventEmitter {
       if (JSON.stringify(completed.header) !== JSON.stringify(header)) {
         this.streamError(pipe, header.streamId, "Stream ID already committed with different metadata");
       } else {
-        pipe.sendRaw(encodeStreamAckResumeFrame({ streamId: header.streamId, status: "COMPLETED", nextExpectedChunkIndex: header.totalChunks }));
+        this.sendSecure(pipe, encodeStreamAckResumeFrame({ streamId: header.streamId, status: "COMPLETED", nextExpectedChunkIndex: header.totalChunks }));
       }
       return;
     }
@@ -1266,7 +1151,7 @@ export class PhoneSessionManager extends EventEmitter {
       }
       let next = 0;
       while (existing.receivedChunks.has(next)) next++;
-      pipe.sendRaw(encodeStreamAckResumeFrame({ streamId: header.streamId, status: "RESUME_REQUEST", nextExpectedChunkIndex: next }));
+      this.sendSecure(pipe, encodeStreamAckResumeFrame({ streamId: header.streamId, status: "RESUME_REQUEST", nextExpectedChunkIndex: next }));
       return;
     }
     // Bound abandoned partial transfers as well as their individual sizes.
@@ -1313,7 +1198,7 @@ export class PhoneSessionManager extends EventEmitter {
       const completed: CompletedFileTransfer = { header: h, savedAbsPath, sha256Actual: actualSha256 };
       this.incomingStreams.delete(streamId);
       this.completedStreams.set(streamId, completed);
-      pipe.sendRaw(encodeStreamAckResumeFrame({ streamId, status: "COMPLETED", nextExpectedChunkIndex: h.totalChunks, savedPath: savedAbsPath }));
+      this.sendSecure(pipe, encodeStreamAckResumeFrame({ streamId, status: "COMPLETED", nextExpectedChunkIndex: h.totalChunks, savedPath: savedAbsPath }));
       this.emit("streamCompleted", completed);
     } catch (err) {
       this.streamError(pipe, streamId, `Could not commit stream: ${String(err)}`);
@@ -1382,7 +1267,7 @@ export class PhoneSessionManager extends EventEmitter {
       }, timeoutMs);
 
       this.pendingRpc.set(reqId, { resolve, reject, timer, pipe });
-      try { pipe.sendRaw(frame); } catch (err) {
+      try { this.sendSecure(pipe, frame); } catch (err) {
         clearTimeout(timer); this.pendingRpc.delete(reqId); reject(err);
       }
     });
@@ -1426,11 +1311,11 @@ export class PhoneSessionManager extends EventEmitter {
       }, opts.timeoutMs ?? 60000);
       this.outgoingStreams.set(streamId, { pipe, resolve, reject, timer });
       try {
-        pipe.sendRaw(encodeStreamStartFrame(startHeader));
+        this.sendSecure(pipe, encodeStreamStartFrame(startHeader));
         for (let i = 0; i < totalChunks; i++) {
           if (!this.outgoingStreams.has(streamId)) break;
           if (!this.isLivePipe(pipe)) throw new Error("Transport changed during stream transfer");
-          pipe.sendRaw(encodeStreamChunkFrame(streamId, i, opts.data.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, opts.data.byteLength))));
+          this.sendSecure(pipe, encodeStreamChunkFrame(streamId, i, opts.data.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, opts.data.byteLength))));
         }
       } catch (err) {
         clearTimeout(timer); this.outgoingStreams.delete(streamId); reject(err);
@@ -1453,7 +1338,7 @@ export class PhoneSessionManager extends EventEmitter {
     while (this.outQueue.size > 0) {
       const nextFrame = this.outQueue.dequeue();
       if (!nextFrame) break;
-      activePipe.sendRaw(nextFrame);
+      this.sendSecure(activePipe, nextFrame);
     }
   }
 
