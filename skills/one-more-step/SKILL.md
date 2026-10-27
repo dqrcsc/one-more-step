@@ -14,7 +14,7 @@ description: 青简·咫尺 (OneMoreStep / oms) —— macOS 本地 AI Agent 与
 ---
 
 
-> 开发分支升级注意：主机和手机同时升级；缺少配对密钥需重新配对。GUI 节点动作必须携带最新 observationId；文件推送等待对端落盘 ACK。当前传输没有应用层端到端加密，BLE/WAN 与完整断点恢复的边界见 [implementation-status](../../docs/implementation-status.md)。
+> 开发分支升级注意：v1.4.0 主机和手机同时升级，旧配对需使用 Mac 本地完整链接重新配对；禁止通过旧 OMS 明文通道或 HTTP 页面传递新凭据。GUI 节点动作必须携带最新 observationId；文件推送等待对端落盘 ACK。v2 使用认证加密业务帧且拒绝明文回退；HTTP 安装页、BLE/WAN 与完整断点恢复的边界见 [implementation-status](../../docs/implementation-status.md)。
 
 ## 1. 调用方式与架构约定
 
@@ -296,7 +296,7 @@ oms gui act click "#8" --confirm --observation "刚才返回的 observationId"
 # 在 Mac 默认浏览器打开实时收件箱与双向协同 Web 看板 (http://127.0.0.1:19527/inbox)
 oms web
 
-# 生成无线安装台地址 (http://<LAN_IP>:19527/install)、6 位 PIN 码与配对 URI
+# 在 Mac 本地生成安全 v2 完整配对 URI；无线安装页仅提供 APK，不提供配对密钥
 oms pair
 
 # 查看或修改 Mac 收到手机投递时的自动联动偏好（自动复制剪贴板 / 自动打开预览）

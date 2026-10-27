@@ -1,12 +1,14 @@
 # 当前实现边界与升级验收
 
-本文件描述 v1.3.8 的稳定性修复与 v1.3.9 的 GUI 窗口事件修复（保留 v1.3.7 验证码同步功能）。它优先于旧模块设计文档中的能力设想。部署与真机验证进度见 [v1.3.8 OTA 记录](ota-1.3.8.md) 和 [GUI 安全验收及 v1.3.9 复测](gui-safety-acceptance-2026-10-26.md)。
+本文件描述 v1.3.8 的稳定性修复、v1.3.9 的 GUI 窗口事件修复与 v1.4.0 候选的安全传输（保留 v1.3.7 验证码同步功能）。它优先于旧模块设计文档中的能力设想。部署与真机验证进度见 [v1.3.8 OTA 记录](ota-1.3.8.md) 和 [GUI 安全验收及 v1.3.9 复测](gui-safety-acceptance-2026-10-26.md)。
+
+v1.4.0 配对方式、加密范围与验证进度见 [安全传输 v2](secure-transport-v2.md)。
 
 ## 本批实现
 
 | 范围 | 现在的行为 | 主要源码 |
 |---|---|---|
-| 重连认证 | 只接受已配对密钥的 HMAC 挑战应答；拒绝固定签名和公开 room ID 密钥；手机检查响应来源及 Mac 身份 | `session-manager.ts`、`OmsTransportClient.kt` |
+| 重连认证 | v2 配对密钥认证临时 ECDH 握手，双向 AES-GCM 加密业务帧；旧配对需重配，拒绝明文降级 | `session-manager.ts`、`OmsTransportClient.kt` |
 | 撤销 | 重新配对撤销旧连接和旧 RPC/文件等待器；同一物理连接重配也撤销旧操作 | `session-manager.ts` |
 | RPC | 请求/响应绑定发起连接，不能被另一条已认证或未认证连接兑现 | 两端 transport |
 | 手机到 Mac | 附件完成并校验后才能提交 inbox；收到相同 itemId 的成功 ACK 才标记 DELIVERED；失败保留 QUEUED | 两端 transport、`InboxManager` |
@@ -24,7 +26,7 @@
 ## 升级兼容性
 
 1. 主机与 Android 必须一起升级。旧版手机可能不回送文件 ACK，新主机会明确报告未确认送达。
-2. 缺少 `pairSecretHex` 的历史配对需要重新配对。移除了固定签名和公开 room ID 的迁移认证路径。
+2. v1.4.0 要求 `pairingVersion=2`；所有旧配对必须重新配对。新长期密钥由双方派生，不通过网络明文下发。完整一次性链接只在 Mac 本地展示，HTTP 六位码解析入口关闭。
 3. 节点编号只对对应观察有效。`gui.observe` 返回 `observationId`；每次重新观察替换旧观察，应用窗口/内容改变也会使旧编号失效。
 4. `gui.act` 的 `deadlineMs` 由当前 CLI/MCP/daemon 自动添加。直接调用手机 RPC 的客户端必须传入绝对毫秒期限。
 5. `sys.control/system_action` 同样传递绝对期限并受 GUI 急停约束。原生 `sys.control` 打开网址、启动 App、音量等能力保持原独立路径，**急停不是所有远程系统能力的总开关**。
@@ -40,11 +42,11 @@ oms gui act click "#3" --observation "刚才返回的 observationId" --confirm
 
 ## 仍未实现或尚未验证
 
-- **首次配对与业务帧没有应用层端到端加密。** 当前 LAN 使用 HTTP/WS，配对密钥在配对返回中传输。HMAC 是认证，不是数据保密；不能据此宣称公共 Wi-Fi 安全。首次配对应在自己控制的可信网络进行。
+- v1.4.0 业务帧使用认证加密；完整配对链接仍须通过用户控制的可信途径传递。该组合协议未经第三方审计，HTTP APK 分发、端点/长度/时序信息、本地密钥存储和被控制的终端不在业务加密保护内。
 - WAN 枚举仍叫 `WAN_WEBRTC`，实际实现为 WebSocket 中继接入；没有可据此验收的 WebRTC DataChannel/ICE/TURN 实现或随仓库部署的生产 relay。
 - Mac 蓝牙桥实际使用 CoreBluetooth BLE GATT。`BT_RFCOMM` 为历史枚举名，不代表 Mac 已实现 RFCOMM。BLE 的 MTU 分片、确认与背压尚未完成专项修复/真机验收。
 - 接收端保留同连接存活期间的重复起始帧处理；没有持久化断点续传、切换连接接续或发送端完整恢复状态机。连接关闭时未完成流清除；重试是重新投递。
-- SHA-256 只能检测内容不一致；在未加密、未对业务帧签名的链路上不构成防篡改认证。
+- 文件 SHA-256 仍用于完整性校验，不是身份认证；v2 记录的认证由 AES-GCM 标签提供。
 - `isSecureWindow` 是包名、活动名和密码字段的启发式策略。截图 API 的 secure-window 错误被保留，但不能识别所有 `FLAG_SECURE` 窗口或保证覆盖所有支付场景。
 - 触摸事件的 OEM 覆盖、浮层权限撤销、蓝牙断线表现需真机验证。等待确认时允许触碰确认条；应用内容变化仍会使操作失效。
 - 已被 Android 接受的手势不能保证中途撤回；取消会阻止后续动作并丢弃迟到回调。

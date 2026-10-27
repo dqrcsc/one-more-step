@@ -88,3 +88,8 @@ Files: OmsTransportClient.kt, paired config storage/model, MainActivity copy.
 - [ ] Update versions1.4.0/code14, docs/changelog/global skill template statements. Check APK same certificate and SHA256.
 - [ ] Save old APK/metadata plus private pairing config backup without printing secrets. Deploy candidate APK under old daemon; manual OTA install. Then deploy host, generate new token only on local review surface; never transmit it over old channel.
 - [ ] User completes new pairing; live filtered status confirms secure v2 then synthetic bidirectional file/ACK tests + reconnect + GUI confirmation. Record precisely what was/was not exercised.
+
+
+## Execution evidence (2026-10-27)
+
+Tasks 1–4 implemented. Shared TypeScript 8 new tests / 55 assertions; independent JCA 9 new tests; fixed public vectors also independently verified with Python cryptography. Mac full suite 49 pass / 391 assertions, two-workspace typecheck pass. Android full JVM suite 32 pass and APK build pass; final frozen-source build check passed before OTA. Review corrected discovery overwriting fresh credentials, stale-socket activation, GATT asynchronous write failure handling, handshake redial, and Bun queued-backpressure return semantics. Runtime deployment and real-device acceptance remain pending.
