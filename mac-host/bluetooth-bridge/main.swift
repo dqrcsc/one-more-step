@@ -102,6 +102,8 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
     private var macInfoChar: CBMutableCharacteristic?
     private var framePipeChar: CBMutableCharacteristic?
     private var subscribedCentrals: [CBCentral] = []
+    private var announcedCentrals: Set<UUID> = []
+    private var txQueue: [Data] = []
     private let ipc: UnixSocketLineClient
     private var macInfoJsonData: Data
 
@@ -175,21 +177,57 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {
-        guard error == nil else { return }
+        if let error = error {
+            ipc.sendJson(["type": "ble_state", "state": "serviceAddError:\(error.localizedDescription)"])
+            return
+        }
         peripheralManager.startAdvertising([
             CBAdvertisementDataServiceUUIDsKey: [SERVICE_UUID],
             CBAdvertisementDataLocalNameKey: "OMS-Mac"
         ])
     }
 
+    func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {
+        if let error = error {
+            ipc.sendJson(["type": "ble_state", "state": "advError:\(error.localizedDescription)"])
+        } else {
+            ipc.sendJson(["type": "ble_state", "state": "advertising"])
+        }
+    }
+
+    private func announceCentralIfNeeded(_ central: CBCentral, reason: String) {
+        if !subscribedCentrals.contains(where: { $0.identifier == central.identifier }) {
+            subscribedCentrals.append(central)
+        }
+        guard !announcedCentrals.contains(central.identifier) else { return }
+        announcedCentrals.insert(central.identifier)
+        ipc.sendJson(["type": "ble_state", "state": "centralReady:\(reason):mtu=\(central.maximumUpdateValueLength)"])
+        ipc.sendJson([
+            "type": "central_connected",
+            "centralId": central.identifier.uuidString,
+            "maxUpdateValueLength": central.maximumUpdateValueLength
+        ])
+    }
+
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
         if request.characteristic.uuid == CHAR_MAC_INFO_UUID {
+            if !subscribedCentrals.contains(where: { $0.identifier == request.central.identifier }) {
+                subscribedCentrals.append(request.central)
+            }
             if request.offset > macInfoJsonData.count {
                 peripheral.respond(to: request, withResult: .invalidOffset)
                 return
             }
             request.value = macInfoJsonData.subdata(in: request.offset..<macInfoJsonData.count)
             peripheral.respond(to: request, withResult: .success)
+            let central = request.central
+            if request.offset == 0 {
+                announcedCentrals.remove(central.identifier)
+                txQueue.removeAll()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                self?.announceCentralIfNeeded(central, reason: "readFallback")
+            }
         } else {
             peripheral.respond(to: request, withResult: .requestNotSupported)
         }
@@ -197,6 +235,9 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
         for req in requests {
+            if !subscribedCentrals.contains(where: { $0.identifier == req.central.identifier }) {
+                subscribedCentrals.append(req.central)
+            }
             if req.characteristic.uuid == CHAR_FRAME_PIPE_UUID, let val = req.value {
                 // Check if this is an OOB JSON control packet (starts with '{') or raw 8-byte binary frame (starts with 0x4F 'O')
                 if let first = val.first, first == 0x7B,
@@ -218,32 +259,50 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
-        if !subscribedCentrals.contains(where: { $0.identifier == central.identifier }) {
-            subscribedCentrals.append(central)
-        }
-        ipc.sendJson(["type": "central_connected", "centralId": central.identifier.uuidString, "maxUpdateValueLength": central.maximumUpdateValueLength])
+        announceCentralIfNeeded(central, reason: "subscribed")
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
         subscribedCentrals.removeAll { $0.identifier == central.identifier }
+        announcedCentrals.remove(central.identifier)
         if subscribedCentrals.isEmpty {
+            txQueue.removeAll()
             ipc.sendJson(["type": "central_disconnected", "centralId": central.identifier.uuidString])
         }
     }
 
+    func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
+        drainTxQueue()
+    }
+
     private func notifyFrameToPhone(_ data: Data) {
-        guard let pipeChar = framePipeChar, !subscribedCentrals.isEmpty else { return }
+        guard !subscribedCentrals.isEmpty else { return }
         let mtu = max(20, subscribedCentrals.first?.maximumUpdateValueLength ?? 180)
         var offset = 0
         while offset < data.count {
             let end = min(offset + mtu, data.count)
-            let slice = data.subdata(in: offset..<end)
-            let ok = peripheralManager.updateValue(slice, for: pipeChar, onSubscribedCentrals: nil)
-            if !ok {
-                Thread.sleep(forTimeInterval: 0.015)
-                _ = peripheralManager.updateValue(slice, for: pipeChar, onSubscribedCentrals: nil)
-            }
+            txQueue.append(data.subdata(in: offset..<end))
             offset = end
+        }
+        drainTxQueue()
+    }
+
+    private func drainTxQueue() {
+        guard let pipeChar = framePipeChar, !subscribedCentrals.isEmpty else {
+            txQueue.removeAll()
+            return
+        }
+        while !txQueue.isEmpty {
+            let slice = txQueue[0]
+            let ok = peripheralManager.updateValue(slice, for: pipeChar, onSubscribedCentrals: nil)
+            if ok {
+                txQueue.removeFirst()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+                    self?.drainTxQueue()
+                }
+                return
+            }
         }
     }
 }
