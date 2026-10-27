@@ -227,6 +227,7 @@ export class PhoneSessionManager extends EventEmitter {
     const apkDir = path.join(repoRoot, "android-app/app/build/outputs/apk/debug");
     const candidatePaths = [
       path.join(apkDir, "app-debug.apk"),
+      path.join(repoRoot, "OneMoreStep-v1.4.3.apk"),
       path.join(repoRoot, "OneMoreStep-v1.4.2.apk"),
       path.join(repoRoot, "OneMoreStep-v1.4.1.apk"),
       path.join(repoRoot, "OneMoreStep-v1.4.0.apk"),
@@ -243,19 +244,19 @@ export class PhoneSessionManager extends EventEmitter {
       return {
         available: false,
         apkPath,
-        versionCode: 16,
-        versionName: "1.4.2",
+        versionCode: 17,
+        versionName: "1.4.3",
         sha256: "",
         sizeBytes: 0,
         updatedAtMs: 0,
         updatedAtIso: "",
-        downloadUrl: "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.4.2.apk",
+        downloadUrl: "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.4.3.apk",
       };
     }
 
     const stat = fs.statSync(apkPath);
-    let versionCode = 16;
-    let versionName = "1.4.2";
+    let versionCode = 17;
+    let versionName = "1.4.3";
     if (fs.existsSync(metaPath)) {
       try {
         const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
@@ -422,7 +423,7 @@ export class PhoneSessionManager extends EventEmitter {
             });
           }
           return Response.redirect(
-            "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.4.2.apk",
+            "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.4.3.apk",
             302
           );
         }
@@ -498,6 +499,8 @@ export class PhoneSessionManager extends EventEmitter {
         );
       },
       websocket: {
+        idleTimeout: 120,
+        sendPings: true,
         open(ws) {
           const tier = ws.data.tier;
           const remoteIp = ws.data.remoteIp;

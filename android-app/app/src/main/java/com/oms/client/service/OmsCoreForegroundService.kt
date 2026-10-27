@@ -6,6 +6,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
@@ -36,11 +37,34 @@ class OmsCoreForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var screenshotWatcher: ScreenshotPillController? = null
     private var smsObserver: SmsContentObserver? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    private fun ensureWifiLockAcquired() {
+        try {
+            if (wifiLock == null) {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
+                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                wifiLock = wm.createWifiLock(mode, "OneMoreStep::LanKeepAliveLock").apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wifiLock?.isHeld == false) {
+                wifiLock?.acquire()
+            }
+        } catch (_: Throwable) {
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         NotificationExecutor.ensureChannelsAndTts(this)
         safeStartForeground("正在连接 Mac...")
+        ensureWifiLockAcquired()
 
         screenshotWatcher = ScreenshotPillController(this).also {
             it.startWatching()
@@ -62,6 +86,7 @@ class OmsCoreForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        ensureWifiLockAcquired()
         val client = OmsApplication.instance?.transportClient
         client?.startAutoConnect()
         val tier = client?.activeTierFlow?.value ?: "DISCONNECTED"
@@ -138,6 +163,13 @@ class OmsCoreForegroundService : Service() {
             .build()
 
     override fun onDestroy() {
+        try {
+            if (wifiLock?.isHeld == true) {
+                wifiLock?.release()
+            }
+        } catch (_: Throwable) {
+        }
+        wifiLock = null
         serviceScope.cancel()
         screenshotWatcher?.stopWatching()
         smsObserver?.stopWatching()

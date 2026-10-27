@@ -169,8 +169,15 @@ class OmsTransportClient(
     private var cachedWifiNetwork: Network? = null
     @Volatile
     private var cachedLanHttpClient: OkHttpClient? = null
+    @Volatile
+    private var preferDefaultSocketFactory = false
 
     private val btDecoder = OmsFrameStreamDecoder()
+    private val bleWriteQueue = java.util.concurrent.ConcurrentLinkedQueue<ByteArray>()
+    private val isBleWriting = AtomicBoolean(false)
+    @Volatile
+    private var blePayloadLimit = 180
+    private var watchdogTickCount = 0L
 
     private val lanRetryRunnable = Runnable {
         val paired = repo.getPairedMac()
@@ -244,8 +251,19 @@ class OmsTransportClient(
                     }
                     for ((id, transfer) in expiredTransfers) streamAck(id, "ERROR", transfer.source, error = "Stream timed out")
                     val paired = repo.getPairedMac()?.takeIf { isV2Pairing(it) } ?: continue
-                    if (_activeTierFlow.value != "LAN_WS" || lanWebSocket == null) {
-                        startBleNearFieldScanner()
+                    val lanSource = captureSource("LAN_WS", lanWebSocket)
+                    if (_activeTierFlow.value == "LAN_WS" && lanWebSocket != null && sourceAuthenticated(lanSource)) {
+                        watchdogTickCount++
+                        if (watchdogTickCount % 2L == 0L) {
+                            val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+                            val pct = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                            val pongBytes = OmsFrameProtocol.encodePong(System.currentTimeMillis(), pct, bm.isCharging)
+                            sendOnSource(pongBytes, lanSource)
+                        }
+                    } else {
+                        if (_activeTierFlow.value == "DISCONNECTED") {
+                            startBleNearFieldScanner()
+                        }
                         connectLanIfPossible(paired.lanIps, paired.lanPort)
                     }
                 } catch (_: Throwable) {
@@ -382,7 +400,7 @@ class OmsTransportClient(
     }
 
     private fun buildLanOkHttpClient(): OkHttpClient {
-        val physicalWifi = findNonVpnWifiNetwork()
+        val physicalWifi = if (preferDefaultSocketFactory) null else findNonVpnWifiNetwork()
         val existing = cachedLanHttpClient
         if (existing != null && physicalWifi == cachedWifiNetwork) {
             return existing
@@ -390,7 +408,7 @@ class OmsTransportClient(
         val builder = OkHttpClient.Builder()
             .connectTimeout(2500, TimeUnit.MILLISECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
-            .pingInterval(15, TimeUnit.SECONDS)
+            .pingInterval(10, TimeUnit.SECONDS)
 
         if (physicalWifi != null) {
             builder.socketFactory(physicalWifi.socketFactory)
@@ -500,12 +518,21 @@ class OmsTransportClient(
         }
 
         try {
-            val client = buildLanOkHttpClient().newBuilder()
+            val wifiNet = findNonVpnWifiNetwork()
+            val clientBuilder = OkHttpClient.Builder()
                 .connectTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
                 .readTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-                .build()
-            val res = executeMacHttpGet(client, ip, port)
-            if (res != null) return res
+            if (wifiNet != null) {
+                clientBuilder.socketFactory(wifiNet.socketFactory)
+            }
+            val res = executeMacHttpGet(clientBuilder.build(), ip, port)
+            if (res != null) {
+                if (preferDefaultSocketFactory) {
+                    preferDefaultSocketFactory = false
+                    cachedLanHttpClient = null
+                }
+                return res
+            }
         } catch (_: Throwable) {
         }
 
@@ -516,7 +543,14 @@ class OmsTransportClient(
                     .connectTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
                     .readTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
                     .build()
-                return executeMacHttpGet(fallbackClient, ip, port)
+                val res = executeMacHttpGet(fallbackClient, ip, port)
+                if (res != null) {
+                    if (!preferDefaultSocketFactory) {
+                        preferDefaultSocketFactory = true
+                        cachedLanHttpClient = null
+                    }
+                    return res
+                }
             } catch (_: Throwable) {
             }
         }
@@ -919,7 +953,6 @@ class OmsTransportClient(
                         lanPort = port
                     )
                 )
-                isConnectingLan.set(false)
                 connectLanIfPossible(ips, port)
             }
             if (pipeChar != null) {
@@ -977,8 +1010,11 @@ class OmsTransportClient(
                                         closeSecureSource(FrameSource("BT_RFCOMM", null, gatt), "Bluetooth connection failed")
                                         return
                                     }
-                                    if (newState == BluetoothProfile.STATE_CONNECTED) {
+                                     if (newState == BluetoothProfile.STATE_CONNECTED) {
                                         btDecoder.reset()
+                                        bleWriteQueue.clear()
+                                        isBleWriting.set(false)
+                                        blePayloadLimit = 180
                                         val paired = repo.getPairedMac()?.takeIf { isV2Pairing(it) }
                                         if (paired == null) { gatt.disconnect(); return }
                                         beginSecureSource(FrameSource("BT_RFCOMM", null, gatt), paired)
@@ -986,19 +1022,30 @@ class OmsTransportClient(
                                             gatt.discoverServices()
                                         }
                                     } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                                        bleWriteQueue.clear()
+                                        isBleWriting.set(false)
                                         closeSecureSource(FrameSource("BT_RFCOMM", null, gatt), "Bluetooth disconnected")
                                     }
                                 }
 
                                 override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
                                     if (gatt !== activeBleGatt) return
+                                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                                        blePayloadLimit = (mtu - 3).coerceIn(20, 500)
+                                    }
                                     gatt.discoverServices()
                                 }
 
                                 override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-                                    if (gatt === activeBleGatt && status != BluetoothGatt.GATT_SUCCESS) {
+                                    if (gatt !== activeBleGatt) return
+                                    if (status != BluetoothGatt.GATT_SUCCESS) {
+                                        bleWriteQueue.clear()
+                                        isBleWriting.set(false)
                                         closeSecureSource(FrameSource("BT_RFCOMM", null, gatt), "Encrypted Bluetooth write failed")
+                                        return
                                     }
+                                    isBleWriting.set(false)
+                                    drainBleWriteQueue(gatt)
                                 }
 
                                 override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -1113,15 +1160,44 @@ class OmsTransportClient(
         captureSource("BT_RFCOMM", null), captureSource("WAN_WEBRTC", wanWebSocket))
         .firstOrNull { sourceAuthenticated(it) } ?: throw IllegalStateException("No encrypted connection")
 
+    @SuppressLint("MissingPermission")
+    private fun drainBleWriteQueue(gatt: BluetoothGatt): Boolean {
+        if (gatt !== activeBleGatt) return false
+        val characteristic = bleFramePipeChar ?: return false
+        if (!isBleWriting.compareAndSet(false, true)) return true
+        val nextChunk = bleWriteQueue.poll()
+        if (nextChunk == null) {
+            isBleWriting.set(false)
+            return true
+        }
+        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        @Suppress("DEPRECATION")
+        characteristic.value = nextChunk
+        @Suppress("DEPRECATION")
+        val started = gatt.writeCharacteristic(characteristic)
+        if (!started) {
+            isBleWriting.set(false)
+            bleWriteQueue.clear()
+            return false
+        }
+        return true
+    }
+
     /** Only secure.start plaintext and already sealed records may reach this transport writer. */
     @SuppressLint("MissingPermission")
     private fun writeTransport(frameBytes: ByteArray, source: FrameSource): Boolean {
         if (!isSourceCurrent(source)) return false
         source.socket?.let { return it.send(frameBytes.toByteString()) }
-        val characteristic = bleFramePipeChar ?: return false
-        @Suppress("DEPRECATION")
-        characteristic.value = frameBytes
-        return source.gatt?.writeCharacteristic(characteristic) == true
+        val gatt = source.gatt ?: return false
+        if (bleFramePipeChar == null) return false
+        val chunkLimit = blePayloadLimit.coerceIn(20, 500)
+        var offset = 0
+        while (offset < frameBytes.size) {
+            val end = (offset + chunkLimit).coerceAtMost(frameBytes.size)
+            bleWriteQueue.add(frameBytes.copyOfRange(offset, end))
+            offset = end
+        }
+        return drainBleWriteQueue(gatt)
     }
 
     private fun sendOnSource(frameBytes: ByteArray, source: FrameSource): Boolean {
@@ -1163,7 +1239,12 @@ class OmsTransportClient(
             if (source.socket === pairingWebSocket && source.socket != null) pairingWebSocket = null
             if (source.socket === lanWebSocket && source.socket != null) { lanWebSocket = null; isConnectingLan.set(false) }
             if (source.socket === wanWebSocket && source.socket != null) wanWebSocket = null
-            if (source.gatt != null && source.gatt === activeBleGatt) { activeBleGatt = null; bleFramePipeChar = null }
+            if (source.gatt != null && source.gatt === activeBleGatt) {
+                activeBleGatt = null
+                bleFramePipeChar = null
+                bleWriteQueue.clear()
+                isBleWriting.set(false)
+            }
             secureLinks.remove(source)
         }
         if (link != null) synchronized(link.lock) {

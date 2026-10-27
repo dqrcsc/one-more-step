@@ -1,5 +1,19 @@
 # Changelog · 更新日志
 
+## 1.4.3 - 2026-10-27
+
+### 大子网 Wi-Fi 锁屏保活与蓝牙/局域网协同修复
+
+- **前台服务 `WifiLock` 低延迟保活**：在 `OmsCoreForegroundService` 中持有 `WifiManager.WifiLock(WIFI_MODE_FULL_LOW_LATENCY)`，解决小米 HyperOS 手机在锁屏熄屏 20～90 秒后 Wi-Fi 芯片进入 DTIM 深度休眠、不再响应局域网二层 ARP 导致 `closeCode=1006` 掉线的问题。
+- **消除蓝牙扫描对局域网握手的抢占中断**：移除 `handleBleMacInfoBytes` 中强制重置 `isConnectingLan.set(false)` 的逻辑，且在局域网已连接时不再每 4.5 秒重复发起冗余 BLE 扫描，避免蓝牙回调打断正在进行的局域网握手（`4003 Stale connection`）。
+- **BLE 流式分片写入队列**：在 Android 端 `OmsTransportClient` 实现基于 `onCharacteristicWrite` 回调的 GATT 分片写入队列（按协商 MTU 自动切片），解决 `secure.finish` 加密帧（~1.1KB）因超过 BLE 单包 512 字节上限而导致蓝牙握手最后一步失败重连死循环的问题。
+- **双向主动心跳与路由自动回退**：手机端在局域网在线期间每 9 秒主动发送加密心跳帧并开启 10 秒 WebSocket Ping，保持企业级 `/23` 大子网无线 AP 的 ARP/转发表项常热；当 `findNonVpnWifiNetwork()` 自定义 SocketFactory 不可达但系统默认路由可达时自动同步回退至 WebSocket 客户端；Mac 端 `Bun.serve` 显式配置 `idleTimeout: 120` 与 `sendPings: true`。
+
+### APK
+
+- `OneMoreStep-v1.4.3.apk`：Android 11+，versionCode 17，22,485,137 bytes（沿用 Android Debug 签名，从 v1.4.x 覆盖安装无需重新配对）。
+- SHA-256：`58c74476b5a3c4dd3404812ec6f6602e08f41217bda04da8956d14b9be7a0b9b`。
+
 ## 1.4.2 - 2026-10-27
 
 ### 手机端 UI 重构与诊断修复
