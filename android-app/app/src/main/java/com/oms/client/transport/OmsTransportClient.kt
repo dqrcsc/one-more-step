@@ -982,10 +982,17 @@ class OmsTransportClient(
                                         val paired = repo.getPairedMac()?.takeIf { isV2Pairing(it) }
                                         if (paired == null) { gatt.disconnect(); return }
                                         beginSecureSource(FrameSource("BT_RFCOMM", null, gatt), paired)
-                                        gatt.discoverServices()
+                                        if (!gatt.requestMtu(512)) {
+                                            gatt.discoverServices()
+                                        }
                                     } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                                         closeSecureSource(FrameSource("BT_RFCOMM", null, gatt), "Bluetooth disconnected")
                                     }
+                                }
+
+                                override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                                    if (gatt !== activeBleGatt) return
+                                    gatt.discoverServices()
                                 }
 
                                 override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {

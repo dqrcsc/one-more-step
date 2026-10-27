@@ -58,7 +58,12 @@ object OtpExtractor {
         RegexOption.IGNORE_CASE
     )
 
-    private val PURE_DIGITS_REGEX = Regex("""(?<!\d)(\d{4,8})(?!\d)""")
+    private val PURE_DIGITS_REGEX = Regex("""(?<![0-9A-Za-z])(\d{4,8})(?![0-9A-Za-z])""")
+
+    private val ANTI_FRAUD_WARNING_REGEX = Regex(
+        """(?:请勿|切勿|不要|谨防|以防|切莫|严禁)[^，。；！？,\n]{0,16}(?:提供|透露|泄露|告知|索要|轻信|转发)[^，。；！？,\n]{0,12}(?:验证码|校验码|动态码|安全码|密码)""",
+        RegexOption.IGNORE_CASE
+    )
 
     private fun isValidOtpCandidate(raw: String): Boolean {
         if (raw.length < 4 || raw.length > 8) return false
@@ -92,6 +97,8 @@ object OtpExtractor {
 
     private fun maskInterferingNumbers(text: String): String {
         return text
+            // Mask anti-fraud disclaimer phrases so they don't act as proximity anchors
+            .replace(ANTI_FRAUD_WARNING_REGEX, " ")
             // Mask URLs
             .replace(Regex("""https?://\S+""", RegexOption.IGNORE_CASE), " ")
             // Mask bracketed brand names that might contain digits like 【12306】 or 【58同城】
@@ -136,7 +143,7 @@ object OtpExtractor {
         val fullText = rawText.trim()
         if (fullText.length < 4 || fullText.length > 600) return null
 
-        val combinedForTrigger = "${senderHint ?: ""} $fullText"
+        val combinedForTrigger = "${senderHint ?: ""} $fullText".replace(ANTI_FRAUD_WARNING_REGEX, " ")
         if (!TRIGGER_KEYWORD_REGEX.containsMatchIn(combinedForTrigger)) {
             return null
         }

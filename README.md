@@ -1,6 +1,6 @@
 # 青简·咫尺 · OneMoreStep
 
-v1.4.1 新增离线原因提示和本地 [连接诊断](docs/connection-diagnostics.md)，沿用 v2 配对，无需重新绑定。
+v1.4.2 优化手机端首页与权限向导 UI 布局、修复 GUI 观察窗口误触急停与行程短信验证码误判，并包含 v1.4.1 离线原因提示与本地 [连接诊断](docs/connection-diagnostics.md)，沿用 v2 配对，无需重新绑定。
 
 > 当前开发分支的修复、升级要求与未实现能力见 **[实现边界与升级验收](docs/implementation-status.md)**。v1.4.0 加入 [安全传输 v2](docs/secure-transport-v2.md)，升级需重新配对；以下性能数字和硬件行为不代表已完成真机验证。
 

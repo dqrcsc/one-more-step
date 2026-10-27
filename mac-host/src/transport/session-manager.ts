@@ -227,6 +227,9 @@ export class PhoneSessionManager extends EventEmitter {
     const apkDir = path.join(repoRoot, "android-app/app/build/outputs/apk/debug");
     const candidatePaths = [
       path.join(apkDir, "app-debug.apk"),
+      path.join(repoRoot, "OneMoreStep-v1.4.2.apk"),
+      path.join(repoRoot, "OneMoreStep-v1.4.1.apk"),
+      path.join(repoRoot, "OneMoreStep-v1.4.0.apk"),
       path.join(repoRoot, "OneMoreStep-v1.3.7.apk"),
       path.join(repoRoot, "OneMoreStep-v1.3.6.apk"),
       path.join(repoRoot, "OneMoreStep-v1.3.5.apk"),
@@ -240,19 +243,19 @@ export class PhoneSessionManager extends EventEmitter {
       return {
         available: false,
         apkPath,
-        versionCode: 11,
-        versionName: "1.3.7",
+        versionCode: 16,
+        versionName: "1.4.2",
         sha256: "",
         sizeBytes: 0,
         updatedAtMs: 0,
         updatedAtIso: "",
-        downloadUrl: "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.3.7.apk",
+        downloadUrl: "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.4.2.apk",
       };
     }
 
     const stat = fs.statSync(apkPath);
-    let versionCode = 11;
-    let versionName = "1.3.7";
+    let versionCode = 16;
+    let versionName = "1.4.2";
     if (fs.existsSync(metaPath)) {
       try {
         const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
@@ -419,7 +422,7 @@ export class PhoneSessionManager extends EventEmitter {
             });
           }
           return Response.redirect(
-            "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.3.6.apk",
+            "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.4.2.apk",
             302
           );
         }
@@ -1215,6 +1218,11 @@ export class PhoneSessionManager extends EventEmitter {
       fs.renameSync(savedAbsPath + ".partial", savedAbsPath);
       const completed: CompletedFileTransfer = { header: h, savedAbsPath, sha256Actual: actualSha256 };
       this.incomingStreams.delete(streamId);
+      while (this.completedStreams.size >= 128) {
+        const oldestKey = this.completedStreams.keys().next().value;
+        if (oldestKey === undefined) break;
+        this.completedStreams.delete(oldestKey);
+      }
       this.completedStreams.set(streamId, completed);
       this.sendSecure(pipe, encodeStreamAckResumeFrame({ streamId, status: "COMPLETED", nextExpectedChunkIndex: h.totalChunks, savedPath: savedAbsPath }));
       this.emit("streamCompleted", completed);
@@ -1356,7 +1364,11 @@ export class PhoneSessionManager extends EventEmitter {
     while (this.outQueue.size > 0) {
       const nextFrame = this.outQueue.dequeue();
       if (!nextFrame) break;
-      this.sendSecure(activePipe, nextFrame);
+      try {
+        this.sendSecure(activePipe, nextFrame);
+      } catch {
+        break;
+      }
     }
   }
 

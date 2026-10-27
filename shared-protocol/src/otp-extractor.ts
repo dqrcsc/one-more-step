@@ -90,9 +90,14 @@ export function extractSenderSignature(
   return undefined;
 }
 
+const ANTI_FRAUD_WARNING_REGEX =
+  /(?:请勿|切勿|不要|谨防|以防|切莫|严禁)[^，。；！？,\n]{0,16}(?:提供|透露|泄露|告知|索要|轻信|转发)[^，。；！？,\n]{0,12}(?:验证码|校验码|动态码|安全码|密码)/gi;
+
 function maskInterferingNumbers(text: string): string {
   return (
     text
+      // Mask anti-fraud disclaimer phrases so they don't act as proximity anchors
+      .replace(ANTI_FRAUD_WARNING_REGEX, " ")
       // Mask URLs
       .replace(/https?:\/\/\S+/gi, " ")
       // Mask bracketed brand names that might contain digits like 【12306】 or 【58同城】
@@ -132,7 +137,10 @@ export function extractOtpFromText(
   const fullText = rawText.trim();
   if (fullText.length < 4 || fullText.length > 600) return null;
 
-  const combinedForTrigger = `${senderHint || ""} ${fullText}`;
+  const combinedForTrigger = `${senderHint || ""} ${fullText}`.replace(
+    ANTI_FRAUD_WARNING_REGEX,
+    " "
+  );
   if (!TRIGGER_KEYWORD_REGEX.test(combinedForTrigger)) {
     return null;
   }
@@ -165,7 +173,7 @@ export function extractOtpFromText(
 
   // 3. Fallback: standalone 4-8 pure digits in masked text (prefer 6 digits, then 4 digits, then others)
   const pureDigitsMatches = Array.from(
-    masked.matchAll(/(?<!\d)(\d{4,8})(?!\d)/g),
+    masked.matchAll(/(?<![0-9A-Za-z])(\d{4,8})(?![0-9A-Za-z])/g),
     (m) => m[1]
   );
   if (pureDigitsMatches.length > 0) {

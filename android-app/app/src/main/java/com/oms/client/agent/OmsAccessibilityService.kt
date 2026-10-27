@@ -273,8 +273,15 @@ class OmsAccessibilityService : AccessibilityService() {
         return withTimeout((deadline - System.currentTimeMillis()).coerceAtLeast(1L)) {
             withContext(Dispatchers.Main.immediate) {
                 val queuedRevision = guard.revision
+                val requiresQueuedRevisionConsistency =
+                    params.optString("observationId", "").isNotBlank() ||
+                        params.optString("targetNodeId", "").isNotBlank() ||
+                        (params.has("x") && params.has("y"))
                 guiMutex.withLock {
-                check(guard.revision == queuedRevision) { "ERR_STALE_OBSERVATION: Screen or safety state changed while queued" }
+                check(!guard.stopped) { "ERR_USER_INTERRUPTED: GUI emergency stop is active" }
+                if (requiresQueuedRevisionConsistency) {
+                    check(guard.revision == queuedRevision) { "ERR_STALE_OBSERVATION: Screen or safety state changed while queued" }
+                }
                 activeAction = currentCoroutineContext()[Job]
                 try { executeLocked(params, deadline, sessionStillValid) }
                 finally {
@@ -287,6 +294,9 @@ class OmsAccessibilityService : AccessibilityService() {
     }
 
     private suspend fun executeLocked(params: JSONObject, deadline: Long, sessionStillValid: () -> Boolean): JSONObject {
+        val action = params.optString("action", "click").lowercase()
+        val isSafeExitAction = action in setOf("home", "lock_screen", "lock")
+        val isGlobalNavigationAction = action in setOf("back", "home", "recents", "notifications", "quick_settings", "lock_screen", "lock")
         val initialRoots = collectApplicationRoots()
         windowTracker.track(applicationWindows(initialRoots))
         val initialWindow = windowIdentity(initialRoots)
@@ -299,20 +309,22 @@ class OmsAccessibilityService : AccessibilityService() {
             check(currentWindow == initialWindow) { "ERR_STALE_OBSERVATION: Window or package changed" }
             guard.check(System.currentTimeMillis(), deadline, currentWindow, initialRevision,
                 observationId, targetNodeId.isNotBlank(), sessionStillValid())
-            if (isBlockedFinancialOrPasswordWindow(rootInActiveWindow)) {
+            if (!isSafeExitAction && isBlockedFinancialOrPasswordWindow(rootInActiveWindow)) {
                 throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password safety policy")
             }
         }
         checkReady()
-        check(safetyOverlay?.showActivePill() == true) { "ERR_SAFETY_OVERLAY_UNAVAILABLE: Enable phone overlay permission" }
+        val pillShown = safetyOverlay?.showActivePill() == true
+        if (!isGlobalNavigationAction) {
+            check(pillShown) { "ERR_SAFETY_OVERLAY_UNAVAILABLE: Enable phone overlay permission" }
+        }
 
         val root = rootInActiveWindow
-        if (isBlockedFinancialOrPasswordWindow(root)) {
+        if (!isSafeExitAction && isBlockedFinancialOrPasswordWindow(root)) {
             safetyOverlay?.hideActivePill()
             throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password safety policy")
         }
 
-        val action = params.optString("action", "click").lowercase()
         val text = params.optString("text", "")
         val requireConfirm = params.optBoolean("requireUserConfirm", false)
 
@@ -413,6 +425,10 @@ class OmsAccessibilityService : AccessibilityService() {
                 ok = opened
             }
         }
+
+        // Action execution is complete; clear activeAction before the 400ms post-observation
+        // settle window so a user touching the screen after the action does not falsely latch stop.
+        activeAction = null
 
         // Wait 400ms for UI transition to settle and return post-action compact tree
         delay(400)

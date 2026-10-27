@@ -173,6 +173,12 @@ describe("Module 01: Shared Protocol & Pairing", () => {
       "【京东】双11大促开启，尾号8848用户专享满300减50优惠券，退订回T"
     );
     expect(promo).toBeNull();
+
+    // Travel/itinerary SMS with anti-fraud warning ("请勿提供验证码") and flight number ("ZH9949") must not false-trigger
+    const flight = extractOtpFromText(
+      "【阿里商旅】出票成功：杨**等1人10月31日合肥新桥国际机场 21:05降落 ZH9949；机票退改应通过原购票渠道办理，切勿轻信航班变动电话或短信通知，请勿提供验证码等信息。"
+    );
+    expect(flight).toBeNull();
   });
 });
 

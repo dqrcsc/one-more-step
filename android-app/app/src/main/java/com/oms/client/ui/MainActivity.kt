@@ -182,7 +182,7 @@ fun OneMoreStepMainScreen() {
     val streamItems by app.repository.itemsFlow.collectAsState()
 
     var showXiaomiWizard by remember { mutableStateOf(false) }
-    var showPairSheet by remember { mutableStateOf(app.repository.getPairedMac() == null) }
+    var showPairSheet by remember { mutableStateOf(app.repository.getPairedMac()?.pairingVersion != 2) }
     var pairUriInput by remember { mutableStateOf("") }
     var composerText by remember { mutableStateOf("") }
     var selectedTag by remember { mutableStateOf("default_inbox") }
@@ -339,10 +339,9 @@ fun OneMoreStepMainScreen() {
             colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
             shape = RoundedCornerShape(14.dp)
         ) {
-            Row(
+            Column(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 val brandIconBitmap = remember {
                     try {
@@ -352,57 +351,93 @@ fun OneMoreStepMainScreen() {
                     }
                 }
                 Row(
-                    modifier = Modifier.weight(1f),
-                    verticalAlignment = Alignment.CenterVertically
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    if (brandIconBitmap != null) {
-                        Image(
-                            bitmap = brandIconBitmap,
-                            contentDescription = "青简·咫尺",
-                            modifier = Modifier
-                                .size(34.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                    }
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "青简·咫尺 · OneMoreStep v$installedVerName",
-                            color = Color.White,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp,
-                            maxLines = 1,
-                            softWrap = false
-                        )
-                        val tierDesc = when (activeTier) {
-                            "LAN_WS" -> "🟢 局域网高速直连 (Tier 1)"
-                            "BT_RFCOMM" -> "🔵 近场蓝牙连接 (Tier 2)"
-                            "WAN_WEBRTC" -> "🟣 跨网远程在线 (Tier 3)"
-                            else -> "⚪ $connectionHint（点此重连）"
+                    Row(
+                        modifier = Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (brandIconBitmap != null) {
+                            Image(
+                                bitmap = brandIconBitmap,
+                                contentDescription = "青简·咫尺",
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(RoundedCornerShape(9.dp))
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
                         }
-                        Text(
-                            text = tierDesc,
-                            color = if (activeTier == "DISCONNECTED") Color(0xFFFBBF24) else Color(0xFF94A3B8),
-                            fontSize = 12.sp,
-                            maxLines = 2,
-                            softWrap = true,
-                            modifier = Modifier.clickable {
-                                Toast.makeText(context, "🔍 正在扫描局域网 Mac 并重连...", Toast.LENGTH_SHORT).show()
-                                app.transportClient.reconnectNow { _, msg ->
-                                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
-                                }
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Text(
+                                    text = "青简·咫尺 · OneMoreStep",
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 14.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = "v$installedVerName",
+                                    color = Color(0xFF38BDF8),
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier
+                                        .background(Color(0xFF0F172A), RoundedCornerShape(6.dp))
+                                        .padding(horizontal = 6.dp, vertical = 1.dp)
+                                )
                             }
-                        )
-                        TextButton(
-                            contentPadding = PaddingValues(0.dp),
-                            onClick = { diagnosticText = "版本：$installedVerName\n" + app.transportClient.connectionDiagnosticsText() }
-                        ) { Text("连接诊断", fontSize = 12.sp, color = Color(0xFF94A3B8)) }
+                            Spacer(modifier = Modifier.height(2.dp))
+                            val tierDesc = when (activeTier) {
+                                "LAN_WS" -> "🟢 局域网高速直连 (Tier 1)"
+                                "BT_RFCOMM" -> "🔵 近场蓝牙连接 (Tier 2)"
+                                "WAN_WEBRTC" -> "🟣 跨网远程在线 (Tier 3)"
+                                else -> "⚪ $connectionHint（点此重连）"
+                            }
+                            Text(
+                                text = tierDesc,
+                                color = if (activeTier == "DISCONNECTED") Color(0xFFFBBF24) else Color(0xFF4ADE80),
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.clickable {
+                                    Toast.makeText(context, "🔍 正在扫描局域网 Mac 并重连...", Toast.LENGTH_SHORT).show()
+                                    app.transportClient.reconnectNow { _, msg ->
+                                        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    OutlinedButton(
+                        onClick = {
+                            diagnosticText = "版本：$installedVerName\n" + app.transportClient.connectionDiagnosticsText()
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                        modifier = Modifier.height(28.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(containerColor = Color(0xFF0F172A))
+                    ) {
+                        Text("🩺 诊断", fontSize = 11.sp, color = Color(0xFFCBD5E1), maxLines = 1, softWrap = false)
                     }
                 }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(
+
+                // Compact Action Toolbar Row
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(
                         enabled = !checkingOta,
-                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                        modifier = Modifier.weight(1f).height(30.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(containerColor = Color(0xFF0F172A)),
                         onClick = {
                             checkingOta = true
                             app.transportClient.checkOtaUpdate { res ->
@@ -422,24 +457,50 @@ fun OneMoreStepMainScreen() {
                         }
                     ) {
                         Text(
-                            if (checkingOta) "⏳检查" else "🔄更新",
+                            if (checkingOta) "⏳ 检查中" else "🔄 检查更新",
                             color = Color(0xFF4ADE80),
-                            fontSize = 12.sp,
+                            fontSize = 11.sp,
                             maxLines = 1,
                             softWrap = false
                         )
                     }
-                    TextButton(
-                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
-                        onClick = { showPairSheet = !showPairSheet }
+                    OutlinedButton(
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                        modifier = Modifier.weight(1f).height(30.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = if (showPairSheet) Color(0xFF0284C7) else Color(0xFF0F172A)
+                        ),
+                        onClick = {
+                            showPairSheet = !showPairSheet
+                            if (showPairSheet) showXiaomiWizard = false
+                        }
                     ) {
-                        Text("绑定Mac", color = Color(0xFF38BDF8), fontSize = 12.sp, maxLines = 1, softWrap = false)
+                        Text(
+                            if (showPairSheet) "🔐 收起绑定" else "🔐 绑定Mac",
+                            color = if (showPairSheet) Color.White else Color(0xFF38BDF8),
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            softWrap = false
+                        )
                     }
-                    TextButton(
-                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
-                        onClick = { showXiaomiWizard = !showXiaomiWizard }
+                    OutlinedButton(
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                        modifier = Modifier.weight(1f).height(30.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = if (showXiaomiWizard) Color(0xFF0284C7) else Color(0xFF0F172A)
+                        ),
+                        onClick = {
+                            showXiaomiWizard = !showXiaomiWizard
+                            if (showXiaomiWizard) showPairSheet = false
+                        }
                     ) {
-                        Text("小米权限", color = Color(0xFFFBBF24), fontSize = 12.sp, maxLines = 1, softWrap = false)
+                        Text(
+                            if (showXiaomiWizard) "⚡ 收起权限" else "⚡ 小米权限",
+                            color = if (showXiaomiWizard) Color.White else Color(0xFFFBBF24),
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            softWrap = false
+                        )
                     }
                 }
             }
@@ -448,23 +509,41 @@ fun OneMoreStepMainScreen() {
         // 2. Collapsible Pairing Card
         if (showPairSheet) {
             val currentPaired = app.repository.getPairedMac()
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
             Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B))
+                modifier = Modifier.fillMaxWidth().heightIn(max = 210.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                shape = RoundedCornerShape(12.dp)
             ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Text(
-                        "🔐 v2 加密配对与重连",
-                        color = Color.White,
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 13.sp
-                    )
+                Column(
+                    modifier = Modifier
+                        .padding(10.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "🔐 v2 加密配对与重连",
+                            color = Color.White,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 13.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            "收起 ▲",
+                            color = Color(0xFF94A3B8),
+                            fontSize = 11.sp,
+                            modifier = Modifier.clickable { showPairSheet = false }.padding(horizontal = 4.dp, vertical = 2.dp)
+                        )
+                    }
                     if (currentPaired != null) {
-                        Spacer(modifier = Modifier.height(4.dp))
+                        Spacer(modifier = Modifier.height(2.dp))
                         Text(
                             if (currentPaired.pairingVersion == 2) "当前 v2 绑定：${currentPaired.macName} (${currentPaired.macId.takeLast(8)})" else "旧绑定需重新配对：${currentPaired.macName}（数据保留）",
-                            color = Color(0xFF4ADE80),
+                            color = if (currentPaired.pairingVersion == 2) Color(0xFF4ADE80) else Color(0xFFFBBF24),
                             fontSize = 11.sp
                         )
                     }
@@ -472,7 +551,8 @@ fun OneMoreStepMainScreen() {
                     OutlinedTextField(
                         value = pairUriInput,
                         onValueChange = { pairUriInput = it },
-                        placeholder = { Text("粘贴从 Mac 本地取得的完整 v2 oms://pair... 链接", color = Color.Gray) },
+                        placeholder = { Text("粘贴从 Mac 本地取得的完整 v2 oms://pair... 链接", color = Color.Gray, fontSize = 12.sp) },
+                        maxLines = 2,
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedTextColor = Color.White,
                             unfocusedTextColor = Color.White,
@@ -480,30 +560,38 @@ fun OneMoreStepMainScreen() {
                         ),
                         modifier = Modifier.fillMaxWidth()
                     )
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(6.dp))
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        OutlinedButton(onClick = {
-                            Toast.makeText(context, "🔍 正在重连已绑定的 Mac...", Toast.LENGTH_SHORT).show()
-                            app.transportClient.reconnectNow { ok, msg ->
-                                Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
-                                if (ok) showPairSheet = false
-                            }
-                        }) {
-                            Text("🔍 重连已绑Mac", color = Color(0xFF38BDF8), fontSize = 12.sp)
-                        }
-                        Button(onClick = {
-                            app.transportClient.pairWithUri(pairUriInput.trim()) { ok, msg ->
-                                Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
-                                if (ok) {
-                                    pairUriInput = ""
-                                    showPairSheet = false
+                        OutlinedButton(
+                            modifier = Modifier.height(32.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                            onClick = {
+                                Toast.makeText(context, "🔍 正在重连已绑定的 Mac...", Toast.LENGTH_SHORT).show()
+                                app.transportClient.reconnectNow { ok, msg ->
+                                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                    if (ok) showPairSheet = false
                                 }
                             }
-                        }) {
-                            Text("🔐 验证并绑定", fontSize = 12.sp)
+                        ) {
+                            Text("🔍 重连已绑Mac", color = Color(0xFF38BDF8), fontSize = 11.sp)
+                        }
+                        Button(
+                            modifier = Modifier.height(32.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 2.dp),
+                            onClick = {
+                                app.transportClient.pairWithUri(pairUriInput.trim()) { ok, msg ->
+                                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                    if (ok) {
+                                        pairUriInput = ""
+                                        showPairSheet = false
+                                    }
+                                }
+                            }
+                        ) {
+                            Text("🔐 验证并绑定", fontSize = 11.sp)
                         }
                     }
                 }
@@ -512,8 +600,11 @@ fun OneMoreStepMainScreen() {
 
         // 3. Collapsible Xiaomi HyperOS / MIUI Permission Wizard
         if (showXiaomiWizard) {
-            Spacer(modifier = Modifier.height(8.dp))
-            XiaomiPermissionWizardCard(context = context)
+            Spacer(modifier = Modifier.height(6.dp))
+            XiaomiPermissionWizardCard(
+                context = context,
+                onDismiss = { showXiaomiWizard = false }
+            )
         }
 
         Spacer(modifier = Modifier.height(8.dp))
@@ -550,24 +641,26 @@ fun OneMoreStepMainScreen() {
                     }
                 }
             }
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                 TextButton(
-                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                    modifier = Modifier.height(28.dp),
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
                     onClick = {
                         showSearchBar = !showSearchBar
                         if (!showSearchBar) searchQuery = ""
                     }
                 ) {
-                    Text(if (showSearchBar) "收起🔍" else "🔍搜索", color = Color(0xFF38BDF8), fontSize = 11.sp)
+                    Text(if (showSearchBar) "收起🔍" else "🔍搜索", color = Color(0xFF38BDF8), fontSize = 11.sp, maxLines = 1, softWrap = false)
                 }
                 TextButton(
-                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                    modifier = Modifier.height(28.dp),
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
                     onClick = {
                         val removed = app.repository.clearDeliveredHistory()
                         Toast.makeText(context, "🧹 已清理 $removed 条已同步记录", Toast.LENGTH_SHORT).show()
                     }
                 ) {
-                    Text("🧹清理", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                    Text("🧹清理", color = Color(0xFF94A3B8), fontSize = 11.sp, maxLines = 1, softWrap = false)
                 }
             }
         }
@@ -656,9 +749,10 @@ fun OneMoreStepMainScreen() {
                         val active = selectedTag == tag
                         OutlinedButton(
                             onClick = { selectedTag = tag },
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                            modifier = Modifier.height(28.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
                             colors = ButtonDefaults.outlinedButtonColors(
-                                containerColor = if (active) Color(0xFF0284C7) else Color.Transparent
+                                containerColor = if (active) Color(0xFF0284C7) else Color(0xFF0F172A)
                             )
                         ) {
                             Text(label, color = Color.White, fontSize = 11.sp, maxLines = 1, softWrap = false)
@@ -734,6 +828,7 @@ fun OneMoreStepMainScreen() {
                             value = composerText,
                             onValueChange = { composerText = it },
                             placeholder = { Text("发消息、链接，或点右侧🎙️录语音...", color = Color.Gray, fontSize = 12.sp) },
+                            maxLines = 3,
                             colors = OutlinedTextFieldDefaults.colors(
                                 focusedTextColor = Color.White,
                                 unfocusedTextColor = Color.White,
@@ -760,7 +855,8 @@ fun OneMoreStepMainScreen() {
                                     }
                                 }
                             },
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                            modifier = Modifier.height(44.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
                             colors = ButtonDefaults.outlinedButtonColors(
                                 containerColor = Color(0xFF0F172A)
                             )
@@ -783,7 +879,8 @@ fun OneMoreStepMainScreen() {
                                     composerText = ""
                                 }
                             },
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp)
+                            modifier = Modifier.height(44.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
                         ) {
                             Text("发送", fontSize = 12.sp, maxLines = 1, softWrap = false)
                         }
@@ -795,7 +892,7 @@ fun OneMoreStepMainScreen() {
 }
 
 @Composable
-fun XiaomiPermissionWizardCard(context: Context) {
+fun XiaomiPermissionWizardCard(context: Context, onDismiss: (() -> Unit)? = null) {
     val app = OmsApplication.instance
     var refreshTick by remember { mutableStateOf(0) }
     var autoOtpEnabled by remember {
@@ -803,74 +900,112 @@ fun XiaomiPermissionWizardCard(context: Context) {
     }
     val health = remember(refreshTick) { XiaomiAdaptationHelper.inspectAll(context) }
     Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B))
+        modifier = Modifier.fillMaxWidth().heightIn(max = 260.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+        shape = RoundedCornerShape(12.dp)
     ) {
-        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    "⚡ 小米 HyperOS / MIUI 满血权限自检向导",
+                    "⚡ 小米 HyperOS / MIUI 权限自检",
                     color = Color(0xFFFBBF24),
                     fontWeight = FontWeight.Bold,
-                    fontSize = 14.sp
+                    fontSize = 13.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
                 )
-                TextButton(onClick = { refreshTick++ }) {
-                    Text("刷新状态", color = Color(0xFF38BDF8), fontSize = 12.sp)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        "🔄 刷新",
+                        color = Color(0xFF38BDF8),
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        softWrap = false,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable { refreshTick++ }
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                    if (onDismiss != null) {
+                        Text(
+                            "收起 ▲",
+                            color = Color(0xFF94A3B8),
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            softWrap = false,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable { onDismiss() }
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
                 }
             }
-            XiaomiCheckRow(
-                label = "1. 小米「后台弹出界面」与「锁屏显示」(OpCode 10021/10008)",
-                ok = health.backgroundPopupAllowed && health.lockScreenDisplayAllowed,
-                onClick = { XiaomiAdaptationHelper.openXiaomiPermissionEditor(context) }
-            )
-            XiaomiCheckRow(
-                label = "2. 电池省电策略设为「无限制」",
-                ok = health.batteryUnrestricted,
-                onClick = { XiaomiAdaptationHelper.openBatteryUnrestrictedPrompt(context) }
-            )
-            XiaomiCheckRow(
-                label = "3. 悬浮窗权限 (截屏秒传胶囊 & AI 急停按钮)",
-                ok = health.overlayAllowed,
-                onClick = { XiaomiAdaptationHelper.openOverlayPermissionSettings(context) }
-            )
-            XiaomiCheckRow(
-                label = "4. 无障碍服务 (GUI 屏幕自动化与静默截屏)",
-                ok = health.accessibilityEnabled,
-                onClick = { XiaomiAdaptationHelper.openAccessibilitySettings(context) }
-            )
-            XiaomiCheckRow(
-                label = "5. 麦克风录音权限 (发送语音闪念与语音附言)",
-                ok = health.recordAudioGranted,
-                onClick = { XiaomiAdaptationHelper.openXiaomiPermissionEditor(context) }
-            )
-            XiaomiCheckRow(
-                label = "6. 通知使用权 (锁屏实时同步短信/微信/飞书验证码至 Mac)",
-                ok = health.notificationListenerEnabled,
-                onClick = { XiaomiAdaptationHelper.openNotificationListenerSettings(context) }
-            )
-            XiaomiCheckRow(
-                label = "7. 短信与小米「通知类短信」(OpCode 10018 · 穿透锁屏脱敏)",
-                ok = health.smsReadGranted && health.notificationSmsAllowed,
-                onClick = { XiaomiAdaptationHelper.openXiaomiPermissionEditor(context) }
-            )
-            XiaomiCheckRow(
-                label = "8. 小米应用「自启动」开关",
-                ok = true,
-                onClick = { XiaomiAdaptationHelper.openXiaomiAutostartSettings(context) }
-            )
+            Column(
+                modifier = Modifier
+                    .weight(1f, fill = false)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                XiaomiCheckRow(
+                    label = "1. 小米「后台弹出界面」与「锁屏显示」(OpCode 10021/10008)",
+                    ok = health.backgroundPopupAllowed && health.lockScreenDisplayAllowed,
+                    onClick = { XiaomiAdaptationHelper.openXiaomiPermissionEditor(context) }
+                )
+                XiaomiCheckRow(
+                    label = "2. 电池省电策略设为「无限制」",
+                    ok = health.batteryUnrestricted,
+                    onClick = { XiaomiAdaptationHelper.openBatteryUnrestrictedPrompt(context) }
+                )
+                XiaomiCheckRow(
+                    label = "3. 悬浮窗权限 (截屏秒传胶囊 & AI 急停按钮)",
+                    ok = health.overlayAllowed,
+                    onClick = { XiaomiAdaptationHelper.openOverlayPermissionSettings(context) }
+                )
+                XiaomiCheckRow(
+                    label = "4. 无障碍服务 (GUI 屏幕自动化与静默截屏)",
+                    ok = health.accessibilityEnabled,
+                    onClick = { XiaomiAdaptationHelper.openAccessibilitySettings(context) }
+                )
+                XiaomiCheckRow(
+                    label = "5. 麦克风录音权限 (发送语音闪念与语音附言)",
+                    ok = health.recordAudioGranted,
+                    onClick = { XiaomiAdaptationHelper.openXiaomiPermissionEditor(context) }
+                )
+                XiaomiCheckRow(
+                    label = "6. 通知使用权 (锁屏实时同步短信/微信/飞书验证码至 Mac)",
+                    ok = health.notificationListenerEnabled,
+                    onClick = { XiaomiAdaptationHelper.openNotificationListenerSettings(context) }
+                )
+                XiaomiCheckRow(
+                    label = "7. 短信与小米「通知类短信」(OpCode 10018 · 穿透锁屏脱敏)",
+                    ok = health.smsReadGranted && health.notificationSmsAllowed,
+                    onClick = { XiaomiAdaptationHelper.openXiaomiPermissionEditor(context) }
+                )
+                XiaomiCheckRow(
+                    label = "8. 小米应用「自启动」开关",
+                    ok = true,
+                    actionLabel = "去检查 ›",
+                    onClick = { XiaomiAdaptationHelper.openXiaomiAutostartSettings(context) }
+                )
+            }
             Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
                     text = if (autoOtpEnabled) "🔑 验证码实时同步 Mac：已开启" else "🔑 验证码实时同步 Mac：已暂停",
                     color = if (autoOtpEnabled) Color(0xFF4ADE80) else Color(0xFF94A3B8),
-                    fontSize = 12.sp,
+                    fontSize = 11.sp,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f)
                 )
@@ -881,10 +1016,10 @@ fun XiaomiPermissionWizardCard(context: Context) {
                             autoOtpEnabled = next
                             app?.repository?.setAutoSyncOtpEnabled(next)
                         },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                        modifier = Modifier.height(28.dp)
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                        modifier = Modifier.height(26.dp)
                     ) {
-                        Text(if (autoOtpEnabled) "暂停同步" else "开启同步", color = Color.White, fontSize = 11.sp)
+                        Text(if (autoOtpEnabled) "暂停同步" else "开启同步", color = Color.White, fontSize = 11.sp, maxLines = 1, softWrap = false)
                     }
                     Button(
                         onClick = {
@@ -903,11 +1038,11 @@ fun XiaomiPermissionWizardCard(context: Context) {
                                 Toast.LENGTH_SHORT
                             ).show()
                         },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                        modifier = Modifier.height(28.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                        modifier = Modifier.height(26.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF16A34A))
                     ) {
-                        Text("⚡ 测试验证码", fontSize = 11.sp)
+                        Text("⚡ 测试验证码", fontSize = 11.sp, maxLines = 1, softWrap = false)
                     }
                 }
             }
@@ -916,21 +1051,37 @@ fun XiaomiPermissionWizardCard(context: Context) {
 }
 
 @Composable
-fun XiaomiCheckRow(label: String, ok: Boolean, onClick: () -> Unit) {
+fun XiaomiCheckRow(label: String, ok: Boolean, actionLabel: String? = null, onClick: () -> Unit) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(6.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 3.dp, horizontal = 2.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
         Text(
             text = "${if (ok) "✅" else "⚠️"} $label",
             color = if (ok) Color(0xFF4ADE80) else Color(0xFFF87171),
-            fontSize = 12.sp,
+            fontSize = 11.sp,
             modifier = Modifier.weight(1f)
         )
-        TextButton(onClick = onClick) {
-            Text("去开启", color = Color(0xFF38BDF8), fontSize = 12.sp)
-        }
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            text = actionLabel ?: if (ok) "已开启 ›" else "去开启",
+            color = if (ok) Color(0xFF94A3B8) else Color(0xFF38BDF8),
+            fontSize = 11.sp,
+            fontWeight = if (ok) FontWeight.Normal else FontWeight.SemiBold,
+            maxLines = 1,
+            softWrap = false,
+            modifier = Modifier
+                .background(
+                    if (ok) Color(0xFF0F172A) else Color(0xFF0284C7).copy(alpha = 0.2f),
+                    RoundedCornerShape(6.dp)
+                )
+                .padding(horizontal = 8.dp, vertical = 2.dp)
+        )
     }
 }
 

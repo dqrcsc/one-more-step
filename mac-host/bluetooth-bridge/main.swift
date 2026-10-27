@@ -184,14 +184,6 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
         if request.characteristic.uuid == CHAR_MAC_INFO_UUID {
-            if !subscribedCentrals.contains(where: { $0.identifier == request.central.identifier }) {
-                subscribedCentrals.append(request.central)
-                ipc.sendJson([
-                    "type": "central_connected",
-                    "centralId": request.central.identifier.uuidString,
-                    "maxUpdateValueLength": request.central.maximumUpdateValueLength
-                ])
-            }
             if request.offset > macInfoJsonData.count {
                 peripheral.respond(to: request, withResult: .invalidOffset)
                 return

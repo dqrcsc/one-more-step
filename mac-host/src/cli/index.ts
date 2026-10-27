@@ -585,7 +585,7 @@ Commands:
   oms status [--live]                                  Inspect live presence, transport tier, battery, temp, audio, storage & permissions
   oms phone <status|find|say|volume|screenshot|open|launch|home|back|lock>
                                                        Inspect rich phone telemetry or remotely control phone from Mac
-  oms pair [--json]                                    Generate pairing URI, 6-digit PIN & wireless install URL (/install)
+  oms pair [--json]                                    Generate v2 pairing URI & local wireless install URL (/install)
   oms web                                              Open Mac real-time Inbox & Stream Web Dashboard (/inbox)
   oms otp [--limit N] [--copy] [--ack]                 Query latest synced verification codes (OTP) from phone
   oms prefs [--auto-otp] [--auto-copy] [--auto-preview] View or update Mac auto-OTP, auto-clipboard & auto-image-preview preferences
