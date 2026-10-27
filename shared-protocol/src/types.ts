@@ -16,6 +16,7 @@ export enum FrameType {
   STREAM_ACK_RESUME = 0x04,
   PING = 0x05,
   PONG = 0x06,
+  SECURE_RECORD = 0x7e,
 }
 
 export enum FramePriority {
@@ -198,6 +199,7 @@ export interface PhoneDeviceStatus {
   sdkInt?: number;
   romVersion?: string;
   appVersionName?: string;
+  secureProtocolVersion?: number;
   appVersionCode?: number;
   uptimeMinutes?: number;
   pendingOutboxCount?: number;
