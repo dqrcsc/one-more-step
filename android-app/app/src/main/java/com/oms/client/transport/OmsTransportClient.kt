@@ -220,6 +220,7 @@ class OmsTransportClient(
     private val lanGeneration = AtomicLong(0)
     private val wanGeneration = AtomicLong(0)
     @Volatile private var pairingWebSocket: WebSocket? = null
+    @Volatile private var activeBlePairingAttempt: PairAttempt? = null
     private val pendingReplies = ConcurrentHashMap<String, PendingReply>()
     private val decidingApprovals = ConcurrentHashMap.newKeySet<String>()
 
@@ -252,7 +253,7 @@ class OmsTransportClient(
                         }
                     }
                     val expiredTransfers = synchronized(incomingTransferLock) {
-                        incomingTransfers.entries.filter { it.value.createdAtMs + 60_000 <= now }
+                        incomingTransfers.entries.filter { it.value.createdAtMs + 180_000 <= now }
                             .mapNotNull { (id, transfer) -> if (incomingTransfers.remove(id, transfer)) id to transfer else null }
                     }
                     for ((id, transfer) in expiredTransfers) streamAck(id, "ERROR", transfer.source, error = "Stream timed out")
@@ -964,6 +965,27 @@ class OmsTransportClient(
                 if (affectsCurrent) traceConnection(
                     if (tier == "LAN_WS" && findNonVpnWifiNetwork() == null) ConnectionDiagnostics.Event.WIFI_UNAVAILABLE
                     else ConnectionDiagnostics.networkFailure(t), tier, generation)
+                if (pairing != null && !didOpen && tier == "LAN_WS" &&
+                    generation == pairGeneration.get() && System.currentTimeMillis() < pairing.expiresAtMs
+                ) {
+                    val btEnabled = runCatching {
+                        (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter?.isEnabled == true
+                    }.getOrDefault(false)
+                    if (btEnabled) {
+                        activeBlePairingAttempt = pairing
+                        activeBleGatt?.let { existingGatt ->
+                            closeSecureSource(FrameSource("BT_RFCOMM", null, existingGatt), "Pairing attempt replaced")
+                        }
+                        startBleNearFieldScanner(forceRestart = true)
+                        mainHandler.postDelayed({
+                            if (generation == pairGeneration.get() && activeBlePairingAttempt === pairing && !pairing.reported.get()) {
+                                activeBlePairingAttempt = null
+                                reportPairing(pairing, false)
+                            }
+                        }, 15_000L)
+                        return
+                    }
+                }
                 reportPairing(pairing, false)
                 if (tier == "LAN_WS" && pairing == null && generation == lanGeneration.get()) {
                     if (!isSourceAuthenticated("BT_RFCOMM", null)) {
@@ -992,7 +1014,10 @@ class OmsTransportClient(
         valBytes: ByteArray
     ) {
         try {
-            val existing = repo.getPairedMac()
+            val pendingPair = activeBlePairingAttempt?.takeIf {
+                it.generation == pairGeneration.get() && System.currentTimeMillis() < it.expiresAtMs
+            }
+            val existing = pendingPair?.config ?: repo.getPairedMac()
             val info = JSONObject(String(valBytes, Charsets.UTF_8))
             val macId = info.optString("macId")
             // Strict 1-to-1 isolation: disconnect immediately if BLE peripheral is not the paired Mac
@@ -1017,7 +1042,7 @@ class OmsTransportClient(
                     }
                 }
             }
-            if (ips.isNotEmpty()) {
+            if (ips.isNotEmpty() && pendingPair == null) {
                 repo.updatePairedMacDiscovery(
                     existing.copy(
                         macId = macId,
@@ -1058,7 +1083,10 @@ class OmsTransportClient(
     @SuppressLint("MissingPermission")
     private fun startBleNearFieldScanner(forceRestart: Boolean = false) {
         try {
-            if (!isV2Pairing(repo.getPairedMac())) return
+            val pendingPair = activeBlePairingAttempt?.takeIf {
+                it.generation == pairGeneration.get() && System.currentTimeMillis() < it.expiresAtMs
+            }
+            if (pendingPair == null && !isV2Pairing(repo.getPairedMac())) return
             val existingGatt = activeBleGatt
             if (existingGatt != null) {
                 val btSource = FrameSource("BT_RFCOMM", null, existingGatt)
@@ -1126,12 +1154,15 @@ class OmsTransportClient(
                                         isBleWriting.set(false)
                                         blePayloadLimit = 180
                                         bleConnectStartedAtMs = SystemClock.elapsedRealtime()
-                                        val paired = repo.getPairedMac()?.takeIf { isV2Pairing(it) }
+                                        val blePair = activeBlePairingAttempt?.takeIf {
+                                            it.generation == pairGeneration.get() && System.currentTimeMillis() < it.expiresAtMs
+                                        }
+                                        val paired = blePair?.config ?: repo.getPairedMac()?.takeIf { isV2Pairing(it) }
                                         if (paired == null) {
                                             closeSecureSource(FrameSource("BT_RFCOMM", null, gatt), "Not paired")
                                             return
                                         }
-                                        beginSecureSource(FrameSource("BT_RFCOMM", null, gatt), paired)
+                                        beginSecureSource(FrameSource("BT_RFCOMM", null, gatt), paired, blePair)
                                         if (!gatt.requestMtu(512)) {
                                             gatt.discoverServices()
                                         }
@@ -1553,10 +1584,26 @@ class OmsTransportClient(
                     try {
                         val source = activeSource()
                         val attachments = JSONArray()
+                        var totalAttachmentBytes = 0L
                         fun attach(uri: String?) {
                             if (uri.isNullOrBlank()) return
-                            val (bytes, mime, name) = readUriBytesAndMime(uri, item.itemId.takeLast(8))
+                            val (rawBytes, rawMime, rawName) = readUriBytesAndMime(uri, item.itemId.takeLast(8))
                                 ?: throw IllegalStateException("Queued attachment is unavailable")
+                            val (bytes, mime, name) = if (source.tier == "BT_RFCOMM" && rawMime.startsWith("image/") && rawBytes.size > 100 * 1024) {
+                                val compressed = ScopedStorageExecutor.compressToWebpIfPossible(
+                                    rawBytes,
+                                    maxDimensionPx = 960,
+                                    quality = 68
+                                )
+                                if (compressed != null && compressed.size < rawBytes.size) {
+                                    Triple(compressed, "image/webp", rawName.substringBeforeLast('.') + ".webp")
+                                } else {
+                                    Triple(rawBytes, rawMime, rawName)
+                                }
+                            } else {
+                                Triple(rawBytes, rawMime, rawName)
+                            }
+                            totalAttachmentBytes += bytes.size
                             val streamId = streamBinaryBytesToMac(name, mime, bytes, item.intentTag, source)
                             attachments.put(JSONObject().put("streamId", streamId).put("fileName", name)
                                 .put("mimeType", mime).put("totalBytes", bytes.size)
@@ -1574,7 +1621,12 @@ class OmsTransportClient(
                                 .put("otpSender", metadata?.optString("otpSender")?.takeIf { it.isNotBlank() })
                                 .put("sourceApp", metadata?.optString("sourceApp")?.takeIf { it.isNotBlank() })
                                 .put("attachments", attachments))
-                        val result = requestHost(request, source)
+                        val rpcTimeoutMs = if (source.tier == "BT_RFCOMM") {
+                            maxOf(90_000L, 30_000L + (totalAttachmentBytes / 8192L) * 1200L)
+                        } else {
+                            30_000L
+                        }
+                        val result = requestHost(request, source, rpcTimeoutMs)
                         if (DeliveryPolicy.committedInboxAck(result.optBoolean("ack"), result.optString("savedId"), item.itemId)) {
                             repo.updateSyncStatus(item.itemId, "DELIVERED", result.optString("macPath"))
                         }
@@ -1650,6 +1702,14 @@ class OmsTransportClient(
         }
     }
 
+    private fun parseSemVerCode(verName: String, fallbackCode: Int): Int {
+        val parts = verName.removePrefix("v").trim().split('.').mapNotNull { it.toIntOrNull() }
+        if (parts.size == 3 && parts[0] == 1 && parts[1] == 4) {
+            return 14 + parts[2]
+        }
+        return fallbackCode
+    }
+
     fun checkOtaUpdate(onResult: (OtaCheckResult) -> Unit) {
         scope.launch {
             val (localVerName, localVerCode, localSha) = getInstalledApkInfo()
@@ -1670,121 +1730,208 @@ class OmsTransportClient(
                 return@launch
             }
             val port = paired.lanPort
+
+            // 1. Priority 1: Query Mac directly over the active encrypted channel (works over LAN_WS, BT_RFCOMM, and WAN_WEBRTC!)
+            val activeSrc = runCatching { activeSource() }.getOrNull()
+            if (activeSrc != null) {
+                try {
+                    val rpcReq = JSONObject()
+                        .put("jsonrpc", "2.0")
+                        .put("id", "ota_${UUID.randomUUID()}")
+                        .put("method", "apk.getVersion")
+                        .put("params", JSONObject())
+                    val rpcRes = requestHost(rpcReq, activeSrc, 8_000L)
+                    if (rpcRes.has("versionName") || rpcRes.has("available")) {
+                        val available = rpcRes.optBoolean("available", false)
+                        val remoteVerCode = rpcRes.optInt("versionCode", 0)
+                        val remoteVerName = rpcRes.optString("versionName", localVerName)
+                        val remoteSha = rpcRes.optString("sha256", "")
+                        val remoteSize = rpcRes.optLong("sizeBytes", 0L)
+                        val remoteUpdatedIso = rpcRes.optString("updatedAtIso", "")
+                        val ghUrl = rpcRes.optString("githubDownloadUrl").takeIf { it.isNotBlank() }
+                            ?: "https://github.com/dqrcsc/one-more-step/releases/download/v$remoteVerName/OneMoreStep-v$remoteVerName.apk"
+
+                        if (available && remoteSha.isNotBlank()) {
+                            val reachableLanIp = if (activeSrc.tier == "LAN_WS") {
+                                paired.lanIps.firstOrNull {
+                                    probeMacHttpInfo(it, port, 1200, checkTcpFirst = false)?.macId == paired!!.macId
+                                } ?: paired.lanIps.firstOrNull()
+                            } else {
+                                paired.lanIps.firstOrNull {
+                                    probeMacHttpInfo(it, port, 900, checkTcpFirst = false)?.macId == paired!!.macId
+                                }
+                            }
+                            val resolvedDownloadUrl = if (!reachableLanIp.isNullOrBlank()) {
+                                "http://$reachableLanIp:$port/OneMoreStep.apk?t=${System.currentTimeMillis()}"
+                            } else {
+                                ghUrl
+                            }
+                            val isSameBinary = localSha.isNotBlank() && localSha.equals(remoteSha, ignoreCase = true)
+                            val isOlderOnMac = remoteVerCode in 1 until localVerCode && remoteVerName == localVerName
+                            val hasUpdate = !isSameBinary && (remoteVerCode > localVerCode || remoteVerName != localVerName || !isOlderOnMac)
+
+                            mainHandler.post {
+                                onResult(
+                                    OtaCheckResult(
+                                        ok = true,
+                                        hasUpdate = hasUpdate,
+                                        localVersionName = localVerName,
+                                        localVersionCode = localVerCode,
+                                        localSha256 = localSha,
+                                        remoteVersionName = remoteVerName,
+                                        remoteVersionCode = remoteVerCode,
+                                        remoteSha256 = remoteSha,
+                                        remoteSizeBytes = remoteSize,
+                                        remoteUpdatedAtIso = remoteUpdatedIso,
+                                        downloadUrl = resolvedDownloadUrl,
+                                        message = if (hasUpdate) {
+                                            "发现新版本 v$remoteVerName"
+                                        } else {
+                                            "✅ 当前已是最新版本 (v$localVerName)"
+                                        }
+                                    )
+                                )
+                            }
+                            return@launch
+                        }
+                    }
+                } catch (_: Throwable) {
+                    // Fallback to LAN HTTP or GitHub Release API if Mac daemon has not yet updated to support apk.getVersion
+                }
+            }
+
+            // 2. Priority 2: Probe Mac LAN HTTP /apk/version if reachable
             var ip = paired.lanIps.firstOrNull {
-                val info = probeMacHttpInfo(it, port, 2500)
+                val info = probeMacHttpInfo(it, port, 1500, checkTcpFirst = false)
                 info != null && info.macId == paired!!.macId
             }
-            if (ip == null) {
-                val discovered = discoverMacOnLan(port, paired.macId)
+            if (ip == null && activeSrc?.tier != "BT_RFCOMM") {
+                val discovered = discoverMacOnLan(port, paired.macId, allowSubnetScan = false)
                 if (discovered != null) {
                     paired = discovered
                     ip = discovered.lanIps.firstOrNull()
                 }
             }
-            val finalIp = ip ?: paired?.lanIps?.firstOrNull()
-            if (finalIp.isNullOrBlank()) {
-                mainHandler.post {
-                    onResult(
-                        OtaCheckResult(
-                            ok = false,
-                            hasUpdate = false,
-                            localVersionName = localVerName,
-                            localVersionCode = localVerCode,
-                            localSha256 = localSha,
-                            message = "尚未连接或发现局域网内的 Mac 宿主"
-                        )
-                    )
-                }
-                return@launch
-            }
-            val versionUrl = "http://$finalIp:$port/apk/version?t=${System.currentTimeMillis()}"
-            val downloadUrl = "http://$finalIp:$port/OneMoreStep.apk?t=${System.currentTimeMillis()}"
+            if (!ip.isNullOrBlank()) {
+                val versionUrl = "http://$ip:$port/apk/version?t=${System.currentTimeMillis()}"
+                val downloadUrl = "http://$ip:$port/OneMoreStep.apk?t=${System.currentTimeMillis()}"
+                try {
+                    val client = buildLanOkHttpClient()
+                    val req = Request.Builder().url(versionUrl).get().build()
+                    client.newCall(req).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val bodyStr = resp.body?.string() ?: "{}"
+                            val json = JSONObject(bodyStr)
+                            val available = json.optBoolean("available", false)
+                            val remoteVerCode = json.optInt("versionCode", 0)
+                            val remoteVerName = json.optString("versionName", "1.1.0")
+                            val remoteSha = json.optString("sha256", "")
+                            val remoteSize = json.optLong("sizeBytes", 0L)
+                            val remoteUpdatedIso = json.optString("updatedAtIso", "")
 
-            try {
-                val client = buildLanOkHttpClient()
-                val req = Request.Builder().url(versionUrl).get().build()
-                client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        mainHandler.post {
-                            onResult(
-                                OtaCheckResult(
-                                    ok = false,
-                                    hasUpdate = false,
-                                    localVersionName = localVerName,
-                                    localVersionCode = localVerCode,
-                                    localSha256 = localSha,
-                                    message = "查询 Mac 版本失败 (HTTP ${resp.code})"
-                                )
-                            )
-                        }
-                        return@launch
-                    }
+                            if (available && remoteSha.isNotBlank()) {
+                                val isSameBinary = localSha.isNotBlank() && localSha.equals(remoteSha, ignoreCase = true)
+                                val isOlderOnMac = remoteVerCode < localVerCode
+                                val hasUpdate = !isSameBinary && !isOlderOnMac
 
-                    val bodyStr = resp.body?.string() ?: "{}"
-                    val json = JSONObject(bodyStr)
-                    val available = json.optBoolean("available", false)
-                    val remoteVerCode = json.optInt("versionCode", 0)
-                    val remoteVerName = json.optString("versionName", "1.1.0")
-                    val remoteSha = json.optString("sha256", "")
-                    val remoteSize = json.optLong("sizeBytes", 0L)
-                    val remoteUpdatedIso = json.optString("updatedAtIso", "")
-
-                    if (!available || remoteSha.isBlank()) {
-                        mainHandler.post {
-                            onResult(
-                                OtaCheckResult(
-                                    ok = false,
-                                    hasUpdate = false,
-                                    localVersionName = localVerName,
-                                    localVersionCode = localVerCode,
-                                    localSha256 = localSha,
-                                    message = "Mac 端暂未找到可更新的 APK 安装包"
-                                )
-                            )
-                        }
-                        return@launch
-                    }
-
-                    val isSameBinary = localSha.isNotBlank() && localSha.equals(remoteSha, ignoreCase = true)
-                    val isOlderOnMac = remoteVerCode < localVerCode
-                    val hasUpdate = !isSameBinary && !isOlderOnMac
-
-                    mainHandler.post {
-                        onResult(
-                            OtaCheckResult(
-                                ok = true,
-                                hasUpdate = hasUpdate,
-                                localVersionName = localVerName,
-                                localVersionCode = localVerCode,
-                                localSha256 = localSha,
-                                remoteVersionName = remoteVerName,
-                                remoteVersionCode = remoteVerCode,
-                                remoteSha256 = remoteSha,
-                                remoteSizeBytes = remoteSize,
-                                remoteUpdatedAtIso = remoteUpdatedIso,
-                                downloadUrl = downloadUrl,
-                                message = if (hasUpdate) {
-                                    "发现新版本 v$remoteVerName"
-                                } else {
-                                    "✅ 当前已是最新版本 (v$localVerName)"
+                                mainHandler.post {
+                                    onResult(
+                                        OtaCheckResult(
+                                            ok = true,
+                                            hasUpdate = hasUpdate,
+                                            localVersionName = localVerName,
+                                            localVersionCode = localVerCode,
+                                            localSha256 = localSha,
+                                            remoteVersionName = remoteVerName,
+                                            remoteVersionCode = remoteVerCode,
+                                            remoteSha256 = remoteSha,
+                                            remoteSizeBytes = remoteSize,
+                                            remoteUpdatedAtIso = remoteUpdatedIso,
+                                            downloadUrl = downloadUrl,
+                                            message = if (hasUpdate) {
+                                                "发现新版本 v$remoteVerName"
+                                            } else {
+                                                "✅ 当前已是最新版本 (v$localVerName)"
+                                            }
+                                        )
+                                    )
                                 }
-                            )
-                        )
+                                return@launch
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+
+            // 3. Priority 3: Fallback to GitHub Releases API when LAN HTTP is isolated/unreachable
+            try {
+                val ghClient = OkHttpClient.Builder()
+                    .connectTimeout(5, TimeUnit.SECONDS)
+                    .readTimeout(6, TimeUnit.SECONDS)
+                    .build()
+                val ghReq = Request.Builder()
+                    .url("https://api.github.com/repos/dqrcsc/one-more-step/releases/latest")
+                    .header("Accept", "application/vnd.github+json")
+                    .get()
+                    .build()
+                ghClient.newCall(ghReq).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val json = JSONObject(resp.body?.string() ?: "{}")
+                        val tagName = json.optString("tag_name", "").removePrefix("v").trim()
+                        if (tagName.isNotBlank()) {
+                            val assets = json.optJSONArray("assets")
+                            var assetUrl = "https://github.com/dqrcsc/one-more-step/releases/download/v$tagName/OneMoreStep-v$tagName.apk"
+                            var assetSize = 0L
+                            var assetUpdatedIso = json.optString("published_at", "")
+                            if (assets != null && assets.length() > 0) {
+                                val firstAsset = assets.getJSONObject(0)
+                                assetUrl = firstAsset.optString("browser_download_url", assetUrl)
+                                assetSize = firstAsset.optLong("size", 0L)
+                                assetUpdatedIso = firstAsset.optString("updated_at", assetUpdatedIso)
+                            }
+                            val remoteVerCode = parseSemVerCode(tagName, localVerCode)
+                            val hasUpdate = tagName != localVerName && remoteVerCode >= localVerCode
+                            mainHandler.post {
+                                onResult(
+                                    OtaCheckResult(
+                                        ok = true,
+                                        hasUpdate = hasUpdate,
+                                        localVersionName = localVerName,
+                                        localVersionCode = localVerCode,
+                                        localSha256 = localSha,
+                                        remoteVersionName = tagName,
+                                        remoteVersionCode = remoteVerCode,
+                                        remoteSha256 = "github_release",
+                                        remoteSizeBytes = assetSize,
+                                        remoteUpdatedAtIso = assetUpdatedIso,
+                                        downloadUrl = assetUrl,
+                                        message = if (hasUpdate) {
+                                            "发现新版本 v$tagName (GitHub Release)"
+                                        } else {
+                                            "✅ 当前已是最新版本 (v$localVerName)"
+                                        }
+                                    )
+                                )
+                            }
+                            return@launch
+                        }
                     }
                 }
-            } catch (e: Throwable) {
-                mainHandler.post {
-                    onResult(
-                        OtaCheckResult(
-                            ok = false,
-                            hasUpdate = false,
-                            localVersionName = localVerName,
-                            localVersionCode = localVerCode,
-                            localSha256 = localSha,
-                            message = "无法连接 Mac 检查更新: ${e.message}"
-                        )
+            } catch (_: Throwable) {
+            }
+
+            mainHandler.post {
+                onResult(
+                    OtaCheckResult(
+                        ok = false,
+                        hasUpdate = false,
+                        localVersionName = localVerName,
+                        localVersionCode = localVerCode,
+                        localSha256 = localSha,
+                        message = "⚠️ 暂无法通过蓝牙/局域网/GitHub获取更新信息，请稍后重试"
                     )
-                }
+                )
             }
         }
     }
@@ -1967,9 +2114,12 @@ class OmsTransportClient(
                         val config = link.config.copy(pairSecretHex = link.newPairSecret, pairingVersion = 2,
                             wanRoomId = result.optString("wanRoomId", ""))
                         repo.savePairedMac(config)
+                        activeBlePairingAttempt = null
                         lanGeneration.incrementAndGet()
                         wanGeneration.incrementAndGet()
-                        lanWebSocket = source.socket
+                        if (source.tier == "LAN_WS") {
+                            lanWebSocket = source.socket
+                        }
                         pairingWebSocket = null
                     } else {
                         val stored = repo.getPairedMac()
@@ -2081,8 +2231,15 @@ class OmsTransportClient(
                     "storage.listDir" -> ScopedStorageExecutor.listDir(repo, params)
                     "storage.pullFile" -> {
                         val src = params.getString("sourceUriOrPath")
-                        val compress = params.optBoolean("compressImage", false)
-                        val pulled = ScopedStorageExecutor.readAuthorizedFileBytes(context, repo, src, compress)
+                        val isBle = source.tier == "BT_RFCOMM"
+                        val compress = params.optBoolean("compressImage", isBle)
+                        val pulled = ScopedStorageExecutor.readAuthorizedFileBytes(
+                            context,
+                            repo,
+                            src,
+                            compressImage = compress,
+                            compactForBle = isBle
+                        )
                         val streamId = streamBinaryBytesToMac(pulled.fileName, pulled.mimeType, pulled.bytes, source = source)
                         JSONObject().apply {
                             put("streamId", streamId)
@@ -2156,8 +2313,16 @@ class OmsTransportClient(
                             ?: paired?.lanIps?.firstOrNull()
                             ?: "127.0.0.1"
                         val port = params.optInt("port", paired?.lanPort ?: 19527)
-                        val url = params.optString("url").takeIf { it.isNotBlank() }
+                        val ghUrl = params.optString("githubDownloadUrl").takeIf { it.isNotBlank() }
+                        val rawUrl = params.optString("url").takeIf { it.isNotBlank() }
                             ?: "http://$ip:$port/OneMoreStep.apk?t=${System.currentTimeMillis()}"
+                        val url = if (source.tier == "BT_RFCOMM" && !ghUrl.isNullOrBlank() &&
+                            probeMacHttpInfo(ip, port, 1000, checkTcpFirst = false) == null
+                        ) {
+                            ghUrl
+                        } else {
+                            rawUrl
+                        }
                         mainHandler.post {
                             try {
                                 val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
@@ -2245,6 +2410,7 @@ class OmsTransportClient(
                         svc.observeScreen(
                             includeScreenshot = params.optBoolean("includeScreenshot", false),
                             somAnnotation = params.optBoolean("somAnnotation", true),
+                            compactForBle = source.tier == "BT_RFCOMM",
                             onSendBinaryStream = { fName, mime, bytes ->
                                 streamBinaryBytesToMac(fName, mime, bytes, source = source)
                             }
@@ -2418,8 +2584,12 @@ class OmsTransportClient(
             "take_screenshot" -> {
                 val svc = OmsAccessibilityService.instance
                     ?: throw IllegalStateException("ERR_ACCESSIBILITY_DISABLED: 请先在手机上开启青简·咫尺无障碍服务")
-                val webpBytes = ScreenCapturer.captureWebpBytes(svc, emptyList(), false)
-                    ?: throw IllegalStateException("截屏失败，当前页面可能受隐私保护或屏幕已关闭")
+                val webpBytes = ScreenCapturer.captureWebpBytes(
+                    svc,
+                    emptyList(),
+                    false,
+                    compactForBle = source.tier == "BT_RFCOMM"
+                ) ?: throw IllegalStateException("截屏失败，当前页面可能受隐私保护或屏幕已关闭")
                 val fileName = "screen_${System.currentTimeMillis()}.webp"
                 val streamId = streamBinaryBytesToMac(fileName, "image/webp", webpBytes, "default_inbox", source)
                 val sha = OmsFrameProtocol.sha256Hex(webpBytes)

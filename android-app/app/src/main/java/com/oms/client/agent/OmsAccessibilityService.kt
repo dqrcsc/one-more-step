@@ -213,6 +213,7 @@ class OmsAccessibilityService : AccessibilityService() {
     suspend fun observeScreen(
         includeScreenshot: Boolean,
         somAnnotation: Boolean,
+        compactForBle: Boolean = false,
         onSendBinaryStream: (fileName: String, mime: String, bytes: ByteArray) -> String?
     ): JSONObject = withContext(Dispatchers.Main.immediate) { guiMutex.withLock {
         val dm = resources.displayMetrics
@@ -246,7 +247,12 @@ class OmsAccessibilityService : AccessibilityService() {
         val snapshotRevision = guard.revision
         var screenshotStreamId: String? = null
         if (includeScreenshot) {
-            val webpBytes = ScreenCapturer.captureWebpBytes(this@OmsAccessibilityService, extractedNodes, somAnnotation)
+            val webpBytes = ScreenCapturer.captureWebpBytes(
+                this@OmsAccessibilityService,
+                extractedNodes,
+                somAnnotation,
+                compactForBle = compactForBle
+            )
             if (webpBytes != null) {
                 screenshotStreamId = onSendBinaryStream("gui_screen.webp", "image/webp", webpBytes)
             }

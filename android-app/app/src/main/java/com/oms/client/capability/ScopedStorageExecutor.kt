@@ -177,7 +177,8 @@ object ScopedStorageExecutor {
         context: Context,
         repo: StreamRepository,
         sourceUriOrPath: String,
-        compressImage: Boolean
+        compressImage: Boolean,
+        compactForBle: Boolean = false
     ): PulledFilePayload {
         if (sourceUriOrPath.startsWith("content://")) {
             val uri = Uri.parse(sourceUriOrPath)
@@ -199,7 +200,13 @@ object ScopedStorageExecutor {
             } ?: throw SecurityException("ERR_SCOPED_PATH_DENIED: URI directory cannot be verified")
             val rawBytes = context.contentResolver.openInputStream(uri)?.use { DeliveryPolicy.readBounded(it) }
                 ?: throw IllegalArgumentException("Unable to read URI")
-            val compressed = if (compressImage && metadata.second.startsWith("image/")) compressToWebpIfPossible(rawBytes) else null
+            val compressed = if ((compressImage || compactForBle) && metadata.second.startsWith("image/")) {
+                compressToWebpIfPossible(
+                    rawBytes,
+                    maxDimensionPx = if (compactForBle) 960 else 0,
+                    quality = if (compactForBle) 68 else 82
+                )
+            } else null
             return PulledFilePayload(
                 fileName = if (compressed != null) metadata.first.substringBeforeLast('.') + ".webp" else metadata.first,
                 mimeType = if (compressed != null) "image/webp" else metadata.second,
@@ -225,16 +232,42 @@ object ScopedStorageExecutor {
         }
 
         val rawBytes = file.inputStream().use { DeliveryPolicy.readBounded(it) }
+        val isImageExt = file.name.lowercase().let {
+            it.endsWith(".jpg") || it.endsWith(".jpeg") || it.endsWith(".png") || it.endsWith(".webp")
+        }
+        val compressed = if ((compressImage || compactForBle) && isImageExt) {
+            compressToWebpIfPossible(
+                rawBytes,
+                maxDimensionPx = if (compactForBle) 960 else 0,
+                quality = if (compactForBle) 68 else 82
+            )
+        } else null
         return PulledFilePayload(
-            fileName = file.name,
-            mimeType = "application/octet-stream",
-            bytes = rawBytes
+            fileName = if (compressed != null) file.name.substringBeforeLast('.') + ".webp" else file.name,
+            mimeType = if (compressed != null) "image/webp" else "application/octet-stream",
+            bytes = compressed ?: rawBytes
         )
     }
 
-    private fun compressToWebpIfPossible(rawBytes: ByteArray): ByteArray? {
+    fun compressToWebpIfPossible(
+        rawBytes: ByteArray,
+        maxDimensionPx: Int = 0,
+        quality: Int = 82
+    ): ByteArray? {
         return try {
             val bmp = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size) ?: return null
+            val targetBmp = if (maxDimensionPx > 0 && maxOf(bmp.width, bmp.height) > maxDimensionPx) {
+                val ratio = maxDimensionPx.toFloat() / maxOf(bmp.width, bmp.height).toFloat()
+                val targetW = (bmp.width * ratio).toInt().coerceAtLeast(1)
+                val targetH = (bmp.height * ratio).toInt().coerceAtLeast(1)
+                val scaled = Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
+                if (scaled !== bmp) {
+                    bmp.recycle()
+                }
+                scaled
+            } else {
+                bmp
+            }
             val out = ByteArrayOutputStream()
             val format = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 Bitmap.CompressFormat.WEBP_LOSSY
@@ -242,8 +275,8 @@ object ScopedStorageExecutor {
                 @Suppress("DEPRECATION")
                 Bitmap.CompressFormat.WEBP
             }
-            val ok = bmp.compress(format, 82, out)
-            bmp.recycle()
+            val ok = targetBmp.compress(format, quality, out)
+            targetBmp.recycle()
             if (ok) out.toByteArray() else null
         } catch (_: Throwable) {
             null

@@ -21,7 +21,8 @@ object ScreenCapturer {
     suspend fun captureWebpBytes(
         service: AccessibilityService,
         nodes: List<ExtractedSemanticNode>,
-        drawSomAnnotation: Boolean
+        drawSomAnnotation: Boolean,
+        compactForBle: Boolean = false
     ): ByteArray? = suspendCancellableCoroutine { cont ->
         service.takeScreenshot(
             Display.DEFAULT_DISPLAY,
@@ -46,6 +47,19 @@ object ScreenCapturer {
                             drawSetOfMarkBadges(mutableBmp, nodes)
                         }
 
+                        val targetBmp = if (compactForBle && mutableBmp.width > 540) {
+                            val ratio = 540f / mutableBmp.width.toFloat()
+                            val targetW = 540
+                            val targetH = (mutableBmp.height * ratio).toInt().coerceAtLeast(1)
+                            val scaled = Bitmap.createScaledBitmap(mutableBmp, targetW, targetH, true)
+                            if (scaled !== mutableBmp) {
+                                mutableBmp.recycle()
+                            }
+                            scaled
+                        } else {
+                            mutableBmp
+                        }
+
                         val out = ByteArrayOutputStream()
                         val format = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                             Bitmap.CompressFormat.WEBP_LOSSY
@@ -53,8 +67,9 @@ object ScreenCapturer {
                             @Suppress("DEPRECATION")
                             Bitmap.CompressFormat.WEBP
                         }
-                        mutableBmp.compress(format, 80, out)
-                        mutableBmp.recycle()
+                        val quality = if (compactForBle) 62 else 80
+                        targetBmp.compress(format, quality, out)
+                        targetBmp.recycle()
 
                         if (cont.isActive) cont.resume(out.toByteArray())
                     } catch (_: Throwable) {

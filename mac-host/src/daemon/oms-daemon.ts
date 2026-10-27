@@ -332,6 +332,23 @@ export class OmsDaemon {
               "你在小米手机上点击了急停胶囊，GUI 自动化已立即中止。"
             );
             reply({ result: { ack: true } });
+          } else if (req.method === "apk.getVersion") {
+            const meta = this.session.getApkMetadata();
+            reply({
+              result: {
+                available: meta.available,
+                versionCode: meta.versionCode,
+                versionName: meta.versionName,
+                sha256: meta.sha256,
+                sizeBytes: meta.sizeBytes,
+                updatedAtMs: meta.updatedAtMs,
+                updatedAtIso: meta.updatedAtIso,
+                downloadUrl: meta.downloadUrl,
+                githubDownloadUrl: meta.githubDownloadUrl,
+                lanIps: PhoneSessionManager.getLocalLanIps(),
+                lanPort: this.config.lanPort,
+              },
+            });
           } else {
             reply({ result: { ack: true } });
           }
@@ -458,10 +475,11 @@ export class OmsDaemon {
     const now = Date.now();
     if (!force && now - this.lastStatusRefreshMs < 2500) return;
     this.lastStatusRefreshMs = now;
+    const waitMs = this.session.getActiveTier() === "BT_RFCOMM" ? 3500 : 1500;
     try {
       const live = await Promise.race([
-        this.session.callPhone<any>("sys.getStatus", {}),
-        new Promise<null>((r) => setTimeout(() => r(null), 1200)),
+        this.session.callPhone<any>("sys.getStatus", {}, waitMs),
+        new Promise<null>((r) => setTimeout(() => r(null), waitMs)),
       ]);
       if (live && typeof live === "object") {
         this.session.setPhoneStatus(live);
@@ -928,11 +946,15 @@ export class OmsDaemon {
       // OTA APK Update Helper
       case "phone_ota_update": {
         const ips = PhoneSessionManager.getLocalLanIps();
-        const url = `http://${ips[0]}:${this.config.lanPort}/OneMoreStep.apk?t=${Date.now()}`;
+        const meta = this.session.getApkMetadata();
+        const isBle = this.session.getActiveTier() === "BT_RFCOMM";
+        const lanUrl = `http://${ips[0]}:${this.config.lanPort}/OneMoreStep.apk?t=${Date.now()}`;
+        const url = isBle ? meta.githubDownloadUrl : lanUrl;
         return await this.session.callPhone("sys.otaUpdate", {
           ip: ips[0],
           port: this.config.lanPort,
           url,
+          githubDownloadUrl: meta.githubDownloadUrl,
         });
       }
 
@@ -976,7 +998,7 @@ export class OmsDaemon {
             throw new Error("手机端未能返回截屏数据流");
           }
 
-          const completed = await this.session.waitForCompletedStream(streamId, 10000);
+          const completed = await this.session.waitForCompletedStream(streamId);
 
           let inboxItemId: string | undefined;
           let savedAbsPath = completed!.savedAbsPath;

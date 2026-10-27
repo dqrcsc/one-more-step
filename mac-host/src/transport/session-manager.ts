@@ -219,44 +219,56 @@ export class PhoneSessionManager extends EventEmitter {
     updatedAtMs: number;
     updatedAtIso: string;
     downloadUrl: string;
+    githubDownloadUrl: string;
   } {
     const repoRoot = path.resolve(
       path.dirname(new URL(import.meta.url).pathname),
       "../../.."
     );
     const apkDir = path.join(repoRoot, "android-app/app/build/outputs/apk/debug");
+    let rootReleaseApks: string[] = [];
+    try {
+      rootReleaseApks = fs
+        .readdirSync(repoRoot)
+        .filter((f) => /^OneMoreStep-v[\d.]+\.apk$/.test(f))
+        .sort()
+        .reverse()
+        .map((f) => path.join(repoRoot, f));
+    } catch {
+      // ignore
+    }
     const candidatePaths = [
       path.join(apkDir, "app-debug.apk"),
-      path.join(repoRoot, "OneMoreStep-v1.4.3.apk"),
-      path.join(repoRoot, "OneMoreStep-v1.4.2.apk"),
-      path.join(repoRoot, "OneMoreStep-v1.4.1.apk"),
-      path.join(repoRoot, "OneMoreStep-v1.4.0.apk"),
-      path.join(repoRoot, "OneMoreStep-v1.3.7.apk"),
-      path.join(repoRoot, "OneMoreStep-v1.3.6.apk"),
-      path.join(repoRoot, "OneMoreStep-v1.3.5.apk"),
-      path.join(repoRoot, "OneMoreStep-v1.3.4.apk"),
+      ...rootReleaseApks,
       path.join(os.homedir(), ".one_more_step", "OneMoreStep.apk"),
     ];
     const apkPath = candidatePaths.find((p) => fs.existsSync(p)) || candidatePaths[0];
     const metaPath = path.join(apkDir, "output-metadata.json");
 
     if (!fs.existsSync(apkPath)) {
+      const defaultVer = "1.4.6";
+      const ghUrl = `https://github.com/dqrcsc/one-more-step/releases/download/v${defaultVer}/OneMoreStep-v${defaultVer}.apk`;
       return {
         available: false,
         apkPath,
-        versionCode: 17,
-        versionName: "1.4.3",
+        versionCode: 20,
+        versionName: defaultVer,
         sha256: "",
         sizeBytes: 0,
         updatedAtMs: 0,
         updatedAtIso: "",
-        downloadUrl: "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.4.3.apk",
+        downloadUrl: ghUrl,
+        githubDownloadUrl: ghUrl,
       };
     }
 
     const stat = fs.statSync(apkPath);
-    let versionCode = 17;
-    let versionName = "1.4.3";
+    let versionCode = 20;
+    let versionName = "1.4.6";
+    const fileMatch = path.basename(apkPath).match(/^OneMoreStep-v([\d.]+)\.apk$/);
+    if (fileMatch) {
+      versionName = fileMatch[1];
+    }
     if (fs.existsSync(metaPath)) {
       try {
         const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
@@ -288,6 +300,7 @@ export class PhoneSessionManager extends EventEmitter {
       updatedAtMs: Math.floor(stat.mtimeMs),
       updatedAtIso: new Date(stat.mtimeMs).toISOString(),
       downloadUrl: "/OneMoreStep.apk",
+      githubDownloadUrl: `https://github.com/dqrcsc/one-more-step/releases/download/v${versionName}/OneMoreStep-v${versionName}.apk`,
     };
   }
 
@@ -400,6 +413,9 @@ export class PhoneSessionManager extends EventEmitter {
               updatedAtMs: meta.updatedAtMs,
               updatedAtIso: meta.updatedAtIso,
               downloadUrl: meta.downloadUrl,
+              githubDownloadUrl: meta.githubDownloadUrl,
+              lanIps: PhoneSessionManager.getLocalLanIps(),
+              lanPort: self.lanPort,
             }),
             {
               headers: {
@@ -423,7 +439,7 @@ export class PhoneSessionManager extends EventEmitter {
             });
           }
           return Response.redirect(
-            "https://github.com/dqrcsc/one-more-step/releases/latest/download/OneMoreStep-v1.4.3.apk",
+            meta.githubDownloadUrl,
             302
           );
         }
@@ -675,6 +691,12 @@ export class PhoneSessionManager extends EventEmitter {
       }
       if (this.activeTier !== "DISCONNECTED") {
         this.sendPing();
+        if (this.pipes.get("BT_RFCOMM")?.authenticated) {
+          this.presence.onBleRssiSample(this.presence.getSnapshot().rssiRaw ?? -58);
+        }
+        if (this.activeTier !== "LAN_WS" && enableMdns) {
+          this.broadcastLanBeacon();
+        }
       } else {
         this.presence.evaluateTimeouts();
         if (enableMdns) {
@@ -1077,6 +1099,7 @@ export class PhoneSessionManager extends EventEmitter {
     this.phoneStatus = { ...deviceSnapshot, secureProtocolVersion: 2 };
     this.registerAuthenticatedPipe(pipe);
     if (pipe.tier === "LAN_WS") this.presence.onLanDirectActive(1);
+    else if (pipe.tier === "BT_RFCOMM") this.presence.onBleRssiSample(this.presence.getSnapshot().rssiRaw ?? -58);
     this.recomputeActiveTier();
     if (start.mode === "pair") this.emit("devicePaired", trusted);
     this.emit("phoneAuthenticated", { phoneId: start.phoneId, tier: pipe.tier, status: this.phoneStatus });
@@ -1084,6 +1107,9 @@ export class PhoneSessionManager extends EventEmitter {
 
   private dispatchBusinessFrame(pipe: ActiveTransportPipe, frame: ReturnType<FrameStreamDecoder["push"]>[number]): void {
     if (!this.isLivePipe(pipe)) throw new Error("Inactive encrypted pipe");
+    if (pipe.tier === "BT_RFCOMM" && pipe.authenticated) {
+      this.presence.onBleRssiSample(this.presence.getSnapshot().rssiRaw ?? -58);
+    }
     switch (frame.frameType) {
       case FrameType.CONTROL_JSON_RPC: {
         const msg = decodeJsonRpcPayload<JsonRpcMessage>(frame.payload);
@@ -1109,6 +1135,7 @@ export class PhoneSessionManager extends EventEmitter {
         const sentTs = Number(new DataView(frame.payload.buffer, frame.payload.byteOffset, frame.payload.byteLength).getBigUint64(0, false));
         this.lastRttMs = Math.max(1, Date.now() - sentTs);
         if (pipe.tier === "LAN_WS") this.presence.onLanDirectActive(this.lastRttMs);
+        else if (pipe.tier === "BT_RFCOMM") this.presence.onBleRssiSample(this.presence.getSnapshot().rssiRaw ?? -58);
         break;
       }
       default: throw new Error("Unsupported authenticated frame");
@@ -1180,7 +1207,7 @@ export class PhoneSessionManager extends EventEmitter {
     }
     // Bound abandoned partial transfers as well as their individual sizes.
     for (const [id, transfer] of this.incomingStreams) {
-      if (Date.now() - transfer.startedAtMs > 60000) this.incomingStreams.delete(id);
+      if (Date.now() - transfer.startedAtMs > 180000) this.incomingStreams.delete(id);
     }
     if (this.incomingStreams.size >= 16) {
       this.streamError(pipe, header.streamId, "Too many active streams");
@@ -1244,9 +1271,10 @@ export class PhoneSessionManager extends EventEmitter {
     else pending.reject(new Error(ack.errorMessage || "Phone could not commit stream"));
   }
 
-  public waitForCompletedStream(streamId: string, timeoutMs = 15000): Promise<CompletedFileTransfer> {
+  public waitForCompletedStream(streamId: string, timeoutMs?: number): Promise<CompletedFileTransfer> {
     const existing = this.completedStreams.get(streamId);
     if (existing) return Promise.resolve(existing);
+    const effectiveTimeoutMs = timeoutMs ?? (this.activeTier === "BT_RFCOMM" ? 60000 : 15000);
     return new Promise((resolve, reject) => {
       const cleanup = () => { clearTimeout(timer); this.off("streamCompleted", onDone); this.off("sessionRevoked", onRevoke); };
       const onDone = (completed: CompletedFileTransfer) => {
@@ -1254,7 +1282,7 @@ export class PhoneSessionManager extends EventEmitter {
         cleanup(); resolve(completed);
       };
       const onRevoke = () => { cleanup(); reject(new Error("Session revoked")); };
-      const timer = setTimeout(() => { cleanup(); reject(new Error("Timed out waiting for verified stream")); }, timeoutMs);
+      const timer = setTimeout(() => { cleanup(); reject(new Error("Timed out waiting for verified stream")); }, effectiveTimeoutMs);
       this.on("streamCompleted", onDone);
       this.on("sessionRevoked", onRevoke);
     });
@@ -1266,7 +1294,7 @@ export class PhoneSessionManager extends EventEmitter {
   public async callPhone<TResult = any>(
     method: string,
     params: Record<string, unknown> = {},
-    timeoutMs = 15000
+    timeoutMs?: number
   ): Promise<TResult> {
     const pipe = this.pipes.get(this.activeTier);
     if (!pipe || !this.isLivePipe(pipe)) {
@@ -1276,6 +1304,7 @@ export class PhoneSessionManager extends EventEmitter {
       err.code = OmsErrorCode.ERR_DEVICE_OFFLINE;
       throw err;
     }
+    const effectiveTimeoutMs = timeoutMs ?? (this.activeTier === "BT_RFCOMM" ? 45000 : 15000);
 
     const reqId = `req_${generateUuidV7()}`;
     const frame = encodeJsonRpcFrame({
@@ -1288,12 +1317,12 @@ export class PhoneSessionManager extends EventEmitter {
     return new Promise<TResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRpc.delete(reqId);
-        const err = new Error(`RPC timeout calling ${method} (${timeoutMs}ms)`) as Error & {
+        const err = new Error(`RPC timeout calling ${method} (${effectiveTimeoutMs}ms)`) as Error & {
           code?: number;
         };
         err.code = OmsErrorCode.ERR_APPROVAL_TIMEOUT;
         reject(err);
-      }, timeoutMs);
+      }, effectiveTimeoutMs);
 
       this.pendingRpc.set(reqId, { resolve, reject, timer, pipe });
       try { this.sendSecure(pipe, frame); } catch (err) {
@@ -1333,11 +1362,17 @@ export class PhoneSessionManager extends EventEmitter {
       enableCommuteTts: opts.enableCommuteTts,
     };
 
+    const effectiveTimeoutMs =
+      opts.timeoutMs ??
+      (this.activeTier === "BT_RFCOMM"
+        ? Math.max(90000, 30000 + totalChunks * 800)
+        : 60000);
+
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.outgoingStreams.delete(streamId);
         reject(new Error("Phone delivery acknowledgement timed out; delivery is unconfirmed"));
-      }, opts.timeoutMs ?? 60000);
+      }, effectiveTimeoutMs);
       this.outgoingStreams.set(streamId, { pipe, resolve, reject, timer });
       try {
         this.sendSecure(pipe, encodeStreamStartFrame(startHeader));

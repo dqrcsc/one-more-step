@@ -188,3 +188,31 @@ test("approval rejects invalid option mappings and late responses, accepts an id
   expect(respond("execute", true).error).toBeDefined();
   await daemon.stop();
 });
+
+test("BT_RFCOMM authenticated traffic refreshes presence and apk.getVersion RPC returns OTA metadata", async () => {
+  const daemon = new OmsDaemon(fs.mkdtempSync(path.join(os.tmpdir(), "oms-bt-ota-")));
+  let otaReply: any;
+  daemon.session.emit("phoneRequest", { id: "ota_1", method: "apk.getVersion", params: {} } as any, (r: any) => {
+    otaReply = r;
+  });
+  expect(otaReply?.result?.versionName).toBeDefined();
+  expect(otaReply?.result?.githubDownloadUrl).toContain("https://github.com/dqrcsc/one-more-step/releases/download/");
+
+  const raw = daemon.session as any;
+  const creds = { ephemeralToken: "ef".repeat(32), expiresAtMs: Date.now() + 60000 };
+  daemon.session.setActivePairingCredentials(creds);
+  const btPhone = secureMemoryPhone(raw, {
+    phoneId: "phone_bt_test",
+    macId: (daemon as any).identity.deviceId,
+    pskHex: creds.ephemeralToken,
+    tier: "BT_RFCOMM",
+  });
+  expect(daemon.session.getActiveTier()).toBe("BT_RFCOMM");
+  expect(daemon.session.presence.getSnapshot().bleConnected).toBe(true);
+  // Advance candidateAboveSinceMs past 3s hold window and send a frame over BT_RFCOMM
+  (daemon.session.presence as any).candidateAboveSinceMs = Date.now() - 3500;
+  const { encodePongFrame } = await import("@oms/shared-protocol");
+  btPhone.send(encodePongFrame(Date.now() - 25, 88, false));
+  expect(daemon.session.presence.getSnapshot().state).toBe("AT_DESK");
+  await daemon.stop();
+});
