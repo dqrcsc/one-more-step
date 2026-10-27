@@ -31,6 +31,22 @@ function rawPipe(manager: any) {
   return { pipe, wire, hello };
 }
 
+test("connection diagnostics correlate authenticated and rejected sessions without credentials", async () => {
+  const f = fixture();
+  const phone = f.connect();
+  f.raw.onPipeClosed(phone.pipe);
+  const failed = rawPipe(f.raw);
+  f.raw.failPipe(failed.pipe, `test-only private error ${f.token}`);
+  const events = f.manager.getConnectionDiagnostics().events;
+  expect(events.slice(0, 3).map(e => e.event)).toEqual(["OPENED", "AUTHENTICATED", "CLOSED"]);
+  expect(new Set(events.slice(0, 3).map(e => e.connection)).size).toBe(1);
+  expect(events.slice(-3).map(e => e.event)).toEqual(["OPENED", "PROTOCOL_REJECTED", "CLOSED"]);
+  expect(events[0].connection).not.toBe(events.at(-1)!.connection);
+  expect(JSON.stringify(events)).not.toContain(f.token);
+  expect(JSON.stringify(events)).not.toContain("private error");
+  await f.manager.stop();
+});
+
 test("pair token is reserved until encrypted finish and released on a failed connection", async () => {
   const f = fixture();
   const reserved = f.connect({ autoFinish: false });

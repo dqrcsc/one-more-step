@@ -36,6 +36,7 @@ import {
   secureRandomHex,
   establishSecureSession,
 } from "@oms/shared-protocol";
+import { ConnectionDiagnostics } from "./connection-diagnostics.js";
 import { PresenceEngine } from "./presence-engine.js";
 import { BluetoothBridgeServer } from "./bluetooth-bridge-client.js";
 
@@ -67,6 +68,7 @@ export interface CompletedFileTransfer {
 }
 
 interface ActiveTransportPipe {
+  diagnosticId?: string;
   tier: TransportTier;
   authenticated: boolean;
   phoneId?: string;
@@ -154,10 +156,17 @@ export class PhoneSessionManager extends EventEmitter {
   ) => Promise<Response | null> | Response | null;
   private apkHashCache: { mtimeMs: number; size: number; sha256: string } | null = null;
 
+  private connectionDiagnostics: ConnectionDiagnostics;
+
+  public getConnectionDiagnostics() {
+    return { persistenceAvailable: this.connectionDiagnostics.persistenceAvailable, events: this.connectionDiagnostics.snapshot() };
+  }
+
   constructor(opts: {
     hostIdentity: Ed25519Identity;
     lanPort: number;
     streamDownloadDir: string;
+    diagnosticsPath?: string;
     trustedDevices?: TrustedPhoneDevice[];
     presenceOptions?: ConstructorParameters<typeof PresenceEngine>[0];
     customHttpHandler?: (
@@ -167,6 +176,7 @@ export class PhoneSessionManager extends EventEmitter {
     ) => Promise<Response | null> | Response | null;
   }) {
     super();
+    this.connectionDiagnostics = new ConnectionDiagnostics(opts.diagnosticsPath);
     this.hostIdentity = opts.hostIdentity;
     this.lanPort = opts.lanPort;
     this.streamDownloadDir = opts.streamDownloadDir;
@@ -510,7 +520,8 @@ export class PhoneSessionManager extends EventEmitter {
           self.onRawBytesReceived(pipe, bytes);
         },
         close(ws, code, reason) {
-          console.log(`[omsd][ws] closed code=${code} reason=${reason || ""}`);
+          // Remote close reason is untrusted and may contain secrets; keep numeric code only.
+          if (ws.data.pipe?.diagnosticId) self.connectionDiagnostics.record("WS_CLOSED", ws.data.pipe.tier, ws.data.pipe.diagnosticId, code);
           const pipe = ws.data.pipe;
           if (pipe) {
             self.onPipeClosed(pipe);
@@ -783,6 +794,8 @@ export class PhoneSessionManager extends EventEmitter {
 
   private onPipeOpened(pipe: ActiveTransportPipe): void {
     if (this.openPipes.has(pipe)) return;
+    pipe.diagnosticId = crypto.randomBytes(6).toString("hex");
+    this.connectionDiagnostics.record("OPENED", pipe.tier, pipe.diagnosticId);
     pipe.closed = false;
     pipe.authenticated = false;
     this.openPipes.add(pipe);
@@ -820,6 +833,9 @@ export class PhoneSessionManager extends EventEmitter {
 
   private failPipe(pipe: ActiveTransportPipe, message: string): void {
     if (pipe.closed) return;
+    if (pipe.diagnosticId) this.connectionDiagnostics.record(
+      message.includes("timed out") ? "HANDSHAKE_TIMEOUT" : message.includes("send") ? "SEND_FAILED" : "PROTOCOL_REJECTED",
+      pipe.tier, pipe.diagnosticId);
     this.onPipeClosed(pipe);
     try { pipe.close(); } catch {}
     this.emit("protocolError", new Error(message));
@@ -832,6 +848,7 @@ export class PhoneSessionManager extends EventEmitter {
   }
 
   private onPipeClosed(pipe: ActiveTransportPipe): void {
+    if (!pipe.closed && pipe.diagnosticId) this.connectionDiagnostics.record("CLOSED", pipe.tier, pipe.diagnosticId);
     pipe.authenticated = false;
     pipe.closed = true;
     if (pipe.secure) {
@@ -1046,6 +1063,7 @@ export class PhoneSessionManager extends EventEmitter {
     this.trustPersistenceUncertain = false;
     clearTimeout(secure.timer);
     secure.phase = "ready";
+    if (pipe.diagnosticId) this.connectionDiagnostics.record("AUTHENTICATED", pipe.tier, pipe.diagnosticId);
     secure.finishJson = finishJson;
     secure.finishResult = result;
     pipe.authenticated = true;

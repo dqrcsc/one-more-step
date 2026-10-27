@@ -127,6 +127,28 @@ class OmsTransportClient(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    private val diagnostics = ConnectionDiagnostics(File(context.filesDir, "connection-diagnostics.log"))
+    private val _connectionHintFlow = MutableStateFlow(diagnostics.offlineSummary())
+    val connectionHintFlow: StateFlow<String> = _connectionHintFlow
+
+    private fun traceConnection(event: ConnectionDiagnostics.Event, tier: String = "LAN_WS",
+                                attempt: Long = lanGeneration.get(), affectState: Boolean = true) {
+        diagnostics.record(event, tier, attempt, affectState)
+        _connectionHintFlow.value = diagnostics.offlineSummary()
+    }
+
+    fun connectionDiagnosticsText(): String {
+        fun safeIps(values: List<String>) = values.filter { value ->
+            val parts = value.split('.')
+            parts.size == 4 && parts.all { it.toIntOrNull()?.let { n -> n in 0..255 } == true }
+        }.joinToString(", ").ifBlank { "未获取" }
+        val wifi = findNonVpnWifiNetwork() != null
+        val locked = (context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.isKeyguardLocked
+        return "OneMoreStep 连接诊断\n采集时间：${java.time.Instant.now()}\n当前链路：${_activeTierFlow.value}\n" +
+            "Wi-Fi 可用：$wifi；当前锁屏：$locked\n手机 IPv4：${safeIps(getLocalPhoneWifiIpv4s())}\n" +
+            "已保存 Mac IPv4：${safeIps(repo.getPairedMac()?.lanIps ?: emptyList())}\n" + diagnostics.exportText()
+    }
+
     private val _activeTierFlow = MutableStateFlow("DISCONNECTED")
     val activeTierFlow: StateFlow<String> = _activeTierFlow
 
@@ -196,6 +218,9 @@ class OmsTransportClient(
         sourceAuthenticated(captureSource(tier, sourceWebSocket))
 
     init {
+        val saved = repo.getPairedMac()
+        if (saved == null) traceConnection(ConnectionDiagnostics.Event.NOT_PAIRED)
+        else if (!isV2Pairing(saved)) traceConnection(ConnectionDiagnostics.Event.OLD_PAIRING)
         registerWifiNetworkCallback()
         startUdpBeaconListener()
         startBackgroundWatchdog()
@@ -305,6 +330,7 @@ class OmsTransportClient(
                 override fun onAvailable(network: Network) {
                     cachedWifiNetwork = network
                     cachedLanHttpClient = null
+                    traceConnection(ConnectionDiagnostics.Event.WIFI_AVAILABLE, affectState = _activeTierFlow.value != "LAN_WS" && isV2Pairing(repo.getPairedMac()))
                     if (_activeTierFlow.value != "LAN_WS" || lanWebSocket == null) {
                         scheduleLanReconnect(150L)
                     }
@@ -314,6 +340,7 @@ class OmsTransportClient(
                     if (cachedWifiNetwork == network) {
                         cachedWifiNetwork = null
                         cachedLanHttpClient = null
+                        traceConnection(ConnectionDiagnostics.Event.WIFI_UNAVAILABLE, affectState = isV2Pairing(repo.getPairedMac()))
                     }
                 }
             })
@@ -732,6 +759,8 @@ class OmsTransportClient(
         val paired = repo.getPairedMac()?.takeIf { isV2Pairing(it) } ?: return
         if (pairingWebSocket != null || !isConnectingLan.compareAndSet(false, true)) return
         val generation = synchronized(connectionLock) { lanGeneration.incrementAndGet() }
+        traceConnection(if (findNonVpnWifiNetwork() == null) ConnectionDiagnostics.Event.WIFI_UNAVAILABLE
+            else ConnectionDiagnostics.Event.CONNECTING, attempt = generation)
 
         scope.launch {
             try {
@@ -756,6 +785,10 @@ class OmsTransportClient(
                     reachableConfig = discoverMacOnLan(port, paired.macId, allowSubnetScan = false)
                 }
 
+                if (reachableConfig == null && generation == lanGeneration.get()) {
+                    traceConnection(if (findNonVpnWifiNetwork() == null) ConnectionDiagnostics.Event.WIFI_UNAVAILABLE
+                        else ConnectionDiagnostics.Event.MAC_UNREACHABLE, attempt = generation)
+                }
                 val targetIp = reachableConfig?.lanIps?.firstOrNull() ?: candidateIps.firstOrNull()
                 val targetPort = reachableConfig?.lanPort ?: port
                 if (targetIp.isNullOrBlank()) {
@@ -787,7 +820,9 @@ class OmsTransportClient(
     private fun secureSocketListener(tier: String, generation: Long, pairing: PairAttempt? = null) =
         object : WebSocketListener() {
             private val decoder = OmsFrameStreamDecoder()
+            @Volatile private var didOpen = false
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                didOpen = true
                 val source = FrameSource(tier, webSocket, null)
                 var replaced: FrameSource? = null
                 val accepted = synchronized(connectionLock) {
@@ -829,7 +864,13 @@ class OmsTransportClient(
                 closeSecureSource(FrameSource(tier, webSocket, null), "Connection closed")
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                closeSecureSource(FrameSource(tier, webSocket, null), "Connection failed")
+                val source = FrameSource(tier, webSocket, null)
+                val affectsCurrent = isSourceCurrent(source) ||
+                    (!didOpen && pairing == null && tier == "LAN_WS" && generation == lanGeneration.get())
+                closeSecureSource(source, "Connection failed")
+                if (affectsCurrent) traceConnection(
+                    if (tier == "LAN_WS" && findNonVpnWifiNetwork() == null) ConnectionDiagnostics.Event.WIFI_UNAVAILABLE
+                    else ConnectionDiagnostics.networkFailure(t), tier, generation)
                 reportPairing(pairing, false)
                 if (tier == "LAN_WS" && pairing == null && generation == lanGeneration.get()) {
                     isConnectingLan.set(false)
@@ -1102,6 +1143,7 @@ class OmsTransportClient(
         synchronized(connectionLock) {
             check(isSourceCurrent(source) && secureLinks.putIfAbsent(source, link) == null)
         }
+        traceConnection(ConnectionDiagnostics.Event.HANDSHAKE_STARTED, source.tier)
         mainHandler.postDelayed({
             if (secureLinks[source] === link && link.phase != SecurePhase.ACTIVE) closeSecureSource(source, "Secure handshake timed out")
         }, 30_000)
@@ -1109,6 +1151,7 @@ class OmsTransportClient(
 
     @SuppressLint("MissingPermission")
     private fun closeSecureSource(source: FrameSource, reason: String) {
+        val wasCurrent = isSourceCurrent(source)
         val link = synchronized(connectionLock) {
             if (source.socket === pairingWebSocket && source.socket != null) pairingWebSocket = null
             if (source.socket === lanWebSocket && source.socket != null) { lanWebSocket = null; isConnectingLan.set(false) }
@@ -1117,6 +1160,14 @@ class OmsTransportClient(
             secureLinks.remove(source)
         }
         if (link != null) synchronized(link.lock) {
+            if (wasCurrent && reason !in setOf("Connection replaced", "Pairing attempt replaced", "Re-pair completed")) {
+                val event = when {
+                    reason == "Secure protocol validation failed" || reason == "Text frames are not supported" -> ConnectionDiagnostics.Event.SECURITY_REJECTED
+                    reason.contains("timed out") || reason == "Secure handshake expired or connection replaced" -> ConnectionDiagnostics.Event.HANDSHAKE_TIMEOUT
+                    else -> ConnectionDiagnostics.Event.CONNECTION_LOST
+                }
+                traceConnection(event, source.tier)
+            }
             link.phase = SecurePhase.CLOSED
             link.session?.destroy()
             link.session = null
@@ -1708,6 +1759,7 @@ class OmsTransportClient(
                 }
                 for (old in revoked) closeSecureSource(old, "Re-pair completed")
                 recomputeFallbackTier()
+                traceConnection(ConnectionDiagnostics.Event.CONNECTED, source.tier)
                 reportPairing(link.pairing, true)
                 flushOutboxQueue()
             } else {
@@ -2296,6 +2348,7 @@ class OmsTransportClient(
             put("wifiLinkSpeedMbps", wifiSpeedMbps)
             put("bluetoothEnabled", btEnabled)
             put("activeTransportTier", _activeTierFlow.value)
+            put("connectionDiagnosticCode", diagnostics.reason().name)
             put("pairingVersion", repo.getPairedMac()?.pairingVersion ?: 0)
             put("secureProtocolVersion", if (secureLinks.keys.any { sourceAuthenticated(it) }) 2 else 0)
             put("foregroundPackage", fgPkg)

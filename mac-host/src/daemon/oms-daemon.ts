@@ -89,6 +89,7 @@ export class OmsDaemon {
       hostIdentity: this.identity,
       lanPort: this.config.lanPort,
       streamDownloadDir: path.join(this.homeDir, "inbox", "pulled_cache"),
+      diagnosticsPath: path.join(this.homeDir, "logs", "connections.jsonl"),
       trustedDevices: trusted,
       customHttpHandler: (req, url, clientIp) =>
         handleDashboardHttpRequest(this, req, url, clientIp),
@@ -602,6 +603,7 @@ export class OmsDaemon {
           bleConnected: presenceSnap.bleConnected,
           rssiEmaDbm: presenceSnap.rssiEma,
           activeTransportTier: this.session.getActiveTier(),
+          connectionDiagnostics: this.session.getConnectionDiagnostics(),
           ...this.session.getSecurityStatus(),
           lastRttMs: this.session.getLastRttMs(),
           lanPort: this.config.lanPort,

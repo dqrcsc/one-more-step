@@ -8,13 +8,17 @@
 本次在当前会话顺序实施；不另开代理，不改变连接协议。
 
 ## Task 1: 手机原因与日志
-- [ ] 新建 `ConnectionDiagnostics.kt` 和 JVM 测试。接口 `record(Event, tier, attempt)`、`offlineSummary()`、`exportText()`；只允许固定枚举，最多 200 条，重复事件 30 秒内合并。异常仅分类为超时/拒绝/网络 IO/其他，不存 message。
-- [ ] 在 `OmsTransportClient.kt` 接入 Wi-Fi 回调、LAN 尝试/探测失败、socket 失败、握手超时/拒绝、认证成功及关闭；旧 generation 的回调不覆盖当前原因。
-- [ ] `MainActivity.kt` 添加离线原因与诊断对话框、复制入口。导出离线可用，不自动外发。
-- [ ] JVM 测试检查失败后重试保留原因、恢复清除原因、备用链路隔离、历史重载、200 条上限与敏感消息不进入导出。
+- [x] 新建 `ConnectionDiagnostics.kt` 和 JVM 测试。接口 `record(Event, tier, attempt)`、`offlineSummary()`、`exportText()`；只允许固定枚举，最多 200 条，重复事件 30 秒内合并。异常仅分类为超时/拒绝/网络 IO/其他，不存 message。
+- [x] 在 `OmsTransportClient.kt` 接入 Wi-Fi 回调、LAN 尝试/探测失败、socket 失败、握手超时/拒绝、认证成功及关闭；旧 generation 的回调不覆盖当前原因。
+- [x] `MainActivity.kt` 添加离线原因与诊断对话框、复制入口。导出离线可用，不自动外发。
+- [x] JVM 测试检查失败后重试保留原因、恢复清除原因、备用链路隔离、历史重载、200 条上限与敏感消息不进入导出。
 
 ## Task 2: Mac 与验证
-- [ ] `session-manager.ts` 添加连接事件、关联编号与固定失败分类；不记录远端关闭原因或原始握手异常。
-- [ ] Bun 测试截获事件，验证打开/认证/关闭和安全拒绝，确保不包含测试凭据。
-- [ ] 运行类型检查、Bun 测试、Android JVM/构建；记录结果和安装验收边界。
-- [ ] 生成新候选 APK（v1.4.1/code15），保留 v1.4.0 发布包；完成本地交付，不自动发布新 GitHub Release。
+- [x] `session-manager.ts` 添加连接事件、关联编号与固定失败分类；不记录远端关闭原因或原始握手异常。
+- [x] Bun 测试截获事件，验证打开/认证/关闭和安全拒绝，确保不包含测试凭据。
+- [x] 运行类型检查、Bun 测试、Android JVM/构建；记录结果和安装验收边界。
+- [x] 生成新候选 APK（v1.4.1/code15），保留 v1.4.0 发布包；完成本地交付，不自动发布新 GitHub Release。
+
+## 检查结果
+
+类型检查通过；Bun 52 pass / 0 fail / 405 assertions；Android JVM 37 pass / 0 fail/error/skipped；assembleDebug 成功。v1.4.1/code15 APK SHA-256：`6a8bb5bd86cb78d3d0b6709723e571d0830cd575d6f6ca62c22fee53f613efb7`，沿用既有签名。真机安装与 UI 验收另行记录，尚不标记完成。

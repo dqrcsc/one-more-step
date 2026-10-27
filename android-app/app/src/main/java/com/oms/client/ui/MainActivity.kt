@@ -34,6 +34,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -174,6 +177,8 @@ fun OneMoreStepMainScreen() {
     val context = LocalContext.current
     val app = OmsApplication.instance ?: return
     val activeTier by app.transportClient.activeTierFlow.collectAsState()
+    val connectionHint by app.transportClient.connectionHintFlow.collectAsState()
+    var diagnosticText by remember { mutableStateOf<String?>(null) }
     val streamItems by app.repository.itemsFlow.collectAsState()
 
     var showXiaomiWizard by remember { mutableStateOf(false) }
@@ -259,6 +264,27 @@ fun OneMoreStepMainScreen() {
     }
 
     // OTA Update Confirmation Dialog (only shown when a newer/changed APK exists on Mac)
+    diagnosticText?.let { report ->
+        AlertDialog(
+            onDismissRequest = { diagnosticText = null },
+            title = { Text("连接诊断") },
+            text = {
+                SelectionContainer {
+                    Text(report, fontSize = 12.sp,
+                        modifier = Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()))
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    clipboard.setPrimaryClip(ClipData.newPlainText("OMS connection diagnostics", report))
+                    Toast.makeText(context, "已复制诊断，可粘贴给排查者", Toast.LENGTH_SHORT).show()
+                }) { Text("复制诊断") }
+            },
+            dismissButton = { TextButton(onClick = { diagnosticText = null }) { Text("关闭") } }
+        )
+    }
+
     pendingOtaDialog?.let { ota ->
         val sizeMb = String.format(Locale.US, "%.1f MB", ota.remoteSizeBytes / 1048576.0)
         AlertDialog(
@@ -352,14 +378,14 @@ fun OneMoreStepMainScreen() {
                             "LAN_WS" -> "🟢 局域网高速直连 (Tier 1)"
                             "BT_RFCOMM" -> "🔵 近场蓝牙连接 (Tier 2)"
                             "WAN_WEBRTC" -> "🟣 跨网远程在线 (Tier 3)"
-                            else -> "⚪ 离线队列模式 (点此扫描重连)"
+                            else -> "⚪ $connectionHint（点此重连）"
                         }
                         Text(
                             text = tierDesc,
                             color = if (activeTier == "DISCONNECTED") Color(0xFFFBBF24) else Color(0xFF94A3B8),
                             fontSize = 12.sp,
-                            maxLines = 1,
-                            softWrap = false,
+                            maxLines = 2,
+                            softWrap = true,
                             modifier = Modifier.clickable {
                                 Toast.makeText(context, "🔍 正在扫描局域网 Mac 并重连...", Toast.LENGTH_SHORT).show()
                                 app.transportClient.reconnectNow { _, msg ->
@@ -367,6 +393,10 @@ fun OneMoreStepMainScreen() {
                                 }
                             }
                         )
+                        TextButton(
+                            contentPadding = PaddingValues(0.dp),
+                            onClick = { diagnosticText = "版本：$installedVerName\n" + app.transportClient.connectionDiagnosticsText() }
+                        ) { Text("连接诊断", fontSize = 12.sp, color = Color(0xFF94A3B8)) }
                     }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
