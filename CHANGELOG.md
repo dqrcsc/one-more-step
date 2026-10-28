@@ -1,5 +1,34 @@
 # Changelog · 更新日志
 
+## 1.5.2 - 2026-10-28
+
+### AirPods 跨生态无感自动流转、对端媒体自动暂停与实时屏幕镜像工作台
+
+- **AirPods 跨 Mac ⇄ 小米手机蓝牙无感自动切换 (`oms airpods`)**：在 `oms-bt-bridge`（macOS `IOBluetooth` + `CoreAudio`）与 Android 端 `AirPodsAutoSwitchManager`（`BluetoothA2dp` / `BluetoothHeadset` + `AudioPlaybackConfiguration`）之间实现音频焦点仲裁；任意一端持续发声（`>320ms`）或来电通话时，自动将已配对 AirPods 抢占切换至当前活跃设备。
+- **对端媒体自动暂停与切换窗口防外放保护**：当 AirPods 被对端抢占时，自动暂停原设备正在播放的音视频（Android 端结合 `MediaSessionManager.getActiveSessions`、`KEYCODE_MEDIA_PAUSE` 与 `AudioFocus` 抢占；Mac 端结合 `CoreAudio` 运行态守卫与 `MediaRemote` `kMRPause`）；蓝牙切换约 1.5s 窗口期内临时静音内置扬声器防止外放漏音。
+- **实时低延迟手机屏幕镜像与远程触控工作台 (`oms mirror` / `/mirror`)**：新增 `FrameType.SCREEN_FRAME (0x07)` 16 字节二进制帧头与 `P1_STREAM_META` 优先级传输队列（`maxInFlight = 2` 背压丢帧控制），支持在 Mac 浏览器以最高 `12fps` 实时预览手机画面并直接用鼠标点击、拖拽滑动、输入文字、一键解锁与触发系统按键。
+
+### APK
+
+- `OneMoreStep-v1.5.2.apk`：Android 11+，versionCode 26，22,643,605 bytes（沿用 Android Debug 签名，从 v1.4.x 覆盖安装无需重新配对）。
+- SHA-256：`c760477e78d0aa7aadd8aa15ba665db9cf63f7d2d20a52160b27723ac31efdb2`。
+
+## 1.4.9 - 2026-10-28
+
+### 远程 3×3 九宫格图案解锁与原生双卡电话拨打/挂断
+
+- **远程点亮屏幕与 3×3 九宫格图案解锁 (`oms unlock` / `oms phone unlock`)**：支持通过 `PowerManager` 唤醒息屏手机、自动上滑呼出小米 HyperOS 锁屏密码层，并通过 `OmsAccessibilityService` 注入连续单笔轨迹 (`GestureDescription`) 划开 3×3 九宫格图案密码（`1~9` 点位序列，默认适配小米 `1220×2712` 分辨率 `175,1516,1045,2386`，支持 `--bounds` 自定义校准与 `--save` 本地持久化免输调用）。
+- **原生双卡电话拨打与挂断 (`oms call` / `oms hangup`)**：若手机处于锁屏状态会自动先完成图案解锁，支持通过 `TelecomManager` 按卡槽或运营商名称（`--sim 1|2|电信|联通|移动`）发起呼叫、开启免提扬声器（`--speaker`）、仅打开拨号盘（`--dial-only`）以及远程挂断电话（`oms hangup`）。
+- **多 URI Scheme 打开支持**：`AppLauncherHelper` 新增对 `tel:`、`smsto:`、`mailto:`、`market:` 等系统 URI Scheme 的直接跳转支持。
+
+## 1.4.4 ~ 1.4.6 - 2026-10-27
+
+### 蓝牙 BLE 配对回退、多子网 IP 记忆与连接稳定性优化
+
+- **纯蓝牙 BLE 兜底增强 (`v1.4.6`)**：支持在局域网不可达时通过 BLE 通道完成 OTA 版本检查、在场状态刷新、压缩媒体流传输与配对回退（`pairing fallback`）。
+- **BLE 扫描窗口释放与多子网历史 IP 保留 (`v1.4.5`)**：Android 端新增周期性 BLE 扫描窗口释放与 GATT 超时清理；保留多子网历史成功 IP 列表；Mac 端 `oms-bt-bridge` 新增 CoreBluetooth 发送队列与 Central 读回退通告。
+- **跳过单 IP 阻塞探测与同子网优先 (`v1.4.4`)**：修复单配对 IP 在 WebSocket 连接前因 HTTP 预探测阻塞导致误报 `MAC_UNREACHABLE` 的问题，优先匹配与手机当前 Wi-Fi 同子网的 Mac 地址。
+
 ## 1.4.3 - 2026-10-27
 
 ### 大子网 Wi-Fi 锁屏保活与蓝牙/局域网协同修复
