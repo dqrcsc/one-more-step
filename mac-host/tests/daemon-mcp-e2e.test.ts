@@ -86,6 +86,23 @@ describe("Modules 06 & 07: OmsDaemon + Inbox + MCP Server End-to-End", () => {
               })
             );
           }, 50);
+        } else if ("method" in msg && msg.method === "sys.control") {
+          const params = msg.params as { action: string; pattern?: string };
+          ws.send(
+            encodeJsonRpcFrame({
+              jsonrpc: "2.0",
+              id: msg.id!,
+              result: {
+                ok: true,
+                action: params.action,
+                unlocked: true,
+                method: "pattern",
+                patternCells: params.pattern,
+                screenLocked: false,
+                screenInteractive: true,
+              },
+            })
+          );
         } else if ("method" in msg && msg.method === "gui.observe") {
           ws.send(
             encodeJsonRpcFrame({
@@ -277,6 +294,36 @@ describe("Modules 06 & 07: OmsDaemon + Inbox + MCP Server End-to-End", () => {
     expect(otpData.count).toBe(1);
     expect(otpData.items[0].otpCode).toBe("839201");
     expect(otpData.items[0].otpSender).toBe("阿里云");
+
+    // 7c. Test remote pattern screen unlock & saved pattern persistence
+    const unlockCall1 = await mcp.handleRpcRequest({
+      jsonrpc: "2.0",
+      id: 6,
+      method: "tools/call",
+      params: {
+        name: "phone_device_control",
+        arguments: { action: "unlock_screen", pattern: "14789", savePattern: true },
+      },
+    });
+    const unlockRes1 = JSON.parse(unlockCall1.result.content[0].text);
+    expect(unlockRes1.ok).toBe(true);
+    expect(unlockRes1.unlocked).toBe(true);
+    expect(unlockRes1.patternCells).toBe("14789");
+    expect(unlockRes1.savedPatternToMacConfig).toBe(true);
+
+    // Subsequent call without pattern should automatically use saved pattern from Mac config
+    const unlockCall2 = await mcp.handleRpcRequest({
+      jsonrpc: "2.0",
+      id: 7,
+      method: "tools/call",
+      params: {
+        name: "phone_device_control",
+        arguments: { action: "unlock_screen" },
+      },
+    });
+    const unlockRes2 = JSON.parse(unlockCall2.result.content[0].text);
+    expect(unlockRes2.ok).toBe(true);
+    expect(unlockRes2.patternCells).toBe("14789");
 
     // 8. Verify LAN isolation: non-loopback IPs (e.g. another computer on the same LAN) are blocked with 403 Forbidden
     const lanAttackerInboxResp = await handleDashboardHttpRequest(

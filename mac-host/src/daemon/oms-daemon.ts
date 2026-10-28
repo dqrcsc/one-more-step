@@ -30,6 +30,9 @@ export interface OmsHostConfig {
   autoCopyTextToClipboard?: boolean;
   autoPreviewImageOnMac?: boolean;
   autoSyncOtpToMac?: boolean;
+  unlockPattern?: string;
+  unlockPin?: string;
+  unlockBounds?: string;
   dingtalk: DingTalkConfig;
 }
 
@@ -133,11 +136,17 @@ export class OmsDaemon {
     autoCopyTextToClipboard: boolean;
     autoPreviewImageOnMac: boolean;
     autoSyncOtpToMac: boolean;
+    hasUnlockPattern: boolean;
+    hasUnlockPin: boolean;
+    unlockBounds?: string;
   } {
     return {
       autoCopyTextToClipboard: this.config.autoCopyTextToClipboard !== false,
       autoPreviewImageOnMac: this.config.autoPreviewImageOnMac !== false,
       autoSyncOtpToMac: this.config.autoSyncOtpToMac !== false,
+      hasUnlockPattern: Boolean(this.config.unlockPattern),
+      hasUnlockPin: Boolean(this.config.unlockPin),
+      unlockBounds: this.config.unlockBounds,
     };
   }
 
@@ -145,10 +154,16 @@ export class OmsDaemon {
     autoCopyTextToClipboard?: boolean;
     autoPreviewImageOnMac?: boolean;
     autoSyncOtpToMac?: boolean;
+    unlockPattern?: string;
+    unlockPin?: string;
+    unlockBounds?: string;
   }): {
     autoCopyTextToClipboard: boolean;
     autoPreviewImageOnMac: boolean;
     autoSyncOtpToMac: boolean;
+    hasUnlockPattern: boolean;
+    hasUnlockPin: boolean;
+    unlockBounds?: string;
   } {
     if (typeof prefs.autoCopyTextToClipboard === "boolean") {
       this.config.autoCopyTextToClipboard = prefs.autoCopyTextToClipboard;
@@ -159,7 +174,22 @@ export class OmsDaemon {
     if (typeof prefs.autoSyncOtpToMac === "boolean") {
       this.config.autoSyncOtpToMac = prefs.autoSyncOtpToMac;
     }
-    fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), "utf8");
+    if (typeof prefs.unlockPattern === "string") {
+      const cleaned = prefs.unlockPattern.trim();
+      this.config.unlockPattern = cleaned || undefined;
+    }
+    if (typeof prefs.unlockPin === "string") {
+      const cleaned = prefs.unlockPin.trim();
+      this.config.unlockPin = cleaned || undefined;
+    }
+    if (typeof prefs.unlockBounds === "string") {
+      const cleaned = prefs.unlockBounds.trim();
+      this.config.unlockBounds = cleaned || undefined;
+    }
+    fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
     return this.getHostPreferences();
   }
 
@@ -680,12 +710,18 @@ export class OmsDaemon {
         if (
           typeof params.autoCopyTextToClipboard === "boolean" ||
           typeof params.autoPreviewImageOnMac === "boolean" ||
-          typeof params.autoSyncOtpToMac === "boolean"
+          typeof params.autoSyncOtpToMac === "boolean" ||
+          typeof params.unlockPattern === "string" ||
+          typeof params.unlockPin === "string" ||
+          typeof params.unlockBounds === "string"
         ) {
           return this.updateHostPreferences({
             autoCopyTextToClipboard: params.autoCopyTextToClipboard,
             autoPreviewImageOnMac: params.autoPreviewImageOnMac,
             autoSyncOtpToMac: params.autoSyncOtpToMac,
+            unlockPattern: params.unlockPattern,
+            unlockPin: params.unlockPin,
+            unlockBounds: params.unlockBounds,
           });
         }
         return this.getHostPreferences();
@@ -1034,6 +1070,283 @@ export class OmsDaemon {
             localAbsPath: savedAbsPath,
             inboxItemId,
           };
+        }
+
+        if (subAction === "unlock_screen" || subAction === "unlock") {
+          const rawPattern =
+            typeof params.pattern === "string" && params.pattern.trim()
+              ? params.pattern.trim()
+              : undefined;
+          const rawPin =
+            typeof params.pin === "string" && params.pin.trim()
+              ? params.pin.trim()
+              : undefined;
+          const rawBounds =
+            typeof params.bounds === "string" && params.bounds.trim()
+              ? params.bounds.trim()
+              : undefined;
+          if (params.savePattern && rawPattern) {
+            this.updateHostPreferences({ unlockPattern: rawPattern });
+          }
+          if (params.savePin && rawPin) {
+            this.updateHostPreferences({ unlockPin: rawPin });
+          }
+          if ((params.saveBounds || params.savePattern) && rawBounds) {
+            this.updateHostPreferences({ unlockBounds: rawBounds });
+          }
+          const effectivePattern = rawPattern || this.config.unlockPattern || "";
+          const effectivePin = rawPin || this.config.unlockPin || "";
+          const effectiveBounds = rawBounds || this.config.unlockBounds || "175,1516,1045,2386";
+          const unlockPayload = {
+            ...params,
+            action: "unlock_screen",
+            pattern: effectivePattern,
+            pin: effectivePin,
+            bounds: effectiveBounds,
+          };
+
+          try {
+            const cachedStatus = this.session.getPhoneStatus();
+            if (effectivePattern && cachedStatus && cachedStatus.screenInteractive === false) {
+              await this.session
+                .callPhone<any>(
+                  "sys.control",
+                  { action: "unlock_screen", pattern: "", bounds: "" },
+                  10000
+                )
+                .catch(() => {});
+              await new Promise((r) => setTimeout(r, 750));
+            }
+
+            let res = await this.session.callPhone<any>(
+              "sys.control",
+              unlockPayload,
+              25000
+            );
+            if (effectivePattern && res && res.unlocked === false && res.screenLocked === true) {
+              await new Promise((r) => setTimeout(r, 450));
+              res = await this.session.callPhone<any>(
+                "sys.control",
+                {
+                  ...params,
+                  action: "unlock_screen",
+                  pattern: effectivePattern,
+                  pin: effectivePin,
+                  bounds: "",
+                },
+                25000
+              );
+            }
+            if (res?.status) {
+              this.session.setPhoneStatus(res.status);
+            } else {
+              void this.refreshPhoneStatusLive(true);
+            }
+            return {
+              ...res,
+              savedPatternToMacConfig: Boolean(params.savePattern && rawPattern),
+              savedBoundsToMacConfig: Boolean((params.saveBounds || params.savePattern) && rawBounds),
+            };
+          } catch (err: any) {
+            const msg = String(err?.message || "");
+            if (msg.includes("Unsupported sys.control action")) {
+              // APK < v1.4.7 fallback: wake screen + swipe up to bouncer, and prompt OTA update
+              await this.session
+                .callPhone("sys.control", { action: "launch_app", packageOrAlias: "oms" })
+                .catch(() => {});
+              await this.session
+                .callPhone("gui.act", { action: "scroll_down", deadlineMs: Date.now() + 15000 })
+                .catch(() => {});
+              return {
+                ok: false,
+                action: "unlock_screen",
+                bouncerOpened: true,
+                requiresApkUpdate: true,
+                savedPatternToMacConfig: Boolean(params.savePattern && rawPattern),
+                error:
+                  "已点亮屏幕并上滑唤出图案密码盘；当前手机端 APK 版本低于 v1.4.7，请运行 `oms ota` 升级手机端后即可支持连续轨迹图案自动绘制解锁。",
+              };
+            }
+            throw err;
+          }
+        }
+
+        if (subAction === "call_phone" || subAction === "call" || subAction === "dial") {
+          const rawNum = String(params.number || params.phoneNumber || params.text || "").trim();
+          const cleanNumber = rawNum.replace(/[^\d+*#,]/g, "");
+          if (!cleanNumber) {
+            throw new Error("请提供要拨打的电话号码，例如: oms phone call 10000");
+          }
+          const dialOnly = subAction === "dial" ? true : Boolean(params.dialOnly);
+          const simSlot = params.simSlot !== undefined ? String(params.simSlot) : params.sim !== undefined ? String(params.sim) : "1";
+          const speaker = Boolean(params.speaker);
+
+          // Auto-unlock first if phone is locked
+          const cached = this.session.getPhoneStatus();
+          if (!cached || cached.screenLocked !== false || cached.screenInteractive === false) {
+            await this.handleIpcAction("phone_device_control", {
+              action: "unlock_screen",
+              pattern: params.pattern,
+              pin: params.pin,
+            }).catch(() => {});
+            await new Promise((r) => setTimeout(r, 400));
+          }
+
+          try {
+            const res = await this.session.callPhone<any>(
+              "sys.control",
+              {
+                action: "call_phone",
+                number: cleanNumber,
+                dialOnly,
+                simSlot,
+                speaker,
+                pattern: this.config.unlockPattern,
+                pin: this.config.unlockPin,
+                bounds: this.config.unlockBounds || "175,1516,1045,2386",
+              },
+              25000
+            );
+            if (res?.status) this.session.setPhoneStatus(res.status);
+            return res;
+          } catch (err: any) {
+            if (!String(err?.message || "").includes("Unsupported sys.control action")) {
+              throw err;
+            }
+            // Seamless execution for APK <= v1.4.8 via tel:// URI + Accessibility SIM button click
+            await this.session.callPhone<any>("sys.control", {
+              action: "open_url",
+              url: `tel://${cleanNumber}`,
+            });
+            if (dialOnly) {
+              return {
+                ok: true,
+                action: "call_phone",
+                number: cleanNumber,
+                dialedOnly: true,
+                callPlaced: false,
+              };
+            }
+            await new Promise((r) => setTimeout(r, 500));
+            const obs = await this.session.callPhone<any>("gui.observe", {
+              includeScreenshot: false,
+              somAnnotation: false,
+            });
+            const nodes: any[] = Array.isArray(obs?.nodes) ? obs.nodes : [];
+            const callBtns = nodes
+              .filter(
+                (n) =>
+                  n.clickable &&
+                  (n.role === "Button" || n.role === "ImageButton") &&
+                  Array.isArray(n.bounds) &&
+                  n.bounds[1] >= 2100 &&
+                  n.bounds[0] >= 220 &&
+                  n.bounds[2] <= 1000 &&
+                  !String(n.label || "").includes("菜单") &&
+                  !String(n.label || "").includes("关闭")
+              )
+              .sort((a, b) => (a.center?.[0] || 0) - (b.center?.[0] || 0));
+
+            let chosen =
+              callBtns.find((b) => simSlot && String(b.label || "").includes(simSlot)) ||
+              (simSlot === "2" && callBtns.length >= 2 ? callBtns[1] : callBtns[0]);
+
+            if (chosen) {
+              await this.session.callPhone<any>("gui.act", {
+                action: "click",
+                targetNodeId: chosen.id,
+                observationId: obs.observationId,
+                deadlineMs: Date.now() + 15000,
+              });
+            } else {
+              const tapX = simSlot === "2" ? 781 : 438;
+              await this.session.callPhone<any>("gui.act", {
+                action: "click",
+                x: tapX,
+                y: 2344,
+                deadlineMs: Date.now() + 15000,
+              });
+            }
+
+            let speakerEnabled = false;
+            if (speaker) {
+              await new Promise((r) => setTimeout(r, 1800));
+              const inCallObs = await this.session
+                .callPhone<any>("gui.observe", { includeScreenshot: false, somAnnotation: false })
+                .catch(() => null);
+              const spkNode = (inCallObs?.nodes || []).find(
+                (n: any) =>
+                  n.clickable &&
+                  (String(n.label || "").includes("免提") ||
+                    String(n.label || "").includes("扬声器"))
+              );
+              if (spkNode) {
+                await this.session
+                  .callPhone<any>("gui.act", {
+                    action: "click",
+                    targetNodeId: spkNode.id,
+                    observationId: inCallObs.observationId,
+                    deadlineMs: Date.now() + 15000,
+                  })
+                  .catch(() => {});
+                speakerEnabled = true;
+              }
+            }
+
+            return {
+              ok: true,
+              action: "call_phone",
+              number: cleanNumber,
+              simUsed: chosen?.label || (simSlot === "2" ? "SIM卡2" : "SIM卡1"),
+              callPlaced: true,
+              speakerEnabled,
+            };
+          }
+        }
+
+        if (subAction === "hangup_call" || subAction === "hangup" || subAction === "end_call") {
+          try {
+            const res = await this.session.callPhone<any>(
+              "sys.control",
+              { action: "hangup_call" },
+              15000
+            );
+            if (res?.status) this.session.setPhoneStatus(res.status);
+            return res;
+          } catch (err: any) {
+            if (!String(err?.message || "").includes("Unsupported sys.control action")) {
+              throw err;
+            }
+            const obs = await this.session
+              .callPhone<any>("gui.observe", { includeScreenshot: false, somAnnotation: false })
+              .catch(() => null);
+            const hangupNode = (obs?.nodes || []).find(
+              (n: any) =>
+                n.clickable &&
+                (String(n.label || "").includes("挂断") ||
+                  String(n.label || "").includes("结束"))
+            );
+            if (hangupNode) {
+              await this.session.callPhone<any>("gui.act", {
+                action: "click",
+                targetNodeId: hangupNode.id,
+                observationId: obs.observationId,
+                deadlineMs: Date.now() + 15000,
+              });
+            } else {
+              await this.session.callPhone<any>("gui.act", {
+                action: "click",
+                x: 610,
+                y: 2345,
+                deadlineMs: Date.now() + 15000,
+              });
+            }
+            return {
+              ok: true,
+              action: "hangup_call",
+              hungUp: true,
+            };
+          }
         }
 
         try {

@@ -1,6 +1,6 @@
 ---
 name: one-more-step
-description: 青简·咫尺 (OneMoreStep / oms) —— macOS 本地 AI Agent 与小米 Android 手机（HyperOS / MIUI）的全场景双向互操作与跨端协同工具。当用户提到“oms”、“OneMoreStep”、“青简”、“看看手机发来的图/文件/想法”、“拉取手机刚截的图/拍的照片”、“把这个发到我手机上/推送到手机时间流/通勤朗读”、“同步/读取/写入手机剪贴板或验证码”、“在手机上定闹钟”、“查手机日历/加日程”、“给手机发通知/强提醒/语音播报”、“发远程审批卡片到手机”、或“观察/点击/自动化操作手机屏幕 App”时使用。
+description: 青简·咫尺 (OneMoreStep / oms) —— macOS 本地 AI Agent 与小米 Android 手机（HyperOS / MIUI）的全场景双向互操作与跨端协同工具。当用户提到“oms”、“OneMoreStep”、“青简”、“看看手机发来的图/文件/想法”、“拉取手机刚截的图/拍的照片”、“把这个发到我手机上/推送到手机时间流/通勤朗读”、“同步/读取/写入手机剪贴板或验证码”、“在手机上定闹钟”、“查手机日历/加日程”、“给手机发通知/强提醒/语音播报”、“寻找手机/让手机说话”、“解锁手机/图案密码解锁”、“用手机打电话/拨号/挂断电话”、“远程截屏/调节手机音量/打开手机应用或链接”、“发远程审批卡片到手机”、或“观察/点击/自动化操作手机屏幕 App”时使用。
 ---
 
 # 青简·咫尺 · OneMoreStep (`oms`) 跨端双向互操作技能
@@ -172,7 +172,25 @@ oms phone open "https://github.com"
 oms phone launch wechat
 oms phone launch lark
 
-# 7. 执行系统级导航与锁屏动作（home | back | recents | lock | notifications）
+# 7. 远程点亮屏幕、上滑调出密码盘并绘制 3x3 图案密码解锁手机（1~9 对应九宫格左上到右下）
+#    - 支持 oms phone unlock 或顶层捷径 oms unlock
+#    - 加 --save（或 -save）可将图案密码与九宫格边界持久化存入 ~/.one_more_step/config.json，后续直接运行 oms phone unlock 即可免输一键解锁
+#    - 支持 --bounds l,t,r,b 自定义或校准九宫格像素/比例区域（小米 HyperOS 1220x2712 默认精准适配 175,1516,1045,2386）
+oms phone unlock 123698745 --save
+oms phone unlock
+oms unlock
+oms phone unlock --bounds "175,1516,1045,2386" --save
+
+# 8. 原生电话拨打与挂断（若手机锁屏会自动先唤醒并绘制图案解锁，支持双卡 SIM 1 / SIM 2 / 电信 / 联通 / 移动选择、免提扬声器与仅打开拨号盘）
+oms phone call 10000
+oms phone call 10000 --sim 1
+oms phone call 10010 --sim 联通 --speaker
+oms phone call 13800138000 --dial-only
+oms phone hangup
+oms call 10000
+oms hangup
+
+# 9. 执行系统级导航与锁屏动作（home | back | recents | lock | notifications）
 oms phone home
 oms phone back
 oms phone lock
@@ -301,9 +319,10 @@ oms web
 # 在 Mac 本地生成安全 v2 完整配对 URI；无线安装页仅提供 APK，不提供配对密钥
 oms pair
 
-# 查看或修改 Mac 收到手机投递时的自动联动偏好（自动复制剪贴板 / 自动打开预览）
+# 查看或修改 Mac 收到手机投递时的自动联动偏好（自动复制剪贴板 / 自动打开预览 / 默认解锁图案与 PIN）
 oms prefs
 oms prefs --auto-copy true --auto-preview true
+oms prefs --unlock-pattern 123698745
 
 # 当重新编译 Android APK 后，通过局域网一键向手机推送 OTA 更新
 oms ota
@@ -331,6 +350,6 @@ oms daemon install-launchagent
 | **分级通知与TTS** | `phone_notify` | `oms notify <text> [--level silent\|normal\|urgent] [--tts]` |
 | **远程阻塞审批** | `phone_request_approval` | `oms approve --title <t> --summary <s> [--diff <d>]` |
 | **全维状态遥测** | `phone_presence_status` | `oms status [--live] \| oms phone status` |
-| **远程系统操控** | `phone_device_control` | `oms phone <find\|say\|volume\|screenshot\|open\|launch\|home\|back\|lock>` |
+| **远程系统操控** | `phone_device_control` | `oms phone <find\|say\|volume\|screenshot\|open\|launch\|unlock\|call\|hangup\|home\|back\|lock>` |
 | **GUI 语义树观察** | `phone_gui_observe` | `oms gui observe [--screenshot] [--som]` |
 | **GUI 自动化执行** | `phone_gui_action` | `oms gui act <click\|input_text\|...> [#id] --observation <id> [--confirm]` |

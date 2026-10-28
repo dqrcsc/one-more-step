@@ -25,8 +25,8 @@ function parseFlags(args: string[]): { positional: string[]; flags: Record<strin
       } else {
         flags[key] = true;
       }
-    } else if (a.startsWith("-") && a.length === 2) {
-      const key = a.slice(1);
+    } else if (a.startsWith("-") && a.length >= 2 && !/^\d+$/.test(a.slice(1))) {
+      const key = a.startsWith("--") ? a.slice(2) : a.slice(1);
       const next = args[i + 1];
       if (next !== undefined && !next.startsWith("-")) {
         flags[key] = next;
@@ -177,10 +177,24 @@ async function main() {
       const autoCopy = parseBoolFlag(flags["auto-copy"]);
       const autoPreview = parseBoolFlag(flags["auto-preview"]);
       const autoOtp = parseBoolFlag(flags["auto-otp"]);
+      const unlockPattern =
+        typeof flags["unlock-pattern"] === "string"
+          ? flags["unlock-pattern"]
+          : typeof flags.pattern === "string"
+            ? flags.pattern
+            : undefined;
+      const unlockPin =
+        typeof flags["unlock-pin"] === "string"
+          ? flags["unlock-pin"]
+          : typeof flags.pin === "string"
+            ? flags.pin
+            : undefined;
       const res = await ipc.call("daemon.prefs", {
         autoCopyTextToClipboard: autoCopy,
         autoPreviewImageOnMac: autoPreview,
         autoSyncOtpToMac: autoOtp,
+        unlockPattern,
+        unlockPin,
       });
       console.log(JSON.stringify(res, null, 2));
       break;
@@ -488,6 +502,54 @@ async function main() {
       break;
     }
 
+    case "unlock": {
+      const pattern =
+        (typeof flags.pattern === "string" ? flags.pattern : undefined) ||
+        positional[0];
+      const pin = typeof flags.pin === "string" ? flags.pin : undefined;
+      const bounds = typeof flags.bounds === "string" ? flags.bounds : undefined;
+      const res = await ipc.call(
+        "phone_device_control",
+        {
+          action: "unlock_screen",
+          pattern,
+          pin,
+          bounds,
+          savePattern: Boolean(flags.save),
+          savePin: Boolean(flags.save && pin),
+          saveBounds: Boolean(flags.save && bounds),
+        },
+        30000
+      );
+      console.log(JSON.stringify(res, null, 2));
+      break;
+    }
+
+    case "call":
+    case "dial": {
+      const number = (flags.number as string) || positional[0];
+      if (!number) throw new Error("Usage: oms call <phone-number> [--sim 1|2|电信|联通] [--dial-only] [--speaker]");
+      const res = await ipc.call(
+        "phone_device_control",
+        {
+          action: "call_phone",
+          number,
+          simSlot: flags.sim !== undefined ? String(flags.sim) : undefined,
+          dialOnly: cmd === "dial" || Boolean(flags["dial-only"]),
+          speaker: Boolean(flags.speaker),
+        },
+        35000
+      );
+      console.log(JSON.stringify(res, null, 2));
+      break;
+    }
+
+    case "hangup": {
+      const res = await ipc.call("phone_device_control", { action: "hangup_call" }, 20000);
+      console.log(JSON.stringify(res, null, 2));
+      break;
+    }
+
     case "phone":
     case "control": {
       const actionSub = (sub || "status").toLowerCase();
@@ -560,6 +622,48 @@ async function main() {
           packageOrAlias: pkg,
         });
         console.log(JSON.stringify(res, null, 2));
+      } else if (actionSub === "unlock" || actionSub === "unlock_screen") {
+        const pattern =
+          (typeof flags.pattern === "string" ? flags.pattern : undefined) ||
+          positional[1];
+        const pin = typeof flags.pin === "string" ? flags.pin : undefined;
+        const bounds = typeof flags.bounds === "string" ? flags.bounds : undefined;
+        const res = await ipc.call(
+          "phone_device_control",
+          {
+            action: "unlock_screen",
+            pattern,
+            pin,
+            bounds,
+            savePattern: Boolean(flags.save),
+            savePin: Boolean(flags.save && pin),
+            saveBounds: Boolean(flags.save && bounds),
+          },
+          30000
+        );
+        console.log(JSON.stringify(res, null, 2));
+      } else if (actionSub === "call" || actionSub === "dial" || actionSub === "call_phone") {
+        const number = (flags.number as string) || positional[1];
+        if (!number) {
+          throw new Error(
+            "Usage: oms phone call <phone-number> [--sim 1|2|电信|联通] [--dial-only] [--speaker]"
+          );
+        }
+        const res = await ipc.call(
+          "phone_device_control",
+          {
+            action: "call_phone",
+            number,
+            simSlot: flags.sim !== undefined ? String(flags.sim) : undefined,
+            dialOnly: actionSub === "dial" || Boolean(flags["dial-only"]),
+            speaker: Boolean(flags.speaker),
+          },
+          35000
+        );
+        console.log(JSON.stringify(res, null, 2));
+      } else if (actionSub === "hangup" || actionSub === "end-call" || actionSub === "hangup_call") {
+        const res = await ipc.call("phone_device_control", { action: "hangup_call" }, 20000);
+        console.log(JSON.stringify(res, null, 2));
       } else if (
         ["key", "home", "back", "recents", "lock", "lock_screen", "notifications"].includes(
           actionSub
@@ -573,7 +677,7 @@ async function main() {
         console.log(JSON.stringify(res, null, 2));
       } else {
         throw new Error(
-          `Unknown phone subcommand: ${actionSub}. Supported: status | find | say | stop-tts | vibrate | volume | screenshot | open | launch | key | home | back | lock`
+          `Unknown phone subcommand: ${actionSub}. Supported: status | find | say | stop-tts | vibrate | volume | screenshot | open | launch | unlock | call | dial | hangup | key | home | back | lock`
         );
       }
       break;
@@ -583,12 +687,16 @@ async function main() {
       console.log(`OneMoreStep CLI (oms) - Mac AI <-> Xiaomi Android Bidirectional Bridge
 Commands:
   oms status [--live]                                  Inspect live presence, transport tier, battery, temp, audio, storage & permissions
-  oms phone <status|find|say|volume|screenshot|open|launch|home|back|lock>
+  oms phone <status|find|say|volume|screenshot|open|launch|unlock|call|hangup|home|back|lock>
                                                        Inspect rich phone telemetry or remotely control phone from Mac
+  oms phone unlock [pattern] [--save] [--bounds l,t,r,b] Wake screen, swipe up bouncer & draw 3x3 pattern (1~9) to unlock phone
+  oms phone call <number> [--sim 1|2|电信|联通] [--dial-only] [--speaker]
+                                                       Auto-unlock & place phone call (or open dialer) with dual-SIM selection
+  oms phone hangup                                     Hang up / end active or dialing phone call on Xiaomi phone
   oms pair [--json]                                    Generate v2 pairing URI & local wireless install URL (/install)
   oms web                                              Open Mac real-time Inbox & Stream Web Dashboard (/inbox)
   oms otp [--limit N] [--copy] [--ack]                 Query latest synced verification codes (OTP) from phone
-  oms prefs [--auto-otp] [--auto-copy] [--auto-preview] View or update Mac auto-OTP, auto-clipboard & auto-image-preview preferences
+  oms prefs [--auto-otp] [--auto-copy] [--unlock-pattern <1~9>] View or update Mac auto-OTP, clipboard, preview & unlock pattern
   oms inbox [latest] [--tag <tag>] [--unprocessed]     Query items sent from phone (--ack to mark read, --q <keyword>)
   oms inbox show <id> | ack <id> | transcribe <id>     Inspect item, mark processed, or run SenseVoice offline ASR
   oms media [recent] [--type screenshot|camera]        List recent screenshots/photos/videos on phone (--since <min>)

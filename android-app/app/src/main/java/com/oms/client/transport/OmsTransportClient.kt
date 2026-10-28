@@ -2573,6 +2573,11 @@ class OmsTransportClient(
                 val target = params.optString("target", "home").lowercase()
                 val svc = OmsAccessibilityService.instance
                     ?: throw IllegalStateException("ERR_ACCESSIBILITY_DISABLED: 请先在手机上开启青简·咫尺无障碍服务")
+                if (target == "unlock" || target == "unlock_screen") {
+                    val res = svc.performScreenUnlock(params, sessionStillValid)
+                    res.put("status", collectDeviceSnapshot())
+                    return res
+                }
                 val ok = svc.performSystemGlobalAction(target, params.optLong("deadlineMs", 0L), sessionStillValid)
                 delay(250)
                 JSONObject().apply {
@@ -2580,6 +2585,30 @@ class OmsTransportClient(
                     put("target", target)
                     put("status", collectDeviceSnapshot())
                 }
+            }
+            "unlock_screen", "unlock" -> {
+                val svc = OmsAccessibilityService.instance
+                    ?: throw IllegalStateException("ERR_ACCESSIBILITY_DISABLED: 请先在手机上开启青简·咫尺无障碍服务")
+                val res = svc.performScreenUnlock(params, sessionStillValid)
+                res.put("status", collectDeviceSnapshot())
+                res
+            }
+            "call_phone", "call", "dial" -> {
+                val svc = OmsAccessibilityService.instance
+                    ?: throw IllegalStateException("ERR_ACCESSIBILITY_DISABLED: 请先在手机上开启青简·咫尺无障碍服务")
+                if (subAction == "dial" && !params.has("dialOnly")) {
+                    params.put("dialOnly", true)
+                }
+                val res = svc.performPhoneCall(params, sessionStillValid)
+                res.put("status", collectDeviceSnapshot())
+                res
+            }
+            "hangup_call", "hangup", "end_call" -> {
+                val svc = OmsAccessibilityService.instance
+                    ?: throw IllegalStateException("ERR_ACCESSIBILITY_DISABLED: 请先在手机上开启青简·咫尺无障碍服务")
+                val res = svc.performHangupCall(sessionStillValid)
+                res.put("status", collectDeviceSnapshot())
+                res
             }
             "take_screenshot" -> {
                 val svc = OmsAccessibilityService.instance

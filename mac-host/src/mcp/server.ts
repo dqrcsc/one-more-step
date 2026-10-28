@@ -261,7 +261,7 @@ export const OMS_MCP_TOOLS = [
   {
     name: "phone_device_control",
     description:
-      "远程操控小米手机系统能力：响铃找手机 (find_phone)、TTS 语音播报 (tts_speak / stop_tts)、调节媒体/铃声/闹钟音量或静音 (set_volume)、震动 (vibrate)、立即抓取屏幕截图并存入收件箱 (take_screenshot)、打开指定网址 (open_url)、启动常用 App (launch_app: wechat/lark/dingtalk/camera/settings 等)、或执行系统级按键 (system_action: home/back/recents/lock_screen/notifications)。",
+      "远程操控小米手机系统能力：响铃找手机 (find_phone)、TTS 语音播报 (tts_speak / stop_tts)、调节媒体/铃声/闹钟音量或静音 (set_volume)、震动 (vibrate)、立即抓取屏幕截图并存入收件箱 (take_screenshot)、打开指定网址 (open_url)、启动常用 App (launch_app: wechat/lark/dingtalk/camera/settings/phone 等)、远程点亮屏幕并绘制 3x3 图案解锁手机 (unlock_screen)、自动解锁并拨打电话/选卡外呼 (call_phone / dial)、挂断电话 (hangup_call)、或执行系统级按键 (system_action: home/back/recents/lock_screen/notifications)。",
     inputSchema: {
       type: "object",
       properties: {
@@ -277,6 +277,10 @@ export const OMS_MCP_TOOLS = [
             "take_screenshot",
             "open_url",
             "launch_app",
+            "unlock_screen",
+            "call_phone",
+            "dial",
+            "hangup_call",
             "system_action",
           ],
           description: "要执行的远程控制动作",
@@ -313,7 +317,45 @@ export const OMS_MCP_TOOLS = [
         },
         packageOrAlias: {
           type: "string",
-          description: "launch_app 时的应用别名 (wechat/lark/dingtalk/camera/settings) 或包名",
+          description: "launch_app 时的应用别名 (wechat/lark/dingtalk/camera/settings/phone) 或包名",
+        },
+        pattern: {
+          type: "string",
+          description:
+            "unlock_screen 时的 3x3 图案密码点位序列（1~9 从左上到右下，如 '14789' 或 '1-4-7-8-9'；若已在 Mac 本地保存默认图案可省略）",
+        },
+        pin: {
+          type: "string",
+          description: "unlock_screen 时的可选数字 PIN 密码",
+        },
+        bounds: {
+          type: "string",
+          description:
+            "unlock_screen 时的可选九宫格自定义矩形区域 'left,top,right,bottom'（像素或 0~1 比例）",
+        },
+        savePattern: {
+          type: "boolean",
+          default: false,
+          description: "是否将本次传入的 pattern 安全保存到 Mac 本地配置中，供后续免输调用",
+        },
+        number: {
+          type: "string",
+          description: "call_phone / dial 时要拨打的电话号码（如 '10000' 或 '13800138000'）",
+        },
+        simSlot: {
+          type: "string",
+          description:
+            "call_phone 时双卡手机优先使用的 SIM 卡槽或运营商关键字（如 '1'、'2'、'电信'、'联通'、'移动'，默认 SIM 1）",
+        },
+        dialOnly: {
+          type: "boolean",
+          default: false,
+          description: "call_phone 时是否仅打开拨号盘填入号码而不自动按拨出键",
+        },
+        speaker: {
+          type: "boolean",
+          default: false,
+          description: "call_phone 时拨通后是否自动开启免提扬声器",
         },
         target: {
           type: "string",

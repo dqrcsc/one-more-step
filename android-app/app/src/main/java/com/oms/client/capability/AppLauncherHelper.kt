@@ -322,11 +322,18 @@ object AppLauncherHelper {
     suspend fun openUrl(context: Context, rawUrl: String): Pair<Boolean, String?> {
         val trimmed = rawUrl.trim()
         if (trimmed.isEmpty()) return false to "URL 不能为空"
-        val normalizedUrl = if (trimmed.contains("://")) trimmed else "https://$trimmed"
+        val lower = trimmed.lowercase()
+        val isCustomScheme = trimmed.contains("://") ||
+            lower.startsWith("tel:") ||
+            lower.startsWith("sms:") ||
+            lower.startsWith("smsto:") ||
+            lower.startsWith("mailto:")
+        val normalizedUrl = if (isCustomScheme) trimmed else "https://$trimmed"
         return withContext(Dispatchers.Main) {
             try {
                 wakeScreenIfNeeded(context)
-                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(normalizedUrl)).apply {
+                val action = if (lower.startsWith("tel:")) Intent.ACTION_DIAL else Intent.ACTION_VIEW
+                val intent = Intent(action, Uri.parse(normalizedUrl)).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 val launcherCtx: Context = OmsAccessibilityService.instance ?: context
@@ -334,6 +341,24 @@ object AppLauncherHelper {
                 true to null
             } catch (e: Throwable) {
                 false to (e.message ?: "无法打开该链接")
+            }
+        }
+    }
+
+    suspend fun openDialerWithNumber(context: Context, rawNumber: String): Pair<Boolean, String?> {
+        val cleaned = rawNumber.trim().filter { it.isDigit() || it in setOf('+', '*', '#', ',') }
+        if (cleaned.isEmpty()) return false to "电话号码不能为空"
+        return withContext(Dispatchers.Main) {
+            try {
+                wakeScreenIfNeeded(context)
+                val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(cleaned)}")).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                }
+                val launcherCtx: Context = OmsAccessibilityService.instance ?: context
+                launcherCtx.startActivity(intent)
+                true to null
+            } catch (e: Throwable) {
+                false to (e.message ?: "无法打开拨号界面")
             }
         }
     }
