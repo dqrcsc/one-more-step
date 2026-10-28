@@ -101,6 +101,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (intent?.getBooleanExtra(NotificationExecutor.EXTRA_STOP_TTS, false) == true) {
+            NotificationExecutor.stopSpeaking(this)
+        }
         requestRuntimePermissionsIfNeeded()
         startForegroundCoreService()
 
@@ -116,9 +119,32 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra(NotificationExecutor.EXTRA_STOP_TTS, false)) {
+            NotificationExecutor.stopSpeaking(this)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
+        if (intent?.getBooleanExtra(NotificationExecutor.EXTRA_STOP_TTS, false) == true) {
+            NotificationExecutor.stopSpeaking(this)
+            intent?.removeExtra(NotificationExecutor.EXTRA_STOP_TTS)
+        }
         OmsApplication.instance?.transportClient?.startAutoConnect()
+    }
+
+    override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
+        if ((keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN ||
+                keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP) &&
+            NotificationExecutor.isSpeakingFlow.value
+        ) {
+            NotificationExecutor.stopSpeaking(this)
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     private fun requestRuntimePermissionsIfNeeded() {
@@ -180,6 +206,8 @@ fun OneMoreStepMainScreen() {
     val connectionHint by app.transportClient.connectionHintFlow.collectAsState()
     var diagnosticText by remember { mutableStateOf<String?>(null) }
     val streamItems by app.repository.itemsFlow.collectAsState()
+    val isSpeakingTts by NotificationExecutor.isSpeakingFlow.collectAsState()
+    val speakingTtsText by NotificationExecutor.speakingTextFlow.collectAsState()
 
     var showXiaomiWizard by remember { mutableStateOf(false) }
     var showPairSheet by remember { mutableStateOf(app.repository.getPairedMac()?.pairingVersion != 2) }
@@ -333,6 +361,49 @@ fun OneMoreStepMainScreen() {
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
+        if (isSpeakingTts) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 10.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF7F1D1D)),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                        Text(
+                            "🔊 正在语音播报 / 寻找手机",
+                            color = Color(0xFFFCA5A5),
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp
+                        )
+                        if (speakingTtsText.isNotBlank()) {
+                            Text(
+                                speakingTtsText,
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                    Button(
+                        onClick = { NotificationExecutor.stopSpeaking(context) },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444)),
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                    ) {
+                        Text("⏹ 停止声音", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    }
+                }
+            }
+        }
+
         // 1. Top Connection & Control Header
         Card(
             modifier = Modifier.fillMaxWidth(),

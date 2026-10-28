@@ -3,21 +3,29 @@ package com.oms.client.capability
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Base64
 import androidx.core.app.NotificationCompat
 import com.oms.client.R
 import com.oms.client.ui.MainActivity
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
@@ -26,6 +34,12 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 
+class OmsTtsStopReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        NotificationExecutor.stopSpeaking(context)
+    }
+}
+
 /**
  * Module 04: L1~L3 Graded Notification Dispatcher & Neural + Local Alarm-Stream TTS Speaker
  */
@@ -33,6 +47,8 @@ object NotificationExecutor {
     const val CHANNEL_SILENT = "oms_silent_stream"
     const val CHANNEL_STANDARD = "oms_standard_notify"
     const val CHANNEL_URGENT = "oms_urgent_alert"
+    const val ACTION_STOP_TTS = "com.oms.client.ACTION_STOP_TTS"
+    const val EXTRA_STOP_TTS = "stop_tts_on_open"
 
     private data class PendingSpeech(
         val text: String,
@@ -45,14 +61,77 @@ object NotificationExecutor {
     private val pendingSpeechQueue = ConcurrentLinkedQueue<PendingSpeech>()
     private val playbackGeneration = AtomicInteger(0)
 
+    private val _isSpeakingFlow = MutableStateFlow(false)
+    val isSpeakingFlow: StateFlow<Boolean> = _isSpeakingFlow.asStateFlow()
+
+    private val _speakingTextFlow = MutableStateFlow("")
+    val speakingTextFlow: StateFlow<String> = _speakingTextFlow.asStateFlow()
+
     @Volatile
     private var activeMediaPlayer: MediaPlayer? = null
+    @Volatile
+    private var activeTtsNotificationId: Int = 0
+    @Volatile
+    private var playbackStartedElapsedMs: Long = 0L
+    @Volatile
+    private var hardwareStopReceiverRegistered = false
+    @Volatile
+    private var appContextRef: Context? = null
+
     @Volatile
     private var ttsEngine: TextToSpeech? = null
     @Volatile
     private var ttsReady = false
     @Volatile
     private var ttsInitializing = false
+
+    private val hardwareStopReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent?) {
+            val action = intent?.action ?: return
+            if (!_isSpeakingFlow.value) return
+            val elapsedSinceStart = SystemClock.elapsedRealtime() - playbackStartedElapsedMs
+            when (action) {
+                Intent.ACTION_USER_PRESENT -> {
+                    // User unlocked the phone after finding it -> automatically stop ringing
+                    if (elapsedSinceStart > 500L) {
+                        stopSpeaking(context)
+                    }
+                }
+                Intent.ACTION_SCREEN_OFF -> {
+                    // User pressed the physical Power button -> automatically stop ringing
+                    if (elapsedSinceStart > 700L) {
+                        stopSpeaking(context)
+                    }
+                }
+                "android.media.VOLUME_CHANGED_ACTION" -> {
+                    // User pressed physical Volume Up / Volume Down key -> stop ringing immediately
+                    if (elapsedSinceStart > 750L) {
+                        stopSpeaking(context)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun registerHardwareStopReceiverIfNeeded(context: Context) {
+        val appCtx = context.applicationContext
+        appContextRef = appCtx
+        if (hardwareStopReceiverRegistered) return
+        try {
+            val filter = IntentFilter().apply {
+                addAction(Intent.ACTION_USER_PRESENT)
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction("android.media.VOLUME_CHANGED_ACTION")
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                appCtx.registerReceiver(hardwareStopReceiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                appCtx.registerReceiver(hardwareStopReceiver, filter)
+            }
+            hardwareStopReceiverRegistered = true
+        } catch (_: Throwable) {
+        }
+    }
 
     fun ensureChannelsAndTts(context: Context) {
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -111,6 +190,24 @@ object NotificationExecutor {
                                 engine.voice = bestVoice
                             }
                             engine?.setPitch(1.0f)
+                            engine?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                                override fun onStart(utteranceId: String?) {
+                                    _isSpeakingFlow.value = true
+                                }
+
+                                override fun onDone(utteranceId: String?) {
+                                    if (utteranceId?.endsWith("_last") == true) {
+                                        _isSpeakingFlow.value = false
+                                        _speakingTextFlow.value = ""
+                                    }
+                                }
+
+                                @Deprecated("Deprecated in Java")
+                                override fun onError(utteranceId: String?) {
+                                    _isSpeakingFlow.value = false
+                                    _speakingTextFlow.value = ""
+                                }
+                            })
                         } catch (_: Throwable) {
                         }
                         ttsReady = true
@@ -164,20 +261,22 @@ object NotificationExecutor {
             engine.setSpeechRate(item.speechRate.coerceIn(0.8f, 1.3f))
             engine.setPitch(1.0f)
             val count = item.repeatCount.coerceIn(1, 20)
+            val ts = System.currentTimeMillis()
             for (i in 0 until count) {
                 val queueMode = if (i == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
                 if (i > 0) {
                     engine.playSilentUtterance(
                         420L,
                         TextToSpeech.QUEUE_ADD,
-                        "oms_tts_pause_${System.currentTimeMillis()}_$i"
+                        "oms_tts_pause_${ts}_$i"
                     )
                 }
+                val suffix = if (i == count - 1) "_last" else "_$i"
                 engine.speak(
                     item.text,
                     queueMode,
                     Bundle.EMPTY,
-                    "oms_tts_${System.currentTimeMillis()}_$i"
+                    "oms_tts_${ts}$suffix"
                 )
             }
         }
@@ -199,6 +298,9 @@ object NotificationExecutor {
 
             val openIntent = Intent(context, MainActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                if (ttsSpeak) {
+                    putExtra(EXTRA_STOP_TTS, true)
+                }
             }
             val pi = PendingIntent.getActivity(
                 context,
@@ -207,13 +309,35 @@ object NotificationExecutor {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
 
+            val stopIntent = Intent(context, OmsTtsStopReceiver::class.java).apply {
+                action = ACTION_STOP_TTS
+            }
+            val stopPi = PendingIntent.getBroadcast(
+                context,
+                notificationId + 1,
+                stopIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val displayBody = if (ttsSpeak && level == "urgent") {
+                "$body\n💡 点击此通知、上滑清除或按手机音量键即可立即停止声音"
+            } else {
+                body
+            }
+
             val builder = NotificationCompat.Builder(context, channelId)
                 .setSmallIcon(R.drawable.ic_stat_oms)
                 .setContentTitle(title)
-                .setContentText(body)
-                .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+                .setContentText(displayBody)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(displayBody))
                 .setContentIntent(pi)
+                .setDeleteIntent(stopPi)
                 .setAutoCancel(true)
+
+            if (ttsSpeak) {
+                activeTtsNotificationId = notificationId
+                builder.addAction(0, "⏹ 我找到了 · 停止声音", stopPi)
+            }
 
             if (level == "urgent") {
                 builder.setPriority(NotificationCompat.PRIORITY_MAX)
@@ -268,9 +392,13 @@ object NotificationExecutor {
         ttsEngine?.stop()
         releaseActiveMediaPlayer()
 
+        registerHardwareStopReceiverIfNeeded(context)
         if (useAlarmStream) {
             ensureAlarmStreamAudible(context)
         }
+        playbackStartedElapsedMs = SystemClock.elapsedRealtime()
+        _isSpeakingFlow.value = true
+        _speakingTextFlow.value = cleanText.ifBlank { "语音播报中" }
 
         if (!audioBase64.isNullOrBlank()) {
             val appCtx = context.applicationContext
@@ -285,12 +413,19 @@ object NotificationExecutor {
                 )
                 if (!played && cleanText.isNotEmpty() && playbackGeneration.get() == gen) {
                     enqueueLocalSpeech(appCtx, cleanText, useAlarmStream, speechRate, repeatCount)
+                } else if (!played && playbackGeneration.get() == gen) {
+                    _isSpeakingFlow.value = false
+                    _speakingTextFlow.value = ""
                 }
             }
             return
         }
 
-        if (cleanText.isEmpty()) return
+        if (cleanText.isEmpty()) {
+            _isSpeakingFlow.value = false
+            _speakingTextFlow.value = ""
+            return
+        }
         enqueueLocalSpeech(context, cleanText, useAlarmStream, speechRate, repeatCount)
     }
 
@@ -332,6 +467,8 @@ object NotificationExecutor {
                                 mp.start()
                             } catch (_: Throwable) {
                                 releaseActiveMediaPlayer()
+                                _isSpeakingFlow.value = false
+                                _speakingTextFlow.value = ""
                             }
                         }
                     }, 420L)
@@ -344,6 +481,10 @@ object NotificationExecutor {
                         } catch (_: Throwable) {
                         }
                     }
+                    if (playbackGeneration.get() == gen) {
+                        _isSpeakingFlow.value = false
+                        _speakingTextFlow.value = ""
+                    }
                 }
             }
             player.setOnErrorListener { mp, _, _ ->
@@ -354,6 +495,10 @@ object NotificationExecutor {
                         mp.release()
                     } catch (_: Throwable) {
                     }
+                }
+                if (playbackGeneration.get() == gen) {
+                    _isSpeakingFlow.value = false
+                    _speakingTextFlow.value = ""
                 }
                 true
             }
@@ -387,9 +532,28 @@ object NotificationExecutor {
         }
     }
 
-    fun stopSpeaking() {
+    fun stopSpeaking(context: Context? = null) {
         playbackGeneration.incrementAndGet()
         pendingSpeechQueue.clear()
+        _isSpeakingFlow.value = false
+        _speakingTextFlow.value = ""
+        val ctx = context ?: appContextRef
+        val notifId = activeTtsNotificationId
+        activeTtsNotificationId = 0
+        if (ctx != null) {
+            try {
+                val vibrator = ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                vibrator.cancel()
+            } catch (_: Throwable) {
+            }
+            if (notifId != 0) {
+                try {
+                    val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    nm.cancel(notifId)
+                } catch (_: Throwable) {
+                }
+            }
+        }
         mainHandler.post {
             releaseActiveMediaPlayer()
             ttsEngine?.stop()

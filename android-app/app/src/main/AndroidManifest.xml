@@ -182,5 +182,15 @@
             </intent-filter>
         </receiver>
 
+        <!-- 10. One-Tap Stop TTS / Find-My-Phone Notification Action Receiver -->
+        <receiver
+            android:name=".capability.OmsTtsStopReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.oms.client.ACTION_STOP_TTS" />
+            </intent-filter>
+        </receiver>
+
     </application>
 </manifest>
