@@ -2591,6 +2591,50 @@ class OmsTransportClient(
         }
     }
 
+    fun speakTextSmart(
+        rawText: String,
+        useAlarmStream: Boolean = false,
+        repeatCount: Int = 1,
+        voice: String = "xiaoyi"
+    ) {
+        scope.launch {
+            val activeSrc = runCatching { activeSource() }.getOrNull()
+            if (activeSrc != null) {
+                try {
+                    val rpcReq = JSONObject()
+                        .put("jsonrpc", "2.0")
+                        .put("id", "tts_${UUID.randomUUID()}")
+                        .put("method", "tts.synthesize")
+                        .put("params", JSONObject().apply {
+                            put("text", rawText)
+                            put("voice", voice)
+                        })
+                    val rpcRes = requestHost(rpcReq, activeSrc, 7_500L)
+                    val audioB64 = rpcRes.optString("audioBase64", "")
+                    if (audioB64.isNotBlank()) {
+                        NotificationExecutor.speakText(
+                            context,
+                            rawText,
+                            useAlarmStream = useAlarmStream,
+                            speechRate = 1.0f,
+                            audioBase64 = audioB64,
+                            repeatCount = repeatCount
+                        )
+                        return@launch
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            NotificationExecutor.speakText(
+                context,
+                rawText,
+                useAlarmStream = useAlarmStream,
+                speechRate = 1.0f,
+                repeatCount = repeatCount
+            )
+        }
+    }
+
     private suspend fun handleSysControlRpc(params: JSONObject, source: FrameSource, sessionStillValid: () -> Boolean): JSONObject {
         val subAction = params.optString("action", "status").lowercase()
         return when (subAction) {
@@ -2599,6 +2643,8 @@ class OmsTransportClient(
                 val text = params.optString("text", "正在寻找手机，我在这里！请查看青简咫尺。").ifBlank {
                     "正在寻找手机，我在这里！"
                 }
+                val audioBase64 = params.optString("audioBase64", "").takeIf { it.isNotBlank() }
+                val repeatCount = params.optInt("repeatCount", 2).coerceIn(1, 20)
                 NotificationExecutor.sendNotification(
                     context,
                     JSONObject().apply {
@@ -2607,24 +2653,40 @@ class OmsTransportClient(
                         put("level", "urgent")
                         put("ttsSpeak", true)
                         put("forceSpeakerAlarmStream", true)
+                        if (audioBase64 != null) put("audioBase64", audioBase64)
+                        put("repeatCount", repeatCount)
                     }
                 )
                 JSONObject().apply {
                     put("ok", true)
                     put("action", "find_phone")
                     put("spokenText", text)
+                    put("ttsEngine", if (audioBase64 != null) "edge_neural" else "android_local")
+                    put("repeatCount", repeatCount)
                 }
             }
             "tts_speak" -> {
                 val text = params.optString("text", "").trim()
                 val useAlarm = params.optBoolean("useAlarmStream", false)
-                val rate = params.optDouble("speechRate", 1.15).toFloat()
-                if (text.isNotEmpty()) {
-                    NotificationExecutor.speakText(context, text, useAlarmStream = useAlarm, speechRate = rate)
+                val rate = params.optDouble("speechRate", 1.0).toFloat()
+                val audioBase64 = params.optString("audioBase64", "").takeIf { it.isNotBlank() }
+                val repeatCount = params.optInt("repeatCount", 1).coerceIn(1, 20)
+                val hasContent = text.isNotEmpty() || audioBase64 != null
+                if (hasContent) {
+                    NotificationExecutor.speakText(
+                        context,
+                        text,
+                        useAlarmStream = useAlarm,
+                        speechRate = rate,
+                        audioBase64 = audioBase64,
+                        repeatCount = repeatCount
+                    )
                 }
                 JSONObject().apply {
-                    put("ok", text.isNotEmpty())
+                    put("ok", hasContent)
                     put("action", "tts_speak")
+                    put("ttsEngine", if (audioBase64 != null) "edge_neural" else "android_local")
+                    put("repeatCount", repeatCount)
                 }
             }
             "stop_tts" -> {

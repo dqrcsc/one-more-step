@@ -255,12 +255,12 @@ export class PhoneSessionManager extends EventEmitter {
     const metaPath = path.join(apkDir, "output-metadata.json");
 
     if (!fs.existsSync(apkPath)) {
-      const defaultVer = "1.5.1";
+      const defaultVer = "1.5.4";
       const ghUrl = `https://github.com/dqrcsc/one-more-step/releases/download/v${defaultVer}/OneMoreStep-v${defaultVer}.apk`;
       return {
         available: false,
         apkPath,
-        versionCode: 25,
+        versionCode: 28,
         versionName: defaultVer,
         sha256: "",
         sizeBytes: 0,
@@ -272,8 +272,8 @@ export class PhoneSessionManager extends EventEmitter {
     }
 
     const stat = fs.statSync(apkPath);
-    let versionCode = 25;
-    let versionName = "1.5.1";
+    let versionCode = 28;
+    let versionName = "1.5.4";
     const fileMatch = path.basename(apkPath).match(/^OneMoreStep-v([\d.]+)\.apk$/);
     if (fileMatch) {
       versionName = fileMatch[1];

@@ -1341,12 +1341,18 @@ fun StreamTimelineCard(item: StreamItemModel) {
                             TextButton(
                                 contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
                                 onClick = {
-                                    NotificationExecutor.speakText(
-                                        context,
-                                        "${item.title ?: ""}。${item.textContent}",
-                                        useAlarmStream = false,
-                                        speechRate = 1.2f
-                                    )
+                                    val speakStr = "${item.title ?: ""}。${item.textContent}"
+                                    val tc = OmsApplication.instance?.transportClient
+                                    if (tc != null) {
+                                        tc.speakTextSmart(speakStr, useAlarmStream = false)
+                                    } else {
+                                        NotificationExecutor.speakText(
+                                            context,
+                                            speakStr,
+                                            useAlarmStream = false,
+                                            speechRate = 1.0f
+                                        )
+                                    }
                                 }
                             ) {
                                 Text("🎧 TTS朗读", color = Color(0xFF4ADE80), fontSize = 11.sp)

@@ -503,6 +503,8 @@ async function main() {
         body,
         level: (flags.level as string) || "normal",
         ttsSpeak: Boolean(flags.tts),
+        voice: typeof flags.voice === "string" ? flags.voice : undefined,
+        repeat: flags.repeat !== undefined ? Number(flags.repeat) : undefined,
         syncDingtalk: Boolean(flags.dingtalk),
       });
       console.log(JSON.stringify(res, null, 2));
@@ -621,17 +623,31 @@ async function main() {
         const res = await ipc.call("phone_device_control", {
           action: "find_phone",
           text,
+          voice: typeof flags.voice === "string" ? flags.voice : undefined,
+          repeat: flags.repeat !== undefined ? Number(flags.repeat) : undefined,
+          saveVoice: Boolean(flags.save),
         });
         console.log(JSON.stringify(res, null, 2));
       } else if (actionSub === "say" || actionSub === "speak" || actionSub === "tts") {
         const text = (flags.text as string) || positional.slice(1).join(" ");
         if (!text) {
-          throw new Error("Usage: oms phone say <text> [--alarm]");
+          throw new Error(
+            "Usage: oms phone say <text> [--alarm] [--voice xiaoyi|xiaoxiao|yunxia|yunxi|xiaobei|hsiaochen] [--repeat N] [--save]"
+          );
         }
         const res = await ipc.call("phone_device_control", {
           action: "tts_speak",
           text,
           useAlarmStream: Boolean(flags.alarm),
+          voice: typeof flags.voice === "string" ? flags.voice : undefined,
+          repeat: flags.repeat !== undefined ? Number(flags.repeat) : undefined,
+          saveVoice: Boolean(flags.save),
+        });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (actionSub === "voices" || actionSub === "tts-voices") {
+        const res = await ipc.call("phone_device_control", {
+          action: "tts_voices",
+          voice: (flags.voice as string) || positional[1],
         });
         console.log(JSON.stringify(res, null, 2));
       } else if (actionSub === "stop-tts" || actionSub === "mute-tts") {

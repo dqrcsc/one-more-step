@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import net from "node:net";
+import crypto from "node:crypto";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import {
   AirPodsStatusSnapshot,
@@ -41,11 +42,24 @@ export interface OmsHostConfig {
   autoSwitchAirpods?: boolean;
   pauseOtherOnAirpodsSwitch?: boolean;
   preferredAirpodsMac?: string;
+  preferredTtsVoice?: string;
   unlockPattern?: string;
   unlockPin?: string;
   unlockBounds?: string;
   dingtalk: DingTalkConfig;
 }
+
+export const NEURAL_TTS_VOICE_CATALOG: Record<string, { id: string; label: string }> = {
+  xiaoyi: { id: "zh-CN-XiaoyiNeural", label: "晓伊 · 轻快灵动甜美女声 (默认推荐)" },
+  xiaoxiao: { id: "zh-CN-XiaoxiaoNeural", label: "晓晓 · 温暖知性自然女声" },
+  yunxia: { id: "zh-CN-YunxiaNeural", label: "云夏 · 活泼元气动漫少年音" },
+  yunxi: { id: "zh-CN-YunxiNeural", label: "云希 · 阳光清朗青年男声" },
+  yunjian: { id: "zh-CN-YunjianNeural", label: "云健 · 磁性沉稳男声" },
+  xiaobei: { id: "zh-CN-liaoning-XiaobeiNeural", label: "晓北 · 幽默亲切东北话女声" },
+  xiaoni: { id: "zh-CN-shaanxi-XiaoniNeural", label: "晓妮 · 热情陕西中原女声" },
+  hsiaochen: { id: "zh-TW-HsiaoChenNeural", label: "晓臻 · 温柔台湾腔女声" },
+  hiugaai: { id: "zh-HK-HiuGaaiNeural", label: "晓佳 · 自然粤语女声" },
+};
 
 /**
  * Module 06: Mac Host Singleton Daemon (`omsd`)
@@ -111,6 +125,7 @@ export class OmsDaemon {
     fs.mkdirSync(path.join(this.homeDir, "keystore"), { recursive: true });
     fs.mkdirSync(path.join(this.homeDir, "run"), { recursive: true });
     fs.mkdirSync(path.join(this.homeDir, "logs"), { recursive: true });
+    fs.mkdirSync(path.join(this.homeDir, "cache", "tts"), { recursive: true });
 
     this.configPath = path.join(this.homeDir, "config.json");
     this.identityPath = path.join(this.homeDir, "keystore", "host_identity.json");
@@ -180,6 +195,7 @@ export class OmsDaemon {
     autoSwitchAirpods: boolean;
     pauseOtherOnAirpodsSwitch: boolean;
     preferredAirpodsMac?: string;
+    preferredTtsVoice: string;
     hasUnlockPattern: boolean;
     hasUnlockPin: boolean;
     unlockBounds?: string;
@@ -191,6 +207,7 @@ export class OmsDaemon {
       autoSwitchAirpods: this.config.autoSwitchAirpods !== false,
       pauseOtherOnAirpodsSwitch: this.config.pauseOtherOnAirpodsSwitch !== false,
       preferredAirpodsMac: this.config.preferredAirpodsMac,
+      preferredTtsVoice: this.config.preferredTtsVoice || "xiaoyi",
       hasUnlockPattern: Boolean(this.config.unlockPattern),
       hasUnlockPin: Boolean(this.config.unlockPin),
       unlockBounds: this.config.unlockBounds,
@@ -204,6 +221,7 @@ export class OmsDaemon {
     autoSwitchAirpods?: boolean;
     pauseOtherOnAirpodsSwitch?: boolean;
     preferredAirpodsMac?: string;
+    preferredTtsVoice?: string;
     unlockPattern?: string;
     unlockPin?: string;
     unlockBounds?: string;
@@ -214,6 +232,7 @@ export class OmsDaemon {
     autoSwitchAirpods: boolean;
     pauseOtherOnAirpodsSwitch: boolean;
     preferredAirpodsMac?: string;
+    preferredTtsVoice: string;
     hasUnlockPattern: boolean;
     hasUnlockPin: boolean;
     unlockBounds?: string;
@@ -237,6 +256,10 @@ export class OmsDaemon {
       const cleaned = prefs.preferredAirpodsMac.trim().toUpperCase();
       this.config.preferredAirpodsMac = cleaned || undefined;
     }
+    if (typeof prefs.preferredTtsVoice === "string") {
+      const cleaned = prefs.preferredTtsVoice.trim();
+      this.config.preferredTtsVoice = cleaned || undefined;
+    }
     if (typeof prefs.unlockPattern === "string") {
       const cleaned = prefs.unlockPattern.trim();
       this.config.unlockPattern = cleaned || undefined;
@@ -255,6 +278,152 @@ export class OmsDaemon {
     });
     this.syncAirpodsConfigToBridgeAndPhone();
     return this.getHostPreferences();
+  }
+
+  public resolveNeuralTtsVoice(rawVoice?: string): { alias: string; voiceId: string; label: string } {
+    const key = String(rawVoice || this.config.preferredTtsVoice || "xiaoyi").trim().toLowerCase();
+    const zhAliasMap: Record<string, string> = {
+      晓伊: "xiaoyi",
+      甜美: "xiaoyi",
+      晓晓: "xiaoxiao",
+      温柔: "xiaoxiao",
+      云夏: "yunxia",
+      皮卡丘: "yunxia",
+      少年: "yunxia",
+      云希: "yunxi",
+      男声: "yunxi",
+      云健: "yunjian",
+      晓北: "xiaobei",
+      东北: "xiaobei",
+      东北话: "xiaobei",
+      晓妮: "xiaoni",
+      陕西: "xiaoni",
+      晓臻: "hsiaochen",
+      台湾: "hsiaochen",
+      晓佳: "hiugaai",
+      粤语: "hiugaai",
+    };
+    const mappedAlias = zhAliasMap[key] || key;
+    if (NEURAL_TTS_VOICE_CATALOG[mappedAlias]) {
+      return {
+        alias: mappedAlias,
+        voiceId: NEURAL_TTS_VOICE_CATALOG[mappedAlias].id,
+        label: NEURAL_TTS_VOICE_CATALOG[mappedAlias].label,
+      };
+    }
+    const byId = Object.entries(NEURAL_TTS_VOICE_CATALOG).find(
+      ([, v]) => v.id.toLowerCase() === key
+    );
+    if (byId) {
+      return { alias: byId[0], voiceId: byId[1].id, label: byId[1].label };
+    }
+    if (rawVoice && rawVoice.includes("Neural")) {
+      return { alias: rawVoice, voiceId: rawVoice, label: rawVoice };
+    }
+    return {
+      alias: "xiaoyi",
+      voiceId: NEURAL_TTS_VOICE_CATALOG.xiaoyi.id,
+      label: NEURAL_TTS_VOICE_CATALOG.xiaoyi.label,
+    };
+  }
+
+  public async synthesizeNeuralTts(
+    rawText: string,
+    opts?: { voice?: string; rate?: string; pitch?: string }
+  ): Promise<{
+    audioBase64: string;
+    voiceId: string;
+    voiceLabel: string;
+    cached: boolean;
+    bytes: number;
+  } | null> {
+    const cleanText = String(rawText || "")
+      .replace(/```[\s\S]*?```/g, "，代码片段已略过，")
+      .replace(/[#*`>|\[\]]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 600);
+    if (!cleanText) return null;
+
+    const resolved = this.resolveNeuralTtsVoice(opts?.voice);
+    const rate = opts?.rate || "+6%";
+    const pitch = opts?.pitch || "+0Hz";
+    const cacheDir = path.join(this.homeDir, "cache", "tts");
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const hash = crypto
+      .createHash("sha256")
+      .update(`${resolved.voiceId}|${rate}|${pitch}|${cleanText}`)
+      .digest("hex")
+      .slice(0, 32);
+    const mp3Path = path.join(cacheDir, `${hash}.mp3`);
+
+    try {
+      if (fs.existsSync(mp3Path)) {
+        const stat = fs.statSync(mp3Path);
+        if (stat.size > 200) {
+          const buf = fs.readFileSync(mp3Path);
+          return {
+            audioBase64: buf.toString("base64"),
+            voiceId: resolved.voiceId,
+            voiceLabel: resolved.label,
+            cached: true,
+            bytes: buf.length,
+          };
+        }
+      }
+    } catch {
+      // regenerate
+    }
+
+    const studioScriptDir = path.join(
+      os.homedir(),
+      ".codex",
+      "skills",
+      "video-neural-voiceover",
+      "scripts"
+    );
+    const studioScriptFile = path.join(studioScriptDir, "neural_voiceover_studio.py");
+    if (!fs.existsSync(studioScriptFile)) {
+      return null;
+    }
+
+    const pyCode = [
+      "import sys, os",
+      `sys.path.insert(0, ${JSON.stringify(studioScriptDir)})`,
+      "from neural_voiceover_studio import synthesize_edge_tts",
+      "ca = '/etc/ssl/cert.pem' if os.path.exists('/etc/ssl/cert.pem') else None",
+      "synthesize_edge_tts(sys.argv[1], voice=sys.argv[2], out_mp3=sys.argv[3], rate=sys.argv[4], pitch=sys.argv[5], ca_file=ca)",
+    ].join("; ");
+
+    return await new Promise((resolve) => {
+      execFile(
+        "python3",
+        ["-c", pyCode, cleanText, resolved.voiceId, mp3Path, rate, pitch],
+        { timeout: 7500 },
+        (err) => {
+          if (err || !fs.existsSync(mp3Path)) {
+            resolve(null);
+            return;
+          }
+          try {
+            const buf = fs.readFileSync(mp3Path);
+            if (buf.length <= 200) {
+              resolve(null);
+              return;
+            }
+            resolve({
+              audioBase64: buf.toString("base64"),
+              voiceId: resolved.voiceId,
+              voiceLabel: resolved.label,
+              cached: false,
+              bytes: buf.length,
+            });
+          } catch {
+            resolve(null);
+          }
+        }
+      );
+    });
   }
 
   public copyTextToMacClipboard(text: string): void {
@@ -617,6 +786,30 @@ export class OmsDaemon {
               pairedAirpods: Array.isArray(p.pairedAirpods) ? p.pairedAirpods : undefined,
             });
             reply({ result: { ok: true } });
+          } else if (req.method === "tts.synthesize") {
+            const p = (req.params || {}) as Record<string, any>;
+            const text = String(p.text || "").trim();
+            const voice = p.voice ? String(p.voice) : undefined;
+            void this.synthesizeNeuralTts(text, { voice })
+              .then((res) => {
+                if (!res) {
+                  reply({ result: { ok: false } });
+                  return;
+                }
+                reply({
+                  result: {
+                    ok: true,
+                    audioBase64: res.audioBase64,
+                    voiceId: res.voiceId,
+                    voiceLabel: res.voiceLabel,
+                    cached: res.cached,
+                    bytes: res.bytes,
+                  },
+                });
+              })
+              .catch(() => {
+                reply({ result: { ok: false } });
+              });
           } else {
             reply({ result: { ack: true } });
           }
@@ -1675,12 +1868,39 @@ export class OmsDaemon {
         const effectivePhoneLevel =
           presenceState === "AT_DESK" && level === "normal" ? "silent" : level;
 
-        return await this.session.callPhone("notify.send", {
+        const ttsSpeak = Boolean(params.ttsSpeak);
+        const repeatCount =
+          typeof params.repeat === "number" && Number.isFinite(params.repeat)
+            ? Math.max(1, Math.min(20, Math.round(params.repeat)))
+            : 1;
+        let neuralTts: Awaited<ReturnType<typeof this.synthesizeNeuralTts>> = null;
+        if (ttsSpeak) {
+          const speakContent = [title, body].filter(Boolean).join("。");
+          neuralTts = await this.synthesizeNeuralTts(speakContent, {
+            voice: params.voice ? String(params.voice) : undefined,
+          });
+        }
+
+        const res = await this.session.callPhone<any>("notify.send", {
           title,
           body,
           level: effectivePhoneLevel,
-          ttsSpeak: Boolean(params.ttsSpeak),
+          ttsSpeak,
+          audioBase64: neuralTts?.audioBase64,
+          voiceId: neuralTts?.voiceId,
+          repeatCount,
         });
+        return {
+          ...res,
+          ...(neuralTts
+            ? {
+                ttsEngine: "edge_neural",
+                voiceId: neuralTts.voiceId,
+                voiceLabel: neuralTts.voiceLabel,
+                cached: neuralTts.cached,
+              }
+            : {}),
+        };
       }
 
       // Tool 9: phone_request_approval (Blocking Human-in-the-Loop Remote Approval)
@@ -2145,14 +2365,85 @@ export class OmsDaemon {
           }
         }
 
+        if (subAction === "tts_voices" || subAction === "voices") {
+          if (typeof params.voice === "string" && params.voice.trim()) {
+            const resolved = this.resolveNeuralTtsVoice(params.voice);
+            this.updateHostPreferences({ preferredTtsVoice: resolved.alias });
+          }
+          const current = this.resolveNeuralTtsVoice(this.config.preferredTtsVoice);
+          return {
+            ok: true,
+            currentVoice: current,
+            voices: Object.entries(NEURAL_TTS_VOICE_CATALOG).map(([alias, v]) => ({
+              alias,
+              voiceId: v.id,
+              label: v.label,
+              active: alias === current.alias,
+            })),
+          };
+        }
+
+        let enrichedParams: Record<string, any> = params;
+        let neuralTtsMeta: Awaited<ReturnType<typeof this.synthesizeNeuralTts>> = null;
+        if (subAction === "find_phone" || subAction === "tts_speak") {
+          if (params.saveVoice && typeof params.voice === "string" && params.voice.trim()) {
+            const resolved = this.resolveNeuralTtsVoice(params.voice);
+            this.updateHostPreferences({ preferredTtsVoice: resolved.alias });
+          }
+          const speakText =
+            subAction === "find_phone"
+              ? String(params.text || "正在寻找手机，我在这里！请查看青简咫尺。").trim()
+              : String(params.text || "").trim();
+          const defaultRepeat = subAction === "find_phone" ? 2 : 1;
+          const repeatCount =
+            typeof params.repeat === "number" && Number.isFinite(params.repeat)
+              ? Math.max(1, Math.min(20, Math.round(params.repeat)))
+              : typeof params.repeatCount === "number" && Number.isFinite(params.repeatCount)
+                ? Math.max(1, Math.min(20, Math.round(params.repeatCount)))
+                : defaultRepeat;
+
+          if (speakText) {
+            neuralTtsMeta = await this.synthesizeNeuralTts(speakText, {
+              voice: params.voice ? String(params.voice) : undefined,
+            });
+          }
+          enrichedParams = {
+            ...params,
+            text: speakText,
+            repeatCount,
+            ...(neuralTtsMeta
+              ? {
+                  audioBase64: neuralTtsMeta.audioBase64,
+                  voiceId: neuralTtsMeta.voiceId,
+                  voiceLabel: neuralTtsMeta.voiceLabel,
+                }
+              : {}),
+          };
+        }
+
         try {
-          const res = await this.session.callPhone<any>("sys.control",
-            subAction === "system_action" ? { ...params, deadlineMs: Date.now() + 60000 } : params,
-            subAction === "system_action" ? 65000 : 15000);
+          const res = await this.session.callPhone<any>(
+            "sys.control",
+            subAction === "system_action"
+              ? { ...enrichedParams, deadlineMs: Date.now() + 60000 }
+              : enrichedParams,
+            subAction === "system_action" ? 65000 : 15000
+          );
           if (res?.status) {
             this.session.setPhoneStatus(res.status);
           } else {
             void this.refreshPhoneStatusLive(true);
+          }
+          if (neuralTtsMeta && res && typeof res === "object") {
+            return {
+              ...res,
+              ttsEngine: "edge_neural",
+              voiceId: neuralTtsMeta.voiceId,
+              voiceLabel: neuralTtsMeta.voiceLabel,
+              cached: neuralTtsMeta.cached,
+              audioBytes: neuralTtsMeta.bytes,
+              repeatCount: enrichedParams.repeatCount,
+            };
           }
           return res;
         } catch (err: any) {
@@ -2162,23 +2453,27 @@ export class OmsDaemon {
           }
           // Backward compatibility fallback for APK < v1.3.3
           if (subAction === "find_phone") {
-            const text = String(params.text || "正在寻找手机，我在这里！");
+            const text = String(enrichedParams.text || "正在寻找手机，我在这里！");
             return await this.session.callPhone("notify.send", {
               title: "🔔 Mac 正在寻找此手机",
               body: text,
               level: "urgent",
               ttsSpeak: true,
               forceSpeakerAlarmStream: true,
+              audioBase64: neuralTtsMeta?.audioBase64,
+              repeatCount: enrichedParams.repeatCount,
             });
           }
           if (subAction === "tts_speak") {
-            const text = String(params.text || "");
+            const text = String(enrichedParams.text || "");
             return await this.session.callPhone("notify.send", {
               title: "🗣️ 语音播报",
               body: text,
               level: "silent",
               ttsSpeak: true,
               forceSpeakerAlarmStream: Boolean(params.useAlarmStream),
+              audioBase64: neuralTtsMeta?.audioBase64,
+              repeatCount: enrichedParams.repeatCount,
             });
           }
           if (subAction === "open_url") {
