@@ -109,7 +109,7 @@ export function establishSecureSession(
 
 function validateInner(frame: Buffer): void {
   if (frame.length < 8 || frame.length > SECURE_MAX_INNER_BYTES || frame[0] !== 0x4f || frame[1] !== 1 ||
-    frame[2] < 1 || frame[2] > 6 || frame[3] !== 0 || frame.readUInt32BE(4) !== frame.length - 8) {
+    frame[2] < 1 || frame[2] > 7 || frame[3] !== 0 || frame.readUInt32BE(4) !== frame.length - 8) {
     throw new Error("Invalid encrypted business frame");
   }
 }

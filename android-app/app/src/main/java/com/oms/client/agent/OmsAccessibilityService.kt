@@ -60,6 +60,9 @@ class OmsAccessibilityService : AccessibilityService() {
     var currentActivityName: String = ""
         private set
 
+    @Volatile
+    var onMirrorUiEvent: (() -> Unit)? = null
+
     private val guiMutex = Mutex()
     private val windowTracker = GuiWindowTracker()
     private lateinit var guard: GuiSessionGuard
@@ -127,11 +130,14 @@ class OmsAccessibilityService : AccessibilityService() {
             return
         }
         if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+            onMirrorUiEvent?.invoke()
             if (windowTracker.windowsChanged(applicationWindows(collectApplicationRoots()))) {
                 guard.invalidate("application windows changed")
             }
         } else if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-            event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+            event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            onMirrorUiEvent?.invoke()
             if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
                 event.windowId in applicationWindows(collectApplicationRoots())) {
                 event.packageName?.toString()?.let { currentPackageName = it }
@@ -140,7 +146,9 @@ class OmsAccessibilityService : AccessibilityService() {
                 }?.let { currentActivityName = it }
             }
             if (!windowTracker.belongsToApplication(event.windowId, event.packageName?.toString())) return
-            guard.invalidate("event=${event.eventType}, window=${event.windowId}, package=${event.packageName}, class=${event.className}")
+            if (event.eventType != AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+                guard.invalidate("event=${event.eventType}, window=${event.windowId}, package=${event.packageName}, class=${event.className}")
+            }
         }
     }
 
@@ -1022,6 +1030,178 @@ class OmsAccessibilityService : AccessibilityService() {
                 put("hungUp", hungUp)
             }
         }
+
+    private fun findFocusedEditableNode(): AccessibilityNodeInfo? {
+        val activeFocus = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        if (activeFocus != null && activeFocus.isEditable) return activeFocus
+
+        val roots = collectAllWindowRoots()
+        for (r in roots) {
+            val f = r.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            if (f != null && f.isEditable) return f
+        }
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        roots.forEach { queue.addLast(it) }
+        var firstEditable: AccessibilityNodeInfo? = null
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            if (n.isEditable && n.isVisibleToUser) {
+                if (n.isFocused) return n
+                if (firstEditable == null) firstEditable = n
+            }
+            for (i in 0 until n.childCount) {
+                n.getChild(i)?.let { queue.addLast(it) }
+            }
+        }
+        return firstEditable
+    }
+
+    /**
+     * Direct, low-latency human input injection for Mac Live Screen Mirroring (L1/L2).
+     * Bypasses AI safety pill & 400ms semantic tree settle wait so mouse clicks, drags,
+     * wheel scrolls, and keyboard typing feel instantaneous (< 20ms).
+     */
+    suspend fun executeMirrorInput(
+        params: JSONObject,
+        sessionStillValid: () -> Boolean
+    ): JSONObject = withContext(Dispatchers.Main.immediate) {
+        check(sessionStillValid()) { "Session closed" }
+        val dm = resources.displayMetrics
+        val screenW = dm.widthPixels.coerceAtLeast(1)
+        val screenH = dm.heightPixels.coerceAtLeast(1)
+        val type = params.optString("type", params.optString("action", "tap")).lowercase()
+
+        fun resolveCoord(normKey: String, pxKey: String, maxDim: Int, defaultPx: Int): Int {
+            if (params.has(normKey)) {
+                val norm = params.optDouble(normKey, 0.5).coerceIn(0.0, 1.0)
+                return (norm * maxDim).toInt().coerceIn(1, maxDim - 1)
+            }
+            if (params.has(pxKey)) {
+                return params.optInt(pxKey, defaultPx).coerceIn(1, maxDim - 1)
+            }
+            return defaultPx.coerceIn(1, maxDim - 1)
+        }
+
+        var ok = false
+        when (type) {
+            "tap", "click" -> {
+                val tx = resolveCoord("normX", "x", screenW, screenW / 2)
+                val ty = resolveCoord("normY", "y", screenH, screenH / 2)
+                val dur = params.optLong("durationMs", 55L).coerceIn(30L, 250L)
+                ok = injectTapGesture(tx, ty, dur)
+            }
+            "long_press", "long_click" -> {
+                val tx = resolveCoord("normX", "x", screenW, screenW / 2)
+                val ty = resolveCoord("normY", "y", screenH, screenH / 2)
+                val dur = params.optLong("durationMs", 620L).coerceIn(400L, 2500L)
+                ok = injectTapGesture(tx, ty, dur)
+            }
+            "swipe", "drag" -> {
+                val x1 = resolveCoord("normX1", "x1", screenW, resolveCoord("normX", "x", screenW, screenW / 2))
+                val y1 = resolveCoord("normY1", "y1", screenH, resolveCoord("normY", "y", screenH, (screenH * 0.7).toInt()))
+                val x2 = resolveCoord("normX2", "x2", screenW, screenW / 2)
+                val y2 = resolveCoord("normY2", "y2", screenH, (screenH * 0.3).toInt())
+                val dur = params.optLong("durationMs", 220L).coerceIn(60L, 1500L)
+                val path = Path().apply {
+                    moveTo(x1.toFloat(), y1.toFloat())
+                    lineTo(x2.toFloat(), y2.toFloat())
+                }
+                val stroke = GestureDescription.StrokeDescription(path, 0L, dur)
+                val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                ok = dispatchAndAwait(gesture)
+            }
+            "scroll", "wheel" -> {
+                val cx = resolveCoord("normX", "x", screenW, screenW / 2)
+                val cy = resolveCoord("normY", "y", screenH, screenH / 2)
+                val dy = params.optDouble("deltaY", 120.0)
+                val dx = params.optDouble("deltaX", 0.0)
+                // Positive wheel deltaY on Mac means scrolling down content (finger swipes up on phone)
+                val spanY = (-dy * 2.4).toInt().coerceIn(-(screenH * 0.42).toInt(), (screenH * 0.42).toInt())
+                val spanX = (-dx * 2.0).toInt().coerceIn(-(screenW * 0.42).toInt(), (screenW * 0.42).toInt())
+                val endX = (cx + spanX).coerceIn(24, screenW - 24)
+                val endY = (cy + spanY).coerceIn(48, screenH - 48)
+                if (abs(endX - cx) > 8 || abs(endY - cy) > 8) {
+                    val path = Path().apply {
+                        moveTo(cx.toFloat(), cy.toFloat())
+                        lineTo(endX.toFloat(), endY.toFloat())
+                    }
+                    val stroke = GestureDescription.StrokeDescription(path, 0L, 165L)
+                    val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                    ok = dispatchAndAwait(gesture)
+                }
+            }
+            "text", "input_text" -> {
+                val text = params.optString("text", "")
+                val append = params.optBoolean("append", false)
+                val submit = params.optBoolean("submit", false)
+                val node = findFocusedEditableNode()
+                if (node != null) {
+                    val existing = if (append && !node.isShowingHintText) {
+                        node.text?.toString() ?: ""
+                    } else {
+                        ""
+                    }
+                    val finalStr = existing + text
+                    val args = Bundle().apply {
+                        putCharSequence(
+                            AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                            finalStr
+                        )
+                    }
+                    ok = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                    if (submit && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                        node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                    }
+                }
+            }
+            "backspace" -> {
+                val node = findFocusedEditableNode()
+                if (node != null && !node.isShowingHintText) {
+                    val cur = node.text?.toString() ?: ""
+                    if (cur.isNotEmpty()) {
+                        val next = cur.dropLast(1)
+                        val args = Bundle().apply {
+                            putCharSequence(
+                                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                                next
+                            )
+                        }
+                        ok = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                    }
+                }
+            }
+            "enter" -> {
+                val node = findFocusedEditableNode()
+                if (node != null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                    ok = node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                }
+            }
+            "key", "nav" -> {
+                val key = params.optString("key", params.optString("target", "home")).lowercase()
+                ok = when (key) {
+                    "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
+                    "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
+                    "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
+                    "notifications" -> performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+                    "quick_settings" -> performGlobalAction(GLOBAL_ACTION_QUICK_SETTINGS)
+                    "lock", "lock_screen" -> performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
+                    "wake" -> {
+                        AppLauncherHelper.wakeScreenIfNeeded(this@OmsAccessibilityService)
+                        true
+                    }
+                    else -> false
+                }
+            }
+        }
+
+        onMirrorUiEvent?.invoke()
+        JSONObject().apply {
+            put("ok", ok)
+            put("type", type)
+            put("screenWidth", screenW)
+            put("screenHeight", screenH)
+        }
+    }
 
     private suspend fun injectTapGesture(x: Int, y: Int, durationMs: Long): Boolean {
         val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }

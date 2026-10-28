@@ -1,15 +1,18 @@
 import {
+  DecodedScreenFrame,
   FramePriority,
   FrameType,
   JsonRpcMessage,
   OMS_MAGIC_BYTE,
   OMS_PROTOCOL_VERSION,
+  ScreenFrameHeader,
   StreamAckResumeHeader,
   StreamStartHeader,
 } from "./types.js";
 
 export const FRAME_HEADER_BYTES = 8;
 export const STREAM_CHUNK_PREFIX_BYTES = 20; // 16B UUID + 4B uint32 chunkIndex
+export const SCREEN_FRAME_HEADER_BYTES = 16; // [1B codec][1B flags][2B width][2B height][2B seq][8B timestampMs]
 
 export interface DecodedFrame {
   version: number;
@@ -139,6 +142,51 @@ export function encodePongFrame(
 }
 
 /**
+ * Pack a real-time screen mirror frame (FrameType.SCREEN_FRAME = 0x07):
+ * [1B codec][1B flags][2B width][2B height][2B seq][8B timestampMs][raw_image_bytes]
+ */
+export function encodeScreenFrame(
+  header: ScreenFrameHeader,
+  imageData: Uint8Array = new Uint8Array(0)
+): Uint8Array {
+  const payload = new Uint8Array(SCREEN_FRAME_HEADER_BYTES + imageData.byteLength);
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  view.setUint8(0, header.codec & 0xff);
+  view.setUint8(1, header.flags & 0xff);
+  view.setUint16(2, header.width & 0xffff, false);
+  view.setUint16(4, header.height & 0xffff, false);
+  view.setUint16(6, header.seq & 0xffff, false);
+  view.setBigUint64(8, BigInt(Math.max(0, Math.floor(header.timestampMs))), false);
+  if (imageData.byteLength > 0) {
+    payload.set(imageData, SCREEN_FRAME_HEADER_BYTES);
+  }
+  return encodeFrame(FrameType.SCREEN_FRAME, payload);
+}
+
+export function decodeScreenFramePayload(payload: Uint8Array): DecodedScreenFrame {
+  if (payload.byteLength < SCREEN_FRAME_HEADER_BYTES) {
+    throw new Error(`SCREEN_FRAME payload too short: ${payload.byteLength}`);
+  }
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const codec = view.getUint8(0);
+  const flags = view.getUint8(1);
+  const width = view.getUint16(2, false);
+  const height = view.getUint16(4, false);
+  const seq = view.getUint16(6, false);
+  const timestampMs = Number(view.getBigUint64(8, false));
+  const data = payload.subarray(SCREEN_FRAME_HEADER_BYTES);
+  return {
+    codec,
+    flags,
+    width,
+    height,
+    seq,
+    timestampMs,
+    data,
+  };
+}
+
+/**
  * Stateful streaming decoder for byte-oriented channels (Bluetooth RFCOMM / TCP)
  * as well as frame-oriented channels (WebSocket / WebRTC DataChannel).
  */
@@ -237,7 +285,18 @@ export class PriorityFrameQueue {
 
   public enqueue(rawFrame: Uint8Array, frameType: FrameType): void {
     const priority = PriorityFrameQueue.priorityForType(frameType);
-    this.queues.get(priority)!.push(rawFrame);
+    const q = this.queues.get(priority)!;
+    // Latest-Frame-Wins for real-time SCREEN_FRAME: drop any queued stale SCREEN_FRAME
+    if (frameType === FrameType.SCREEN_FRAME) {
+      const existingIdx = q.findIndex(
+        (f) => f.byteLength >= FRAME_HEADER_BYTES && f[2] === FrameType.SCREEN_FRAME
+      );
+      if (existingIdx !== -1) {
+        q[existingIdx] = rawFrame;
+        return;
+      }
+    }
+    q.push(rawFrame);
   }
 
   public dequeue(): Uint8Array | undefined {

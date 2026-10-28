@@ -16,7 +16,56 @@ export enum FrameType {
   STREAM_ACK_RESUME = 0x04,
   PING = 0x05,
   PONG = 0x06,
+  SCREEN_FRAME = 0x07,
   SECURE_RECORD = 0x7e,
+}
+
+export enum ScreenFrameCodec {
+  STATUS_ONLY = 0x00,
+  WEBP = 0x01,
+  JPEG = 0x02,
+  H264_ANNEXB = 0x10,
+}
+
+export enum ScreenFrameFlags {
+  NONE = 0x00,
+  IS_SECURE_WINDOW = 0x01,
+  IS_SCREEN_OFF = 0x02,
+  IS_SCREEN_LOCKED = 0x04,
+  IS_KEY_FRAME = 0x08,
+}
+
+export interface ScreenFrameHeader {
+  codec: ScreenFrameCodec | number;
+  flags: number;
+  width: number; // physical phone screen width in px
+  height: number; // physical phone screen height in px
+  seq: number; // uint16 wrapping sequence number
+  timestampMs: number;
+}
+
+export interface DecodedScreenFrame extends ScreenFrameHeader {
+  data: Uint8Array;
+}
+
+export interface MirrorStatusSnapshot {
+  running: boolean;
+  mode: "native_stream" | "legacy_poll" | "stopped";
+  codec: string;
+  fps: number;
+  seq: number;
+  width: number;
+  height: number;
+  isSecureWindow: boolean;
+  isScreenOff: boolean;
+  isScreenLocked: boolean;
+  foregroundPackage?: string;
+  foregroundAppLabel?: string;
+  lastFrameAtMs: number;
+  clientCount: number;
+  maxWidth: number;
+  quality: number;
+  maxFps: number;
 }
 
 export enum FramePriority {
@@ -204,7 +253,53 @@ export interface PhoneDeviceStatus {
   uptimeMinutes?: number;
   pendingOutboxCount?: number;
   updatedAtMs?: number;
+  airpodsAutoSwitchEnabled?: boolean;
+  airpodsConnected?: boolean;
+  airpodsName?: string;
+  airpodsMac?: string;
+  pairedAirpods?: Array<{ name: string; mac: string; connected: boolean }>;
+  mediaPlaying?: boolean;
+  audioModeInCall?: boolean;
   permissions: PhonePermissionStatus;
+}
+
+export interface PairedAirPodsDevice {
+  name: string;
+  mac: string;
+  connected: boolean;
+}
+
+export interface AirPodsStatusSnapshot {
+  autoSwitchEnabled: boolean;
+  pauseOtherOnSwitch: boolean;
+  preferredAirpodsMac?: string;
+  activeOwner: "MAC" | "PHONE" | "NONE";
+  activeDeviceName?: string;
+  activeDeviceMac?: string;
+  mac: {
+    connected: boolean;
+    isDefaultOutput: boolean;
+    audioRunning: boolean;
+    defaultOutputName?: string;
+    deviceName?: string;
+    deviceMac?: string;
+    pairedAirpods: PairedAirPodsDevice[];
+  };
+  phone: {
+    connected: boolean;
+    mediaPlaying: boolean;
+    inCall: boolean;
+    deviceName?: string;
+    deviceMac?: string;
+    pairedAirpods: PairedAirPodsDevice[];
+  };
+  lastSwitchEvent?: {
+    direction: "MAC_TO_PHONE" | "PHONE_TO_MAC";
+    reason: string;
+    deviceName?: string;
+    deviceMac?: string;
+    atMs: number;
+  };
 }
 
 export interface MediaItemMeta {

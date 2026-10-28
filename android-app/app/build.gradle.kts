@@ -11,8 +11,8 @@ android {
         applicationId = "com.oms.client"
         minSdk = 30
         targetSdk = 34
-        versionCode = 23
-        versionName = "1.4.9"
+        versionCode = 26
+        versionName = "1.5.2"
     }
 
     buildTypes {
@@ -60,4 +60,5 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.2.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("org.lsposed.hiddenapibypass:hiddenapibypass:4.3")
 }

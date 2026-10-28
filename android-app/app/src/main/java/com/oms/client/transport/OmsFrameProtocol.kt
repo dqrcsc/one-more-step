@@ -31,6 +31,18 @@ object OmsFrameProtocol {
     const val TYPE_STREAM_ACK_RESUME: Int = 0x04
     const val TYPE_PING: Int = 0x05
     const val TYPE_PONG: Int = 0x06
+    const val TYPE_SCREEN_FRAME: Int = 0x07
+
+    const val SCREEN_FRAME_HEADER_BYTES = 16
+    const val CODEC_STATUS_ONLY: Int = 0x00
+    const val CODEC_WEBP: Int = 0x01
+    const val CODEC_JPEG: Int = 0x02
+
+    const val SCREEN_FLAG_NONE: Int = 0x00
+    const val SCREEN_FLAG_SECURE_WINDOW: Int = 0x01
+    const val SCREEN_FLAG_SCREEN_OFF: Int = 0x02
+    const val SCREEN_FLAG_SCREEN_LOCKED: Int = 0x04
+    const val SCREEN_FLAG_KEY_FRAME: Int = 0x08
 
     private val secureRandom = SecureRandom()
 
@@ -117,6 +129,33 @@ object OmsFrameProtocol {
         payload.put(batteryPct.coerceIn(0, 100).toByte())
         payload.put(if (isCharging) 1.toByte() else 0.toByte())
         return encodeFrame(TYPE_PONG, payload.array())
+    }
+
+    /**
+     * Encode real-time screen mirror frame (FrameType 0x07):
+     * [1B codec][1B flags][2B width][2B height][2B seq][8B timestampMs][raw_image_bytes]
+     */
+    fun encodeScreenFrame(
+        codec: Int,
+        flags: Int,
+        width: Int,
+        height: Int,
+        seq: Int,
+        timestampMs: Long,
+        imageBytes: ByteArray = ByteArray(0)
+    ): ByteArray {
+        val payload = ByteBuffer.allocate(SCREEN_FRAME_HEADER_BYTES + imageBytes.size)
+            .order(ByteOrder.BIG_ENDIAN)
+        payload.put((codec and 0xFF).toByte())
+        payload.put((flags and 0xFF).toByte())
+        payload.putShort((width and 0xFFFF).toShort())
+        payload.putShort((height and 0xFFFF).toShort())
+        payload.putShort((seq and 0xFFFF).toShort())
+        payload.putLong(timestampMs)
+        if (imageBytes.isNotEmpty()) {
+            payload.put(imageBytes)
+        }
+        return encodeFrame(TYPE_SCREEN_FRAME, payload.array())
     }
 
     fun sha256Hex(data: ByteArray): String {

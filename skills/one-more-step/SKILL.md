@@ -194,6 +194,18 @@ oms hangup
 oms phone home
 oms phone back
 oms phone lock
+
+# 10. AirPods 跨 Mac ⇄ 安卓手机蓝牙无缝抢占切换与对端自动暂停
+oms airpods status
+oms airpods mac
+oms airpods phone
+oms airpods auto on
+oms airpods pause on
+
+# 11. 实时低延迟手机屏幕镜像与远程触控投屏（自动打开 http://127.0.0.1:19527/mirror）
+oms mirror
+oms mirror start --fps 10 --quality 68 --width 720
+oms mirror stop
 ```
 
 `oms status` 返回的 `phoneStatus` 包含丰富遥测字段：

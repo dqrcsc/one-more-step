@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { spawn, ChildProcess } from "node:child_process";
+import { PairedAirPodsDevice } from "@oms/shared-protocol";
 
 export interface BluetoothBridgeOptions {
   socketPath: string;
@@ -13,8 +14,28 @@ export interface BluetoothBridgeOptions {
   binaryPath?: string;
 }
 
+export interface MacBridgeAirPodsStatus {
+  connected: boolean;
+  isDefaultOutput: boolean;
+  macAudioRunning: boolean;
+  defaultOutputName?: string;
+  deviceName?: string;
+  deviceMac?: string;
+  pairedAirpods: PairedAirPodsDevice[];
+}
+
+export interface MacBridgeAirPodsConfig {
+  autoSwitch: boolean;
+  pauseOtherOnSwitch: boolean;
+  preferredMac?: string;
+  phoneAirpodsConnected: boolean;
+  phoneAirpodsMac?: string;
+  phoneAirpodsName?: string;
+  phoneInCall: boolean;
+}
+
 /**
- * Module 02: TypeScript IPC Server for macOS Native Swift CoreBluetooth Bridge (`oms-bt-bridge`)
+ * Module 02: TypeScript IPC Server for macOS Native Swift CoreBluetooth & AirPods Bridge (`oms-bt-bridge`)
  */
 export class BluetoothBridgeServer extends EventEmitter {
   private server: net.Server | null = null;
@@ -22,6 +43,25 @@ export class BluetoothBridgeServer extends EventEmitter {
   private childProc: ChildProcess | null = null;
   private connectedCentralId: string | null = null;
   private readonly opts: BluetoothBridgeOptions;
+  private latestAirpodsStatus: MacBridgeAirPodsStatus = {
+    connected: false,
+    isDefaultOutput: false,
+    macAudioRunning: false,
+    pairedAirpods: [],
+  };
+  private latestAirpodsConfig: MacBridgeAirPodsConfig = {
+    autoSwitch: true,
+    pauseOtherOnSwitch: true,
+    phoneAirpodsConnected: false,
+    phoneInCall: false,
+  };
+  private pendingCmdWaiters = new Map<
+    string,
+    {
+      resolve: (res: Record<string, any>) => void;
+      timer: Timer;
+    }
+  >();
 
   constructor(opts: BluetoothBridgeOptions) {
     super();
@@ -45,7 +85,7 @@ export class BluetoothBridgeServer extends EventEmitter {
         let buffer = "";
         socket.setEncoding("utf8");
 
-        // Immediately send latest Mac LAN info
+        // Immediately send latest Mac LAN info & AirPods config
         this.sendToBridge({
           type: "update_mac_info",
           payload: JSON.stringify({
@@ -54,6 +94,7 @@ export class BluetoothBridgeServer extends EventEmitter {
             lanPort: this.opts.lanPort,
           }),
         });
+        this.pushAirpodsConfigToBridge();
 
         socket.on("data", (chunk: string) => {
           buffer += chunk;
@@ -99,6 +140,86 @@ export class BluetoothBridgeServer extends EventEmitter {
 
   public get isPhoneConnectedOverBt(): boolean {
     return this.activeClient !== null && this.connectedCentralId !== null;
+  }
+
+  public getAirpodsStatus(): MacBridgeAirPodsStatus {
+    return this.latestAirpodsStatus;
+  }
+
+  public updateAirpodsConfig(partial: Partial<MacBridgeAirPodsConfig>): void {
+    this.latestAirpodsConfig = {
+      ...this.latestAirpodsConfig,
+      ...partial,
+    };
+    this.pushAirpodsConfigToBridge();
+  }
+
+  private pushAirpodsConfigToBridge(): void {
+    this.sendToBridge({
+      type: "airpods_config",
+      autoSwitch: this.latestAirpodsConfig.autoSwitch,
+      pauseOtherOnSwitch: this.latestAirpodsConfig.pauseOtherOnSwitch,
+      preferredMac: this.latestAirpodsConfig.preferredMac || "",
+      phoneAirpodsConnected: this.latestAirpodsConfig.phoneAirpodsConnected,
+      phoneAirpodsMac: this.latestAirpodsConfig.phoneAirpodsMac || "",
+      phoneAirpodsName: this.latestAirpodsConfig.phoneAirpodsName || "",
+      phoneInCall: this.latestAirpodsConfig.phoneInCall,
+    });
+  }
+
+  public async connectAirpodsToMac(targetMac?: string, timeoutMs = 6500): Promise<Record<string, any>> {
+    if (!this.activeClient) {
+      return { ok: false, message: "oms-bt-bridge 未连接" };
+    }
+    const reqId = `ap_conn_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    return await new Promise<Record<string, any>>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingCmdWaiters.delete(reqId);
+        resolve({ ok: false, message: "连接 AirPods 等待超时" });
+      }, timeoutMs);
+      this.pendingCmdWaiters.set(reqId, { resolve, timer });
+      this.sendToBridge({
+        type: "airpods_connect_mac",
+        reqId,
+        targetMac: targetMac || undefined,
+      });
+    });
+  }
+
+  public async releaseAirpodsFromMac(opts?: {
+    pauseMedia?: boolean;
+    targetMac?: string;
+    timeoutMs?: number;
+  }): Promise<Record<string, any>> {
+    if (!this.activeClient) {
+      return { ok: false, message: "oms-bt-bridge 未连接" };
+    }
+    const reqId = `ap_rel_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const timeoutMs = opts?.timeoutMs ?? 3000;
+    return await new Promise<Record<string, any>>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingCmdWaiters.delete(reqId);
+        resolve({ ok: true, message: "已下发释放指令" });
+      }, timeoutMs);
+      this.pendingCmdWaiters.set(reqId, { resolve, timer });
+      this.sendToBridge({
+        type: "airpods_release_mac",
+        reqId,
+        pauseMedia: opts?.pauseMedia !== false,
+        targetMac: opts?.targetMac || undefined,
+      });
+    });
+  }
+
+  public suppressAirpodsAutoGrab(durationMs = 2500): void {
+    this.sendToBridge({
+      type: "airpods_suppress_grab",
+      durationMs,
+    });
+  }
+
+  public requestAirpodsStatusRefresh(): void {
+    this.sendToBridge({ type: "airpods_get_status" });
   }
 
   public sendFrameOverBluetooth(rawFrame: Uint8Array): boolean {
@@ -159,10 +280,51 @@ export class BluetoothBridgeServer extends EventEmitter {
           this.emit("frame", bytes);
         }
         break;
+      case "airpods_status": {
+        const pairedRaw = Array.isArray(msg.pairedAirpods) ? msg.pairedAirpods : [];
+        const pairedAirpods: PairedAirPodsDevice[] = pairedRaw.map((item: any) => ({
+          name: String(item?.name || "AirPods"),
+          mac: String(item?.mac || ""),
+          connected: Boolean(item?.connected),
+        }));
+        this.latestAirpodsStatus = {
+          connected: Boolean(msg.connected),
+          isDefaultOutput: Boolean(msg.isDefaultOutput),
+          macAudioRunning: Boolean(msg.macAudioRunning),
+          defaultOutputName: msg.defaultOutputName ? String(msg.defaultOutputName) : undefined,
+          deviceName: msg.deviceName ? String(msg.deviceName) : undefined,
+          deviceMac: msg.deviceMac ? String(msg.deviceMac) : undefined,
+          pairedAirpods,
+        };
+        this.emit("airpodsStatus", this.latestAirpodsStatus);
+        break;
+      }
+      case "airpods_mac_claim_triggered":
+        this.emit("airpodsMacClaimTriggered", {
+          targetMac: msg.targetMac ? String(msg.targetMac) : undefined,
+          targetName: msg.targetName ? String(msg.targetName) : undefined,
+          reason: String(msg.reason || "mac_audio_started"),
+        });
+        break;
+      case "airpods_cmd_result": {
+        const reqId = String(msg.reqId || "");
+        const waiter = this.pendingCmdWaiters.get(reqId);
+        if (waiter) {
+          clearTimeout(waiter.timer);
+          this.pendingCmdWaiters.delete(reqId);
+          waiter.resolve(msg);
+        }
+        break;
+      }
     }
   }
 
   public async stop(): Promise<void> {
+    for (const [, w] of this.pendingCmdWaiters) {
+      clearTimeout(w.timer);
+      w.resolve({ ok: false, message: "stopped" });
+    }
+    this.pendingCmdWaiters.clear();
     if (this.childProc) {
       this.childProc.kill();
       this.childProc = null;

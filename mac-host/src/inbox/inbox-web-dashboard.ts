@@ -33,6 +33,7 @@ export async function handleDashboardHttpRequest(
   const isDashboardRoute =
     url.pathname === "/inbox" ||
     url.pathname === "/dashboard" ||
+    url.pathname === "/mirror" ||
     url.pathname.startsWith("/api/inbox");
 
   const requestHost = req.headers.get("host");
@@ -70,6 +71,41 @@ export async function handleDashboardHttpRequest(
     });
   }
 
+  if (url.pathname === "/mirror") {
+    return new Response(renderMirrorStandaloneHtml(), {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+      },
+    });
+  }
+
+  if (url.pathname === "/api/inbox/mirror/frame" && req.method === "GET") {
+    const latest = daemon.session.getLatestScreenFrame();
+    if (!latest || latest.decoded.data.byteLength === 0) {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Cache-Control": "no-store",
+          "X-Oms-Flags": String(latest?.decoded.flags ?? 0),
+          "X-Oms-Seq": String(latest?.decoded.seq ?? 0),
+        },
+      });
+    }
+    const mime = latest.decoded.codec === 2 ? "image/jpeg" : "image/webp";
+    return new Response(Buffer.from(latest.decoded.data), {
+      headers: {
+        "Content-Type": mime,
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "X-Oms-Seq": String(latest.decoded.seq),
+        "X-Oms-Width": String(latest.decoded.width),
+        "X-Oms-Height": String(latest.decoded.height),
+        "X-Oms-Flags": String(latest.decoded.flags),
+        "X-Oms-Timestamp": String(latest.decoded.timestampMs),
+      },
+    });
+  }
+
   if (url.pathname === "/api/inbox" && req.method === "GET") {
     const tag = (url.searchParams.get("tag") || "all") as "all" | IntentTag;
     const onlyUnprocessed = url.searchParams.get("unprocessed") === "1";
@@ -84,6 +120,7 @@ export async function handleDashboardHttpRequest(
     });
     const status = await daemon.handleIpcAction("phone_presence_status", {});
     const hostPrefs = daemon.getHostPreferences();
+    const mirror = daemon.getMirrorStatus();
 
     return new Response(
       JSON.stringify({
@@ -91,6 +128,7 @@ export async function handleDashboardHttpRequest(
         items,
         status,
         preferences: hostPrefs,
+        mirror,
       }),
       {
         headers: {
@@ -187,8 +225,25 @@ export async function handleDashboardHttpRequest(
             autoCopyTextToClipboard: body.autoCopyTextToClipboard,
             autoPreviewImageOnMac: body.autoPreviewImageOnMac,
             autoSyncOtpToMac: body.autoSyncOtpToMac,
+            autoSwitchAirpods: body.autoSwitchAirpods,
+            pauseOtherOnAirpodsSwitch: body.pauseOtherOnAirpodsSwitch,
+            preferredAirpodsMac: body.preferredAirpodsMac,
           });
           return Response.json({ ok: true, preferences: updated });
+        }
+        case "airpods_switch_mac": {
+          const res = await daemon.switchAirpodsToMac(
+            body.targetMac ? String(body.targetMac) : undefined,
+            "web_dashboard"
+          );
+          return Response.json({ ok: res.ok, result: res });
+        }
+        case "airpods_switch_phone": {
+          const res = await daemon.switchAirpodsToPhone(
+            body.targetMac ? String(body.targetMac) : undefined,
+            "web_dashboard"
+          );
+          return Response.json({ ok: res.ok, result: res });
         }
         case "push_to_phone": {
           const text = String(body.text || "").trim();
@@ -244,6 +299,21 @@ export async function handleDashboardHttpRequest(
         case "ota_update": {
           const res = await daemon.handleIpcAction("phone_ota_update", {});
           return Response.json({ ok: true, result: res });
+        }
+        case "mirror_start": {
+          const status = await daemon.startMirror(body.params || body);
+          return Response.json({ ok: true, status });
+        }
+        case "mirror_stop": {
+          const status = await daemon.stopMirror();
+          return Response.json({ ok: true, status });
+        }
+        case "mirror_status": {
+          return Response.json({ ok: true, status: daemon.getMirrorStatus() });
+        }
+        case "mirror_input": {
+          const result = await daemon.sendMirrorInput(body.params || body);
+          return Response.json({ ok: true, result });
         }
         default:
           return Response.json(
@@ -644,6 +714,10 @@ function renderDashboardHtml(): string {
         <input type="checkbox" id="chkAutoPreview" onchange="savePrefs()"/>
         🖼️ 收到图片自动弹窗预览
       </label>
+      <label class="toggle-label" title="识别到 Mac 或小米手机开始输出音频时，自动把已配对的 AirPods 切换到发声设备并暂停对端播放">
+        <input type="checkbox" id="chkAutoAirpods" onchange="savePrefs()"/>
+        🎧 AirPods 自动切换 & 暂停对端
+      </label>
       <a class="btn btn-secondary" href="/install">📲 无线安装/配对页</a>
     </div>
   </div>
@@ -654,12 +728,19 @@ function renderDashboardHtml(): string {
         📱 小米手机实时状态与远程操控台
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;">
+        <button class="btn" style="background:#0EA5E9;" onclick="switchAirpodsToMac()">💻 耳机切到 Mac</button>
+        <button class="btn" style="background:#14B8A6;" onclick="switchAirpodsToPhone()">📱 耳机切到手机</button>
+        <button class="btn" style="background:#7C3AED;" onclick="toggleInlineMirror()" id="btnToggleMirror">📺 开启实时同屏</button>
+        <button class="btn btn-secondary" onclick="openStandaloneMirror()">🗗 独立同屏小窗 (/mirror)</button>
         <button class="btn btn-secondary" onclick="ctrlPhone({action:'refresh'})">🔄 刷新实时状态</button>
         <button class="btn" onclick="takePhoneScreenshot()">📸 立即截屏回传 Mac</button>
         <button class="btn btn-secondary" onclick="pullPhoneClip()">📥 读手机剪贴板</button>
         <button class="btn btn-secondary" onclick="findPhone()">🔔 响铃找手机</button>
         <button class="btn btn-green" onclick="triggerOta()">📲 推送APK升级</button>
       </div>
+    </div>
+    <div id="inlineMirrorDrawer" style="display:none;margin-bottom:12px;border:1px solid #334155;border-radius:12px;overflow:hidden;background:#090D16;">
+      <iframe id="inlineMirrorFrame" src="about:blank" style="width:100%;height:720px;border:none;display:block;"></iframe>
     </div>
     <div class="status-grid" id="deviceStatsGrid">
       <div class="stat-tile"><div class="stat-label">正在读取手机状态...</div><div class="stat-value">--</div></div>
@@ -790,13 +871,40 @@ async function savePrefs() {
   const autoSyncOtpToMac = document.getElementById('chkAutoOtp').checked;
   const autoCopyTextToClipboard = document.getElementById('chkAutoCopy').checked;
   const autoPreviewImageOnMac = document.getElementById('chkAutoPreview').checked;
+  const autoSwitchAirpods = document.getElementById('chkAutoAirpods').checked;
   await callAction({
     action: 'update_preferences',
     autoSyncOtpToMac,
     autoCopyTextToClipboard,
-    autoPreviewImageOnMac
+    autoPreviewImageOnMac,
+    autoSwitchAirpods,
+    pauseOtherOnAirpodsSwitch: autoSwitchAirpods
   });
-  showToast('✅ 已保存 Mac 自动联动设置');
+  showToast('✅ 已保存 Mac 自动联动与 AirPods 自动切换设置');
+}
+
+async function switchAirpodsToMac() {
+  showToast('🎧 正在将 AirPods 切换到 Mac 并暂停手机播放...');
+  const res = await callAction({ action: 'airpods_switch_mac' });
+  if (res.ok) {
+    showToast('✅ AirPods 已切换到 Mac！');
+  } else {
+    showToast('⚠️ 切换未成功: ' + ((res.result && res.result.message) || res.error || '请确认耳机在盒外'));
+  }
+  lastRenderSignature = '';
+  fetchInbox();
+}
+
+async function switchAirpodsToPhone() {
+  showToast('🎧 正在释放 Mac 蓝牙并将 AirPods 切换到小米手机...');
+  const res = await callAction({ action: 'airpods_switch_phone' });
+  if (res.ok) {
+    showToast('✅ AirPods 已切换到小米手机！');
+  } else {
+    showToast('⚠️ 切换提示: ' + ((res.result && res.result.phoneResult && res.result.phoneResult.error) || res.error || '已从 Mac 释放耳机'));
+  }
+  lastRenderSignature = '';
+  fetchInbox();
 }
 
 async function copyText(text, label) {
@@ -1004,13 +1112,23 @@ function renderDevicePanel(st) {
     ? ('内存可用 ' + (ps.ramAvailableMb / 1024).toFixed(1) + ' / ' + (ps.ramTotalMb / 1024).toFixed(1) + ' GB (' + ps.ramUsedPct + '%)')
     : '';
 
+  const ap = st.airpodsStatus || {};
+  const apOwnerMap = { MAC: '💻 已连 Mac', PHONE: '📱 已连手机', NONE: '⚪ 待机/在盒中' };
+  const apOwnerText = apOwnerMap[ap.activeOwner] || '⚪ 待机';
+  const apNameText = ap.activeDeviceName || 'AirPods';
+  const apSubText = [
+    ap.autoSwitchEnabled !== false ? '自动无感切换已开' : '自动切换已关',
+    ap.mac && ap.mac.audioRunning ? 'Mac发声中' : '',
+    (ap.phone && ap.phone.mediaPlaying) || ps.mediaPlaying ? '手机播放中' : ''
+  ].filter(Boolean).join(' · ');
+
   grid.innerHTML = [
     { label: '📱 设备型号与系统', value: escapeHtml(devModel + ' · ' + appVer) + '<br/><span style="font-size:11px;color:var(--muted);">' + escapeHtml([osVer, uptimeStr].filter(Boolean).join(' · ')) + '</span>' },
     { label: '🔋 电池与温度状态', value: escapeHtml(battPct + '% · ' + chargeText) + '<br/><span style="font-size:11px;color:var(--muted);">' + escapeHtml([tempText, voltText, ps.powerSaveMode ? '省电模式开启' : '全性能模式'].filter(Boolean).join(' · ')) + '</span>' },
     { label: '🖥️ 屏幕与当前前台应用', value: escapeHtml(screenState) + '<br/><span style="font-size:11px;color:#38BDF8;">前台: ' + escapeHtml(fgApp) + '</span>' },
     { label: '🌐 网络与局域网 IP', value: escapeHtml('IP: ' + ips) + '<br/><span style="font-size:11px;color:var(--muted);">' + escapeHtml([wifiInfo, ps.bluetoothEnabled !== undefined ? (ps.bluetoothEnabled ? '蓝牙已开' : '蓝牙已关') : '', 'RTT ' + (st.lastRttMs || 0) + 'ms'].filter(Boolean).join(' · ')) + '</span>' },
-    { label: '🔊 音量与响铃模式', value: escapeHtml(audioInfo) },
-    { label: '💾 存储与运行内存', value: escapeHtml(storageInfo) + (ramInfo ? ('<br/><span style="font-size:11px;color:var(--muted);">' + escapeHtml(ramInfo) + '</span>') : '') }
+    { label: '🎧 AirPods 双端连接状态', value: escapeHtml(apNameText + ' · ' + apOwnerText) + '<br/><span style="font-size:11px;color:#38BDF8;">' + escapeHtml(apSubText) + '</span>' },
+    { label: '🔊 音量与存储状态', value: escapeHtml(audioInfo) + '<br/><span style="font-size:11px;color:var(--muted);">' + escapeHtml(storageInfo) + '</span>' }
   ].map(t => '<div class="stat-tile"><div class="stat-label">' + t.label + '</div><div class="stat-value">' + t.value + '</div></div>').join('');
 
   const p = ps.permissions || {};
@@ -1070,6 +1188,7 @@ async function fetchInbox() {
       document.getElementById('chkAutoOtp').checked = data.preferences.autoSyncOtpToMac !== false;
       document.getElementById('chkAutoCopy').checked = data.preferences.autoCopyTextToClipboard !== false;
       document.getElementById('chkAutoPreview').checked = data.preferences.autoPreviewImageOnMac !== false;
+      document.getElementById('chkAutoAirpods').checked = data.preferences.autoSwitchAirpods !== false;
       window.__prefsLoaded = true;
     }
 
@@ -1151,6 +1270,640 @@ async function fetchInbox() {
 
 fetchInbox();
 setInterval(fetchInbox, 2000);
+
+function openStandaloneMirror() {
+  window.open('/mirror', 'oms_live_mirror', 'width=440,height=880,menubar=no,toolbar=no,location=no,status=no');
+}
+
+function toggleInlineMirror() {
+  const drawer = document.getElementById('inlineMirrorDrawer');
+  const frame = document.getElementById('inlineMirrorFrame');
+  const btn = document.getElementById('btnToggleMirror');
+  if (drawer.style.display === 'none') {
+    drawer.style.display = 'block';
+    frame.src = '/mirror?embed=1';
+    btn.textContent = '⏹️ 收起实时同屏';
+    btn.style.background = '#DC2626';
+  } else {
+    drawer.style.display = 'none';
+    frame.src = 'about:blank';
+    btn.textContent = '📺 开启实时同屏';
+    btn.style.background = '#7C3AED';
+    callAction({ action: 'mirror_stop' }).catch(() => {});
+  }
+}
+</script>
+</body>
+</html>`;
+}
+
+function renderMirrorStandaloneHtml(): string {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>OneMoreStep · 手机实时同屏与键鼠直控台</title>
+<style>
+  :root {
+    --bg: #070B14;
+    --panel: #111827;
+    --border: #1F2937;
+    --text: #F8FAFC;
+    --muted: #94A3B8;
+    --accent: #38BDF8;
+    --purple: #8B5CF6;
+    --green: #4ADE80;
+    --amber: #FBBF24;
+    --red: #F87171;
+  }
+  * { box-sizing: border-box; user-select: none; }
+  body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .topbar-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .pill {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: #0F172A;
+    border: 1px solid #334155;
+    color: #E2E8F0;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .select, .btn-sm, .text-in {
+    background: #0F172A;
+    color: #F8FAFC;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 5px 9px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    outline: none;
+  }
+  .btn-sm:hover { border-color: var(--accent); }
+  .btn-primary { background: #7C3AED; border-color: #8B5CF6; }
+  .btn-danger { background: #991B1B; border-color: #DC2626; }
+  .workspace {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: 10px;
+    overflow: hidden;
+    position: relative;
+  }
+  .phone-shell {
+    position: relative;
+    height: 100%;
+    max-height: calc(100vh - 118px);
+    aspect-ratio: 9 / 20;
+    background: #000;
+    border-radius: 26px;
+    border: 3px solid #334155;
+    box-shadow: 0 20px 50px rgba(0,0,0,0.75);
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas#mirrorCanvas {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+    cursor: crosshair;
+    touch-action: none;
+  }
+  canvas#fxCanvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
+  .overlay-banner {
+    position: absolute;
+    inset: 0;
+    background: rgba(7, 11, 20, 0.86);
+    backdrop-filter: blur(6px);
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    text-align: center;
+    gap: 12px;
+  }
+  .overlay-banner.show { display: flex; }
+  .side-dock {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 8px;
+  }
+  .dock-btn {
+    background: #0F172A;
+    border: 1px solid #334155;
+    color: #E2E8F0;
+    border-radius: 9px;
+    padding: 8px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: left;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  .dock-btn:hover { background: #1E293B; border-color: var(--accent); }
+  .bottombar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+  }
+  .text-in {
+    flex: 1;
+    cursor: text;
+    user-select: text;
+    padding: 7px 11px;
+  }
+  .nav-group {
+    display: flex;
+    gap: 6px;
+  }
+  .toast {
+    position: fixed;
+    bottom: 56px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(2, 132, 199, 0.95);
+    color: #fff;
+    padding: 6px 14px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    display: none;
+    z-index: 999;
+  }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="topbar-left">
+      <span class="pill" id="liveBadge">🟢 正在连接手机画面...</span>
+      <span class="pill" id="fpsBadge">⚡ -- FPS</span>
+      <span class="pill" id="resBadge">📐 -- × --</span>
+      <span class="pill" id="appBadge">📱 --</span>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center;">
+      <select class="select" id="presetSelect" onchange="onPresetChange()">
+        <option value="540,68,8">⚡ 540p 极速流畅</option>
+        <option value="640,72,8" selected>✨ 640p 高清均衡</option>
+        <option value="860,78,8">💎 860p 超清细节</option>
+      </select>
+      <button class="btn-sm btn-primary" id="btnStartStop" onclick="toggleStartStop()">⏸️ 暂停</button>
+    </div>
+  </div>
+
+  <div class="workspace">
+    <div class="phone-shell" id="phoneShell">
+      <canvas id="mirrorCanvas" width="640" height="1422" tabindex="0"></canvas>
+      <canvas id="fxCanvas" width="640" height="1422"></canvas>
+      <div class="overlay-banner" id="stateOverlay">
+        <div style="font-size:28px;" id="overlayIcon">🌙</div>
+        <div style="font-size:14px;font-weight:700;" id="overlayTitle">手机当前处于息屏状态</div>
+        <div style="font-size:12px;color:var(--muted);line-height:1.5;" id="overlaySub">点击下方按钮立即点亮屏幕并自动解锁</div>
+        <button class="btn-sm btn-primary" style="padding:9px 16px;font-size:13px;" onclick="wakeAndUnlock()">☀️ 点亮并解锁屏幕</button>
+      </div>
+    </div>
+
+    <div class="side-dock">
+      <button class="dock-btn" onclick="sendNav('back')" title="手机返回键">◀ 返回</button>
+      <button class="dock-btn" onclick="sendNav('home')" title="回到手机桌面">● 桌面</button>
+      <button class="dock-btn" onclick="sendNav('recents')" title="多任务视图">■ 多任务</button>
+      <hr style="width:100%;border:0;border-top:1px solid #1F2937;margin:2px 0;"/>
+      <button class="dock-btn" onclick="wakeAndUnlock()" title="点亮并自动绘制解锁图案">🔓 唤醒解锁</button>
+      <button class="dock-btn" onclick="sendNav('lock_screen')" title="立即锁屏">🔒 锁屏</button>
+      <button class="dock-btn" onclick="sendNav('notifications')" title="下拉通知栏">🔔 通知栏</button>
+      <button class="dock-btn" onclick="sendNav('quick_settings')" title="下拉控制中心">🎛️ 控制中心</button>
+      <hr style="width:100%;border:0;border-top:1px solid #1F2937;margin:2px 0;"/>
+      <button class="dock-btn" onclick="adjustVol('up')">🔊 音量+</button>
+      <button class="dock-btn" onclick="adjustVol('down')">🔉 音量-</button>
+      <button class="dock-btn" onclick="saveCurrentScreenshot()">📸 截屏存Inbox</button>
+    </div>
+  </div>
+
+  <div class="bottombar">
+    <div class="nav-group">
+      <button class="btn-sm" onclick="sendNav('back')">◀</button>
+      <button class="btn-sm" onclick="sendNav('home')">●</button>
+      <button class="btn-sm" onclick="sendNav('recents')">■</button>
+    </div>
+    <input class="text-in" id="mirrorTextInput" placeholder="⌨️ 在此输入中文/英文按回车，直接填入手机当前焦点输入框..." onkeydown="onTextInputKey(event)" />
+    <button class="btn-sm btn-primary" onclick="submitMirrorText(false)">填入</button>
+    <button class="btn-sm" onclick="submitMirrorText(true)">填入并回车</button>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+<script>
+const canvas = document.getElementById('mirrorCanvas');
+const ctx = canvas.getContext('2d');
+const fxCanvas = document.getElementById('fxCanvas');
+const fxCtx = fxCanvas.getContext('2d');
+const shell = document.getElementById('phoneShell');
+
+let ws = null;
+let isRunning = true;
+let phoneWidth = 1080;
+let phoneHeight = 2400;
+let clientFrameTimes = [];
+let pointerState = null;
+let lastWheelSentAt = 0;
+let ripples = [];
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  clearTimeout(window.__mirrorToast);
+  window.__mirrorToast = setTimeout(() => { t.style.display = 'none'; }, 1800);
+}
+
+function addRipple(normX, normY, normX2, normY2) {
+  ripples.push({
+    x1: normX * fxCanvas.width,
+    y1: normY * fxCanvas.height,
+    x2: normX2 !== undefined ? normX2 * fxCanvas.width : undefined,
+    y2: normY2 !== undefined ? normY2 * fxCanvas.height : undefined,
+    born: performance.now()
+  });
+  requestAnimationFrame(renderRipples);
+}
+
+function renderRipples(now) {
+  fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
+  ripples = ripples.filter(r => now - r.born < 420);
+  for (const r of ripples) {
+    const p = Math.min(1, (now - r.born) / 420);
+    const alpha = 1 - p;
+    if (r.x2 !== undefined && r.y2 !== undefined) {
+      fxCtx.strokeStyle = 'rgba(56, 189, 248, ' + (alpha * 0.85) + ')';
+      fxCtx.lineWidth = 5;
+      fxCtx.lineCap = 'round';
+      fxCtx.beginPath();
+      fxCtx.moveTo(r.x1, r.y1);
+      fxCtx.lineTo(r.x2, r.y2);
+      fxCtx.stroke();
+    }
+    fxCtx.strokeStyle = 'rgba(139, 92, 246, ' + alpha + ')';
+    fxCtx.fillStyle = 'rgba(56, 189, 248, ' + (alpha * 0.35) + ')';
+    fxCtx.lineWidth = 3;
+    fxCtx.beginPath();
+    fxCtx.arc(r.x2 ?? r.x1, r.y2 ?? r.y1, 10 + p * 22, 0, Math.PI * 2);
+    fxCtx.fill();
+    fxCtx.stroke();
+  }
+  if (ripples.length > 0) requestAnimationFrame(renderRipples);
+}
+
+function updateOverlayFlags(flags) {
+  const isSecure = Boolean(flags & 0x01);
+  const isScreenOff = Boolean(flags & 0x02);
+  const ov = document.getElementById('stateOverlay');
+  if (isSecure) {
+    ov.classList.add('show');
+    document.getElementById('overlayIcon').textContent = '🔒';
+    document.getElementById('overlayTitle').textContent = '手机当前处于安全隐私窗口';
+    document.getElementById('overlaySub').textContent = '支付、密码或受 FLAG_SECURE 保护页面已自动遮蔽，切出该页面后自动恢复实时画面';
+  } else if (isScreenOff) {
+    ov.classList.add('show');
+    document.getElementById('overlayIcon').textContent = '🌙';
+    document.getElementById('overlayTitle').textContent = '手机当前处于息屏状态';
+    document.getElementById('overlaySub').textContent = '点击下方按钮点亮屏幕（如已配置图案将自动解锁）';
+  } else {
+    ov.classList.remove('show');
+  }
+}
+
+async function handleBinaryScreenFrame(buf) {
+  if (buf.byteLength < 16) return;
+  const view = new DataView(buf);
+  const codec = view.getUint8(0);
+  const flags = view.getUint8(1);
+  const width = view.getUint16(2, false);
+  const height = view.getUint16(4, false);
+  const seq = view.getUint16(6, false);
+
+  if (width > 0 && height > 0) {
+    phoneWidth = width;
+    phoneHeight = height;
+    shell.style.aspectRatio = width + ' / ' + height;
+    document.getElementById('resBadge').textContent = '📐 ' + width + '×' + height;
+  }
+
+  updateOverlayFlags(flags);
+  if (codec === 0 || buf.byteLength <= 16) return;
+
+  const imgSlice = new Uint8Array(buf, 16);
+  const mime = codec === 2 ? 'image/jpeg' : 'image/webp';
+  try {
+    const bmp = await createImageBitmap(new Blob([imgSlice], { type: mime }));
+    if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+      canvas.width = bmp.width;
+      canvas.height = bmp.height;
+      fxCanvas.width = bmp.width;
+      fxCanvas.height = bmp.height;
+    }
+    ctx.drawImage(bmp, 0, 0);
+    bmp.close();
+
+    const now = performance.now();
+    clientFrameTimes.push(now);
+    while (clientFrameTimes.length > 0 && now - clientFrameTimes[0] > 2500) {
+      clientFrameTimes.shift();
+    }
+    const fps = clientFrameTimes.length >= 2
+      ? ((clientFrameTimes.length - 1) * 1000 / Math.max(150, now - clientFrameTimes[0])).toFixed(1)
+      : '1.0';
+    document.getElementById('fpsBadge').textContent = '⚡ ' + fps + ' FPS (#' + seq + ')';
+  } catch (e) {}
+}
+
+function applyMirrorStatus(st) {
+  if (!st) return;
+  isRunning = Boolean(st.running);
+  const badge = document.getElementById('liveBadge');
+  const btn = document.getElementById('btnStartStop');
+  if (st.running) {
+    badge.textContent = st.mode === 'native_stream' ? '🟢 实时同屏中 (原生流)' : '🟢 实时同屏中 (兼容轮询)';
+    btn.textContent = '⏸️ 暂停';
+    btn.className = 'btn-sm btn-primary';
+  } else {
+    badge.textContent = '⚪ 已暂停同屏';
+    btn.textContent = '▶️ 继续同屏';
+    btn.className = 'btn-sm';
+  }
+  if (st.width && st.height) {
+    phoneWidth = st.width;
+    phoneHeight = st.height;
+    document.getElementById('resBadge').textContent = '📐 ' + st.width + '×' + st.height;
+  }
+  if (st.foregroundAppLabel || st.foregroundPackage) {
+    document.getElementById('appBadge').textContent = '📱 ' + (st.foregroundAppLabel || st.foregroundPackage);
+  }
+}
+
+function sendCommand(payload) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
+    return;
+  }
+  fetch('/api/inbox/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: payload.type === 'start' ? 'mirror_start' : payload.type === 'stop' ? 'mirror_stop' : 'mirror_input',
+      params: payload
+    })
+  }).catch(() => {});
+}
+
+function connectMirrorWs() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/ws/mirror');
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    const [maxWidth, quality, maxFps] = document.getElementById('presetSelect').value.split(',').map(Number);
+    ws.send(JSON.stringify({ type: 'start', maxWidth, quality, maxFps, autoWake: true }));
+  };
+  ws.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) {
+      handleBinaryScreenFrame(ev.data);
+    } else if (typeof ev.data === 'string') {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'mirror_status') applyMirrorStatus(msg.status);
+        else if (msg.type === 'mirror_error') showToast('⚠️ ' + msg.error);
+      } catch {}
+    }
+  };
+  ws.onclose = () => {
+    document.getElementById('liveBadge').textContent = '🟡 正在重连画面流...';
+    setTimeout(connectMirrorWs, 1200);
+  };
+}
+
+function normCoords(e) {
+  const rect = canvas.getBoundingClientRect();
+  const normX = Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width)));
+  const normY = Math.max(0, Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height)));
+  return { normX, normY, pxX: e.clientX - rect.left, pxY: e.clientY - rect.top };
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+  canvas.focus();
+  canvas.setPointerCapture(e.pointerId);
+  const c = normCoords(e);
+  const state = {
+    pointerId: e.pointerId,
+    startX: c.normX,
+    startY: c.normY,
+    startPxX: c.pxX,
+    startPxY: c.pxY,
+    curX: c.normX,
+    curY: c.normY,
+    curPxX: c.pxX,
+    curPxY: c.pxY,
+    downAt: performance.now(),
+    longPressed: false,
+    timer: setTimeout(() => {
+      if (!pointerState || pointerState !== state) return;
+      const dist = Math.hypot(state.curPxX - state.startPxX, state.curPxY - state.startPxY);
+      if (dist < 12) {
+        state.longPressed = true;
+        addRipple(state.startX, state.startY);
+        sendCommand({ type: 'input', inputType: 'long_press', normX: state.startX, normY: state.startY, durationMs: 650 });
+        showToast('👆 长按已触发');
+      }
+    }, 520)
+  };
+  pointerState = state;
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  if (!pointerState || pointerState.pointerId !== e.pointerId) return;
+  const c = normCoords(e);
+  pointerState.curX = c.normX;
+  pointerState.curY = c.normY;
+  pointerState.curPxX = c.pxX;
+  pointerState.curPxY = c.pxY;
+});
+
+canvas.addEventListener('pointerup', (e) => {
+  if (!pointerState || pointerState.pointerId !== e.pointerId) return;
+  const st = pointerState;
+  pointerState = null;
+  clearTimeout(st.timer);
+  if (st.longPressed) return;
+
+  const c = normCoords(e);
+  const dist = Math.hypot(c.pxX - st.startPxX, c.pxY - st.startPxY);
+  const dur = Math.max(80, Math.min(700, Math.round(performance.now() - st.downAt)));
+
+  if (dist < 12) {
+    addRipple(c.normX, c.normY);
+    sendCommand({ type: 'input', inputType: 'tap', normX: c.normX, normY: c.normY });
+  } else {
+    addRipple(st.startX, st.startY, c.normX, c.normY);
+    sendCommand({
+      type: 'input',
+      inputType: 'swipe',
+      normX1: st.startX,
+      normY1: st.startY,
+      normX2: c.normX,
+      normY2: c.normY,
+      durationMs: Math.max(140, Math.min(520, dur))
+    });
+  }
+});
+
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const now = performance.now();
+  if (now - lastWheelSentAt < 180) return;
+  lastWheelSentAt = now;
+  const c = normCoords(e);
+  sendCommand({
+    type: 'input',
+    inputType: 'scroll',
+    normX: c.normX,
+    normY: c.normY,
+    deltaX: e.deltaX,
+    deltaY: e.deltaY
+  });
+}, { passive: false });
+
+canvas.addEventListener('keydown', (e) => {
+  if (e.key === 'Backspace') {
+    e.preventDefault();
+    sendCommand({ type: 'input', inputType: 'backspace' });
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    sendCommand({ type: 'input', inputType: 'enter' });
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    sendNav('back');
+  }
+});
+
+window.addEventListener('paste', (e) => {
+  if (document.activeElement === document.getElementById('mirrorTextInput')) return;
+  const text = (e.clipboardData || window.clipboardData)?.getData('text');
+  if (text) {
+    e.preventDefault();
+    sendCommand({ type: 'input', inputType: 'text', text, append: true });
+    showToast('📋 已将剪贴板文字填入手机输入框');
+  }
+});
+
+function onTextInputKey(e) {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    submitMirrorText(true);
+  }
+}
+
+function submitMirrorText(submitEnter) {
+  const input = document.getElementById('mirrorTextInput');
+  const text = input.value;
+  if (!text) return;
+  sendCommand({ type: 'input', inputType: 'text', text, append: false, submit: Boolean(submitEnter) });
+  input.value = '';
+  showToast('⌨️ 已向手机输入文字');
+}
+
+function sendNav(target) {
+  sendCommand({ type: 'input', inputType: 'key', key: target });
+}
+
+function wakeAndUnlock() {
+  showToast('☀️ 正在点亮并解锁手机...');
+  sendCommand({ type: 'input', inputType: 'unlock' });
+}
+
+function adjustVol(direction) {
+  fetch('/api/inbox/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'phone_control', params: { action: 'set_volume', stream: 'music', direction } })
+  }).then(() => showToast(direction === 'up' ? '🔊 音量+' : '🔉 音量-')).catch(() => {});
+}
+
+function saveCurrentScreenshot() {
+  showToast('📸 正在保存高清截屏至 Mac Inbox...');
+  fetch('/api/inbox/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'phone_control', params: { action: 'take_screenshot', saveToInbox: true } })
+  }).then(r => r.json()).then(d => {
+    if (d.ok) showToast('✅ 截屏已存入 Mac 收件箱');
+  }).catch(() => {});
+}
+
+function onPresetChange() {
+  const [maxWidth, quality, maxFps] = document.getElementById('presetSelect').value.split(',').map(Number);
+  sendCommand({ type: 'start', maxWidth, quality, maxFps, autoWake: true });
+  showToast('✨ 已切换画质: ' + maxWidth + 'p');
+}
+
+function toggleStartStop() {
+  if (isRunning) {
+    sendCommand({ type: 'stop' });
+  } else {
+    const [maxWidth, quality, maxFps] = document.getElementById('presetSelect').value.split(',').map(Number);
+    sendCommand({ type: 'start', maxWidth, quality, maxFps, autoWake: true });
+  }
+}
+
+connectMirrorWs();
 </script>
 </body>
 </html>`;

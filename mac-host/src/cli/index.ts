@@ -164,6 +164,63 @@ async function main() {
       break;
     }
 
+    case "mirror": {
+      const action = (sub || "open").toLowerCase();
+      if (action === "stop") {
+        const res = await ipc.call("phone_mirror_stop", { reason: "cli_stop" });
+        console.log(JSON.stringify(res, null, 2));
+        break;
+      }
+      if (action === "status") {
+        const res = await ipc.call("phone_mirror_status", {});
+        console.log(JSON.stringify(res, null, 2));
+        break;
+      }
+      const st = await ipc.call("phone_presence_status", {});
+      const port = st.lanPort || 19527;
+      const mirrorUrl = `http://127.0.0.1:${port}/mirror`;
+      let mirrorRes: any = null;
+      try {
+        mirrorRes = await ipc.call("phone_mirror_start", {
+          maxWidth: flags.width ? Number(flags.width) : 720,
+          quality: flags.quality ? Number(flags.quality) : 72,
+          maxFps: flags.fps ? Number(flags.fps) : 12,
+          wakeScreen: flags["no-wake"] ? false : true,
+        });
+      } catch (err: any) {
+        mirrorRes = { ok: false, error: err?.message || String(err) };
+      }
+      const shouldOpen =
+        action !== "start" || Boolean(flags.open)
+          ? !flags["no-open"] && process.env.OMS_DISABLE_OSASCRIPT !== "1"
+          : false;
+      if (shouldOpen) {
+        execFile("open", [mirrorUrl]);
+      }
+      if (flags.json || action === "start") {
+        console.log(
+          JSON.stringify(
+            {
+              ...mirrorRes,
+              mirrorUrl,
+            },
+            null,
+            2
+          )
+        );
+      } else {
+        console.log(`🪞 Opening Live Phone Mirror Studio: ${mirrorUrl}`);
+        if (mirrorRes?.mode) {
+          console.log(
+            `   Mode: ${mirrorRes.mode} (${mirrorRes.targetMaxWidth || 720}px @ ${mirrorRes.targetMaxFps || 12}fps)`
+          );
+        } else if (mirrorRes?.error) {
+          console.log(`   Note: ${mirrorRes.error}`);
+        }
+      }
+      break;
+    }
+
     case "status":
     case "doctor": {
       const res = await ipc.call("phone_presence_status", {
@@ -683,10 +740,47 @@ async function main() {
       break;
     }
 
+    case "airpods": {
+      const actionSub = (sub || "status").toLowerCase();
+      const targetMac = (flags.mac as string) || undefined;
+      if (actionSub === "status") {
+        const res = await ipc.call("airpods.status", { refresh: true, force: Boolean(flags.live) });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (actionSub === "mac" || actionSub === "to-mac" || actionSub === "connect-mac") {
+        const res = await ipc.call("airpods.switch_to_mac", { targetMac }, 15000);
+        console.log(JSON.stringify(res, null, 2));
+      } else if (actionSub === "phone" || actionSub === "to-phone" || actionSub === "connect-phone") {
+        const res = await ipc.call("airpods.switch_to_phone", { targetMac }, 15000);
+        console.log(JSON.stringify(res, null, 2));
+      } else if (actionSub === "auto" || actionSub === "config") {
+        const toggleVal = parseBoolFlag(positional[1] ?? flags.enable ?? flags.auto);
+        const pauseVal = parseBoolFlag(flags.pause);
+        const res = await ipc.call("airpods.config", {
+          autoSwitchAirpods: toggleVal,
+          pauseOtherOnAirpodsSwitch: pauseVal,
+          preferredAirpodsMac: typeof flags.preferred === "string" ? flags.preferred : undefined,
+        });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (actionSub === "pause") {
+        const pauseVal = parseBoolFlag(positional[1] ?? flags.enable);
+        const res = await ipc.call("airpods.config", {
+          pauseOtherOnAirpodsSwitch: pauseVal ?? true,
+        });
+        console.log(JSON.stringify(res, null, 2));
+      } else {
+        throw new Error(
+          `Unknown airpods subcommand: ${actionSub}. Supported: status | mac | phone | auto <on|off> | pause <on|off>`
+        );
+      }
+      break;
+    }
+
     default:
       console.log(`OneMoreStep CLI (oms) - Mac AI <-> Xiaomi Android Bidirectional Bridge
 Commands:
   oms status [--live]                                  Inspect live presence, transport tier, battery, temp, audio, storage & permissions
+  oms airpods [status|mac|phone|auto <on|off>|pause <on|off>]
+                                                       Seamless AirPods auto-switch between Mac & Android on audio output + media pause
   oms phone <status|find|say|volume|screenshot|open|launch|unlock|call|hangup|home|back|lock>
                                                        Inspect rich phone telemetry or remotely control phone from Mac
   oms phone unlock [pattern] [--save] [--bounds l,t,r,b] Wake screen, swipe up bouncer & draw 3x3 pattern (1~9) to unlock phone
@@ -695,6 +789,7 @@ Commands:
   oms phone hangup                                     Hang up / end active or dialing phone call on Xiaomi phone
   oms pair [--json]                                    Generate v2 pairing URI & local wireless install URL (/install)
   oms web                                              Open Mac real-time Inbox & Stream Web Dashboard (/inbox)
+  oms mirror [open|start|stop|status] [--fps 12]       Open real-time Phone Screen Mirror & remote control studio (/mirror)
   oms otp [--limit N] [--copy] [--ack]                 Query latest synced verification codes (OTP) from phone
   oms prefs [--auto-otp] [--auto-copy] [--unlock-pattern <1~9>] View or update Mac auto-OTP, clipboard, preview & unlock pattern
   oms inbox [latest] [--tag <tag>] [--unprocessed]     Query items sent from phone (--ack to mark read, --q <keyword>)

@@ -4,8 +4,10 @@ import {
   computePairingHmac,
   createEphemeralPairingCredentials,
   decodeJsonRpcPayload,
+  decodeScreenFramePayload,
   decodeStreamChunkPayload,
   encodeJsonRpcFrame,
+  encodeScreenFrame,
   encodeStreamChunkFrame,
   encodeStreamStartFrame,
   extractOtpFromText,
@@ -15,6 +17,8 @@ import {
   generateUuidV7,
   parsePairingUri,
   PriorityFrameQueue,
+  ScreenFrameCodec,
+  ScreenFrameFlags,
   signEd25519,
   verifyEd25519,
 } from "../src/index.js";
@@ -179,6 +183,55 @@ describe("Module 01: Shared Protocol & Pairing", () => {
       "【阿里商旅】出票成功：杨**等1人10月31日合肥新桥国际机场 21:05降落 ZH9949；机票退改应通过原购票渠道办理，切勿轻信航班变动电话或短信通知，请勿提供验证码等信息。"
     );
     expect(flight).toBeNull();
+  });
+
+  test("SCREEN_FRAME (0x07) binary encoding, decoding, and Latest-Frame-Wins queue drop-oldest", () => {
+    const decoder = new FrameStreamDecoder();
+    const imgBytes1 = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0x01, 0x02]);
+    const imgBytes2 = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0x09, 0x0a, 0x0b]);
+
+    const rawFrame1 = encodeScreenFrame(
+      {
+        codec: ScreenFrameCodec.WEBP,
+        flags: ScreenFrameFlags.NONE,
+        width: 1220,
+        height: 2712,
+        seq: 41,
+        timestampMs: 1730000000100,
+      },
+      imgBytes1
+    );
+    const rawFrame2 = encodeScreenFrame(
+      {
+        codec: ScreenFrameCodec.WEBP,
+        flags: ScreenFrameFlags.IS_SCREEN_LOCKED,
+        width: 1220,
+        height: 2712,
+        seq: 42,
+        timestampMs: 1730000000250,
+      },
+      imgBytes2
+    );
+
+    const queue = new PriorityFrameQueue();
+    queue.enqueue(rawFrame1, FrameType.SCREEN_FRAME);
+    queue.enqueue(rawFrame2, FrameType.SCREEN_FRAME);
+    // Latest-Frame-Wins: stale frame 41 is overwritten by frame 42
+    expect(queue.size).toBe(1);
+
+    const dequeued = queue.dequeue()!;
+    const decodedFrames = decoder.push(dequeued);
+    expect(decodedFrames.length).toBe(1);
+    expect(decodedFrames[0].frameType).toBe(FrameType.SCREEN_FRAME);
+
+    const screen = decodeScreenFramePayload(decodedFrames[0].payload);
+    expect(screen.codec).toBe(ScreenFrameCodec.WEBP);
+    expect(screen.flags).toBe(ScreenFrameFlags.IS_SCREEN_LOCKED);
+    expect(screen.width).toBe(1220);
+    expect(screen.height).toBe(2712);
+    expect(screen.seq).toBe(42);
+    expect(screen.timestampMs).toBe(1730000000250);
+    expect(Array.from(screen.data)).toEqual(Array.from(imgBytes2));
   });
 });
 

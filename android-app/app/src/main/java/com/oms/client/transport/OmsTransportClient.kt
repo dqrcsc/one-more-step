@@ -42,6 +42,7 @@ import android.os.Vibrator
 import android.provider.Settings
 import com.oms.client.agent.OmsAccessibilityService
 import com.oms.client.agent.ScreenCapturer
+import com.oms.client.capability.AirPodsAutoSwitchManager
 import com.oms.client.capability.AlarmExecutor
 import com.oms.client.capability.AppLauncherHelper
 import com.oms.client.capability.CalendarExecutor
@@ -57,13 +58,16 @@ import com.oms.client.xiaomi.XiaomiAdaptationHelper
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -92,7 +96,9 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 data class OtaCheckResult(
     val ok: Boolean,
@@ -231,6 +237,37 @@ class OmsTransportClient(
     private fun isSourceAuthenticated(tier: String, sourceWebSocket: WebSocket?): Boolean =
         sourceAuthenticated(captureSource(tier, sourceWebSocket))
 
+    val airpodsManager = AirPodsAutoSwitchManager(
+        context = context,
+        onClaimByPhone = { targetMac, targetName, reason ->
+            scope.launch {
+                val req = JSONObject().apply {
+                    put("jsonrpc", "2.0")
+                    put("id", "ap_claim_${UUID.randomUUID()}")
+                    put("method", "airpods.claimByPhone")
+                    put("params", JSONObject().apply {
+                        put("targetMac", targetMac)
+                        put("targetName", targetName)
+                        put("reason", reason)
+                        put("pauseMacMedia", true)
+                    })
+                }
+                sendRawFrame(OmsFrameProtocol.encodeJsonRpc(req))
+            }
+        },
+        onStatusChanged = { statusJson ->
+            scope.launch {
+                if (_activeTierFlow.value == "DISCONNECTED") return@launch
+                val req = JSONObject().apply {
+                    put("jsonrpc", "2.0")
+                    put("method", "airpods.statusReport")
+                    put("params", statusJson)
+                }
+                sendRawFrame(OmsFrameProtocol.encodeJsonRpc(req))
+            }
+        }
+    )
+
     init {
         val saved = repo.getPairedMac()
         if (saved == null) traceConnection(ConnectionDiagnostics.Event.NOT_PAIRED)
@@ -238,6 +275,7 @@ class OmsTransportClient(
         registerWifiNetworkCallback()
         startUdpBeaconListener()
         startBackgroundWatchdog()
+        airpodsManager.start()
     }
 
     private fun startBackgroundWatchdog() {
@@ -603,54 +641,43 @@ class OmsTransportClient(
         return candidateMacId == pairedMacId
     }
 
-    /**
-     * Automatically discover the ALREADY PAIRED Mac Host on LAN when DHCP IP changes (e.g. 192.168.1.77 -> 192.168.1.100).
-     * Strictly enforces 1-to-1 device binding: only accepts responses where `macId == targetMacId`.
-     * Never binds to or overwrites config with an unknown Mac on the same LAN.
-     */
-    private suspend fun discoverMacOnLan(
-        port: Int = 19527,
-        expectedMacId: String? = null,
-        allowSubnetScan: Boolean = false
-    ): PairedMacConfig? = coroutineScope {
+    private fun sendFastUdpDiscoveryWake(
+        port: Int,
+        targetMacId: String,
+        phoneIps: List<String>,
+        candidateIps: Collection<String>,
+        timeoutMs: Int = 280
+    ): PairedMacConfig? {
         val paired = repo.getPairedMac()
-        val targetMacId = expectedMacId?.takeIf { it.isNotBlank() }
-            ?: paired?.macId?.takeIf { it.isNotBlank() }
-            ?: return@coroutineScope null
-        val phoneIps = getLocalPhoneWifiIpv4s()
-
-        // 1. Priority Direct Probe first (0 contention, generous 2500ms timeout for Wi-Fi wake/ARP!)
-        val priorityIps = LinkedHashSet<String>()
-        paired?.lanIps?.forEach { if (it.isNotBlank() && !it.startsWith("198.18.")) priorityIps.add(it) }
-        for (pip in priorityIps) {
-            val cfg = probeMacHttpInfo(pip, port, timeoutMs = 2500, checkTcpFirst = false)
-            if (cfg != null && isMatchingPairedMacId(cfg.macId, targetMacId)) {
-                repo.updatePairedMacDiscovery(cfg)
-                return@coroutineScope repo.getPairedMac() ?: cfg
-            }
-        }
-
-        // 2. Fast UDP Broadcast Discovery Probe
         try {
             DatagramSocket().use { udpSocket ->
-                findNonVpnWifiNetwork()?.bindSocket(udpSocket)
+                val wifiNet = findNonVpnWifiNetwork()
+                wifiNet?.bindSocket(udpSocket)
                 udpSocket.broadcast = true
-                udpSocket.soTimeout = 300
+                udpSocket.soTimeout = timeoutMs
                 val payload = "OMS_DISCOVER_V1".toByteArray(Charsets.UTF_8)
-                val broadcastTargets = mutableSetOf("255.255.255.255")
-                for (pip in phoneIps + priorityIps) {
-                    val parts = pip.split(".")
+                val targets = LinkedHashSet<String>()
+                targets.add("255.255.255.255")
+                for (pip in phoneIps + candidateIps) {
+                    val clean = pip.trim()
+                    if (clean.isNotBlank() && !clean.startsWith("198.18.")) {
+                        targets.add(clean)
+                    }
+                    val parts = clean.split(".")
                     if (parts.size == 4) {
                         val p0 = parts[0]
                         val p1 = parts[1]
                         val p2 = parts[2].toIntOrNull() ?: continue
-                        broadcastTargets.add("$p0.$p1.$p2.255")
-                        broadcastTargets.add("$p0.$p1.${p2 or 1}.255")
+                        targets.add("$p0.$p1.$p2.255")
+                        targets.add("$p0.$p1.${p2 or 1}.255")
+                        // Wake up enterprise AC/AP gateway ARP & client forwarding table
+                        targets.add("$p0.$p1.${p2 or 1}.254")
+                        targets.add("$p0.$p1.$p2.1")
                     }
                 }
-                for (bcast in broadcastTargets) {
+                for (dst in targets) {
                     try {
-                        val pkt = DatagramPacket(payload, payload.size, InetAddress.getByName(bcast), port)
+                        val pkt = DatagramPacket(payload, payload.size, InetAddress.getByName(dst), port)
                         udpSocket.send(pkt)
                     } catch (_: Throwable) {
                     }
@@ -686,12 +713,58 @@ class OmsTransportClient(
                                 pairingVersion = paired?.takeIf { it.macId == macId }?.pairingVersion ?: 0
                             )
                             repo.updatePairedMacDiscovery(found)
-                            return@coroutineScope repo.getPairedMac() ?: found
+                            return repo.getPairedMac() ?: found
                         }
                     }
                 }
             }
         } catch (_: Throwable) {
+        }
+        return null
+    }
+
+    /**
+     * Automatically discover the ALREADY PAIRED Mac Host on LAN when DHCP IP changes (e.g. 192.168.1.77 -> 192.168.1.100).
+     * Strictly enforces 1-to-1 device binding: only accepts responses where `macId == targetMacId`.
+     * Never binds to or overwrites config with an unknown Mac on the same LAN.
+     */
+    private suspend fun discoverMacOnLan(
+        port: Int = 19527,
+        expectedMacId: String? = null,
+        allowSubnetScan: Boolean = false
+    ): PairedMacConfig? = coroutineScope {
+        val paired = repo.getPairedMac()
+        val targetMacId = expectedMacId?.takeIf { it.isNotBlank() }
+            ?: paired?.macId?.takeIf { it.isNotBlank() }
+            ?: return@coroutineScope null
+        val phoneIps = getLocalPhoneWifiIpv4s()
+        val phonePrefixes = phoneIps.mapNotNull { ip ->
+            val parts = ip.split(".")
+            if (parts.size == 4) "${parts[0]}.${parts[1]}." else null
+        }.toSet()
+
+        val priorityIps = LinkedHashSet<String>()
+        paired?.lanIps?.forEach { if (it.isNotBlank() && !it.startsWith("198.18.")) priorityIps.add(it) }
+
+        // 1. Fast UDP Broadcast + Unicast Discovery Probe FIRST (<=300ms, wakes enterprise AP ARP/forwarding table!)
+        val udpFound = sendFastUdpDiscoveryWake(port, targetMacId, phoneIps, priorityIps, timeoutMs = 300)
+        if (udpFound != null) {
+            return@coroutineScope udpFound
+        }
+
+        // 2. Priority Direct HTTP Probe (prioritize current Wi-Fi subnet; avoid stalling 5s+ on stale hotspot IPs!)
+        val subnetMatchedIps = if (phonePrefixes.isNotEmpty()) {
+            priorityIps.filter { cand -> phonePrefixes.any { p -> cand.startsWith(p) } }
+        } else {
+            priorityIps.toList()
+        }
+        val probeCandidates = if (subnetMatchedIps.isNotEmpty()) subnetMatchedIps else priorityIps.toList()
+        for (pip in probeCandidates) {
+            val cfg = probeMacHttpInfo(pip, port, timeoutMs = 1500, checkTcpFirst = false)
+            if (cfg != null && isMatchingPairedMacId(cfg.macId, targetMacId)) {
+                repo.updatePairedMacDiscovery(cfg)
+                return@coroutineScope repo.getPairedMac() ?: cfg
+            }
         }
 
         if (!allowSubnetScan) {
@@ -853,7 +926,8 @@ class OmsTransportClient(
 
         scope.launch {
             try {
-                val phonePrefixes = getLocalPhoneWifiIpv4s().mapNotNull { ip ->
+                val phoneIps = getLocalPhoneWifiIpv4s()
+                val phonePrefixes = phoneIps.mapNotNull { ip ->
                     val parts = ip.split(".")
                     if (parts.size == 4) "${parts[0]}.${parts[1]}." else null
                 }.toSet()
@@ -868,13 +942,31 @@ class OmsTransportClient(
                 var reachableConfig: PairedMacConfig? = null
                 if (candidateIps.isEmpty() || (phonePrefixes.isNotEmpty() && subnetMatched.isEmpty())) {
                     reachableConfig = discoverMacOnLan(port, paired.macId, allowSubnetScan = false)
+                } else if (subnetMatched.size == 1 && !subnetMatched.first().startsWith("127.")) {
+                    // Always fire a fast 180ms UDP broadcast/unicast wake probe before WS connect on enterprise Wi-Fi
+                    reachableConfig = sendFastUdpDiscoveryWake(
+                        port = port,
+                        targetMacId = paired.macId,
+                        phoneIps = phoneIps,
+                        candidateIps = subnetMatched,
+                        timeoutMs = 180
+                    )
                 } else if (subnetMatched.size > 1) {
-                    for (candidate in subnetMatched) {
-                        val info = probeMacHttpInfo(candidate, port, timeoutMs = 2000, checkTcpFirst = false)
-                        if (info != null && isMatchingPairedMacId(info.macId, paired.macId)) {
-                            reachableConfig = info
-                            repo.updatePairedMacDiscovery(info)
-                            break
+                    reachableConfig = sendFastUdpDiscoveryWake(
+                        port = port,
+                        targetMacId = paired.macId,
+                        phoneIps = phoneIps,
+                        candidateIps = subnetMatched,
+                        timeoutMs = 180
+                    )
+                    if (reachableConfig == null) {
+                        for (candidate in subnetMatched) {
+                            val info = probeMacHttpInfo(candidate, port, timeoutMs = 1500, checkTcpFirst = false)
+                            if (info != null && isMatchingPairedMacId(info.macId, paired.macId)) {
+                                reachableConfig = info
+                                repo.updatePairedMacDiscovery(info)
+                                break
+                            }
                         }
                     }
                 }
@@ -992,8 +1084,10 @@ class OmsTransportClient(
                         startBleNearFieldScanner()
                     }
                     if (!didOpen) {
-                        preferDefaultSocketFactory = !preferDefaultSocketFactory
-                        cachedLanHttpClient = null
+                        if (preferDefaultSocketFactory) {
+                            preferDefaultSocketFactory = false
+                            cachedLanHttpClient = null
+                        }
                         val paired = repo.getPairedMac()
                         if (paired != null) {
                             scope.launch {
@@ -1706,6 +1800,9 @@ class OmsTransportClient(
         val parts = verName.removePrefix("v").trim().split('.').mapNotNull { it.toIntOrNull() }
         if (parts.size == 3 && parts[0] == 1 && parts[1] == 4) {
             return 14 + parts[2]
+        }
+        if (parts.size == 3 && parts[0] == 1 && parts[1] == 5) {
+            return 24 + parts[2]
         }
         return fallbackCode
     }
@@ -2425,7 +2522,36 @@ class OmsTransportClient(
                         OmsAccessibilityService.instance?.abortGuiSession()
                         JSONObject().put("ok", true)
                     }
+                    "mirror.start" -> startScreenMirror(params, source)
+                    "mirror.stop" -> stopScreenMirror()
+                    "mirror.status" -> getScreenMirrorStatus()
+                    "mirror.input" -> handleMirrorInput(params, sessionStillValid)
                     "sys.control" -> handleSysControlRpc(params, source, sessionStillValid)
+                    "airpods.handoffToMac" -> {
+                        airpodsManager.handleHandoffToMac(
+                            targetMac = params.optString("targetMac", ""),
+                            pausePhoneMedia = params.optBoolean("pausePhoneMedia", true),
+                            disconnectOnPhone = params.optBoolean("disconnectOnPhone", true)
+                        )
+                    }
+                    "airpods.connectOnPhone" -> {
+                        val targetMac = params.optString("targetMac", "")
+                        val def = CompletableDeferred<Pair<Boolean, String>>()
+                        airpodsManager.connectAirpodsOnPhone(targetMac) { ok, msg ->
+                            def.complete(ok to msg)
+                        }
+                        val (ok, msg) = withTimeoutOrNull(4200L) { def.await() }
+                            ?: (false to "连接 AirPods 等待超时")
+                        JSONObject().apply {
+                            put("ok", ok)
+                            put("message", msg)
+                            put("status", collectDeviceSnapshot())
+                        }
+                    }
+                    "airpods.syncConfig" -> {
+                        airpodsManager.updateSyncConfig(params)
+                        JSONObject().put("ok", true)
+                    }
                     else -> throw IllegalArgumentException("Unknown RPC method: $method")
                 }
 
@@ -2692,6 +2818,8 @@ class OmsTransportClient(
         var wifiSsid = ""
         var wifiRssi = 0
         var wifiSpeedMbps = 0
+        var wifiFreqMhz = 0
+        var wifiGateway = ""
         try {
             val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
             @Suppress("DEPRECATION")
@@ -2699,9 +2827,19 @@ class OmsTransportClient(
             if (info != null) {
                 wifiRssi = info.rssi
                 wifiSpeedMbps = info.linkSpeed
+                wifiFreqMhz = info.frequency
                 val rawSsid = info.ssid?.trim('"') ?: ""
                 if (rawSsid.isNotBlank() && rawSsid != "<unknown ssid>") {
                     wifiSsid = rawSsid
+                }
+            }
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val wifiNet = findNonVpnWifiNetwork()
+            if (cm != null && wifiNet != null) {
+                val lp = cm.getLinkProperties(wifiNet)
+                val gw = lp?.routes?.firstOrNull { it.isDefaultRoute && it.gateway is Inet4Address }?.gateway?.hostAddress
+                if (!gw.isNullOrBlank()) {
+                    wifiGateway = gw
                 }
             }
         } catch (_: Throwable) {
@@ -2749,6 +2887,7 @@ class OmsTransportClient(
         val fgLabel = resolveFriendlyAppName(fgPkg)
         val (verName, verCode, _) = getInstalledApkInfo()
         val health = XiaomiAdaptationHelper.inspectAll(context)
+        val apSnap = airpodsManager.buildStatusJson()
         val queuedCount = try {
             repo.listQueuedOutboxItems().size
         } catch (_: Throwable) {
@@ -2766,6 +2905,8 @@ class OmsTransportClient(
             put("wifiSsid", wifiSsid)
             put("wifiRssiDbm", wifiRssi)
             put("wifiLinkSpeedMbps", wifiSpeedMbps)
+            put("wifiFrequencyMhz", wifiFreqMhz)
+            put("wifiGateway", wifiGateway)
             put("bluetoothEnabled", btEnabled)
             put("activeTransportTier", _activeTierFlow.value)
             put("connectionDiagnosticCode", diagnostics.reason().name)
@@ -2799,7 +2940,289 @@ class OmsTransportClient(
             put("uptimeMinutes", SystemClock.elapsedRealtime() / 60000L)
             put("pendingOutboxCount", queuedCount)
             put("updatedAtMs", System.currentTimeMillis())
+            put("airpodsAutoSwitchEnabled", apSnap.optBoolean("autoSwitchEnabled", true))
+            put("airpodsConnected", apSnap.optBoolean("connected", false))
+            put("airpodsName", apSnap.optString("deviceName", ""))
+            put("airpodsMac", apSnap.optString("deviceMac", ""))
+            put("pairedAirpods", apSnap.optJSONArray("pairedAirpods") ?: JSONArray())
+            put("mediaPlaying", apSnap.optBoolean("mediaPlaying", false))
+            put("audioModeInCall", apSnap.optBoolean("inCall", false))
             put("permissions", health.toJson())
         }
+    }
+
+    // =========================================================================
+    // Real-Time Screen Mirroring Engine (L1 Silent Stream + Direct Input)
+    // =========================================================================
+    private val mirrorActive = AtomicBoolean(false)
+    private val mirrorSeq = AtomicInteger(0)
+    private val mirrorBoostUntilElapsedMs = AtomicLong(0L)
+    private val latestMirrorFrameSlot = AtomicReference<ByteArray?>(null)
+    private val mirrorWakeSignal = Channel<Unit>(Channel.CONFLATED)
+    private val mirrorSendSignal = Channel<Unit>(Channel.CONFLATED)
+
+    @Volatile
+    private var mirrorCaptureJob: Job? = null
+    @Volatile
+    private var mirrorSenderJob: Job? = null
+    @Volatile
+    private var mirrorMaxWidth: Int = 640
+    @Volatile
+    private var mirrorQuality: Int = 72
+    @Volatile
+    private var mirrorMaxFps: Int = 8
+    @Volatile
+    private var mirrorWakeLock: PowerManager.WakeLock? = null
+
+    private fun boostMirrorPacing(durationMs: Long = 2200L) {
+        if (!mirrorActive.get()) return
+        val target = SystemClock.elapsedRealtime() + durationMs
+        while (true) {
+            val cur = mirrorBoostUntilElapsedMs.get()
+            if (target <= cur || mirrorBoostUntilElapsedMs.compareAndSet(cur, target)) break
+        }
+        mirrorWakeSignal.trySend(Unit)
+    }
+
+    private fun acquireMirrorWakeLock() {
+        try {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (mirrorWakeLock?.isHeld == true) return
+            @Suppress("DEPRECATION")
+            val wl = pm.newWakeLock(
+                PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ON_AFTER_RELEASE,
+                "OneMoreStep:LiveMirrorKeepScreenOn"
+            )
+            wl.setReferenceCounted(false)
+            wl.acquire(15 * 60 * 1000L) // max 15 min per session renew
+            mirrorWakeLock = wl
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun releaseMirrorWakeLock() {
+        try {
+            if (mirrorWakeLock?.isHeld == true) {
+                mirrorWakeLock?.release()
+            }
+        } catch (_: Throwable) {
+        } finally {
+            mirrorWakeLock = null
+        }
+    }
+
+    private fun startScreenMirror(params: JSONObject, source: FrameSource): JSONObject {
+        val svc = OmsAccessibilityService.instance
+            ?: throw IllegalStateException("ERR_ACCESSIBILITY_DISABLED: 请先在手机上开启青简·咫尺无障碍服务")
+        if (source.tier == "BT_RFCOMM") {
+            throw IllegalStateException("实时同屏需要局域网 (LAN_WS) 或高速通道，蓝牙通道带宽不足")
+        }
+
+        mirrorMaxWidth = params.optInt("maxWidth", 640).coerceIn(360, 1080)
+        mirrorQuality = params.optInt("quality", 72).coerceIn(45, 90)
+        mirrorMaxFps = params.optInt("maxFps", 8).coerceIn(2, 12)
+        val autoWake = params.optBoolean("autoWake", true)
+        val keepScreenOn = params.optBoolean("keepScreenOn", true)
+
+        if (autoWake) {
+            AppLauncherHelper.wakeScreenIfNeeded(context)
+        }
+        if (keepScreenOn) {
+            acquireMirrorWakeLock()
+        }
+
+        svc.onMirrorUiEvent = { boostMirrorPacing(1800L) }
+        boostMirrorPacing(3500L)
+
+        if (mirrorActive.compareAndSet(false, true)) {
+            latestMirrorFrameSlot.set(null)
+
+            // Non-blocking Latest-Frame-Wins sender coroutine
+            mirrorSenderJob = scope.launch {
+                while (isActive && mirrorActive.get()) {
+                    val frameBytes = latestMirrorFrameSlot.getAndSet(null)
+                    if (frameBytes != null) {
+                        val curSrc = activeSource()
+                        if (curSrc.tier == "LAN_WS" || curSrc.tier == "WAN_WEBRTC") {
+                            sendOnSource(frameBytes, curSrc)
+                        }
+                    } else {
+                        withTimeoutOrNull(400L) {
+                            mirrorSendSignal.receive()
+                        }
+                    }
+                }
+            }
+
+            // Adaptive screen capture coroutine
+            mirrorCaptureJob = scope.launch {
+                var lastHash = 0L
+                var lastSentAtElapsed = 0L
+                var lastStatusFlags = -1
+
+                try {
+                    while (isActive && mirrorActive.get()) {
+                        val curSrc = activeSource()
+                        if (curSrc.tier != "LAN_WS" && curSrc.tier != "WAN_WEBRTC") {
+                            delay(500L)
+                            continue
+                        }
+                        val currentSvc = OmsAccessibilityService.instance
+                        if (currentSvc == null) {
+                            delay(500L)
+                            continue
+                        }
+
+                        val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+                        val km = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+                        val screenOn = pm.isInteractive
+                        val screenLocked = km.isKeyguardLocked
+                        val dm = currentSvc.resources.displayMetrics
+                        val screenW = dm.widthPixels.coerceAtLeast(1)
+                        val screenH = dm.heightPixels.coerceAtLeast(1)
+                        val nowElapsed = SystemClock.elapsedRealtime()
+
+                        if (!screenOn) {
+                            val flags = OmsFrameProtocol.SCREEN_FLAG_SCREEN_OFF or
+                                (if (screenLocked) OmsFrameProtocol.SCREEN_FLAG_SCREEN_LOCKED else 0)
+                            if (flags != lastStatusFlags || nowElapsed - lastSentAtElapsed > 2000L) {
+                                val seq = mirrorSeq.incrementAndGet() and 0xFFFF
+                                val encoded = OmsFrameProtocol.encodeScreenFrame(
+                                    codec = OmsFrameProtocol.CODEC_STATUS_ONLY,
+                                    flags = flags,
+                                    width = screenW,
+                                    height = screenH,
+                                    seq = seq,
+                                    timestampMs = System.currentTimeMillis()
+                                )
+                                latestMirrorFrameSlot.set(encoded)
+                                mirrorSendSignal.trySend(Unit)
+                                lastStatusFlags = flags
+                                lastSentAtElapsed = nowElapsed
+                                lastHash = 0L
+                            }
+                            withTimeoutOrNull(500L) { mirrorWakeSignal.receive() }
+                            continue
+                        }
+
+                        val forceHeartbeat = (nowElapsed - lastSentAtElapsed) > 2800L
+                        val captured = ScreenCapturer.captureMirrorFrame(
+                            service = currentSvc,
+                            maxWidth = mirrorMaxWidth,
+                            quality = mirrorQuality,
+                            previousHash = lastHash,
+                            forceEncode = forceHeartbeat
+                        )
+
+                        if (captured != null) {
+                            if (captured.isSecureWindow) {
+                                val flags = OmsFrameProtocol.SCREEN_FLAG_SECURE_WINDOW or
+                                    (if (screenLocked) OmsFrameProtocol.SCREEN_FLAG_SCREEN_LOCKED else 0)
+                                if (flags != lastStatusFlags || forceHeartbeat) {
+                                    val seq = mirrorSeq.incrementAndGet() and 0xFFFF
+                                    val encoded = OmsFrameProtocol.encodeScreenFrame(
+                                        codec = OmsFrameProtocol.CODEC_STATUS_ONLY,
+                                        flags = flags,
+                                        width = captured.screenWidth,
+                                        height = captured.screenHeight,
+                                        seq = seq,
+                                        timestampMs = System.currentTimeMillis()
+                                    )
+                                    latestMirrorFrameSlot.set(encoded)
+                                    mirrorSendSignal.trySend(Unit)
+                                    lastStatusFlags = flags
+                                    lastSentAtElapsed = nowElapsed
+                                    lastHash = -1L
+                                }
+                            } else if (!captured.unchanged && captured.bytes.isNotEmpty()) {
+                                val flags = if (screenLocked) OmsFrameProtocol.SCREEN_FLAG_SCREEN_LOCKED else 0
+                                val seq = mirrorSeq.incrementAndGet() and 0xFFFF
+                                val encoded = OmsFrameProtocol.encodeScreenFrame(
+                                    codec = OmsFrameProtocol.CODEC_WEBP,
+                                    flags = flags,
+                                    width = captured.screenWidth,
+                                    height = captured.screenHeight,
+                                    seq = seq,
+                                    timestampMs = System.currentTimeMillis(),
+                                    imageBytes = captured.bytes
+                                )
+                                latestMirrorFrameSlot.set(encoded)
+                                mirrorSendSignal.trySend(Unit)
+                                lastHash = captured.frameHash
+                                lastStatusFlags = flags
+                                lastSentAtElapsed = SystemClock.elapsedRealtime()
+                            }
+                        }
+
+                        val isBoosted = SystemClock.elapsedRealtime() < mirrorBoostUntilElapsedMs.get()
+                        val waitMs = if (isBoosted) {
+                            (1000L / mirrorMaxFps.coerceIn(2, 12)).coerceIn(110L, 350L)
+                        } else {
+                            480L
+                        }
+                        if (isBoosted) {
+                            delay(waitMs)
+                        } else {
+                            withTimeoutOrNull(waitMs) { mirrorWakeSignal.receive() }
+                        }
+                    }
+                } finally {
+                    releaseMirrorWakeLock()
+                }
+            }
+        } else {
+            // Already running: force an immediate refresh frame
+            boostMirrorPacing(2500L)
+        }
+
+        val dm = svc.resources.displayMetrics
+        return JSONObject().apply {
+            put("ok", true)
+            put("running", true)
+            put("mode", "native_stream")
+            put("maxWidth", mirrorMaxWidth)
+            put("quality", mirrorQuality)
+            put("maxFps", mirrorMaxFps)
+            put("screenWidth", dm.widthPixels)
+            put("screenHeight", dm.heightPixels)
+        }
+    }
+
+    private fun stopScreenMirror(): JSONObject {
+        mirrorActive.set(false)
+        OmsAccessibilityService.instance?.onMirrorUiEvent = null
+        latestMirrorFrameSlot.set(null)
+        mirrorCaptureJob?.cancel()
+        mirrorSenderJob?.cancel()
+        mirrorCaptureJob = null
+        mirrorSenderJob = null
+        releaseMirrorWakeLock()
+        return JSONObject().apply {
+            put("ok", true)
+            put("running", false)
+        }
+    }
+
+    private fun getScreenMirrorStatus(): JSONObject {
+        val dm = context.resources.displayMetrics
+        return JSONObject().apply {
+            put("ok", true)
+            put("running", mirrorActive.get())
+            put("seq", mirrorSeq.get())
+            put("maxWidth", mirrorMaxWidth)
+            put("quality", mirrorQuality)
+            put("maxFps", mirrorMaxFps)
+            put("screenWidth", dm.widthPixels)
+            put("screenHeight", dm.heightPixels)
+        }
+    }
+
+    private suspend fun handleMirrorInput(params: JSONObject, sessionStillValid: () -> Boolean): JSONObject {
+        val svc = OmsAccessibilityService.instance
+            ?: throw IllegalStateException("ERR_ACCESSIBILITY_DISABLED: 请先在手机上开启青简·咫尺无障碍服务")
+        boostMirrorPacing(2400L)
+        val res = svc.executeMirrorInput(params, sessionStillValid)
+        boostMirrorPacing(2400L)
+        return res
     }
 }

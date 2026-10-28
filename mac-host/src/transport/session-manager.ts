@@ -6,7 +6,9 @@ import dgram from "node:dgram";
 import { spawn, execFile, ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
+  DecodedScreenFrame,
   decodeJsonRpcPayload,
+  decodeScreenFramePayload,
   decodeStreamChunkPayload,
   deriveWanRoomId,
   Ed25519Identity,
@@ -149,6 +151,9 @@ export class PhoneSessionManager extends EventEmitter {
   >();
   private readonly incomingStreams = new Map<string, IncomingFileTransfer>();
   private readonly completedStreams = new Map<string, CompletedFileTransfer>();
+  private readonly mirrorViewers = new Set<{ send: (data: string | Uint8Array) => unknown; close: () => void }>();
+  private latestRawScreenFrame: Uint8Array | null = null;
+  private latestDecodedScreenFrame: DecodedScreenFrame | null = null;
   private customHttpHandler?: (
     req: Request,
     url: URL,
@@ -160,6 +165,10 @@ export class PhoneSessionManager extends EventEmitter {
 
   public getConnectionDiagnostics() {
     return { persistenceAvailable: this.connectionDiagnostics.persistenceAvailable, events: this.connectionDiagnostics.snapshot() };
+  }
+
+  public getBluetoothBridge(): BluetoothBridgeServer | null {
+    return this.btBridge;
   }
 
   constructor(opts: {
@@ -246,12 +255,12 @@ export class PhoneSessionManager extends EventEmitter {
     const metaPath = path.join(apkDir, "output-metadata.json");
 
     if (!fs.existsSync(apkPath)) {
-      const defaultVer = "1.4.9";
+      const defaultVer = "1.5.1";
       const ghUrl = `https://github.com/dqrcsc/one-more-step/releases/download/v${defaultVer}/OneMoreStep-v${defaultVer}.apk`;
       return {
         available: false,
         apkPath,
-        versionCode: 23,
+        versionCode: 25,
         versionName: defaultVer,
         sha256: "",
         sizeBytes: 0,
@@ -263,8 +272,8 @@ export class PhoneSessionManager extends EventEmitter {
     }
 
     const stat = fs.statSync(apkPath);
-    let versionCode = 23;
-    let versionName = "1.4.9";
+    let versionCode = 25;
+    let versionName = "1.5.1";
     const fileMatch = path.basename(apkPath).match(/^OneMoreStep-v([\d.]+)\.apk$/);
     if (fileMatch) {
       versionName = fileMatch[1];
@@ -346,6 +355,42 @@ export class PhoneSessionManager extends EventEmitter {
     return this.completedStreams.get(streamId);
   }
 
+  public getMirrorViewerCount(): number {
+    return this.mirrorViewers.size;
+  }
+
+  public getLatestScreenFrame(): { raw: Uint8Array; decoded: DecodedScreenFrame } | null {
+    if (!this.latestRawScreenFrame || !this.latestDecodedScreenFrame) return null;
+    return { raw: this.latestRawScreenFrame, decoded: this.latestDecodedScreenFrame };
+  }
+
+  public ingestScreenFrame(rawPayload: Uint8Array, decoded?: DecodedScreenFrame): DecodedScreenFrame {
+    const frame = decoded ?? decodeScreenFramePayload(rawPayload);
+    const copy = new Uint8Array(rawPayload);
+    this.latestRawScreenFrame = copy;
+    this.latestDecodedScreenFrame = frame;
+    for (const viewer of this.mirrorViewers) {
+      try {
+        viewer.send(copy);
+      } catch {
+        this.mirrorViewers.delete(viewer);
+      }
+    }
+    this.emit("screenFrame", frame, copy);
+    return frame;
+  }
+
+  public broadcastMirrorEvent(eventObj: Record<string, unknown>): void {
+    const json = JSON.stringify(eventObj);
+    for (const viewer of this.mirrorViewers) {
+      try {
+        viewer.send(json);
+      } catch {
+        this.mirrorViewers.delete(viewer);
+      }
+    }
+  }
+
   public static getLocalLanIps(): string[] {
     const nets = os.networkInterfaces();
     const primaryIps: string[] = [];
@@ -379,13 +424,39 @@ export class PhoneSessionManager extends EventEmitter {
     const self = this;
 
     // 1. Start Tier 1: High-Speed LAN WebSocket Server
-    this.wsServer = Bun.serve<{ pipe?: ActiveTransportPipe; tier: TransportTier; remoteIp?: string }>({
+    this.wsServer = Bun.serve<{ pipe?: ActiveTransportPipe; tier: TransportTier; remoteIp?: string; isMirrorViewer?: boolean }>({
       port: this.lanPort,
       async fetch(req, server) {
         const url = new URL(req.url);
         const clientIp = server.requestIP(req)?.address || "unknown";
         const normalizedIp = clientIp.replace(/^::ffff:/i, "");
         console.log(`[omsd][http] ${req.method} ${url.pathname} from ${clientIp}`);
+
+        // Localhost-only WebSocket for real-time screen mirroring in Mac browser (/ws/mirror)
+        if (url.pathname === "/ws/mirror") {
+          const reqHost = req.headers.get("host") || "";
+          let validHost = PhoneSessionManager.isLoopbackAddress(url.hostname);
+          if (reqHost) {
+            try {
+              validHost = validHost && PhoneSessionManager.isLoopbackAddress(new URL(`http://${reqHost}`).hostname);
+            } catch {
+              validHost = false;
+            }
+          }
+          const origin = req.headers.get("origin");
+          const validOrigin = !origin || origin === url.origin;
+          if (!PhoneSessionManager.isLoopbackAddress(clientIp) || !validHost || !validOrigin) {
+            return new Response(
+              JSON.stringify({ ok: false, error: "Forbidden: Mirror WebSocket is strictly restricted to localhost (127.0.0.1 / ::1)." }),
+              { status: 403, headers: { "Content-Type": "application/json; charset=utf-8" } }
+            );
+          }
+          if (server.upgrade(req, { data: { tier: "LAN_WS", remoteIp: normalizedIp, isMirrorViewer: true } })) {
+            return undefined;
+          }
+          return new Response("WebSocket upgrade required", { status: 426 });
+        }
+
         const tierParam = url.searchParams.get("tier") === "wan" ? "WAN_WEBRTC" : "LAN_WS";
         if (server.upgrade(req, { data: { tier: tierParam, remoteIp: normalizedIp } })) {
           return undefined;
@@ -518,6 +589,16 @@ export class PhoneSessionManager extends EventEmitter {
         idleTimeout: 120,
         sendPings: true,
         open(ws) {
+          if (ws.data.isMirrorViewer) {
+            self.mirrorViewers.add(ws);
+            if (self.latestRawScreenFrame) {
+              try {
+                ws.send(self.latestRawScreenFrame);
+              } catch {}
+            }
+            self.emit("mirrorViewerChanged", self.mirrorViewers.size, ws);
+            return;
+          }
           const tier = ws.data.tier;
           const remoteIp = ws.data.remoteIp;
           console.log(`[omsd][ws] opened tier=${tier} from=${remoteIp || "unknown"}`);
@@ -533,6 +614,16 @@ export class PhoneSessionManager extends EventEmitter {
           self.onPipeOpened(pipe);
         },
         message(ws, message) {
+          if (ws.data.isMirrorViewer) {
+            try {
+              const txt = typeof message === "string" ? message : new TextDecoder().decode(new Uint8Array(message));
+              const parsed = JSON.parse(txt);
+              if (parsed && typeof parsed === "object") {
+                self.emit("mirrorViewerCommand", parsed, ws);
+              }
+            } catch {}
+            return;
+          }
           const pipe = ws.data.pipe;
           if (!pipe) return;
           const bytes =
@@ -542,6 +633,11 @@ export class PhoneSessionManager extends EventEmitter {
           self.onRawBytesReceived(pipe, bytes);
         },
         close(ws, code, reason) {
+          if (ws.data.isMirrorViewer) {
+            self.mirrorViewers.delete(ws);
+            self.emit("mirrorViewerChanged", self.mirrorViewers.size);
+            return;
+          }
           // Remote close reason is untrusted and may contain secrets; keep numeric code only.
           if (ws.data.pipe?.diagnosticId) self.connectionDiagnostics.record("WS_CLOSED", ws.data.pipe.tier, ws.data.pipe.diagnosticId, code);
           const pipe = ws.data.pipe;
@@ -609,6 +705,14 @@ export class PhoneSessionManager extends EventEmitter {
           this.onPipeOpened(btPipe);
         }
         this.onRawBytesReceived(btPipe, bytes);
+      });
+
+      this.btBridge.on("airpodsStatus", (status) => {
+        this.emit("airpodsStatus", status);
+      });
+
+      this.btBridge.on("airpodsMacClaimTriggered", (evt) => {
+        this.emit("airpodsMacClaimTriggered", evt);
       });
 
       await this.btBridge.start();
@@ -1136,6 +1240,10 @@ export class PhoneSessionManager extends EventEmitter {
         this.lastRttMs = Math.max(1, Date.now() - sentTs);
         if (pipe.tier === "LAN_WS") this.presence.onLanDirectActive(this.lastRttMs);
         else if (pipe.tier === "BT_RFCOMM") this.presence.onBleRssiSample(this.presence.getSnapshot().rssiRaw ?? -58);
+        break;
+      }
+      case FrameType.SCREEN_FRAME: {
+        this.ingestScreenFrame(frame.payload);
         break;
       }
       default: throw new Error("Unsupported authenticated frame");

@@ -215,7 +215,7 @@ object SecureChannel {
 
         private fun validateInner(inner: ByteArray) {
             require(inner.size in 8..MAX_INNER_BYTES && inner[0] == 0x4f.toByte() && inner[1] == 1.toByte()
-                && inner[2].toInt() in 1..6 && inner[3] == 0.toByte()) { "Invalid inner OMS frame" }
+                && inner[2].toInt() in 1..7 && inner[3] == 0.toByte()) { "Invalid inner OMS frame" }
             require(ByteBuffer.wrap(inner, 4, 4).int.toLong() == inner.size.toLong() - 8) { "Invalid inner frame length" }
         }
 

@@ -5,8 +5,12 @@ import os from "node:os";
 import net from "node:net";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import {
+  AirPodsStatusSnapshot,
   ApprovalRespondParams,
   buildPairingUri,
+  DecodedScreenFrame,
+  encodeScreenFrame,
+  FRAME_HEADER_BYTES,
   secureRandomHex,
   Ed25519Identity,
   generateEd25519Identity,
@@ -14,9 +18,13 @@ import {
   InboxSubmitItemParams,
   IntentTag,
   JsonRpcRequest,
+  MirrorStatusSnapshot,
   OMS_BLE_SERVICE_SHORT_UUID,
   OMS_DEFAULT_LAN_PORT,
   OmsErrorCode,
+  PairedAirPodsDevice,
+  ScreenFrameCodec,
+  ScreenFrameFlags,
 } from "@oms/shared-protocol";
 import { PhoneSessionManager, TrustedPhoneDevice } from "../transport/session-manager.js";
 import { InboxManager } from "../inbox/inbox-manager.js";
@@ -30,6 +38,9 @@ export interface OmsHostConfig {
   autoCopyTextToClipboard?: boolean;
   autoPreviewImageOnMac?: boolean;
   autoSyncOtpToMac?: boolean;
+  autoSwitchAirpods?: boolean;
+  pauseOtherOnAirpodsSwitch?: boolean;
+  preferredAirpodsMac?: string;
   unlockPattern?: string;
   unlockPin?: string;
   unlockBounds?: string;
@@ -68,6 +79,32 @@ export class OmsDaemon {
   >();
 
   private readonly settledApprovals = new Map<string, { response: ApprovalRespondParams; expiresAtMs: number }>();
+
+  // Real-time screen mirroring state
+  private mirrorRunning = false;
+  private mirrorMode: "native_stream" | "legacy_poll" | "stopped" = "stopped";
+  private mirrorMaxWidth = 640;
+  private mirrorQuality = 72;
+  private mirrorMaxFps = 8;
+  private mirrorLegacyPollTimer: Timer | null = null;
+  private mirrorLegacyPollingInFlight = false;
+  private mirrorLegacyBoostUntilMs = 0;
+  private mirrorIdleStopTimer: Timer | null = null;
+  private mirrorFrameTimestamps: number[] = [];
+  private mirrorSeq = 0;
+  private mirrorWidth = 1080;
+  private mirrorHeight = 2400;
+  private mirrorFlags = 0;
+  private mirrorLastFrameAtMs = 0;
+
+  // AirPods Seamless Auto-Switch State
+  private lastAirpodsSwitchEvent?: AirPodsStatusSnapshot["lastSwitchEvent"];
+  private phoneAirpodsState: AirPodsStatusSnapshot["phone"] = {
+    connected: false,
+    mediaPlaying: false,
+    inCall: false,
+    pairedAirpods: [],
+  };
 
   constructor(customHomeDir?: string) {
     this.homeDir = customHomeDir || path.join(os.homedir(), ".one_more_step");
@@ -114,6 +151,8 @@ export class OmsDaemon {
           autoCopyTextToClipboard: true,
           autoPreviewImageOnMac: true,
           autoSyncOtpToMac: true,
+          autoSwitchAirpods: true,
+          pauseOtherOnAirpodsSwitch: true,
           ...parsed,
         };
       } catch {
@@ -126,6 +165,8 @@ export class OmsDaemon {
       autoCopyTextToClipboard: true,
       autoPreviewImageOnMac: true,
       autoSyncOtpToMac: true,
+      autoSwitchAirpods: true,
+      pauseOtherOnAirpodsSwitch: true,
       dingtalk: { enabled: false },
     };
     fs.writeFileSync(this.configPath, JSON.stringify(defaultCfg, null, 2), "utf8");
@@ -136,6 +177,9 @@ export class OmsDaemon {
     autoCopyTextToClipboard: boolean;
     autoPreviewImageOnMac: boolean;
     autoSyncOtpToMac: boolean;
+    autoSwitchAirpods: boolean;
+    pauseOtherOnAirpodsSwitch: boolean;
+    preferredAirpodsMac?: string;
     hasUnlockPattern: boolean;
     hasUnlockPin: boolean;
     unlockBounds?: string;
@@ -144,6 +188,9 @@ export class OmsDaemon {
       autoCopyTextToClipboard: this.config.autoCopyTextToClipboard !== false,
       autoPreviewImageOnMac: this.config.autoPreviewImageOnMac !== false,
       autoSyncOtpToMac: this.config.autoSyncOtpToMac !== false,
+      autoSwitchAirpods: this.config.autoSwitchAirpods !== false,
+      pauseOtherOnAirpodsSwitch: this.config.pauseOtherOnAirpodsSwitch !== false,
+      preferredAirpodsMac: this.config.preferredAirpodsMac,
       hasUnlockPattern: Boolean(this.config.unlockPattern),
       hasUnlockPin: Boolean(this.config.unlockPin),
       unlockBounds: this.config.unlockBounds,
@@ -154,6 +201,9 @@ export class OmsDaemon {
     autoCopyTextToClipboard?: boolean;
     autoPreviewImageOnMac?: boolean;
     autoSyncOtpToMac?: boolean;
+    autoSwitchAirpods?: boolean;
+    pauseOtherOnAirpodsSwitch?: boolean;
+    preferredAirpodsMac?: string;
     unlockPattern?: string;
     unlockPin?: string;
     unlockBounds?: string;
@@ -161,6 +211,9 @@ export class OmsDaemon {
     autoCopyTextToClipboard: boolean;
     autoPreviewImageOnMac: boolean;
     autoSyncOtpToMac: boolean;
+    autoSwitchAirpods: boolean;
+    pauseOtherOnAirpodsSwitch: boolean;
+    preferredAirpodsMac?: string;
     hasUnlockPattern: boolean;
     hasUnlockPin: boolean;
     unlockBounds?: string;
@@ -173,6 +226,16 @@ export class OmsDaemon {
     }
     if (typeof prefs.autoSyncOtpToMac === "boolean") {
       this.config.autoSyncOtpToMac = prefs.autoSyncOtpToMac;
+    }
+    if (typeof prefs.autoSwitchAirpods === "boolean") {
+      this.config.autoSwitchAirpods = prefs.autoSwitchAirpods;
+    }
+    if (typeof prefs.pauseOtherOnAirpodsSwitch === "boolean") {
+      this.config.pauseOtherOnAirpodsSwitch = prefs.pauseOtherOnAirpodsSwitch;
+    }
+    if (typeof prefs.preferredAirpodsMac === "string") {
+      const cleaned = prefs.preferredAirpodsMac.trim().toUpperCase();
+      this.config.preferredAirpodsMac = cleaned || undefined;
     }
     if (typeof prefs.unlockPattern === "string") {
       const cleaned = prefs.unlockPattern.trim();
@@ -190,6 +253,7 @@ export class OmsDaemon {
       encoding: "utf8",
       mode: 0o600,
     });
+    this.syncAirpodsConfigToBridgeAndPhone();
     return this.getHostPreferences();
   }
 
@@ -259,6 +323,138 @@ export class OmsDaemon {
     this.session.on("trustStore", (devices: TrustedPhoneDevice[]) => {
       this.saveTrustedDevices(devices);
     });
+
+    this.session.on("phoneAuthenticated", (evt: any) => {
+      if (evt?.status) {
+        this.ingestPhoneAirpodsSnapshot(evt.status);
+      }
+      this.syncAirpodsConfigToBridgeAndPhone();
+    });
+
+    this.session.on("airpodsStatus", () => {
+      this.syncAirpodsConfigToBridgeAndPhone();
+    });
+
+    this.session.on(
+      "airpodsMacClaimTriggered",
+      (evt: { targetMac?: string; targetName?: string; reason?: string }) => {
+        if (this.config.autoSwitchAirpods === false) return;
+        this.lastAirpodsSwitchEvent = {
+          direction: "PHONE_TO_MAC",
+          reason: evt.reason || "mac_audio_started",
+          deviceName: evt.targetName || "AirPods",
+          deviceMac: evt.targetMac,
+          atMs: Date.now(),
+        };
+        if (this.session.getActiveTier() !== "DISCONNECTED") {
+          void this.session
+            .callPhone(
+              "airpods.handoffToMac",
+              {
+                targetMac: evt.targetMac,
+                targetName: evt.targetName,
+                pausePhoneMedia: this.config.pauseOtherOnAirpodsSwitch !== false,
+                disconnectOnPhone: true,
+                reason: evt.reason || "mac_audio_started",
+              },
+              3500
+            )
+            .catch(() => {});
+        }
+      }
+    );
+
+    this.session.on("screenFrame", (frame: DecodedScreenFrame) => {
+      const now = Date.now();
+      this.mirrorSeq = frame.seq;
+      if (frame.width > 0) this.mirrorWidth = frame.width;
+      if (frame.height > 0) this.mirrorHeight = frame.height;
+      this.mirrorFlags = frame.flags;
+      this.mirrorLastFrameAtMs = now;
+      if (frame.codec !== ScreenFrameCodec.STATUS_ONLY && frame.data.byteLength > 0) {
+        this.mirrorFrameTimestamps.push(now);
+        while (
+          this.mirrorFrameTimestamps.length > 0 &&
+          now - this.mirrorFrameTimestamps[0] > 3000
+        ) {
+          this.mirrorFrameTimestamps.shift();
+        }
+      }
+      this.session.broadcastMirrorEvent({
+        type: "mirror_status",
+        status: this.getMirrorStatus(),
+      });
+    });
+
+    this.session.on(
+      "mirrorViewerChanged",
+      (count: number, newWs?: { send: (data: string | Uint8Array) => unknown }) => {
+        if (newWs) {
+          try {
+            newWs.send(JSON.stringify({ type: "mirror_status", status: this.getMirrorStatus() }));
+          } catch {}
+        }
+        if (count > 0) {
+          if (this.mirrorIdleStopTimer) {
+            clearTimeout(this.mirrorIdleStopTimer);
+            this.mirrorIdleStopTimer = null;
+          }
+          if (!this.mirrorRunning && this.session.getActiveTier() !== "DISCONNECTED") {
+            void this.startMirror({}).catch(() => {});
+          }
+        } else if (this.mirrorRunning) {
+          if (this.mirrorIdleStopTimer) clearTimeout(this.mirrorIdleStopTimer);
+          this.mirrorIdleStopTimer = setTimeout(() => {
+            this.mirrorIdleStopTimer = null;
+            if (this.session.getMirrorViewerCount() === 0 && this.mirrorRunning) {
+              void this.stopMirror().catch(() => {});
+            }
+          }, 25000);
+          (this.mirrorIdleStopTimer as any).unref?.();
+        }
+      }
+    );
+
+    this.session.on(
+      "mirrorViewerCommand",
+      async (
+        cmd: Record<string, any>,
+        ws: { send: (data: string | Uint8Array) => unknown }
+      ) => {
+        const cmdType = String(cmd.type || cmd.cmd || "");
+        try {
+          if (cmdType === "start") {
+            const st = await this.startMirror(cmd);
+            ws.send(JSON.stringify({ type: "mirror_status", status: st }));
+          } else if (cmdType === "stop") {
+            const st = await this.stopMirror();
+            ws.send(JSON.stringify({ type: "mirror_status", status: st }));
+          } else if (cmdType === "status") {
+            ws.send(JSON.stringify({ type: "mirror_status", status: this.getMirrorStatus() }));
+          } else if (cmdType === "input") {
+            const res = await this.sendMirrorInput(cmd);
+            ws.send(
+              JSON.stringify({
+                type: "input_ack",
+                reqId: cmd.reqId,
+                ok: true,
+                result: res,
+              })
+            );
+          }
+        } catch (err: any) {
+          try {
+            ws.send(
+              JSON.stringify({
+                type: "mirror_error",
+                reqId: cmd.reqId,
+                error: err?.message || String(err),
+              })
+            );
+          } catch {}
+        }
+      }
+    );
 
     this.session.on(
       "phoneRequest",
@@ -379,6 +575,48 @@ export class OmsDaemon {
                 lanPort: this.config.lanPort,
               },
             });
+          } else if (req.method === "airpods.claimByPhone") {
+            const p = (req.params || {}) as Record<string, any>;
+            const isManual = p.reason === "manual";
+            if (this.config.autoSwitchAirpods === false && !isManual) {
+              reply({ result: { ok: false, ignored: true, reason: "autoSwitchAirpods disabled" } });
+              return;
+            }
+            const targetMac = p.targetMac ? String(p.targetMac) : undefined;
+            const targetName = p.targetName ? String(p.targetName) : "AirPods";
+            const pauseMacMedia =
+              this.config.pauseOtherOnAirpodsSwitch !== false && p.pauseMacMedia !== false;
+            this.lastAirpodsSwitchEvent = {
+              direction: "MAC_TO_PHONE",
+              reason: String(p.reason || "phone_audio_started"),
+              deviceName: targetName,
+              deviceMac: targetMac,
+              atMs: Date.now(),
+            };
+            void this.session
+              .getBluetoothBridge()
+              ?.releaseAirpodsFromMac({
+                pauseMedia: pauseMacMedia,
+                targetMac,
+                timeoutMs: 2200,
+              })
+              .then(() => {
+                reply({ result: { ok: true, released: true, pausedMacMedia: pauseMacMedia } });
+              })
+              .catch(() => {
+                reply({ result: { ok: true, released: true } });
+              });
+          } else if (req.method === "airpods.statusReport") {
+            const p = (req.params || {}) as Record<string, any>;
+            this.ingestPhoneAirpodsSnapshot({
+              airpodsConnected: Boolean(p.connected),
+              airpodsName: p.deviceName ? String(p.deviceName) : undefined,
+              airpodsMac: p.deviceMac ? String(p.deviceMac) : undefined,
+              mediaPlaying: Boolean(p.mediaPlaying),
+              audioModeInCall: Boolean(p.inCall),
+              pairedAirpods: Array.isArray(p.pairedAirpods) ? p.pairedAirpods : undefined,
+            });
+            reply({ result: { ok: true } });
           } else {
             reply({ result: { ack: true } });
           }
@@ -394,6 +632,197 @@ export class OmsDaemon {
     );
   }
 
+  private ingestPhoneAirpodsSnapshot(snap: Record<string, any>): void {
+    if (typeof snap.airpodsConnected === "boolean") {
+      this.phoneAirpodsState.connected = snap.airpodsConnected;
+    }
+    if (typeof snap.airpodsName === "string") {
+      this.phoneAirpodsState.deviceName = snap.airpodsName || undefined;
+    }
+    if (typeof snap.airpodsMac === "string") {
+      this.phoneAirpodsState.deviceMac = snap.airpodsMac || undefined;
+    }
+    if (typeof snap.mediaPlaying === "boolean") {
+      this.phoneAirpodsState.mediaPlaying = snap.mediaPlaying;
+    }
+    if (typeof snap.audioModeInCall === "boolean") {
+      this.phoneAirpodsState.inCall = snap.audioModeInCall;
+    }
+    if (Array.isArray(snap.pairedAirpods)) {
+      this.phoneAirpodsState.pairedAirpods = snap.pairedAirpods.map((item: any) => ({
+        name: String(item?.name || "AirPods"),
+        mac: String(item?.mac || ""),
+        connected: Boolean(item?.connected),
+      }));
+    }
+    this.session.getBluetoothBridge()?.updateAirpodsConfig({
+      autoSwitch: this.config.autoSwitchAirpods !== false,
+      pauseOtherOnSwitch: this.config.pauseOtherOnAirpodsSwitch !== false,
+      preferredMac: this.config.preferredAirpodsMac,
+      phoneAirpodsConnected: this.phoneAirpodsState.connected,
+      phoneAirpodsMac: this.phoneAirpodsState.deviceMac,
+      phoneAirpodsName: this.phoneAirpodsState.deviceName,
+      phoneInCall: this.phoneAirpodsState.inCall,
+    });
+  }
+
+  public syncAirpodsConfigToBridgeAndPhone(): void {
+    const btBridge = this.session.getBluetoothBridge();
+    btBridge?.updateAirpodsConfig({
+      autoSwitch: this.config.autoSwitchAirpods !== false,
+      pauseOtherOnSwitch: this.config.pauseOtherOnAirpodsSwitch !== false,
+      preferredMac: this.config.preferredAirpodsMac,
+      phoneAirpodsConnected: this.phoneAirpodsState.connected,
+      phoneAirpodsMac: this.phoneAirpodsState.deviceMac,
+      phoneAirpodsName: this.phoneAirpodsState.deviceName,
+      phoneInCall: this.phoneAirpodsState.inCall,
+    });
+    if (this.session.getActiveTier() !== "DISCONNECTED") {
+      const macSt = btBridge?.getAirpodsStatus();
+      void this.session
+        .callPhone(
+          "airpods.syncConfig",
+          {
+            autoSwitchAirpods: this.config.autoSwitchAirpods !== false,
+            pauseOtherOnAirpodsSwitch: this.config.pauseOtherOnAirpodsSwitch !== false,
+            preferredAirpodsMac: this.config.preferredAirpodsMac || "",
+            macAirpodsConnected: Boolean(macSt?.connected),
+            macAirpodsMac: macSt?.deviceMac || "",
+            macAirpodsName: macSt?.deviceName || "",
+          },
+          2000
+        )
+        .catch(() => {});
+    }
+  }
+
+  public getAirpodsStatusSnapshot(): AirPodsStatusSnapshot {
+    const macSt = this.session.getBluetoothBridge()?.getAirpodsStatus() || {
+      connected: false,
+      isDefaultOutput: false,
+      macAudioRunning: false,
+      pairedAirpods: [],
+    };
+    const activeOwner: "MAC" | "PHONE" | "NONE" = macSt.connected
+      ? "MAC"
+      : this.phoneAirpodsState.connected
+        ? "PHONE"
+        : "NONE";
+    const activeDeviceName =
+      (macSt.connected ? macSt.deviceName : undefined) ||
+      (this.phoneAirpodsState.connected ? this.phoneAirpodsState.deviceName : undefined) ||
+      macSt.deviceName ||
+      this.phoneAirpodsState.deviceName;
+    const activeDeviceMac =
+      (macSt.connected ? macSt.deviceMac : undefined) ||
+      (this.phoneAirpodsState.connected ? this.phoneAirpodsState.deviceMac : undefined) ||
+      macSt.deviceMac ||
+      this.phoneAirpodsState.deviceMac;
+
+    return {
+      autoSwitchEnabled: this.config.autoSwitchAirpods !== false,
+      pauseOtherOnSwitch: this.config.pauseOtherOnAirpodsSwitch !== false,
+      preferredAirpodsMac: this.config.preferredAirpodsMac,
+      activeOwner,
+      activeDeviceName,
+      activeDeviceMac,
+      mac: {
+        connected: macSt.connected,
+        isDefaultOutput: macSt.isDefaultOutput,
+        audioRunning: macSt.macAudioRunning,
+        defaultOutputName: macSt.defaultOutputName,
+        deviceName: macSt.deviceName,
+        deviceMac: macSt.deviceMac,
+        pairedAirpods: macSt.pairedAirpods,
+      },
+      phone: {
+        ...this.phoneAirpodsState,
+      },
+      lastSwitchEvent: this.lastAirpodsSwitchEvent,
+    };
+  }
+
+  public async switchAirpodsToMac(targetMac?: string, reason = "manual"): Promise<Record<string, any>> {
+    const pausePhoneMedia = this.config.pauseOtherOnAirpodsSwitch !== false;
+    this.lastAirpodsSwitchEvent = {
+      direction: "PHONE_TO_MAC",
+      reason,
+      deviceMac: targetMac,
+      atMs: Date.now(),
+    };
+    if (this.session.getActiveTier() !== "DISCONNECTED") {
+      await this.session
+        .callPhone(
+          "airpods.handoffToMac",
+          {
+            targetMac,
+            pausePhoneMedia,
+            disconnectOnPhone: true,
+            reason,
+          },
+          2500
+        )
+        .catch(() => {});
+    }
+    const res = await this.session.getBluetoothBridge()?.connectAirpodsToMac(targetMac);
+    if (res?.deviceName || res?.deviceMac) {
+      this.lastAirpodsSwitchEvent = {
+        direction: "PHONE_TO_MAC",
+        reason,
+        deviceName: res.deviceName,
+        deviceMac: res.deviceMac,
+        atMs: Date.now(),
+      };
+    }
+    return {
+      ok: Boolean(res?.ok),
+      direction: "PHONE_TO_MAC",
+      message: res?.message || (res?.ok ? "已切换到 Mac" : "切换到 Mac 失败"),
+      status: this.getAirpodsStatusSnapshot(),
+    };
+  }
+
+  public async switchAirpodsToPhone(targetMac?: string, reason = "manual"): Promise<Record<string, any>> {
+    const pauseMacMedia = this.config.pauseOtherOnAirpodsSwitch !== false;
+    this.lastAirpodsSwitchEvent = {
+      direction: "MAC_TO_PHONE",
+      reason,
+      deviceMac: targetMac,
+      atMs: Date.now(),
+    };
+    await this.session
+      .getBluetoothBridge()
+      ?.releaseAirpodsFromMac({
+        pauseMedia: pauseMacMedia,
+        targetMac,
+        timeoutMs: 2500,
+      })
+      .catch(() => {});
+    let phoneRes: any = null;
+    if (this.session.getActiveTier() !== "DISCONNECTED") {
+      phoneRes = await this.session
+        .callPhone<any>(
+          "airpods.connectOnPhone",
+          {
+            targetMac: targetMac || this.config.preferredAirpodsMac,
+            reason,
+          },
+          5500
+        )
+        .catch((err) => ({ ok: false, error: err?.message || String(err) }));
+      if (phoneRes?.status) {
+        this.session.setPhoneStatus(phoneRes.status);
+        this.ingestPhoneAirpodsSnapshot(phoneRes.status);
+      }
+    }
+    return {
+      ok: phoneRes ? Boolean(phoneRes.ok) : true,
+      direction: "MAC_TO_PHONE",
+      phoneResult: phoneRes,
+      status: this.getAirpodsStatusSnapshot(),
+    };
+  }
+
   private showMacDesktopNotification(
     title: string,
     message: string,
@@ -401,6 +830,9 @@ export class OmsDaemon {
     soundName?: string
   ): void {
     if (process.env.OMS_DISABLE_OSASCRIPT === "1") return;
+    if (soundName) {
+      this.session.getBluetoothBridge()?.suppressAirpodsAutoGrab(2600);
+    }
     const safeTitle = title.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
     const safeMsg = message.replace(/\\/g, "\\\\").replace(/"/g, '\\"').slice(0, 180);
     const safeSub = subtitle
@@ -513,10 +945,309 @@ export class OmsDaemon {
       ]);
       if (live && typeof live === "object") {
         this.session.setPhoneStatus(live);
+        this.ingestPhoneAirpodsSnapshot(live);
       }
     } catch {
       // keep cached phoneStatus on transient RPC error
     }
+  }
+
+  public getMirrorStatus(): MirrorStatusSnapshot {
+    const now = Date.now();
+    while (
+      this.mirrorFrameTimestamps.length > 0 &&
+      now - this.mirrorFrameTimestamps[0] > 3000
+    ) {
+      this.mirrorFrameTimestamps.shift();
+    }
+    const fps =
+      this.mirrorFrameTimestamps.length >= 2
+        ? Math.round(
+            ((this.mirrorFrameTimestamps.length - 1) * 10000) /
+              Math.max(
+                200,
+                this.mirrorFrameTimestamps[this.mirrorFrameTimestamps.length - 1] -
+                  this.mirrorFrameTimestamps[0]
+              )
+          ) / 10
+        : this.mirrorFrameTimestamps.length === 1 && now - this.mirrorLastFrameAtMs < 1500
+          ? 1
+          : 0;
+    const ps = this.session.getPhoneStatus();
+    return {
+      running: this.mirrorRunning,
+      mode: this.mirrorRunning ? this.mirrorMode : "stopped",
+      codec: "webp",
+      fps,
+      seq: this.mirrorSeq,
+      width: this.mirrorWidth,
+      height: this.mirrorHeight,
+      isSecureWindow: Boolean(this.mirrorFlags & ScreenFrameFlags.IS_SECURE_WINDOW),
+      isScreenOff: Boolean(this.mirrorFlags & ScreenFrameFlags.IS_SCREEN_OFF),
+      isScreenLocked:
+        Boolean(this.mirrorFlags & ScreenFrameFlags.IS_SCREEN_LOCKED) ||
+        Boolean(ps?.screenLocked),
+      foregroundPackage: ps?.foregroundPackage,
+      foregroundAppLabel: ps?.foregroundAppLabel,
+      lastFrameAtMs: this.mirrorLastFrameAtMs,
+      clientCount: this.session.getMirrorViewerCount(),
+      maxWidth: this.mirrorMaxWidth,
+      quality: this.mirrorQuality,
+      maxFps: this.mirrorMaxFps,
+    };
+  }
+
+  private stopLegacyMirrorLoop(): void {
+    if (this.mirrorLegacyPollTimer) {
+      clearTimeout(this.mirrorLegacyPollTimer);
+      this.mirrorLegacyPollTimer = null;
+    }
+    this.mirrorLegacyPollingInFlight = false;
+  }
+
+  private startLegacyMirrorLoop(): void {
+    this.stopLegacyMirrorLoop();
+    const pollOnce = async () => {
+      if (!this.mirrorRunning || this.mirrorMode !== "legacy_poll") return;
+      if (this.session.getActiveTier() === "DISCONNECTED") {
+        this.mirrorLegacyPollTimer = setTimeout(pollOnce, 1000);
+        (this.mirrorLegacyPollTimer as any).unref?.();
+        return;
+      }
+      if (!this.mirrorLegacyPollingInFlight) {
+        this.mirrorLegacyPollingInFlight = true;
+        try {
+          let streamId: string | undefined;
+          try {
+            const res = await this.session.callPhone<any>(
+              "sys.control",
+              { action: "take_screenshot" },
+              6000
+            );
+            streamId = res?.streamId;
+          } catch (err: any) {
+            const msg = String(err?.message || "");
+            if (msg.includes("ERR_SECURE_WINDOW_BLOCKED") || msg.includes("隐私保护")) {
+              const seq = (this.mirrorSeq + 1) & 0xffff;
+              const rawFrame = encodeScreenFrame({
+                codec: ScreenFrameCodec.STATUS_ONLY,
+                flags: ScreenFrameFlags.IS_SECURE_WINDOW,
+                width: this.mirrorWidth,
+                height: this.mirrorHeight,
+                seq,
+                timestampMs: Date.now(),
+              });
+              this.session.ingestScreenFrame(rawFrame.subarray(FRAME_HEADER_BYTES));
+            } else if (msg.includes("Unknown RPC method")) {
+              const obs = await this.session.callPhone<any>(
+                "gui.observe",
+                { includeScreenshot: true, somAnnotation: false },
+                6000
+              );
+              if (obs?.screenWidth) this.mirrorWidth = obs.screenWidth;
+              if (obs?.screenHeight) this.mirrorHeight = obs.screenHeight;
+              streamId = obs?.screenshotStreamId;
+            }
+          }
+          if (streamId && this.mirrorRunning) {
+            const comp = await this.session.waitForCompletedStream(streamId, 5000);
+            if (comp && fs.existsSync(comp.savedAbsPath)) {
+              const imgBytes = new Uint8Array(fs.readFileSync(comp.savedAbsPath));
+              try {
+                fs.unlinkSync(comp.savedAbsPath);
+              } catch {}
+              const seq = (this.mirrorSeq + 1) & 0xffff;
+              const ps = this.session.getPhoneStatus();
+              const flags = ps?.screenLocked ? ScreenFrameFlags.IS_SCREEN_LOCKED : 0;
+              const rawFrame = encodeScreenFrame(
+                {
+                  codec: ScreenFrameCodec.WEBP,
+                  flags,
+                  width: this.mirrorWidth,
+                  height: this.mirrorHeight,
+                  seq,
+                  timestampMs: Date.now(),
+                },
+                imgBytes
+              );
+              this.session.ingestScreenFrame(rawFrame.subarray(FRAME_HEADER_BYTES));
+            }
+          }
+        } catch {
+          // ignore transient poll error
+        } finally {
+          this.mirrorLegacyPollingInFlight = false;
+        }
+      }
+      if (!this.mirrorRunning || this.mirrorMode !== "legacy_poll") return;
+      const isBoosted = Date.now() < this.mirrorLegacyBoostUntilMs;
+      const delayMs = isBoosted ? 180 : 520;
+      this.mirrorLegacyPollTimer = setTimeout(pollOnce, delayMs);
+      (this.mirrorLegacyPollTimer as any).unref?.();
+    };
+    this.mirrorLegacyBoostUntilMs = Date.now() + 3000;
+    void pollOnce();
+  }
+
+  public async startMirror(params: Record<string, any> = {}): Promise<MirrorStatusSnapshot> {
+    if (this.mirrorIdleStopTimer) {
+      clearTimeout(this.mirrorIdleStopTimer);
+      this.mirrorIdleStopTimer = null;
+    }
+    if (typeof params.maxWidth === "number" && Number.isFinite(params.maxWidth)) {
+      this.mirrorMaxWidth = Math.max(360, Math.min(1080, Math.round(params.maxWidth)));
+    }
+    if (typeof params.quality === "number" && Number.isFinite(params.quality)) {
+      this.mirrorQuality = Math.max(45, Math.min(90, Math.round(params.quality)));
+    }
+    if (typeof params.maxFps === "number" && Number.isFinite(params.maxFps)) {
+      this.mirrorMaxFps = Math.max(2, Math.min(12, Math.round(params.maxFps)));
+    }
+    const autoWake = params.autoWake !== false;
+
+    try {
+      const res = await this.session.callPhone<any>(
+        "mirror.start",
+        {
+          maxWidth: this.mirrorMaxWidth,
+          quality: this.mirrorQuality,
+          maxFps: this.mirrorMaxFps,
+          autoWake,
+          keepScreenOn: params.keepScreenOn !== false,
+        },
+        6000
+      );
+      this.stopLegacyMirrorLoop();
+      this.mirrorRunning = true;
+      this.mirrorMode = "native_stream";
+      if (res?.screenWidth) this.mirrorWidth = Number(res.screenWidth);
+      if (res?.screenHeight) this.mirrorHeight = Number(res.screenHeight);
+    } catch (err: any) {
+      const msg = String(err?.message || "");
+      if (msg.includes("Unknown RPC method")) {
+        // Seamless backward-compatible fallback for APK <= v1.4.9
+        this.mirrorRunning = true;
+        this.mirrorMode = "legacy_poll";
+        if (autoWake) {
+          const ps = this.session.getPhoneStatus();
+          if (ps?.screenInteractive === false) {
+            void this.session
+              .callPhone("sys.control", { action: "unlock_screen", pattern: "", bounds: "" }, 4000)
+              .catch(() => {});
+          }
+        }
+        this.startLegacyMirrorLoop();
+      } else {
+        throw err;
+      }
+    }
+
+    const snap = this.getMirrorStatus();
+    this.session.broadcastMirrorEvent({ type: "mirror_status", status: snap });
+    return snap;
+  }
+
+  public async stopMirror(): Promise<MirrorStatusSnapshot> {
+    this.mirrorRunning = false;
+    this.mirrorMode = "stopped";
+    this.stopLegacyMirrorLoop();
+    if (this.mirrorIdleStopTimer) {
+      clearTimeout(this.mirrorIdleStopTimer);
+      this.mirrorIdleStopTimer = null;
+    }
+    if (this.session.getActiveTier() !== "DISCONNECTED") {
+      await this.session.callPhone("mirror.stop", {}, 3000).catch(() => {});
+    }
+    const snap = this.getMirrorStatus();
+    this.session.broadcastMirrorEvent({ type: "mirror_status", status: snap });
+    return snap;
+  }
+
+  public async sendMirrorInput(params: Record<string, any>): Promise<any> {
+    this.mirrorLegacyBoostUntilMs = Date.now() + 2800;
+    const inputType = String(params.inputType || params.action || params.type || "tap").toLowerCase();
+
+    if (inputType === "unlock" || inputType === "unlock_screen") {
+      return await this.handleIpcAction("phone_device_control", {
+        action: "unlock_screen",
+        pattern: params.pattern,
+        pin: params.pin,
+      });
+    }
+
+    const rpcPayload = {
+      ...params,
+      type: inputType,
+    };
+
+    if (this.mirrorMode !== "legacy_poll") {
+      try {
+        return await this.session.callPhone("mirror.input", rpcPayload, 6000);
+      } catch (err: any) {
+        if (!String(err?.message || "").includes("Unknown RPC method")) {
+          throw err;
+        }
+      }
+    }
+
+    // Legacy fallback input translation for APK <= v1.4.9
+    const w = this.mirrorWidth || 1080;
+    const h = this.mirrorHeight || 2400;
+    const toPxX = (norm?: number, px?: number) =>
+      typeof norm === "number" ? Math.round(norm * w) : typeof px === "number" ? Math.round(px) : Math.round(w / 2);
+    const toPxY = (norm?: number, px?: number) =>
+      typeof norm === "number" ? Math.round(norm * h) : typeof px === "number" ? Math.round(px) : Math.round(h / 2);
+
+    if (inputType === "tap" || inputType === "click" || inputType === "long_press") {
+      const x = toPxX(params.normX, params.x);
+      const y = toPxY(params.normY, params.y);
+      return await this.session.callPhone("gui.act", {
+        action: inputType === "long_press" ? "long_click" : "click",
+        x,
+        y,
+        deadlineMs: Date.now() + 10000,
+      });
+    }
+    if (inputType === "swipe" || inputType === "drag") {
+      const x1 = toPxX(params.normX1 ?? params.normX, params.x1 ?? params.x);
+      const y1 = toPxY(params.normY1 ?? params.normY, params.y1 ?? params.y);
+      const x2 = toPxX(params.normX2, params.x2);
+      const y2 = toPxY(params.normY2, params.y2);
+      return await this.session.callPhone("gui.act", {
+        action: "swipe",
+        x: x1,
+        y: y1,
+        x2,
+        y2,
+        deadlineMs: Date.now() + 10000,
+      });
+    }
+    if (inputType === "scroll" || inputType === "wheel") {
+      const dy = Number(params.deltaY ?? 120);
+      return await this.session.callPhone("gui.act", {
+        action: dy >= 0 ? "scroll_down" : "scroll_up",
+        deadlineMs: Date.now() + 10000,
+      });
+    }
+    if (inputType === "text" || inputType === "input_text") {
+      const text = String(params.text || "");
+      await this.session.callPhone("clipboard.set", { text, showToast: false }).catch(() => {});
+      return await this.session
+        .callPhone("gui.act", {
+          action: "input_text",
+          text,
+          deadlineMs: Date.now() + 10000,
+        })
+        .catch(() => ({ ok: true, clipboardFallback: true }));
+    }
+    if (inputType === "key" || inputType === "nav") {
+      const key = String(params.key || params.target || "home").toLowerCase();
+      return await this.session.callPhone("sys.control", {
+        action: "system_action",
+        target: key,
+      });
+    }
+    return { ok: false, error: `Unsupported mirror input type: ${inputType}` };
   }
 
   public async start(opts?: { startTransport?: boolean }): Promise<void> {
@@ -527,11 +1258,13 @@ export class OmsDaemon {
       );
       const btBin = path.join(macHostRoot, "bin", "oms-bt-bridge");
       const btSrc = path.join(macHostRoot, "bluetooth-bridge", "main.swift");
+      const btStat = fs.existsSync(btBin) ? fs.statSync(btBin) : null;
+      const srcStat = fs.existsSync(btSrc) ? fs.statSync(btSrc) : null;
       if (
         this.config.enableBluetoothBridge &&
         process.platform === "darwin" &&
-        !fs.existsSync(btBin) &&
-        fs.existsSync(btSrc)
+        srcStat &&
+        (!btStat || srcStat.mtimeMs > btStat.mtimeMs)
       ) {
         try {
           fs.mkdirSync(path.dirname(btBin), { recursive: true });
@@ -545,6 +1278,7 @@ export class OmsDaemon {
         btBinaryPath: fs.existsSync(btBin) ? btBin : undefined,
         wanRelayWssUrl: this.config.wanRelayWssUrl,
       });
+      this.syncAirpodsConfigToBridgeAndPhone();
     }
 
     if (fs.existsSync(this.ipcSocketPath)) {
@@ -662,8 +1396,46 @@ export class OmsDaemon {
             pairingVersion: d.pairingVersion ?? 1,
             lastSeenIso: new Date(d.lastSeenMs).toISOString(),
           })),
+          airpodsStatus: this.getAirpodsStatusSnapshot(),
           phoneStatus: this.session.getPhoneStatus(),
         };
+      }
+
+      case "airpods.status": {
+        if (params.refresh !== false) {
+          this.session.getBluetoothBridge()?.requestAirpodsStatusRefresh();
+          await this.refreshPhoneStatusLive(Boolean(params.force));
+        }
+        return this.getAirpodsStatusSnapshot();
+      }
+
+      case "airpods.switch_to_mac": {
+        return await this.switchAirpodsToMac(
+          params.targetMac ? String(params.targetMac) : undefined,
+          params.reason ? String(params.reason) : "manual"
+        );
+      }
+
+      case "airpods.switch_to_phone": {
+        return await this.switchAirpodsToPhone(
+          params.targetMac ? String(params.targetMac) : undefined,
+          params.reason ? String(params.reason) : "manual"
+        );
+      }
+
+      case "airpods.config": {
+        if (
+          typeof params.autoSwitchAirpods === "boolean" ||
+          typeof params.pauseOtherOnAirpodsSwitch === "boolean" ||
+          typeof params.preferredAirpodsMac === "string"
+        ) {
+          this.updateHostPreferences({
+            autoSwitchAirpods: params.autoSwitchAirpods,
+            pauseOtherOnAirpodsSwitch: params.pauseOtherOnAirpodsSwitch,
+            preferredAirpodsMac: params.preferredAirpodsMac,
+          });
+        }
+        return this.getAirpodsStatusSnapshot();
       }
 
       // Tool 1: phone_inbox_latest
@@ -711,6 +1483,9 @@ export class OmsDaemon {
           typeof params.autoCopyTextToClipboard === "boolean" ||
           typeof params.autoPreviewImageOnMac === "boolean" ||
           typeof params.autoSyncOtpToMac === "boolean" ||
+          typeof params.autoSwitchAirpods === "boolean" ||
+          typeof params.pauseOtherOnAirpodsSwitch === "boolean" ||
+          typeof params.preferredAirpodsMac === "string" ||
           typeof params.unlockPattern === "string" ||
           typeof params.unlockPin === "string" ||
           typeof params.unlockBounds === "string"
@@ -719,6 +1494,9 @@ export class OmsDaemon {
             autoCopyTextToClipboard: params.autoCopyTextToClipboard,
             autoPreviewImageOnMac: params.autoPreviewImageOnMac,
             autoSyncOtpToMac: params.autoSyncOtpToMac,
+            autoSwitchAirpods: params.autoSwitchAirpods,
+            pauseOtherOnAirpodsSwitch: params.pauseOtherOnAirpodsSwitch,
+            preferredAirpodsMac: params.preferredAirpodsMac,
             unlockPattern: params.unlockPattern,
             unlockPin: params.unlockPin,
             unlockBounds: params.unlockBounds,
@@ -992,6 +1770,20 @@ export class OmsDaemon {
           url,
           githubDownloadUrl: meta.githubDownloadUrl,
         });
+      }
+
+      // Real-Time Screen Mirroring Actions
+      case "phone_mirror_start": {
+        return await this.startMirror(params);
+      }
+      case "phone_mirror_stop": {
+        return await this.stopMirror();
+      }
+      case "phone_mirror_status": {
+        return this.getMirrorStatus();
+      }
+      case "phone_mirror_input": {
+        return await this.sendMirrorInput(params);
       }
 
       // Tool 13: phone_device_control (Rich Status & Remote Device Operations)
@@ -1456,6 +2248,12 @@ export class OmsDaemon {
   }
 
   public async stop(): Promise<void> {
+    this.mirrorRunning = false;
+    this.stopLegacyMirrorLoop();
+    if (this.mirrorIdleStopTimer) {
+      clearTimeout(this.mirrorIdleStopTimer);
+      this.mirrorIdleStopTimer = null;
+    }
     for (const [, w] of this.pendingApprovals) {
       clearTimeout(w.timer);
       w.reject(new Error("Daemon stopping"));

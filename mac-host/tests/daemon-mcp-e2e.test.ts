@@ -6,7 +6,9 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import {
   decodeJsonRpcPayload,
+  decodeScreenFramePayload,
   encodeJsonRpcFrame,
+  encodeScreenFrame,
   encodeStreamChunkFrame,
   encodeStreamStartFrame,
   FrameType,
@@ -14,6 +16,8 @@ import {
   generateUuidV7,
   JsonRpcMessage,
   parsePairingUri,
+  ScreenFrameCodec,
+  ScreenFrameFlags,
 } from "@oms/shared-protocol";
 import { OmsDaemon } from "../src/daemon/oms-daemon.js";
 import { OmsMcpServer } from "../src/mcp/server.js";
@@ -127,6 +131,60 @@ describe("Modules 06 & 07: OmsDaemon + Inbox + MCP Server End-to-End", () => {
                   },
                 ],
               },
+            })
+          );
+        } else if ("method" in msg && msg.method === "mirror.start") {
+          const params = (msg.params || {}) as Record<string, any>;
+          ws.send(
+            encodeJsonRpcFrame({
+              jsonrpc: "2.0",
+              id: msg.id!,
+              result: {
+                ok: true,
+                active: true,
+                mode: "l1_accessibility",
+                targetMaxWidth: params.maxWidth ?? 720,
+                targetQuality: params.quality ?? 72,
+                targetMaxFps: params.maxFps ?? 12,
+              },
+            })
+          );
+          setTimeout(() => {
+            ws.send(
+              encodeScreenFrame(
+                {
+                  codec: ScreenFrameCodec.WEBP,
+                  flags: 0,
+                  width: 1080,
+                  height: 2400,
+                  seq: 1,
+                  timestampMs: Date.now(),
+                },
+                new TextEncoder().encode("FAKE_WEBP_MIRROR_FRAME_01")
+              )
+            );
+          }, 20);
+        } else if ("method" in msg && msg.method === "mirror.input") {
+          const params = (msg.params || {}) as Record<string, any>;
+          ws.send(
+            encodeJsonRpcFrame({
+              jsonrpc: "2.0",
+              id: msg.id!,
+              result: {
+                ok: true,
+                action: params.action || params.type,
+                x: params.x,
+                y: params.y,
+                text: params.text,
+              },
+            })
+          );
+        } else if ("method" in msg && msg.method === "mirror.stop") {
+          ws.send(
+            encodeJsonRpcFrame({
+              jsonrpc: "2.0",
+              id: msg.id!,
+              result: { ok: true, active: false },
             })
           );
         }
@@ -325,6 +383,71 @@ describe("Modules 06 & 07: OmsDaemon + Inbox + MCP Server End-to-End", () => {
     expect(unlockRes2.ok).toBe(true);
     expect(unlockRes2.patternCells).toBe("14789");
 
+    // 7d. Verify Live Screen Mirroring (/mirror, /ws/mirror, mirror_start, SCREEN_FRAME ingestion, mirror_input)
+    const mirrorHtmlResp = await fetch(`http://127.0.0.1:${customPort}/mirror`);
+    expect(mirrorHtmlResp.status).toBe(200);
+    const mirrorHtml = await mirrorHtmlResp.text();
+    expect(mirrorHtml).toContain("OneMoreStep · 手机实时同屏与键鼠直控台");
+
+    const mirrorStartResp = await fetch(`http://127.0.0.1:${customPort}/api/inbox/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "mirror_start",
+        params: { maxWidth: 720, quality: 72, maxFps: 12, wakeScreen: false },
+      }),
+    });
+    const mirrorStartJson = (await mirrorStartResp.json()) as any;
+    expect(mirrorStartJson.ok).toBe(true);
+    expect(mirrorStartJson.status.running).toBe(true);
+    expect(mirrorStartJson.status.mode).toBe("native_stream");
+
+    await new Promise((r) => setTimeout(r, 60));
+
+    const mirrorFrameResp = await fetch(`http://127.0.0.1:${customPort}/api/inbox/mirror/frame`);
+    expect(mirrorFrameResp.status).toBe(200);
+    expect(mirrorFrameResp.headers.get("X-Oms-Width")).toBe("1080");
+    expect(mirrorFrameResp.headers.get("X-Oms-Height")).toBe("2400");
+    expect(await mirrorFrameResp.text()).toBe("FAKE_WEBP_MIRROR_FRAME_01");
+
+    // Connect a local viewer WebSocket to /ws/mirror and verify cached binary frame delivery
+    const receivedViewerFrames: Uint8Array[] = [];
+    const viewerWs = new WebSocket(`ws://127.0.0.1:${customPort}/ws/mirror`);
+    viewerWs.binaryType = "arraybuffer";
+    viewerWs.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer) {
+        receivedViewerFrames.push(new Uint8Array(ev.data));
+      }
+    };
+    await new Promise((r) => setTimeout(r, 50));
+    expect(receivedViewerFrames.length).toBeGreaterThanOrEqual(1);
+    const decodedViewerFrame = decodeScreenFramePayload(receivedViewerFrames[0]);
+    expect(decodedViewerFrame.width).toBe(1080);
+    expect(decodedViewerFrame.height).toBe(2400);
+    expect(new TextDecoder().decode(decodedViewerFrame.data)).toBe("FAKE_WEBP_MIRROR_FRAME_01");
+    viewerWs.close();
+
+    const mirrorInputResp = await fetch(`http://127.0.0.1:${customPort}/api/inbox/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "mirror_input",
+        params: { action: "tap", x: 540, y: 1200 },
+      }),
+    });
+    const mirrorInputJson = (await mirrorInputResp.json()) as any;
+    expect(mirrorInputJson.ok).toBe(true);
+    expect(mirrorInputJson.result.action).toBe("tap");
+    expect(mirrorInputJson.result.x).toBe(540);
+    expect(mirrorInputJson.result.y).toBe(1200);
+
+    const mirrorStopResp = await fetch(`http://127.0.0.1:${customPort}/api/inbox/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "mirror_stop" }),
+    });
+    expect(((await mirrorStopResp.json()) as any).ok).toBe(true);
+
     // 8. Verify LAN isolation: non-loopback IPs (e.g. another computer on the same LAN) are blocked with 403 Forbidden
     const lanAttackerInboxResp = await handleDashboardHttpRequest(
       daemon,
@@ -333,6 +456,14 @@ describe("Modules 06 & 07: OmsDaemon + Inbox + MCP Server End-to-End", () => {
       "192.168.1.99"
     );
     expect(lanAttackerInboxResp?.status).toBe(403);
+
+    const lanAttackerMirrorResp = await handleDashboardHttpRequest(
+      daemon,
+      new Request(`http://192.168.1.50:${customPort}/mirror`),
+      new URL(`http://192.168.1.50:${customPort}/mirror`),
+      "192.168.1.99"
+    );
+    expect(lanAttackerMirrorResp?.status).toBe(403);
 
     const lanAttackerControlResp = await handleDashboardHttpRequest(
       daemon,
