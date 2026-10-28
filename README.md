@@ -1,142 +1,260 @@
-# 青简·咫尺 · OneMoreStep
+# <img src="./docs/assets/icon-qingjian-zhichi.png" width="36" height="36" align="top" alt="QingJian ZhiChi Icon" /> 青简 · 咫尺 (OneMoreStep) — macOS 本地 AI ⇄ 小米 Android 全场景双向协同底座
 
-v1.4.3 修复企业大子网 Wi-Fi 锁屏休眠断流（新增 `WifiLock` 与双向主动保活）、蓝牙与局域网握手抢占冲突及 BLE 分片传输，并包含 v1.4.2 手机端 UI 重构与 v1.4.1 本地 [连接诊断](docs/connection-diagnostics.md)，沿用 v2 配对，无需重新绑定。
+[![Release: v1.5.2](https://img.shields.io/badge/Release-v1.5.2-10b981?style=flat-square)](./CHANGELOG.md)
+[![Runtime: Bun >= 1.1](https://img.shields.io/badge/Runtime-Bun_%E2%89%A51.1-f472b6?style=flat-square&logo=bun&logoColor=white)](https://bun.sh)
+[![macOS Host](https://img.shields.io/badge/macOS_Host-TypeScript_%2B_Swift_(CoreBluetooth_%2F_IOBluetooth)-0284c7?style=flat-square&logo=apple&logoColor=white)](./mac-host)
+[![Xiaomi Android](https://img.shields.io/badge/Xiaomi_Android-Kotlin_%2B_Compose_(HyperOS_%2F_MIUI)-ff6900?style=flat-square&logo=xiaomi&logoColor=white)](./android-app)
+[![Security: Transport v2](https://img.shields.io/badge/Security-ECDH_P--256_%2B_AES--256--GCM-4f46e5?style=flat-square)](./docs/secure-transport-v2.md)
+[![MCP: 13 Tools & 3 Resources](https://img.shields.io/badge/MCP_Server-13_Tools_%26_3_Resources-0d9488?style=flat-square)](./mac-host/src/mcp/server.ts)
+[![License: MIT](https://img.shields.io/badge/License-MIT-f59e0b?style=flat-square)](./LICENSE)
 
-> 当前开发分支的修复、升级要求与未实现能力见 **[实现边界与升级验收](docs/implementation-status.md)**。v1.4.0 加入 [安全传输 v2](docs/secure-transport-v2.md)，升级需重新配对；以下性能数字和硬件行为不代表已完成真机验证。
-
-
-<p align="left">
-  <img src="./docs/assets/icon-qingjian-zhichi.png" width="108" alt="青简·咫尺 (OneMoreStep) Icon" />
-</p>
-
-> **青简载思，咫尺通达 (`One More Step`)** —— 打通 macOS 本地 AI Agent（**Codex、Antigravity、OpenCode、Claude Code**）与**小米 Android 手机（HyperOS / MIUI）**的全场景双向互操作与跨端协同底座。
-
----
-
-## 目录
-
-- [1. 项目背景与核心价值](#1-项目背景与核心价值)
-- [2. 核心特性全景](#2-核心特性全景)
-- [3. 系统架构与工程结构](#3-系统架构与工程结构)
-- [4. 快速上手指南（3 分钟全无线配通）](#4-快速上手指南3-分钟全无线配通)
-- [5. AI Agent 接入指南（MCP Server & 全局 Skill）](#5-ai-agent-接入指南mcp-server--全局-skill)
-- [6. CLI 命令行工具 (`oms`) 全集](#6-cli-命令行工具-oms-全集)
-- [7. 本地运行目录与数据规范 (`~/.one_more_step`)](#7-本地运行目录与数据规范-one_more_step)
-- [8. 源码构建与测试](#8-源码构建与测试)
-- [9. 设计文档库导航](#9-设计文档库导航)
+> **青简载思，咫尺通达 (`One More Step`) —— 把小米 Android 手机变成桌面 AI 智能体（Codex / Antigravity / Claude Code / OpenCode）的随身五官、移动控制台与无缝跨生态外设。**  
+> **坚持「零第三方 IM 借道、零云端中转服务器、兼容手机常驻 VPN、一机一码双向认证加密」的纯本机直连设计**——无论是手机三指截屏 1 秒喂给电脑 AI、锁屏验证码毫秒级提取上屏 `⌘V`、AirPods 在 Mac 与小米手机间像苹果全家桶一样随音频焦点无感抢占切换、还是在电脑浏览器以 12fps 实时镜像触控手机、远程九宫格解锁与双卡选卡拨号，皆在咫尺之间。
 
 ---
 
-## 1. 项目背景与核心价值
-
-在使用 **Codex、Antigravity、OpenCode、Claude Code** 等本地 AI Agent 进行研发、写作与知识库治理时，电脑与 Android 手机之间长期存在三大断层：
-
-1. **投递链路繁琐且割裂**：手机截屏、拍白板、刷到好文章想喂给电脑 AI，往往需要借道微信/钉钉「文件传输助手」，经历「发送 ➔ 电脑另存为 ➔ 复制路径 ➔ 粘贴给 AI」的 8~9 步操作，极易打断心流。
-2. **网络隔离与常驻 VPN 阻断**：办公网 AP 隔离、户外无 Wi-Fi、或手机常驻代理软件（Clash / Sing-box 等占用 `VpnService` 槽位）时，传统局域网工具频频断连。
-3. **AI 困在终端，缺乏移动端感知与执行力**：长耗时任务跑在电脑上时人不敢离开工位；电脑 AI 无法直接为你设定手机原生闹钟、检查手机日历冲突、主动拉取手机最新照片，更无法操作仅存在于手机 App 内的封闭功能。
-
-**青简·咫尺 (`OneMoreStep`)** 为此提供了一套**零第三方 IM 依赖、零云端账号绑定、兼容常驻 VPN** 的原生跨端底座：
-- **向上（面向 AI Agent）**：提供标准 **MCP Server（13 Tools + 3 Resources）**、统一 **CLI (`oms`)** 与 **全局 Skill**；
-- **中间（自适应传输与在场感知）**：融合 **局域网 WebSocket + 蓝牙 BLE GATT + 可选 WSS 中继**，自动感知你是否在电脑旁（`AT_DESK` / `AWAY`）；
-- **向下（面向小米 Android）**：基于原生 Kotlin + Jetpack Compose 深度适配小米 HyperOS/MIUI，兼具 **依赖系统权限的原生 API 执行器** 与 **带应用层安全检查的无障碍 GUI 自动化引擎**。
+**v1.5.2 最新演进与实现边界声明**：
+- **v1.5.2 新增能力**：新增 **AirPods 跨 Mac ⇄ 小米手机蓝牙无感自动切换与对端媒体自动暂停**（`oms airpods`）、**实时低延迟手机屏幕镜像与电脑鼠标触控工作台**（`oms mirror` / `http://127.0.0.1:19527/mirror`）；包含 v1.4.9 **远程唤醒、3×3 九宫格图案解锁与双卡原生电话拨打/挂断**（`oms unlock` / `oms call` / `oms hangup`）、v1.4.6 **蓝牙 BLE 配对回退与分片流控**、v1.4.3 **企业大子网 `WifiLock` 低延迟锁屏保活**、以及 v1.4.1 **离线连接诊断引擎**（`connectionDiagnostics`）。完整变更历史见 [CHANGELOG.md](./CHANGELOG.md)。
+- **v2 安全传输与配对要求**：自 v1.4.0 起业务帧统一运行于 **P-256 ECDH + HKDF-SHA256 + 双向 AES-256-GCM** 认证加密会话内（见 [安全传输 v2](./docs/secure-transport-v2.md)）。从 v1.4.x 升级至 v1.5.2 **无需重新配对**，直接运行 `oms ota` 或覆盖安装 [`OneMoreStep-v1.5.2.apk`](./OneMoreStep-v1.5.2.apk) 即可保留全部配对密钥、收件箱与配置；从 v1.3.x 及更早版本升级需同步升级双端并执行一次 `oms pair` 重新绑定。
+- **工程实现边界**：当前已落地能力、升级兼容性及待专项真机验证项（如 WAN WebRTC DataChannel 尚未实现、当前 WAN 为可选 WebSocket 中继接入；Mac 蓝牙桥实际使用 `CoreBluetooth` BLE GATT + `IOBluetooth` 经典蓝牙音频切换；GUI 观察必须携带最新 `observationId` 等）详见 **[当前实现边界与升级验收 (`docs/implementation-status.md`)](./docs/implementation-status.md)**。
 
 ---
 
-## 2. 核心特性全景
+## 📑 目录导航
 
-### 2.1 📱 ➔ 💻 免 IM 极速投递、离线语音转写与个人知识库联动
-- **三指截屏秒传胶囊 (`ScreenshotPillController`)**：监听系统截屏事件，截屏瞬间右上角浮现半透明胶囊（3.5 秒无操作自动消隐）。点击 **`[🚀 发给 Mac AI]`** 1 秒直达 Mac 收件箱；按住 **`[🎙️ 附言]`** 可边发图边附加语音指令。
-- **系统分享 3 大置顶入口 (`Direct Share`)**：在任意 App（浏览器、知乎、公众号、相册等）点击系统分享，首行置顶直达：
-  - `📚 存入个人知识库`（带 `#pkb_vault` 标签，自动进入个人知识库暂存队列）
-  - `🚀 发给 Mac Inbox`（带 `#default_inbox` 标签，自动复制文本到 Mac 剪贴板 / 自动弹出图片预览）
-  - `🐛 发给 AI 修 Bug`（带 `#ui_bug` 标签，专供移动端 UI 走查与修复）
-- **控制中心快捷磁贴 (`OmsQuickTileService`)**：
-  - **单击磁贴**：通过 1×1 透明焦点窗口突破 Android 10+ 后台剪贴板读取限制，1 秒将手机剪贴板同步至 Mac；
-  - **长按磁贴**：呼出「💡 我有一个想法」语音闪念框，说完即刻投递至 Mac `#voice_idea` 队列。
-- **手机验证码锁屏实时同步 Mac (`OmsNotificationListenerService` + `OmsSmsBroadcastReceiver`)**：
-  - 无需拿起并解锁手机，手机收到短信或微信/飞书/邮箱验证码瞬间，自动剔除尾号与金额干扰、提取 4~8 位纯验证码推送至 Mac 桌面通知，并将**纯数字验证码**自动写入 Mac 剪贴板（电脑网页直接 `⌘V` 粘贴）。
-- **手机原生语音录制 + Mac SenseVoice 离线自动转写**：
-  - 手机底部输入栏支持点击 **`🎙️语音`** 直接录制 `.m4a` 语音消息，Mac `omsd` 收到音频附件后自动调用本地 `local-asr`（SenseVoiceSmall 离线模型）转写为文字并自动写入 Mac 剪贴板（可直接 `⌘V`）。
-- **Mac 实时收件箱与协同 Web 看板 (`/inbox`)**：内置深色主题本地 Web 控制台，支持图文流实时预览、手机全维遥测监控与远程快捷控制、一键在 Finder 定位文件、按标签/关键词过滤及反向推送消息。
-
-### 2.2 💻 ➔ 📱 确定性系统能力、全维遥测与远程交互监工
-- **原生系统闹钟 (`AlarmExecutor`)**：调用 `AlarmClock.ACTION_SET_ALARM` 配合小米后台弹出界面权限，静默在小米原生时钟创建闹钟，并附带 `AlarmManager.setAlarmClock()` 双重兜底。
-- **系统日历防冲突读写 (`CalendarExecutor`)**：直接读写 `CalendarContract`，支持自动展开周期性重复日程（`Instances`）以供 AI 检查排期冲突，并支持写入带提前响铃提醒的新日程。
-- **受权目录按需拉取 (`ScopedStorageExecutor`)**：严格遵循目录白名单（`screenshots`、`camera`、`download`），无需拿起手机，直接让电脑 AI 一键检索并拉取手机刚截的图（`oms pull latest-screenshot`）或刚拍的白板照（`oms pull latest-camera`）。
-- **手机全维实时遥测与远程控制 (`phone_device_control`)**：
-  - 实时读取手机电量/充电状态/电池温度/电压、屏幕亮灭与锁屏状态、当前前台应用中文名与包名、Wi-Fi SSID/信号强度/速率、四声道音量、RAM 与存储余量及权限健康度；
-  - 支持从 Mac 一键**响铃找手机**（突破静音）、**远程抓屏回传**、**四声道音量调节**、**手机端直接打开网址或启动常用 App**（微信/飞书/钉钉/相机等）及执行系统级导航与锁屏。
-- **L1~L3 分级通知与闹钟声道强制 TTS (`NotificationExecutor`)**：
-  - `silent` (L1)：静默写入手机时间流；
-  - `normal` (L2)：常规通知栏提醒（人在电脑旁 `AT_DESK` 时自动转为 Mac 桌面通知 + 手机静默入流）；
-  - `urgent` (L3)：突破勿扰模式、锁屏全屏卡片亮屏 (`fullScreenIntent`)、强震动，并支持调用系统 `TextToSpeech` 走闹钟音频流（`STREAM_ALARM`）直接开口播报。
-- **阻塞式远程交互审批 (`phone_request_approval`)**：当长耗时 Agent 遇到高风险操作（如数据库迁移、大范围重构）时，向手机推送带代码 Diff 摘要的紫色审批卡片，阻塞等待你在手机上点击 `[✅ 批准继续]` 或 `[❌ 拒绝并中止]`。
-- **通勤 TTS 随身听**：支持将 Mac 上的研究报告、Markdown 总结一键推送到手机时间流，内置 Markdown 符号清洗与倍速（`1.2x`）中文语音朗读。
-
-### 2.3 🤖 无障碍 GUI 屏幕自动化与四大安全护栏
-针对没有开放 API 的第三方 App 场景，内置 `OmsAccessibilityService`：
-- **三步语义剪枝树 (`SemanticTreeExtractor`)**：过滤冗余布局容器、聚合复合卡片文本，为可交互节点分配 `#1, #2` 短编号，单屏仅 `5~10 KB`，AI 无需看大图即可秒级定位。
-- **零弹窗静默截屏与 Set-of-Mark 合成 (`ScreenCapturer`)**：基于 Android 11+ `takeScreenshot` API，自动在截图上绘制带 `#ID` 的红框视觉角标，赋能多模态视觉精准对齐。
-- **四项应用层安全检查**：
-  1. **顶部物理急停胶囊 (`SafetyStopOverlay`)**：AI 操控手机期间，屏幕顶部常驻橙色 `🤖 Mac AI 操作中 · 点击立即停止` 胶囊，点击后持久化停止状态并取消后续 GUI 动作，需在手机上显式恢复；已注入手势无法保证撤回；
-  2. **用户触碰即让路**：通过 `TYPE_TOUCH_INTERACTION_START` 请求取消当前 GUI 动作；OEM 事件覆盖需真机验证，等待确认时允许触碰确认条；
-  3. **金融与密码页黑名单**：按支付包名、活动名和密码字段拒绝操作；截图保留系统 secure-window 错误，不声称能识别所有 `FLAG_SECURE` 窗口；
-  4. **敏感动作停顿确认 (`requireUserConfirm`)**：在执行「提交/发送/支付」等最后一步前，可在手机端弹出半透明确认框，由人工点按放行；没有浮层权限或超时则拒绝，放行后再次检查观察是否有效。
-
-### 2.4 📡 三级自适应传输与蓝牙空间感知
-- **三级无感热切换**：
-  1. `Tier 1 · LAN_WS`：局域网 WebSocket 直连（吞吐量需实测），绑定底层物理网卡并内置 UDP 广播、ARP 邻居单播信标与子网自动发现；
-  2. `Tier 2 · BT_RFCOMM`：历史枚举名；Mac 实际使用 `CoreBluetooth` BLE GATT，支持近场 IP 交换；MTU、背压与大文件传输仍需专项验证；
-  3. `Tier 3 · WAN`：实际为可选 WebSocket 中继接入，尚未实现 WebRTC DataChannel/ICE/TURN，不占手机 `VpnService` 槽位。
-- **空间在场引擎 (`PresenceEngine`)**：通过蓝牙 RSSI 滑动窗口与滞回滤波，自动识别 `AT_DESK`（在电脑前）与 `AWAY`（离开工位），实现「坐到电脑前自动同步晨报、离开工位自动将 AI 通知路由至手机」。
-- **小米 HyperOS / MIUI 专属适配 (`XiaomiAdaptationHelper`)**：通过反射自检小米专属 AppOps 权限（`10021` 后台弹出界面、`10008` 锁屏显示），提供一键跳转设置向导。
-
-### 2.5 🔐 一机一码与局域网严格 1 对 1 安全隔离
-v1.4.0 将业务帧统一置于认证加密会话内；首次信任依赖安全传递完整配对链接。测试与部署进度、HTTP 安装页和 BLE/WAN 边界见 [安全传输 v2](docs/secure-transport-v2.md)：
-- **加密握手与业务帧**：一次性 256 位 token 认证首次握手，临时 P-256 ECDH 与 HKDF 派生配对及会话密钥；长期密钥不在网络响应中下发。每次重连建立新的双向 AES-256-GCM 会话；密钥确认完成前不接受业务操作。旧配对记录必须重新配对，禁止回退明文。
-- **手机端唯一 `macId` 强锁定**：一旦完成配对，手机端的 UDP 信标监听、局域网子网扫描与蓝牙近场发现仅接受 `macId == paired.macId` 的宿主设备；即使你自己的 Mac 休眠或离线，手机也绝不会自动连接或改绑到同一局域网内的其他电脑。
-- **Mac 本地控制台回环隔离 (`127.0.0.1` Only)**：`/inbox` 实时看板与 `/api/inbox/*` 控制接口严格限制仅允许本机回环地址 (`127.0.0.1` / `::1`) 访问，同一局域网内的其他电脑访问一律返回 `403 Forbidden`，杜绝借道 Mac 操控手机。
-- **配对凭据仅本地展示**：`oms pair` 生成 10 分钟有效、成功后单次消费的完整链接；`/pair/resolve` 不再返回凭据。手机保留完整链接输入，旧 6 位码入口关闭。
+- [0. 项目简介与「青简 · 咫尺」命名释义](#0-项目简介与青简--咫尺命名释义)
+- [1. 为什么需要 OneMoreStep？（核心设计原则与痛点对比）](#1-为什么需要-onemorestep核心设计原则与痛点对比)
+- [2. 八大核心场景与实操案例详解](#2-八大核心场景与实操案例详解)
+  - [场景一：📱 ➔ 💻 免 IM 极速投递、SenseVoice 离线语音转写与知识库联动](#场景一--免-im-极速投递sensevoice-离线语音转写与知识库联动)
+  - [场景二：🔑 手机锁屏验证码（短信 / 微信 / 飞书 / 邮箱）毫秒级提取上屏](#场景二-手机锁屏验证码短信--微信--飞书--邮箱毫秒级提取上屏)
+  - [场景三：🎧 AirPods 跨 Mac ⇄ 小米手机蓝牙无感自动流转与对端自动暂停](#场景三-airpods-跨-mac--小米手机蓝牙无感自动流转与对端自动暂停)
+  - [场景四：🪞 实时低延迟手机屏幕镜像与电脑鼠标远程触控工作台 (`/mirror`)](#场景四-实时低延迟手机屏幕镜像与电脑鼠标远程触控工作台-mirror)
+  - [场景五：🔓 远程唤醒、3×3 九宫格图案密码解锁与双卡原生电话拨打/挂断](#场景五-远程唤醒33-九宫格图案密码解锁与双卡原生电话拨打挂断)
+  - [场景六：⏰ 主动式助理：原生闹钟、防冲突日历、分级强提醒/TTS 与远程审批](#场景六-主动式助理原生闹钟防冲突日历分级强提醒tts-与远程审批)
+  - [场景七：🎛️ 手机全维实时遥测、远程寻机与局域网一键 OTA](#场景七️-手机全维实时遥测远程寻机与局域网一键-ota)
+  - [场景八：🤖 无障碍 GUI 屏幕自动化引擎与四项应用层安全护栏](#场景八-无障碍-gui-屏幕自动化引擎与四项应用层安全护栏)
+- [3. 系统架构与底层工程机制详解](#3-系统架构与底层工程机制详解)
+- [4. 3 分钟快速上手指南（安装、v2 安全绑定与小米满血权限）](#4-3-分钟快速上手指南安装v2-安全绑定与小米满血权限)
+- [5. AI Agent 接入指南（13 个 MCP Tools、3 个 Resources 与全局 Skill）](#5-ai-agent-接入指南13-个-mcp-tools3-个-resources-与全局-skill)
+- [6. CLI 命令行工具 (`oms`) 全集速查表与实战示例](#6-cli-命令行工具-oms-全集速查表与实战示例)
+- [7. 本地数据规范 (`~/.one_more_step`) 与 Web 控制台接口](#7-本地数据规范-one_more_step-与-web-控制台接口)
+- [8. 源码构建、测试隔离与开发验证](#8-源码构建测试隔离与开发验证)
+- [9. 设计文档库与验收记录导航](#9-设计文档库与验收记录导航)
+- [10. 开源协议 (License)](#10-开源协议-license)
 
 ---
 
-## 3. 系统架构与工程结构
+## 0. 项目简介与「青简 · 咫尺」命名释义
 
-### 3.1 架构拓扑图
+### 0.1 什么是「青简 · 咫尺 (OneMoreStep)」？
+
+**青简 · 咫尺 (`OneMoreStep` / `oms`)** 是一套专为 **macOS + 小米 Android（HyperOS / MIUI）** 双持开发者与知识工作者打造的**跨端双向 AI 协同与硬件互操作底座**。
+
+它与浏览器端的 **[青简 · 译读 (`QingJian Translator`)](../translator_plugin)**、ESP32-S3 桌面物理中控端的 **[青简 · 灵枢 (`QingJian LingShu`)](../ai_agent)** 共同构成「青简」个人智能体工具链。通过一套部署在 Mac 本地的轻量级守护进程（`omsd` + 原生 Swift 蓝牙桥接器 `oms-bt-bridge`）与小米手机端的原生 Kotlin 客户端（`OneMoreStep.apk`），它一次性打通了**六大跨端断层**：
+
+1. **📥 手机 ➔ Mac 极速输入流**：三指截屏 3.5 秒悬浮胶囊秒传、系统分享三大置顶入口直达本地知识库、控制中心磁贴秒同步剪贴板、手机原生语音录制 + Mac 本机 **SenseVoiceSmall 离线自动转写**；
+2. **🔑 锁屏验证码零触碰接力**：四通道穿透监听手机短信与 App 验证码，抗干扰提取 4~8 位纯数字验证码直接写入 Mac 剪贴板（电脑直接 `⌘V` 粘贴）并弹出桌面通知；
+3. **🎧 AirPods 跨生态无感流转**：打破苹果与安卓蓝牙壁垒，根据 Mac 与小米手机谁正在播放音频/通话，自动抢占切换 AirPods 连接并自动暂停对端媒体；
+4. **🪞 实时屏幕镜像与远程触控**：在 Mac 浏览器（`/mirror`）提供最高 `12fps` 的实时手机投屏与鼠标点击/滑动操作，无需拿起手机即可在电脑上查看和操作手机；
+5. **🔓 确定性系统能力与远程操控**：电脑端一行命令或一句 AI 指令，即可远程唤醒手机并绘制 **3×3 九宫格图案解锁**、**双卡选卡拨打电话/挂断**、静默设定**小米原生闹钟**、防冲突读写**系统日历**、发送突破勿扰的 **L3 闹钟声道 TTS 语音播报**、发起**阻塞式远程代码审批**、或主动拉取手机相册最新照片；
+6. **🤖 受安全护栏约束的 GUI 自动化**：通过 `OmsAccessibilityService` 提取 `5~10 KB` 紧凑语义控件树与 Set-of-Mark (`#ID`) 静默截屏，配合顶部物理急停胶囊、触屏即让路、金融密码页黑名单与 `--confirm` 停顿确认，替你操作无开放 API 的移动 App。
+
+### 0.2 关于「青简 · 咫尺 (One More Step)」命名的解释说明
+
+1. **「青简」：竹简杀青，治学案头**  
+   古人炙竹渗水谓之「杀青」，编联成册谓之「韦编」。「青简」象征我们在 Mac 本地与个人知识库（Personal Knowledge Base）中长年累月沉淀的思考、笔记与代码资产。
+2. **「咫尺」 (`One More Step`)：跨越桌面与掌心的最后一步**  
+   桌面端的 AI Agent（Codex、Antigravity、Claude Code、OpenCode）拥有强大的推理与编程能力，却始终被困在电脑终端里；而手机作为我们全天候贴身的信息传感器与通讯终端，又因操作系统的生态藩篱与网络隔离而沦为数据孤岛。从手机截屏到电脑 AI 读图、从电脑长任务卡住到手机远程拍板，往往只差**最后一步 (`One More Step`)**。「青简·咫尺」正是为了消弭这最后一步的摩擦而生——**青简载思，咫尺通达**。
+
+---
+
+## 1. 为什么需要 OneMoreStep？（核心设计原则与痛点对比）
+
+### 1.1 四大核心工程设计原则
+
+1. **零第三方 IM 借道、零云端中转（100% Local & Private）**  
+   所有图文、语音、剪贴板、验证码、屏幕帧与控制指令均在你的 Mac 与小米手机之间通过局域网或蓝牙点对点直传，**不借道微信/钉钉文件传输助手，不经过任何外部云服务器**，数据 100% 落盘于本机 `~/.one_more_step/`。
+2. **兼容手机常驻 VPN 与复杂企业大子网（VPN-Friendly & Always-On）**  
+   针对重度用户手机 24 小时挂着 Clash / Sing-box（占用 Android 唯一 `VpnService` 槽位）以及公司 `/23` 大子网锁屏休眠痛点，采用普通应用层 Socket + 物理 Wi-Fi 网卡绑定 + 前台 `WIFI_MODE_FULL_LOW_LATENCY` 低延迟锁 + 9 秒双向加密心跳 + **BLE 近场带外 IP 握手与离线回退**，彻底告别频繁断连。
+3. **跨生态硬件体验平权（Apple ⇄ Xiaomi Ecosystem Bridge）**  
+   用 MacBook 搭配小米旗舰手机的开发者，不必再羡慕 iPhone + Mac 的「通用剪贴板、验证码自动填充、iPhone 镜像、AirPods 自动切换」——OneMoreStep 在原生系统权限之上为你补齐全部跨生态协同体验。
+4. **确定性原生 API 优先，安全护栏 GUI 兜底（Deterministic First, Guarded GUI Second）**  
+   凡是 Android 系统提供公开或反射接口的能力（闹钟、日历、剪贴板、相册拉取、电话拨打、音量、TTS），100% 走毫秒级确定性原生执行器；仅在面对封闭第三方 App 时才调用带 `observationId` 状态校验与物理急停护栏的 GUI 引擎。
+
+### 1.2 日常高频痛点对比（Before vs. After）
+
+| 高频协同场景 | 传统割裂体验（Before） | 接入「青简 · 咫尺」后（After） |
+| :--- | :--- | :--- |
+| **📱 手机截屏/白板照喂给电脑 AI** | 手机截屏 ➔ 打开微信 ➔ 发文件传输助手 ➔ 电脑微信另存为 ➔ 复制路径发给 AI（8~9 步，耗时 1 分钟） | 手机三指截屏 ➔ 点右上角胶囊 **`[🚀 发给 Mac AI]`**（或直接在电脑对 AI 说*“拉取我手机刚截的图”*），1 秒落盘分析 |
+| **🔑 电脑登录收手机验证码** | 低头找手机 ➔ 解锁屏幕 ➔ 打开短信/通知栏看 6 位数字 ➔ 抬头手动敲进电脑网页 | 手机锁屏收到短信瞬间，Mac 弹出通知且**纯数字验证码已自动进 Mac 剪贴板**，直接按 `⌘V` 粘贴 |
+| **🎧 戴着 AirPods 双端切换** | 从 Mac 换到小米手机看视频，要手动打开手机蓝牙设置点连接，且电脑还在外放声音 | 哪台设备开始播放声音/来电，**AirPods 自动毫秒级切过去，同时自动暂停另一台设备的音乐/视频** |
+| **🔓 手机放远处需看屏幕/打电话** | 必须起身走过去拿起手机、手动划开九宫格密码、打开拨号盘选卡拨打 | 在电脑浏览器打开 `/mirror` 直接鼠标点按，或运行 `oms call 10000 --sim 电信`，**手机自动亮屏、画九宫格解锁并选卡外呼** |
+| **⏳ 电脑跑长耗时 Agent 任务** | 不敢离开工位去吃饭或躺沙发，怕 AI 卡在确认步骤或报错空转 | 离开工位（`AWAY`）自动将通知路由至手机；遇到高风险操作弹出**紫色 Diff 审批卡片**，手机点一下 `[✅ 批准继续]` |
+| **💡 路上闪念与好文入知识库** | 微信收藏吃灰，录音懒得回听整理 | 任意 App 点系统分享 ➔ **`📚 存入个人知识库`**，或发一段原生语音，Mac 自动用 **SenseVoice 离线转写**并归入待处理队列 |
+
+---
+
+## 2. 八大核心场景与实操案例详解
+
+### 场景一：📱 ➔ 💻 免 IM 极速投递、SenseVoice 离线语音转写与知识库联动
+
+1. **三指截屏秒传悬浮胶囊 (`ScreenshotPillController`)**
+   - 在小米手机任意界面三指下拉截屏，屏幕右上角立即浮现半透明胶囊 **`[🚀 发给 Mac AI] [🎙️ 附言]`**（若不操作，3.5 秒后自动消隐，绝不遮挡视线）。
+   - 点击 **`[🚀 发给 Mac AI]`** 即刻将原图投递至 Mac 收件箱（默认自动在 Mac 上弹出预览窗口）；点击 **`[🎙️ 附言]`** 可边发截图边说一句“帮我把这个界面的间距调紧凑一点”。
+2. **系统分享 3 大置顶入口 (`Direct Share`)**
+   - 在任意 App（浏览器、公众号、知乎、小红书、相册、文件管理器）点击「系统分享」，首行置顶提供 3 个意图分流入口：
+     - **`📚 存入个人知识库`**（携带 `#pkb_vault` 标签，进入 `~/.one_more_step/inbox/pkb_pending.jsonl` 供 `personal-knowledge-base` Skill 深加工）；
+     - **`🚀 发给 Mac Inbox`**（携带 `#default_inbox` 标签，文字自动进 Mac 剪贴板，文件自动落盘）；
+     - **`🐛 发给 AI 修 Bug`**（携带 `#ui_bug` 标签，进入 `ui_bug_pending.jsonl` 队列）。
+3. **控制中心快捷磁贴 (`OmsQuickTileService`)**
+   - 下拉小米控制中心**单击 `发给 Mac AI` 磁贴**：通过 `1×1` 像素透明焦点窗口（`ClipboardCatcherActivity`）突破 Android 10+ 后台剪贴板读取限制，1 秒将手机剪贴板同步至 Mac；
+   - **长按该磁贴**：直接呼出「💡 我有一个想法」语音闪念框，说完即刻归入 `#voice_idea`。
+4. **手机原生语音录制 + Mac SenseVoiceSmall 离线自动转写**
+   - 在手机端 `OneMoreStep` 底部输入栏点击 **`🎙️语音`** 直接录制 `.m4a` 音频并发送；Mac 端 `omsd` 收到音频附件后，后台自动调用本机 `local-asr`（SenseVoiceSmall 离线模型）完成高精度中文/中英混杂转写，回填 `voiceTranscript` 并自动写入 Mac 系统剪贴板。
+
+---
+
+### 场景二：🔑 手机锁屏验证码（短信 / 微信 / 飞书 / 邮箱）毫秒级提取上屏
+
+- **四通道穿透捕获引擎 (`com.oms.client.otp`)**：
+  1. `OmsNotificationListenerService`：实时监听全系统通知栏（支持短信、微信、飞书、钉钉、邮箱等 `MessagingStyle` 消息）；
+  2. `OmsSmsBroadcastReceiver`：直接解析底层 `SMS_RECEIVED` PDU 广播，即使小米手机开启了「锁屏隐藏通知内容」也能穿透提取；
+  3. `SmsContentObserver`：监听 `content://sms` 数据库写入；
+  4. `OmsAccessibilityService`：无障碍通知事件兜底（内置 25 秒内容哈希幂等去重）。
+- **高精度抗干扰提取 (`OtpExtractor`)**：
+  - 自动识别中英文验证码触发词，并通过正则掩码精准剔除**手机尾号、银行卡尾号、消费金额、有效分钟数、年份日期以及机票航班号（如 `ZH9949` 防诈提示）**等干扰数字，提取出纯净的 4~8 位验证码与机构签名（如 `【阿里云】`、`【招商银行】`）。
+- **Mac 剪贴板与通知分离体验**：
+  - 手机收到验证码后 `0.2 秒`内，Mac 右上角弹出桌面通知：`🔑 【签名】验证码: 839201`（附完整原文），同时 **Mac 系统剪贴板仅写入纯数字 `839201`**，你在电脑浏览器输入框直接按 `⌘V` 即可完成登录！
+
+---
+
+### 场景三：🎧 AirPods 跨 Mac ⇄ 小米手机蓝牙无感自动流转与对端自动暂停
+
+无需购买两副耳机，也不用每次手动去点蓝牙设置，让 AirPods 在 macOS 与小米 Android 之间获得媲美甚至超越苹果原生的无感流转体验：
+
+- **双端音频焦点实时感知**：
+  - **Mac 端**：`oms-bt-bridge` 通过 macOS `CoreAudio` 实时监听默认音频输出设备运行状态（`kAudioDevicePropertyDeviceIsRunningSomewhere`）与 `IOBluetooth` 配对列表；
+  - **手机端**：`AirPodsAutoSwitchManager` 实时监听 Android `AudioPlaybackConfiguration`（音乐/视频播放）与 `AudioManager.OnModeChangedListener`（电话振铃/通话/VoIP）。
+- **智能抢占与对端自动静音暂停**：
+  - **手机 ➔ Mac**：当 AirPods 连着手机且手机处于静音闲置状态，你在 Mac 上点开视频或音乐，Mac 自动通过 `IOBluetoothDevice.openConnection()` 抢回 AirPods 并设为系统默认输出，同时通知手机暂停残留媒体；
+  - **Mac ➔ 手机**：当你在小米手机上点开 B 站/抖音/音乐或突然来电话，手机自动通过 `BluetoothA2dp.connect()` / `BluetoothHeadset.connect()` 将 AirPods 切回手机，同时 **Mac 自动发送系统级 `MRMediaRemoteSendCommand(kMRPause)` 暂停 Mac 上正在播放的音乐或视频**！
+- **灵活控制**：支持在 Mac Web 看板（`/inbox`）、手机首页卡片或命令行 `oms airpods [status | mac | phone | auto on/off | pause on/off]` 随时手动切换或开关自动流转。
+
+---
+
+### 场景四：🪞 实时低延迟手机屏幕镜像与电脑鼠标远程触控工作台 (`/mirror`)
+
+当手机放在书包里、充电器上或另一个房间时，直接在 Mac 浏览器打开实时镜像工作台：
+
+```bash
+oms mirror
+# 或在浏览器直接访问 http://127.0.0.1:19527/mirror
+```
+
+- **二进制高速视频帧流 (`FrameType.SCREEN_FRAME = 0x07`)**：
+  - 手机端基于 `AccessibilityService.takeScreenshot` 硬件 Bitmap 管道，在端侧直接缩放并编码为紧凑 JPEG 帧，封装 16 字节二进制帧头（`[codec][flags][width][height][seq][timestampMs]`），通过 `P1_STREAM_META` 优先级通道直推 Mac；
+  - 内置在途帧背压控制（`maxInFlight = 2`）与无观看者 15 秒自动休眠机制，默认 `720p @ 12fps`，画面流畅且不阻塞控制指令。
+- **网页端所见即所得鼠标触控**：
+  - **单击画面** ➔ 映射为手机真實物理像素坐标 `tap(x, y)`；
+  - **按住鼠标拖拽** ➔ 映射为手机平滑滑动手势 `swipe(x1, y1, x2, y2)`；
+  - **右侧控制面板** ➔ 一键唤醒并绘制九宫格解锁、快速向手机当前焦点输入框发送中英文文本、一键触发 `桌面(Home)` / `返回(Back)` / `多任务(Recents)` / `锁屏(Lock)` / `音量调节` / `高清抓屏入收件箱`。
+
+---
+
+### 场景五：🔓 远程唤醒、3×3 九宫格图案密码解锁与双卡原生电话拨打/挂断
+
+1. **远程点亮屏幕 + 自动绘制 3×3 九宫格图案解锁 (`oms unlock`)**
+   - 九宫格点位按从左到右、从上到下编号为 `1 ~ 9`（第 1 行 `1,2,3`，第 2 行 `4,5,6`，第 3 行 `7,8,9`）。
+   - 执行命令后，手机自动通过 `PowerManager.ACQUIRE_CAUSES_WAKEUP` 点亮屏幕 $\rightarrow$ 自动上滑呼出锁屏密码层（Bouncer） $\rightarrow$ 自动探测或按校准坐标生成单笔画连续贝塞尔轨迹 (`GestureDescription`) 一次性划开九宫格密码！
+   - 支持 `--save` 将图案安全保存在 Mac 本地 `~/.one_more_step/config.json`（权限 `0600`），此后直接运行 `oms unlock` 即可免输密码一键解锁：
+     ```bash
+     # 首次绑定并保存你的九宫格图案（例如 1-2-3-6-9-8-7-4-5），之后直接运行 oms unlock
+     oms phone unlock 123698745 --save
+     oms unlock
+     ```
+2. **自动解锁 + 原生双卡电话拨打与挂断 (`oms call` & `oms hangup`)**
+   - 想要拨打客服电话、测试语音线路或紧急联系某人时，无需拿起手机：
+     ```bash
+     # 若手机处于锁屏状态，会自动先唤醒并绘制九宫格解锁，再使用指定 SIM 卡外呼并开启免提
+     oms call 10000 --sim 电信 --speaker
+     oms call 13800138000 --sim 2
+     oms hangup
+     ```
+   - 底层通过 `TelecomManager.callCapablePhoneAccounts` 自动匹配双卡槽位（支持传入 `1`、`2` 或运营商名称 `电信`、`联通`、`移动`），通过 `ACTION_CALL` 直接发起呼叫，通过 `TelecomManager.endCall()` 一键挂断。
+
+---
+
+### 场景六：⏰ 主动式助理：原生闹钟、防冲突日历、分级强提醒/TTS 与远程审批
+
+- **静默创建小米原生系统闹钟 (`oms alarm`)**：调用 `AlarmClock.ACTION_SET_ALARM` + `EXTRA_SKIP_UI=true` 配合小米后台弹出界面权限，在小米系统时钟 App 内静默建好闹钟，并附带 `AlarmManager.setAlarmClock()` 双保险。
+- **系统日历防冲突查询与写入 (`oms calendar`)**：查询时自动展开周期性重复会议（`CalendarContract.Instances`），让 AI 先检查你下午是否有会，确认无冲突后再写入新日程并配置提前 15 分钟系统日历响铃。
+- **在场感知分级通知与闹钟声道强制 TTS (`oms notify`)**：
+  - 当你在电脑前（`AT_DESK`）时，`normal` 通知自动转为 Mac 桌面轻提示 + 手机静默入流，避免桌上手机频繁震动打扰写代码；
+  - 当遇到紧急情况（`urgent` + `--tts`）时，突破手机勿扰模式亮屏弹窗，并通过 `STREAM_ALARM`（闹钟声道）直接用中文语音开口播报（即使手机处于静音模式也能发声）。
+- **阻塞式远程交互审批 (`oms approve`)**：长耗时任务遇到关键决策点时，向手机推送含代码 Diff 的紫色审批卡片，终端阻塞挂起，直到你在手机上点击 `[批准继续]` 或 `[拒绝并中止]`。
+
+---
+
+### 场景七：🎛️ 手机全维实时遥测、远程寻机与局域网一键 OTA
+
+- **20+ 项实时硬件与系统遥测 (`oms status --live`)**：一键获取手机电量、充电接口（`AC`/`USB`/`WIRELESS`）、电池温度（`°C`）、电压、省电模式、屏幕亮灭与锁屏状态、**当前前台 App 中文名称与包名**、Wi-Fi SSID/信号强度（`dBm`）/协商速率、四声道音量百分比、可用存储（`GB`）与内存（`MB`）、AirPods 连接状态及 11 项权限健康度。
+- **远程寻机与快捷控制 (`oms phone`)**：手机不知道丢在房间哪个角落？运行 `oms phone find`，手机立即以最大闹钟声道播报语音并持续震动；还支持远程抓屏回传（`oms phone screenshot`）、调节音量、打开指定网址或直接拉起微信/飞书/钉钉/相机。
+- **局域网智能 OTA 升级 (`oms ota`)**：重新编译或更新 APK 后，无需插线，运行 `oms ota`（或点击手机端顶部 `🔄 检查更新`），自动校验 `versionCode` 与 `SHA-256` 并拉起无线覆盖安装。
+
+---
+
+### 场景八：🤖 无障碍 GUI 屏幕自动化引擎与四项应用层安全护栏
+
+针对钉钉填表、小程序数据提取、移动端 UI 走查等无公开 API 的场景：
+
+1. **三步语义剪枝树 (`SemanticTreeExtractor`)**：自动剔除无意义容器节点、聚合卡片内碎片文本，为每个可交互控件赋予 `#1, #2` 短编号，单屏仅 `5~10 KB`。
+2. **零弹窗静默截屏与 Set-of-Mark 合成 (`ScreenCapturer`)**：可选自动在截图上绘制 `#1, #2` 红框视觉角标，供多模态大模型精准对齐视觉与控件树。
+3. **四项应用层安全护栏**：
+   - **`observationId` 窗口状态强绑定**：每次 `oms gui observe` 生成唯一 `observationId`，一旦页面发生跳转或窗口改变，旧节点编号立即失效拒绝执行，防止误点；
+   - **顶部物理急停胶囊 (`SafetyStopOverlay`)**：AI 操作期间手机顶部常驻橙色急停条，点按立即持久化熔断后续所有 GUI 动作；
+   - **用户触碰即让路 & 敏感窗口黑名单**：检测到手指触屏或进入支付/密码框窗口立即中止；
+   - **最后一步人工点按放行 (`--confirm`)**：在点击「提交/发送/删除」前，在手机屏幕弹出半透明确认卡片，必须由你本人点按 `[允许执行]` 才真正注入点击。
+
+---
+
+## 3. 系统架构与底层工程机制详解
+
+### 3.1 整体架构拓扑图
 
 ```mermaid
 flowchart TB
-    subgraph MacHost["💻 macOS 宿主端 (TypeScript / Bun + Swift)"]
-        Agents["本地 AI Agents<br/>(Codex / Antigravity / OpenCode / Claude Code)"]
-        MCP["MCP Server (`oms mcp`)<br/>13 Tools + 3 Resources"]
-        CLI["命令行工具 (`oms`)<br/>配对 / 收发 / 遥控 / 闹钟 / 日历 / GUI"]
-        WebUI["本地 Web 控制台<br/>`/install` 无线安装台 · `/inbox` 实时看板"]
-        Daemon["单例守护进程 (`omsd`)<br/>Unix Socket IPC · 在场路由 · 离线ASR · 审批挂起器"]
-        Inbox["本地存储与收件箱 (`~/.one_more_step/`)<br/>`latest.json` · `pkb_pending.jsonl` · 密钥库"]
-        BtBridge["原生蓝牙桥接 (`oms-bt-bridge`)<br/>Swift CoreBluetooth GATT + RSSI"]
+    subgraph MacHost["💻 macOS 宿主端 (TypeScript / Bun + Swift 原生桥接)"]
+        Agents["本地 AI Agents<br/>(Codex / Antigravity / Claude Code / OpenCode)"]
+        MCP["标准 MCP Server (`oms mcp`)<br/>13 Tools + 3 Resources"]
+        CLI["全局命令行工具 (`oms`)<br/>配对 / 投屏 / AirPods / 解锁拨号 / 收发 / GUI"]
+        WebStudio["本地回环 Web 工作台 (`127.0.0.1:19527`)<br/>`/inbox` 实时看板 · `/mirror` 12fps 触控投屏 · `/install` 无线安装"]
+        Daemon["单例守护进程 (`omsd`)<br/>Unix Socket IPC · 在场路由 · SenseVoice 离线转写 · 审批挂起器"]
+        Inbox["本地存储与密钥库 (`~/.one_more_step/`)<br/>`latest.json` · `pkb_pending.jsonl` · `connections.jsonl` · `keystore/`"]
+        BtBridge["原生蓝牙与音频守护助手 (`oms-bt-bridge`)<br/>Swift CoreBluetooth GATT + IOBluetooth & CoreAudio (AirPods 流转)"]
 
         Agents <-->|stdio JSON-RPC| MCP
-        Agents <-->|Bash / Skill| CLI
+        Agents <-->|Bash / Global Skill| CLI
         MCP & CLI <-->|Unix Socket (`omsd.sock`)| Daemon
-        Daemon <--> WebUI
+        Daemon <--> WebStudio
         Daemon <--> Inbox
         Daemon <-->|Unix Socket (`bt.sock`)| BtBridge
     end
 
-    subgraph Transport["📡 三级自适应传输层 (8-Byte P0/P2 多路复用帧协议 + Ed25519 鉴权)"]
-        T1["Tier 1: LAN WebSocket (局域网高速直连 + UDP/ARP 自动发现)"]
-        T2["Tier 2: BLE 信令 + Classic BT RFCOMM (零网络/绕过VPN)"]
-        T3["Tier 3: WAN WSS 中继接入 (需部署)"]
+    subgraph Transport["🔐 安全传输 v2 (P-256 ECDH + AES-256-GCM + 8字节 P0/P1/P2 多路复用帧)"]
+        T1["Tier 1: LAN WebSocket<br/>(物理网卡直绑 · UDP/ARP 发现 · WifiLock 9s 双向保活)"]
+        T2["Tier 2: BLE GATT 分片通道 + Classic BT<br/>(零网络近场信令 · 带外 IP 握手 · AirPods A2DP/HFP 抢占)"]
+        T3["Tier 3: WAN WSS 中继接入<br/>(可选跨网扩展通道)"]
     end
 
     subgraph XiaomiPhone["📱 小米 Android 客户端 (Kotlin + Jetpack Compose, MinSDK 30)"]
-        FgService["核心前台服务 (`OmsCoreForegroundService`)<br/>连接状态机 · 离线重试队列 · 帧复用收发"]
-        ShareSuite["免 IM 极速投递套件<br/>截屏悬浮胶囊 · 3大置顶分享 · 控制中心磁贴 · 原生录音"]
-        SysCap["确定性系统能力与全维遥测<br/>原生闹钟 · 日历读写 · 受权文件 · 远程操控 · L1~L3通知/TTS"]
-        GuiAgent["无障碍 GUI 自动化引擎 (`OmsAccessibilityService`)<br/>语义控件树 · 静默截屏(SoM) · 拟人手势 · 急停胶囊"]
-        ComposeUI["Jetpack Compose 双向时间流<br/>远程审批卡片 · 通勤TTS随身听 · 智能OTA · 小米权限向导"]
+        FgService["核心前台服务 (`OmsCoreForegroundService`)<br/>唯一 macId 强锁定 · 离线重试队列 · 离线连接诊断"]
+        ShareSuite["免 IM 投递与验证码引擎<br/>截屏 3.5s 胶囊 · 3大置顶分享 · 透明焦点剪贴板 · 4通道验证码提取"]
+        AudioAndCall["跨生态音频与通讯执行器<br/>AirPods 自动流转 (`AirPodsAutoSwitchManager`) · 双卡选卡拨号/挂断"]
+        SysCap["确定性系统能力与全维遥测<br/>原生闹钟 · 防冲突日历 · 受权文件 · 20+项遥测 · L1~L3通知/闹钟流TTS"]
+        GuiAgent["无障碍 GUI 与实时投屏引擎 (`OmsAccessibilityService`)<br/>3×3 九宫格轨迹解锁 · 12fps 屏幕帧流 · 语义树(#ID) · 急停护栏"]
+        ComposeUI["Jetpack Compose 双层顶栏主界面<br/>双向时间流 · 远程审批卡片 · 通勤TTS随身听 · 小米满血权限向导"]
 
-        FgService <--> ShareSuite & SysCap & GuiAgent & ComposeUI
+        FgService <--> ShareSuite & AudioAndCall & SysCap & GuiAgent & ComposeUI
     end
 
     Daemon <--> T1 & T3
@@ -144,64 +262,78 @@ flowchart TB
     T1 & T2 & T3 <--> FgService
 ```
 
-### 3.2 Monorepo 目录结构与核心产物
+### 3.2 四大核心底层工程机制
+
+#### 1) 8 字节 `P0 / P1 / P2` 三级优先级多路复用二进制帧协议 (`shared-protocol/src/framing.ts`)
+所有通道底层统一采用紧凑的 8 字节 Big-Endian 帧头（`[0x4F 'O'][Version][FrameType][Flags][PayloadLength(uint32)]`），并在发送队列中实施严格的三级优先级调度，彻底消除大文件传输或投屏时的「队头阻塞（Head-of-Line Blocking）」：
+- **`P0_URGENT_CONTROL`**：JSON-RPC 控制信令（`0x01`）、心跳 `PING/PONG`（`0x05/0x06`）、流确认 `STREAM_ACK`（`0x04`）——永远插队在最前方毫秒级发出；
+- **`P1_STREAM_META`**：实时屏幕镜像帧 `SCREEN_FRAME`（`0x07`）与文件流起始元数据 `STREAM_START`（`0x02`）——带在途帧上限（`maxInFlight = 2`）自适应丢帧防积压；
+- **`P2_BULK_DATA`**：64KB 切片的二进制文件块 `STREAM_CHUNK`（`0x03`，`[16B UUIDv7][4B chunkIndex][raw_bytes]`）——在后台空闲间隙平滑穿插传输，并在对端完成 `SHA-256` 落盘校验返回 `COMPLETED` ACK 后才确认送达。
+
+#### 2) 安全传输 v2（P-256 ECDH + HKDF-SHA256 + 双向 AES-256-GCM）与唯一 `macId` 强锁定
+- **零明文密钥下发**：首次配对使用 `oms pair` 在 Mac 本地生成 10 分钟有效、单次消费的 256 位 `ephemeralToken`，双方通过临时 `P-256 ECDH` 密钥交换与 `HKDF-SHA256` 独立派生长期配对密钥，网络中绝不传输明文密钥。
+- **每连接独立前向安全会话**：每次重连均重新执行双向挑战与临时 ECDH，派生独立的 `macToPhoneKey` 与 `phoneToMacKey`，所有业务帧封装为 `SECURE_RECORD (0x7E)`（含严格递增 64 位序号防重放、防篡改、防跨连接注入）。
+- **唯一 `macId` 强锁定与本机回环隔离**：手机一旦绑定你的 Mac，其 UDP 探测、子网扫描与 BLE 发现仅接受 `macId == paired.macId`，绝不误连局域网内其他电脑；Mac 端 `/inbox`、`/mirror` 与 `/api/*` 严格限制仅 `127.0.0.1` / `::1` 可访问。
+
+#### 3) 企业大子网 `WifiLock` 保活与 BLE GATT 自动分片流控
+- **解决小米锁屏断流**：`OmsCoreForegroundService` 持有 `WIFI_MODE_FULL_LOW_LATENCY` 锁，配合 9 秒应用层加密心跳与 10 秒 WebSocket Ping，防止小米 HyperOS 锁屏后 Wi-Fi 芯片进入 DTIM 深度休眠导致企业 `/23` 大子网 AP 清除 ARP 表项。
+- **BLE GATT 分片写入队列**：针对蓝牙 MTU 限制（如 `secure.finish` 握手帧约 `1.1 KB` 超过 BLE 512 字节上限），两端实现了基于 `onCharacteristicWrite` 回调的流式分片发送与重组队列，并避免蓝牙扫描抢占正在握手的局域网连接。
+
+#### 4) 离线可用的双端结构化连接诊断引擎 (`connectionDiagnostics`)
+- 手机与 Mac 各维护最近 200 条固定大小连接事件环（Mac 保存在 `~/.one_more_step/logs/connections.jsonl`），精确区分「Wi-Fi 不可用」、「Mac 探测不可达」、「握手超时」与「安全校验失败」，手机端断网时可直接在首页点击 **`🩺 诊断 ➔ 复制诊断`** 保留排查现场。
+
+### 3.3 Monorepo 代码目录结构
 
 ```text
 one_more_step/
-├── package.json                  # Bun Workspace 根配置与快捷脚本
-├── tsconfig.base.json            # TypeScript 基础编译配置
+├── package.json                  # Bun Workspace 根配置与快捷脚本 (v1.5.2)
+├── bunfig.toml                   # 测试隔离配置（自动加载预置守卫，阻断测试访问真实设备或生产目录）
+├── OneMoreStep-v1.5.2.apk        # [已编译产物] 最新版小米 Android 客户端安装包 (与 OneMoreStep.apk 同步)
 ├── scripts/
-│   └── setup.ts                  # 一键编译蓝牙桥、链接全局 `oms` 命令与安装全局 Skill
+│   └── setup.ts                  # 一键编译 Swift 蓝牙桥、链接全局 `oms` 命令与安装全局 Agent Skill
 ├── skills/
-│   └── one-more-step/SKILL.md    # 面向 Codex / Antigravity / OpenCode 的仓库内置 Skill 模板
-├── shared-protocol/              # [@oms/shared-protocol] 跨端协议与加密原语
+│   └── one-more-step/SKILL.md    # 面向 Codex / Antigravity / OpenCode 的全局 Skill 规范模板
+├── shared-protocol/              # [@oms/shared-protocol] 跨端协议、帧编解码与 v2 加密会话原语
 │   ├── src/
-│   │   ├── types.ts              # 双向 JSON-RPC 2.0 方法定义、遥测模型、意图标签、错误码
-│   │   ├── framing.ts            # 8 字节二进制帧协议 (P0 控制信令 / P2 分块文件流多路复用)
-│   │   └── crypto-pairing.ts     # Ed25519 密钥生成、挑战签名鉴权、UUIDv7、配对 URI
-│   └── tests/protocol.test.ts    # 协议帧编解码、乱序抢占与加密签名单元测试
-├── mac-host/                     # [@oms/mac-host] macOS 守护进程、MCP Server、CLI 与蓝牙桥
-│   ├── bluetooth-bridge/         # [Swift] CoreBluetooth BLE Peripheral/Central 源码
+│   │   ├── types.ts              # JSON-RPC 2.0 契约、遥测模型、AirPods/投屏状态、意图标签与错误码
+│   │   ├── framing.ts            # 8 字节 P0/P1/P2 多路复用帧编解码与 16 字节屏幕镜像帧头
+│   │   ├── secure-session.ts     # 安全传输 v2 (P-256 ECDH + HKDF-SHA256 + AES-256-GCM 会话状态机)
+│   │   └── crypto-pairing.ts     # Ed25519 密钥对、挑战签名、UUIDv7 与 v2 配对 URI 构造
+│   └── tests/                    # 协议帧抢占、v2 跨语言密码向量与安全会话单元测试
+├── mac-host/                     # [@oms/mac-host] macOS 守护进程、MCP Server、CLI、Web 工作台与蓝牙桥
+│   ├── bluetooth-bridge/         # [Swift] CoreBluetooth BLE GATT + IOBluetooth/CoreAudio AirPods 控制器
 │   ├── src/
-│   │   ├── daemon/               # omsd 守护进程、Unix Socket IPC 服务端与客户端
+│   │   ├── daemon/               # omsd 单例守护进程、Unix Socket IPC、SenseVoice 离线转写与 AirPods 仲裁
 │   │   ├── transport/            # 会话管理、UDP/ARP 自动发现、蓝牙桥客户端、RSSI 滞回滤波在场引擎
-│   │   ├── inbox/                # 本地收件箱管理 (InboxManager) 与 Web 看板 (/inbox & /install)
+│   │   ├── inbox/                # 本地收件箱管理 (InboxManager) 与 Web 工作台 (/inbox & /mirror & /install)
 │   │   ├── mcp/server.ts         # 标准 stdio MCP Server (13 Tools & 3 Resources)
 │   │   ├── cli/index.ts          # oms 命令行工具全集
 │   │   └── plugins/dingtalk.ts   # 可选钉钉自定义机器人 HMAC-SHA256 抄送插件
-│   └── tests/                    # 传输层、在场状态机与 Daemon+MCP 端到端集成测试
-├── android-app/                  # [com.oms.client] 小米 Android 原生客户端 (Kotlin + Compose)
+│   └── tests/                    # 传输层、安全握手、测试隔离与 Daemon+MCP 端到端集成测试
+├── android-app/                  # [com.oms.client] 小米 Android 原生客户端 (Kotlin + Jetpack Compose)
 │   └── app/src/main/java/com/oms/client/
-│       ├── transport/            # 8 字节帧协议编解码与三级传输客户端 (OmsTransportClient)
-│       ├── service/              # 常驻前台协同服务 (OmsCoreForegroundService)
-│       ├── share/                # 截屏胶囊、Direct Share 接收器、磁贴服务、语音闪念、透明剪贴板捕获
-│       ├── capability/           # 原生闹钟、系统日历、受权存储白名单、语音录制、分级通知与闹钟流 TTS
-│       ├── agent/                # 无障碍服务、语义树剪枝提取、静默截屏 SoM 标注、顶部急停悬浮窗
-│       ├── xiaomi/               # 小米 HyperOS / MIUI 专属权限反射自检与跳转工具
-│       └── ui/                   # Jetpack Compose 主界面、双向时间流、远程审批卡片、智能 OTA 与通勤随身听
-└── docs/                         # 完整立项评估、架构设计与模块规范文档库 (01 ~ 11)
+│       ├── transport/            # 8 字节帧协议、SecureChannel v2 加密层与三级传输客户端
+│       ├── service/          # 常驻前台服务 (OmsCoreForegroundService, WifiLock 低延迟保活)
+│       ├── share/            # 截屏胶囊、Direct Share、快捷磁贴、语音闪念、透明剪贴板捕获
+│       ├── otp/              # 四通道验证码穿透监听 (NotificationListener + SMS PDU + ContentObserver)
+│       ├── capability/       # AirPods 自动流转、双卡拨号/挂断、原生闹钟、日历、受权存储、分级通知/TTS
+│       ├── agent/            # 无障碍服务、九宫格轨迹解锁、12fps 屏幕捕获、语义树剪枝、物理急停胶囊
+│       ├── xiaomi/           # 小米 HyperOS / MIUI 专属 AppOps 权限反射自检与一键跳转向导
+│       └── ui/               # Jetpack Compose 双层顶栏主页、双向时间流、诊断面板、审批卡片与随身听
+└── docs/                         # 完整立项评估、7 大模块详细设计、安全传输 v2 与真机验收记录
 ```
-
-| 核心构件 | 路径 / 获取方式 | 说明 |
-| :--- | :--- | :--- |
-| **Android 安装包 (APK)** | [GitHub Releases (`OneMoreStep-v1.3.7.apk`)](https://github.com/dqrcsc/one-more-step/releases/latest) 或 `bun run build:apk` | 原生 Kotlin + Jetpack Compose 客户端 |
-| **macOS 蓝牙桥接器** | [`mac-host/bluetooth-bridge/main.swift`](./mac-host/bluetooth-bridge/main.swift) | 基于 Swift `CoreBluetooth` 的蓝牙近场通信助手（首次启动或 `bun run setup` 自动编译） |
-| **Mac 守护进程 (`omsd`)** | [`mac-host/src/daemon/main.ts`](./mac-host/src/daemon/main.ts) | 管理多通道会话、本地收件箱、离线语音转写、Web 控制台与多 Agent IPC |
-| **MCP Server (`oms mcp`)** | [`mac-host/src/mcp/server.ts`](./mac-host/src/mcp/server.ts) | 面向 AI Agent 暴露 13 个标准工具与 3 个动态资源 |
-| **CLI 工具 (`oms`)** | [`mac-host/src/cli/index.ts`](./mac-host/src/cli/index.ts) | 终端一键配对、Web 看板、文件推拉、远程操控、系统能力与 GUI 自动化 |
-| **全局 Agent Skill** | [`skills/one-more-step/SKILL.md`](./skills/one-more-step/SKILL.md) | 供本地 Agent 自动发现并调用手机协同能力的全局 Skill 模板 |
 
 ---
 
-## 4. 快速上手指南（3 分钟全无线配通）
+## 4. 3 分钟快速上手指南（安装、v2 安全绑定与小米满血权限）
 
-### 环境要求
-- **macOS**：支持 Apple Silicon / Intel，已安装 [`Bun`](https://bun.sh/)（`>= 1.1.0`）。
+### 4.1 环境要求
+- **macOS**：支持 Apple Silicon / Intel，已安装 [`Bun`](https://bun.sh/)（`>= 1.1.0`）与 Xcode Command Line Tools（用于自动编译 `oms-bt-bridge`）。
 - **手机端**：运行 Android 11+ (`MinSDK 30`) 的小米 / Redmi 手机（HyperOS 或 MIUI）。
 
-### 第一步：初始化 Mac 宿主并启动无线配对台
+### 4.2 第一步：初始化 Mac 宿主并生成配对凭证
 
-无需寻找数据线，亦无需通过微信传安装包（避免 `.apk.1` 拦截），在项目根目录运行：
+在项目根目录运行以下命令，一键编译原生蓝牙桥、挂载全局 `oms` 命令、安装全局 Skill 并启动守护进程：
 
 ```bash
 bun install
@@ -209,7 +341,7 @@ bun run setup
 oms pair
 ```
 
-终端将自动拉起后台守护进程 `omsd`，并输出无线安装台地址与配对凭证：
+终端将输出无线安装页地址与 **v2 一次性加密配对 URI**：
 
 ```text
 ==============================================================
@@ -221,51 +353,49 @@ oms pair
 📬 【Mac 实时收件箱看板】(电脑浏览器打开):
    👉 http://127.0.0.1:19527/inbox
 
-🔐 安全 v2：通过自己控制的可信途径将完整 URI 输入手机。
+🔐 安全 v2：旧版 PIN/链接不可用。请通过自己控制的可信途径将下方完整 URI 输入手机。
 🌐 本机局域网地址:   192.168.x.x : 19527
 🔑 完整配对 URI:
    oms://pair?v=2&id=mac_...
 ==============================================================
 ```
 
-- **方式 A（推荐 · 手机浏览器无线直装）**：
-  1. 确保手机与 Mac 处于同一 Wi-Fi（若手机开着 VPN，请开启「绕过局域网」或暂停 VPN 10 秒）；
-  2. 用手机浏览器访问终端显示的 `http://192.168.x.x:19527/install`；
-  3. 点击页面上的 **`[📥 点击下载 OneMoreStep.apk]`** 完成安装（若本地未编译 APK，将自动引导下载最新 GitHub Release 安装包）。
-- **方式 B（备选 · 通过有线/无线 ADB 安装）**：
-  > 通过 ADB 安装的 APK 会被系统直接视为受信任应用，**可自动免除 Android 13/14/15 开启无障碍服务时的「受限制的设置」解锁步骤**：
-  ```bash
-  adb install -r android-app/app/build/outputs/apk/debug/app-debug.apk
-  ```
+- **安装 APK 到小米手机（二选一）**：
+  - **方式 A（手机浏览器免线下载）**：确保手机与 Mac 在同一 Wi-Fi，用手机浏览器打开 `http://192.168.x.x:19527/install` 点击下载安装 `OneMoreStep.apk`；
+  - **方式 B（推荐 · 通过 ADB 安装自动豁免受限设置）**：若手机已连接有线或无线 ADB，直接运行以下命令安装，**系统将自动豁免 Android 13/14/15 无障碍与通知使用权的「受限制的设置」解锁步骤**：
+    ```bash
+    adb install -r OneMoreStep-v1.5.2.apk
+    ```
 
-### 第二步：首次信任绑定与常驻 VPN 分流
+### 4.3 第二步：完成 v2 一机一码绑定与常驻 VPN 分流
 
-1. 打开手机上的 **「青简·咫尺 (`OneMoreStep`)」**，在顶部 **「🔐 1 对 1 安全绑定与重连」** 输入框中粘贴 Mac 本地显示的完整 `oms://pair?v=2&...` 链接（通过可信途径获取，不经旧 OMS 明文推送或 HTTP 页面），点击 **`[🔐 验证并绑定]`**。
-2. 状态栏变为 **`🟢 局域网高速直连 (Tier 1)`** 在两端均为 v1.4.0 时代表 v2 加密会话已建立（此后即使在同一局域网有其他电脑运行同款服务，手机也只认你绑定的这台 Mac）。
-3. **常驻 VPN 用户必配**：打开手机上的代理软件（Clash Meta / Sing-box / NekoBox 等），进入「分应用代理（Per-App Proxy）」，勾选 **`青简·咫尺 (OneMoreStep)` 绕过代理 / 直连**。
+1. 打开手机上的 **「青简·咫尺 (`OneMoreStep`)」**，点击顶栏 **`[🔐 绑定Mac]`** 展开绑定面板。
+2. 将 Mac 终端输出的完整 `oms://pair?v=2&...` 粘贴至输入框，点击 **`[🔐 验证并绑定]`**。
+3. 顶部状态栏变为 **`🟢 局域网直连`** 即完成 `ECDH P-256 + AES-256-GCM` 双向加密绑定。
+4. **💡 常驻 VPN 用户必配**：打开手机上的 Clash Meta / Sing-box / NekoBox 等软件，进入 **「分应用代理（Per-App Proxy）」**，将 **`青简·咫尺 (OneMoreStep)`** 勾选为 **「绕过代理 / 直连」**。
 
-### 第三步：一键开启小米 HyperOS / MIUI 专属权限
+### 4.4 第三步：一键开启小米 HyperOS / MIUI 满血权限
 
-点击手机 App 右上角的 **`[小米权限]`** 按钮，按向导依次开启以下权限以解锁全部能力：
+点击手机 App 顶栏的 **`[⚡ 小米权限]`** 按钮，展开权限自检向导并依次点击 **`[去开启]`**：
 
-| 权限项 | 作用说明 |
-| :--- | :--- |
-| **1. 后台弹出界面 & 锁屏显示** | 跳转到小米专属权限页设为「始终允许」，确保 AI 能在后台静默设定小米原生闹钟、控制中心秒读剪贴板及弹出锁屏强提醒。 |
-| **2. 省电策略设为「无限制」** | 防止手机锁屏后后台协同通道被小米系统冻结。 |
-| **3. 悬浮窗权限** | 用于截屏后右上角浮现 3.5 秒「🚀 发给 Mac AI」胶囊，以及 AI 操控屏幕时的顶部橙色急停胶囊。 |
-| **4. 无障碍服务** | 开启「OneMoreStep 屏幕协同助手」，赋予 AI 提取屏幕紧凑语义树、静默截屏与自动化手势能力。（注：若浏览器安装提示“受限制的设置”，先到 `设置 ➔ 应用管理 ➔ 青简·咫尺 ➔ 右上角 ⋮ ➔ 允许受限制的设置` 解锁即可）。 |
+| 序号 | 权限项 | 作用说明 |
+| :---: | :--- | :--- |
+| **1** | **小米「后台弹出界面」&「锁屏显示」** (`OpCode 10021 / 10008`) | 确保 AI 能在后台静默创建小米原生闹钟、控制中心透明窗口秒读剪贴板、远程唤醒屏幕及弹出锁屏强提醒。 |
+| **2** | **通知使用权 & 小米「通知类短信」** (`OpCode 10018`) | 用于锁屏实时捕获短信与微信/飞书/邮箱验证码，毫秒级同步至 Mac 剪贴板。 |
+| **3** | **电池省电策略设为「无限制」+ 自启动** | 配合 `WifiLock` 防止锁屏后后台协同通道被小米系统休眠清理。 |
+| **4** | **悬浮窗权限** | 用于三指截屏后浮现 3.5 秒「🚀 发给 Mac AI」胶囊，以及 AI 操控屏幕时的顶部橙色物理急停胶囊。 |
+| **5** | **无障碍服务 (`OneMoreStep 屏幕协同助手`)** | 赋予 AI 提取语义控件树、12fps 实时屏幕镜像、3×3 九宫格自动轨迹解锁与 GUI 自动化手势能力。 |
+| **6** | **附近设备（蓝牙）、电话、日历、相册与麦克风** | 支撑 BLE 近场连接、AirPods 跨生态自动切换、双卡选卡拨号、日历防冲突读写与原生语音闪念录制。 |
 
 ---
 
-## 5. AI Agent 接入指南（MCP Server & 全局 Skill）
+## 5. AI Agent 接入指南（13 个 MCP Tools、3 个 Resources 与全局 Skill）
 
-### 5.1 全局 Skill 自动安装
-
-运行 `bun run setup` 会自动将 [`skills/one-more-step/SKILL.md`](./skills/one-more-step/SKILL.md) 渲染并安装至 `~/.codex/skills/one-more-step/SKILL.md`，并将全局 CLI 链接至 `~/.local/bin/oms`。支持全局 Skill 发现的 Agent（Codex、Antigravity、OpenCode 等）开箱即用。
+### 5.1 全局 Skill 自动就位
+运行 `bun run setup` 后，全局 Skill 已自动安装至 `~/.codex/skills/one-more-step/SKILL.md`，全局命令 `oms` 已链接至 `~/.local/bin/oms`。支持全局 Skill 发现的本地 Agent（**Antigravity、Codex、OpenCode** 等）无需额外配置即可自动调用全套 `oms` 能力。
 
 ### 5.2 挂载标准 MCP Server
-
-在 **Antigravity、Codex、Claude Code、OpenCode** 等客户端的 MCP 配置文件中添加：
+在 **Antigravity、Codex、Claude Code、OpenCode** 的 MCP 配置文件中加入：
 
 ```json
 {
@@ -274,143 +404,153 @@ oms pair
       "command": "bun",
       "args": [
         "run",
-        "/path/to/one_more_step/mac-host/src/mcp/server.ts"
+        "/Users/dqrcsc/x_project/one_more_step/mac-host/src/mcp/server.ts"
       ]
     }
   }
 }
 ```
 
-### 5.3 13 个标准 MCP Tools 一览
+### 5.3 13 个标准 MCP Tools 完整契约表
 
-| 类别 | Tool 名称 | 核心功能与典型使用场景 |
+| 能力域 | Tool 名称 | 核心功能与支持参数说明 |
 | :--- | :--- | :--- |
-| **收件箱与文件流转** | `phone_inbox_latest` | 获取刚从手机投递到 Mac 的最新图文、截图、链接或语音闪念，支持按标签（`default_inbox` / `pkb_vault` / `voice_idea` / `ui_bug`）过滤。 |
-| | `phone_media_recent` | 主动列出手机相册或截图目录中最近生成的 N 个媒体文件元数据（无需用户在手机上手动发送）。 |
-| | `phone_file_pull` | 将手机受权目录（`screenshots` / `camera` / `download`）中的指定图片或文档拉取到 Mac 本地并返回绝对路径。 |
-| | `phone_file_push` | 将 Mac 上的 Markdown 总结、代码报告或文件推送到手机时间流，支持开启 `enableCommuteTts` 通勤随身听语音朗读。 |
-| | `phone_clipboard_sync` | 读取小米手机当前剪贴板内容（含可选近期白名单验证码提取），或将 Mac 生成的文本直接写入手机剪贴板。 |
-| **主动式助理与远程审批** | `phone_alarm_set` | 在小米手机原生系统时钟 App 中静默创建闹钟（支持设置重复周期与备注标签）。 |
-| | `phone_calendar_manage` | 查询手机系统日历日程（自动展开重复会议以防排期冲突），或直接向手机日历写入带提前响铃提醒的新日程。 |
-| | `phone_notify` | 发送分级通知：`silent`（静默入流）、`normal`（常规通知）、`urgent`（突破勿扰+锁屏全屏高亮+闹钟声道强制 TTS 语音播报）。 |
-| | `phone_request_approval` | 长耗时任务遇到高风险操作或关键分叉时，向手机推送含代码 Diff 摘要的交互式审批卡片，阻塞等待用户点击决策后返回。 |
-| **在场遥测与远程操控** | `phone_presence_status` | 查询用户当前是否在电脑旁（`AT_DESK` / `AWAY`）、当前激活的传输通道、电池电量/温度、前台应用、Wi-Fi 信号、音量、存储/内存余量及小米权限健康度。 |
-| | `phone_device_control` | 远程操控小米手机系统能力：响铃找手机 (`find_phone`)、TTS 语音播报 (`tts_speak`/`stop_tts`)、调节音量 (`set_volume`)、远程抓屏入收件箱 (`take_screenshot`)、打开网址 (`open_url`)、启动常用 App (`launch_app`) 或执行系统按键 (`home`/`back`/`lock_screen`)。 |
-| **GUI 屏幕自动化** | `phone_gui_observe` | 获取手机当前前台 App 的精简无障碍语义控件树（每个元素带 `#1, #2` 短编号），可选附带静默截屏或 Set-of-Mark (`#ID`) 标注截图。 |
-| | `phone_gui_action` | 执行无障碍 GUI 自动化操作（按 `#ID` 或坐标点击、长按、输入文本、滚动、滑动、启动 App/URL、返回/桌面键），支持 `requireUserConfirm` 敏感操作停顿确认。 |
+| **收件箱、验证码与文件流转** | `phone_inbox_latest` | 获取手机投递或自动同步到 Mac 的最新记录。支持按标签 `tag`（`all` \| `sms_otp` \| `default_inbox` \| `pkb_vault` \| `voice_idea` \| `ui_bug`）与未处理状态过滤。 |
+| | `phone_media_recent` | 主动列出手机相册或截图目录中最近生成的 N 个媒体文件元数据（`screenshot` \| `camera` \| `all_images` \| `video`，支持 `sinceMinutesAgo`）。 |
+| | `phone_file_pull` | 将手机受权目录（`screenshots` / `camera` / `download`）中的指定图片或文件拉取到 Mac 本地并返回绝对路径。 |
+| | `phone_file_push` | 将 Mac 上的报告、Markdown 总结或文件推送到手机时间流，支持 `enableCommuteTts: true` 开启通勤随身听语音朗读。 |
+| | `phone_clipboard_sync` | 双向读写小米手机剪贴板（`get_phone_clipboard` / `set_phone_clipboard`），支持 `includeRecentOtp: true` 附带最近验证码。 |
+| **主动式助理与远程审批** | `phone_alarm_set` | 在小米手机原生系统时钟 App 中静默创建闹钟（支持 `hour`、`minute`、`label`、`daysOfWeek` 重复周期）。 |
+| | `phone_calendar_manage` | 查询手机系统日历日程（`list_events`，自动展开重复会议防冲突），或写入（`add_event`）/ 删除（`delete_event`）日程。 |
+| | `phone_notify` | 发送分级通知：`silent`（静默入流）、`normal`（常规通知）、`urgent`（突破勿扰 + 锁屏亮屏 + 闹钟声道强制 TTS 语音播报）。 |
+| | `phone_request_approval` | 长耗时任务遇到高风险操作时，向手机推送含代码 `diffOrContext` 的交互式审批卡片，阻塞等待用户点击决策后返回。 |
+| **全维遥测与远程系统操控** | `phone_presence_status` | 查询是否在电脑旁（`AT_DESK` / `AWAY`）、传输通道、电量/温度、屏幕锁屏状态、前台 App 中文名、Wi-Fi 信号、AirPods 状态、存储/内存余量及权限健康度。 |
+| | `phone_device_control` | **全能远程系统控制**：<br>• `unlock_screen`：唤醒屏幕并绘制 3×3 九宫格图案（`pattern`）或 `pin` 解锁手机（支持 `savePattern`）；<br>• `call_phone` / `dial` / `hangup_call`：自动解锁并按双卡槽位（`simSlot: 1\|2\|电信\|联通`）拨打或挂断电话（支持 `speaker: true` 免提）；<br>• `find_phone` / `tts_speak` / `stop_tts`：突破静音响铃找手机或强制语音播报；<br>• `set_volume` / `vibrate` / `take_screenshot`：四声道音量调节、震动、远程抓屏入收件箱；<br>• `open_url` / `launch_app` / `system_action`：打开网址、启动常用 App（`wechat`/`lark`/`dingtalk`）或执行系统导航键（`home`/`back`/`lock_screen`）。 |
+| **GUI 屏幕自动化** | `phone_gui_observe` | 获取手机当前前台 App 的紧凑无障碍语义控件树（带 `#1, #2` 短编号与 `observationId`），可选附带静默截屏或 Set-of-Mark (`#ID`) 标注图。 |
+| | `phone_gui_action` | 执行 GUI 自动化操作（`click`、`long_click`、`input_text`、`scroll_down`、`scroll_up`、`swipe`、`back`、`home`、`launch_app`、`open_url`），节点动作需携带 `observationId`，支持 `requireUserConfirm` 停顿确认。 |
 
 ### 5.4 3 个 MCP Resources 一览
 
 | Resource URI | 名称 | 说明 |
 | :--- | :--- | :--- |
-| `oms://inbox/latest` | Latest Mobile Submission | 最新一条从小米手机投递到 Mac 的图文/闪念元数据与本地文件路径 |
+| `oms://inbox/latest` | Latest Mobile Submission | 最新一条从小米手机投递到 Mac 的图文/验证码/闪念元数据与本地文件路径 |
 | `oms://inbox/pkb_pending` | Pending PKB Submissions | 待归入个人知识库 (`pkb_vault` / `voice_idea`) 的手机未处理投递队列 |
-| `oms://phone/status` | Xiaomi Phone Presence & Status | 手机在场状态 (`AT_DESK` / `AWAY`)、传输通道层级与小米权限状态快照 |
+| `oms://phone/status` | Xiaomi Phone Presence & Status | 手机在场状态 (`AT_DESK` / `AWAY`)、传输通道、连接诊断与全维遥测快照 |
 
 ---
 
-## 6. CLI 命令行工具 (`oms`) 全集
+## 6. CLI 命令行工具 (`oms`) 全集速查表与实战示例
 
-执行 `bun run setup` 后，全局可执行命令 `oms` 将自动链接至 `~/.local/bin/oms`。除了通过 MCP 供 AI 调用外，你或 AI Agent 可以在**任意工作目录**直接运行 `oms <command>`（在项目根目录下亦可使用 `bun run oms <command>`）执行所有跨端操作：
+### 6.1 核心命令速查表
+
+| 命令分类 | 命令语法 | 功能说明 |
+| :--- | :--- | :--- |
+| **配对与工作台** | `oms pair [--json]` | 在 Mac 本地生成 10 分钟有效的安全 v2 配对 URI 并启动无线安装台 (`/install`) |
+| | `oms web` | 在 Mac 默认浏览器打开实时收件箱与双向协同 Web 看板 (`http://127.0.0.1:19527/inbox`) |
+| | `oms mirror [open\|start\|stop\|status]` | 打开 `12fps` 实时手机屏幕镜像与电脑鼠标远程触控工作台 (`http://127.0.0.1:19527/mirror`) |
+| **AirPods 流转** | `oms airpods [status\|mac\|phone\|auto\|pause]` | 查看 AirPods 双端状态、一键抢占切换至 Mac 或手机、开关音频焦点自动流转与对端自动暂停 |
+| **解锁与电话** | `oms unlock [pattern] [--save] [--bounds ...]` | 远程唤醒手机屏幕、上滑调出密码盘并绘制 3×3 九宫格图案（`1~9`）或 PIN 解锁手机 |
+| | `oms call <number> [--sim 1\|2\|电信] [--speaker]` | 自动解锁手机并使用指定 SIM 卡槽发起原生电话呼叫（`oms dial` 仅打开拨号盘） |
+| | `oms hangup` | 远程挂断手机当前正在振铃或通话中的电话 |
+| **遥测与遥控** | `oms status [--live]` | 查看在场状态、传输通道、电池温度、前台应用、AirPods、权限健康度与连接诊断日志 |
+| | `oms phone <find\|say\|volume\|screenshot\|open\|launch\|lock>` | 远程响铃找手机、TTS 开口说话、调音量、远程抓屏、打开网址/App、执行系统导航与锁屏 |
+| **验证码与剪贴板**| `oms otp [--limit N] [--copy] [--ack]` | 查询手机锁屏实时同步的最新验证码（加 `--copy` 自动将纯数字写入 Mac 剪贴板） |
+| | `oms clip [get [--otp] \| set <text> \| pull \| push]` | 双向读写手机剪贴板，或与 Mac 系统剪贴板（`pbcopy` / `pbpaste`）一键互推互拉 |
+| **收件箱与媒体** | `oms inbox [--tag <tag>] [--unprocessed] [--q <kw>]` | 查询手机投递记录；支持 `show <id>`、`ack <id>`、`transcribe <id>`（SenseVoice 离线转写） |
+| | `oms pull <latest-screenshot\|latest-camera\|path>` | 一键拉取手机最新截屏、最新相机照片或受权目录（`screenshots`/`camera`/`download`）文件 |
+| | `oms push <file\|--text\|--stdin> [--title <t>] [--tts]` | 将 Mac 文件或 Markdown 推送至手机时间流（`--tts` 开启通勤随身听语音朗读） |
+| **助理与审批** | `oms alarm <HH:MM> [--label <t>] [--days 1,2,3]` | 在小米原生系统时钟 App 中静默创建闹钟 |
+| | `oms calendar [list [--days N] \| add ... \| delete <id>]` | 防冲突查询手机未来日历日程，或写入带提前响铃提醒的新日程 |
+| | `oms notify <text> [--level silent\|normal\|urgent] [--tts]` | 发送 L1~L3 分级通知或突破勿扰的闹钟声道强制 TTS 语音播报 |
+| | `oms approve --title <t> --summary <s> [--diff <d>]` | 向手机推送阻塞式远程审批卡片，挂起等待手机端点击决策后返回 |
+| **GUI 自动化** | `oms gui observe [--screenshot] [--som]` | 提取当前屏幕紧凑无障碍语义树（`#1, #2`）及可选 Set-of-Mark 红框标注截图 |
+| | `oms gui act <click\|input_text\|...> [#id] --observation <id>` | 按节点 `#ID` 或坐标执行无障碍自动化操作（敏感操作加 `--confirm` 触发手机端人工放行） |
+| **维护与升级** | `oms ota` / `oms prefs` / `oms daemon <restart\|logs>` | 局域网一键推送 APK 升级、配置自动复制/预览偏好、管理后台 `omsd` 守护进程 |
+
+### 6.2 常用命令行实战示例
 
 ```bash
-# ──────────────── 1. 配对、全维状态、远程控制与 Web 看板 ────────────────
-# 在 Mac 本地生成安全 v2 配对 URI；/install 仅提供 APK 下载
-oms pair
+# ──────────────── 1. 屏幕镜像投屏、AirPods 无感切换与远程解锁拨号 ────────────────
+# 打开 12fps 实时手机屏幕镜像与鼠标触控工作台 (http://127.0.0.1:19527/mirror)
+oms mirror
 
-# 在 Mac 浏览器打开实时收件箱与双向时间流 Web 看板 (http://127.0.0.1:19527/inbox)
-oms web
+# 查看 AirPods 状态 / 手动切到 Mac 或手机 / 开启音频焦点自动切换与对端自动暂停
+oms airpods status
+oms airpods mac
+oms airpods phone
+oms airpods auto on
+oms airpods pause on
 
-# 查看手机在场状态 (AT_DESK / AWAY)、传输通道、电池温度、前台应用、网络与权限状态 (--live 强制实时刷新)
-oms status --live
+# 远程点亮手机并绘制 3x3 九宫格图案解锁（首次加 --save 保存图案，后续直接运行 oms unlock）
+oms unlock 123698745 --save
+oms unlock
 
-# 远程操控手机：响铃找手机 / TTS 开口说话 / 调节音量 / 远程截屏回传 / 打开网址或 App / 锁屏
-oms phone find --text "正在寻找手机，我在这里！"
-oms phone say "构建与测试已全部通过" --alarm
-oms phone volume 60 --stream music
-oms phone screenshot
-oms phone open "https://github.com/dqrcsc/one-more-step"
-oms phone launch wechat
-oms phone lock
+# 自动解锁手机并用电信卡拨打电话（开启免提扬声器）/ 挂断电话
+oms call 10000 --sim 电信 --speaker
+oms hangup
 
-# 一键向手机推送局域网 OTA 升级 / 安装 macOS LaunchAgent 开机自启
-oms ota
-oms daemon install-launchagent
+# ──────────────── 2. 验证码提取、收件箱、离线语音转写与相册拉取 ────────────────
+# 查看手机最新同步的验证码并写入 Mac 剪贴板
+oms otp --copy
 
-# ──────────────── 2. 收件箱、离线语音转写、媒体拉取与文件推送 ────────────────
-# 读取从手机投递到 Mac 的最新记录（可按 --tag 过滤、--q 搜索关键词、ack 标记已处理）
-oms inbox --limit 5
-oms inbox --tag pkb_vault --unprocessed
-oms inbox --q "白板"
-oms inbox show <itemId>
-oms inbox transcribe <itemId>
-oms inbox ack <itemId>
-
-# 一键拉取手机最新一张截屏或相机照片到 Mac 本地
+# 一键拉取手机刚截的图或刚拍的照片到 Mac 本地
 oms pull latest-screenshot
 oms pull latest-camera
 
-# 列出手机相册近期截图或相机照片 (--type screenshot|camera|all_images, --since 最近 N 分钟)
-oms media --type screenshot --limit 10
+# 查看待归入个人知识库的手机投递 / 对语音消息执行 SenseVoice 离线转写
+oms inbox --tag pkb_vault --unprocessed
+oms inbox transcribe <itemId>
+oms inbox ack <itemId>
 
-# 将手机受权目录中的图片或文件拉取到 Mac 本地
-oms pull "content://media/external/images/media/100001234"
-oms pull "download/architecture.pdf" -o ~/Downloads
-
-# 将 Mac 本地文件或 Markdown 文本推送到手机时间流（--tts 开启通勤语音朗读）
+# 将电脑上的 Markdown 报告推送到手机『🎧 通勤 TTS 随身听』
 oms push ./docs/02-scenarios-and-value.md --title "全景场景分析" --tts
-oms push --text "这是给手机的一段速记备忘" --title "Mac 速记"
 
-# ──────────────── 3. 双向剪贴板、原生闹钟、系统日历 ────────────────
-# 读取手机剪贴板 (含验证码) / 写入手机剪贴板 / 与 Mac 系统剪贴板双向一键同步
-oms clip get --otp
-oms clip set "https://github.com/dqrcsc/one-more-step"
-oms clip pull
-oms clip push
+# ──────────────── 3. 远程控制、原生闹钟、防冲突日历与远程审批 ────────────────
+# 响铃寻找手机（突破静音走闹钟声道发声）/ 远程抓屏 / 启动微信
+oms phone find --text "正在寻找手机，我在这里！"
+oms phone screenshot
+oms phone launch wechat
 
-# 在小米手机原生时钟中静默设置闹钟
-oms alarm 08:30 --label "起床检查 AI 任务结果"
-
-# 查询手机未来日历日程 / 写入新日程（默认提前 15 分钟响铃提醒）
+# 静默定小米原生闹钟 / 检查未来 3 天日历冲突并写入新日程
+oms alarm 08:30 --label "起床检查夜间构建结果"
 oms calendar list --days 3
-oms calendar add --title "OneMoreStep 架构复盘" --desc "验证跨端协同" --remind 15
+oms calendar add --title "OneMoreStep 架构评审" --duration 60 --remind 15
 
-# ──────────────── 4. 分级强提醒、TTS 播报与远程审批 ────────────────
-# 发送常规通知或突破勿扰的 L3 紧急通知（--tts 让手机用闹钟声道直接语音播报）
-oms notify "代码重构与单元测试已全部通过" --level urgent --tts
+# 发起阻塞式远程交互审批（终端等待手机端点击按钮拍板）
+oms approve --title "是否执行生产数据库迁移？" --summary "新增 2 张索引表，预计耗时 3 秒"
 
-# 发起阻塞式远程交互审批（终端挂起等待手机端点击按钮返回决策）
-oms approve --title "是否执行生产数据库迁移？" --summary "将新增 2 张索引表，预计耗时 3 秒"
-
-# ──────────────── 5. 无障碍 GUI 屏幕观察与自动化控制 ────────────────
-# 提取当前手机屏幕的紧凑语义控件树，并生成带 #1, #2 红框角标的 SoM 截图
+# ──────────────── 4. 无障碍 GUI 屏幕观察与受护栏保护的自动化 ────────────────
+# 提取紧凑语义树与带 #1, #2 红框角标的 SoM 截图
 oms gui observe --screenshot --som
 
-# 按控件编号点击、输入文本或执行导航（--confirm 在执行前弹出人工确认框）
-oms gui act click "#2" --observation "刚才返回的 observationId"
-oms gui act input_text "#5" --text "今日研发日报内容..." --observation "刚才返回的 observationId"
-oms gui act click "#8" --confirm --observation "刚才返回的 observationId"
+# 携带最新 observationId 点击控件或在最后一步提交前弹出手机确认框 (--confirm)
+oms gui act click "#3" --observation "<observationId>"
+oms gui act click "#8" --observation "<observationId>" --confirm
 ```
 
 ---
 
-## 7. 本地运行目录与数据规范 (`~/.one_more_step`)
+## 7. 本地数据规范 (`~/.one_more_step`) 与 Web 控制台接口
 
-Mac 守护进程 `omsd` 运行时会将所有配置、密钥与手机投递的文件统一管理在 `~/.one_more_step/`（可通过环境变量 `OMS_HOME` 自定义）：
+### 7.1 本地运行目录结构 (`~/.one_more_step`)
+`omsd` 将所有配置、加密密钥、结构化诊断日志与收件箱附件统一保存在 `~/.one_more_step/`（可通过环境变量 `OMS_HOME` 覆盖）：
 
 ```text
 ~/.one_more_step/
-├── config.json                   # 端口、蓝牙开关、剪贴板自动复制、图片自动预览、钉钉插件配置
+├── config.json                   # 端口、蓝牙开关、自动复制/预览/验证码开关、AirPods 策略、保存的解锁图案 (0600)
 ├── keystore/
-│   ├── host_identity.json        # Mac 端 Ed25519 长期身份密钥对 (0600)
-│   └── trusted_devices.json      # 已绑定的小米手机设备公钥与信任记录
+│   ├── host_identity.json        # Mac 端长期身份密钥对 (0600)
+│   └── trusted_devices.json      # 已绑定的小米手机设备 ID、派生配对密钥与信任记录 (0600)
 ├── run/
 │   ├── omsd.pid                  # 守护进程 PID
 │   ├── omsd.sock                 # 供 MCP Server 与 CLI 并发调用的本地 Unix Domain Socket
-│   └── bt.sock                   # omsd 与原生 Swift 蓝牙助手 (oms-bt-bridge) 的通信 Socket
+│   └── bt.sock                   # omsd 与原生 Swift 蓝牙/音频助手 (oms-bt-bridge) 的通信 Socket
+├── logs/
+│   ├── omsd.log                  # 守护进程运行日志
+│   └── connections.jsonl         # 最近 200 条结构化连接诊断事件环 (UTC 时间戳、事件码、尝试编号)
 └── inbox/
     ├── latest.json               # 最新一条手机投递记录的即时快照 (O(1) 读取)
-    ├── items_index.jsonl         # 全量投递历史索引 (JSON Lines)
+    ├── items_index.jsonl         # 全量投递历史索引 (同目录临时文件原子替换)
     ├── pkb_pending.jsonl         # 待个人知识库 (personal-knowledge-base) 消化的暂存队列
     ├── ui_bug_pending.jsonl      # 待修复的移动端 UI Bug 队列
     ├── asr_cache/                # SenseVoice (local-asr) 离线语音转写结果缓存
@@ -418,56 +558,67 @@ Mac 守护进程 `omsd` 运行时会将所有配置、密钥与手机投递的�
     └── YYYY-MM-DD/<itemId>/      # 按日期与 UUIDv7 归档的原始附件与 meta.json
 ```
 
+### 7.2 本地 HTTP 控制台与局域网安装接口
+`omsd` 内置 HTTP 服务（默认端口 `19527`），严格区分**局域网公开只读下载端点**与**仅限本机回环（`127.0.0.1` / `::1`）访问的管理端点**（内置 Host Header 与同源 `Origin` 校验，阻断 DNS Rebinding 与跨站伪造）：
+
+| 路径 | 访问边界 | 功能说明 |
+| :--- | :--- | :--- |
+| `GET /install` | 局域网可读 | 无数据线 APK 无线下载页（仅提供安装包下载，**绝不暴露任何配对密钥或 PIN**） |
+| `GET /apk/latest.apk` | 局域网可读 | 下载最新编译的 `OneMoreStep.apk` 安装包（供首次安装与手机端无线 OTA 使用） |
+| `GET /apk/version` | 局域网可读 | 返回当前 APK 的 `versionCode`、`versionName`、`sha256` 与字节大小 |
+| `GET /inbox` | **仅限本机 `127.0.0.1`** | 打开 Mac 实时收件箱、全维遥测、AirPods 切换与反向推送 Web 看板 |
+| `GET /mirror` | **仅限本机 `127.0.0.1`** | 打开 `12fps` 实时手机屏幕镜像与电脑鼠标远程触控工作台 |
+| `GET/POST /api/inbox/*` | **仅限本机 `127.0.0.1`** | 收件箱查询、附件规范路径安全读取、手机远程操控、AirPods 切换与偏好配置接口 |
+| `GET/POST /api/mirror/*`| **仅限本机 `127.0.0.1`** | 实时屏幕帧二进制拉取（`/api/mirror/frame.jpg`）、镜像启停与鼠标点击/滑动/按键注入接口 |
+
 ---
 
-## 8. 源码构建与测试
+## 8. 源码构建、测试隔离与开发验证
 
-### 8.1 运行 TypeScript 类型检查与自动化测试
-项目包含针对二进制帧协议、Ed25519 签名、传输层优先级抢占、在场状态机及 Daemon ⇄ MCP 全链路集成测试：
+本项目配备完整的单元测试、跨语言加密向量测试与 Daemon ⇄ MCP 端到端集成测试。通过仓库根目录的 [`bunfig.toml`](./bunfig.toml)，所有测试默认在**严格隔离模式**下运行（自动使用独立临时 `OMS_HOME`、仅监听回环地址、禁用真实局域网广播与系统 `osascript` 弹窗，绝不污染本机真实 `~/.one_more_step` 数据或干扰已运行的 `omsd`）：
 
 ```bash
-# 运行全仓单元测试与端到端集成测试
+# 1. 运行全仓 TypeScript 严格类型检查
+bun run typecheck
+
+# 2. 运行全仓单元测试与端到端集成测试（shared-protocol + mac-host）
 bun test
 
-# 运行 TypeScript 类型检查
-bun run typecheck
-```
-
-### 8.2 编译 macOS 原生蓝牙桥接助手 (`oms-bt-bridge`)
-`omsd` 首次启动或运行 `bun run setup` 时会自动编译 [`mac-host/bluetooth-bridge/main.swift`](./mac-host/bluetooth-bridge/main.swift)，亦可通过以下命令手动编译：
-
-```bash
+# 3. 重新编译 macOS 原生 Swift 蓝牙与 AirPods 音频桥接助手 (mac-host/bin/oms-bt-bridge)
 bun run build:bt
-```
 
-### 8.3 编译小米 Android 客户端 (`app-debug.apk`)
-若修改了 [`android-app/`](./android-app) 下的 Kotlin 源码，可使用 Gradle 编译打包：
-
-```bash
-bun run build:apk
-# 产物路径：android-app/app/build/outputs/apk/debug/app-debug.apk
+# 4. 运行 Android 客户端 JVM 单元测试并编译打包 APK
+cd android-app && ./gradlew :app:testDebugUnitTest assembleDebug
+# 编译产物：android-app/app/build/outputs/apk/debug/app-debug.apk
 ```
 
 ---
 
-## 9. 设计文档库导航
+## 9. 设计文档库与验收记录导航
 
-完整的立项论证、22 个场景 ROI 分析与 7 大核心模块详细设计均存放在 [`docs/`](./docs/README.md) 目录下：
+完整的立项论证、22 个高价值场景 ROI 分析、7 大核心模块详细设计以及各版本安全/真机验收报告均存放在 [`docs/`](./docs/README.md) 目录下：
 
+### 9.1 实现状态、安全协议与诊断规范（优先参考）
+- 🛡️ **[当前实现边界与升级验收 (`docs/implementation-status.md`)](./docs/implementation-status.md)**：当前版本真实行为、升级兼容性要求与待验证边界说明。
+- 🔐 **[安全传输 v2 规范 (`docs/secure-transport-v2.md`)](./docs/secure-transport-v2.md)**：一次性配对令牌、临时 P-256 ECDH、HKDF-SHA256 与双向 AES-256-GCM 会话设计。
+- 🩺 **[离线连接诊断规范 (`docs/connection-diagnostics.md`)](./docs/connection-diagnostics.md)**：双端最近 200 条连接事件环、错误分类码与离线排查流程。
+- 📝 **[版本更新日志 (`CHANGELOG.md`)](./CHANGELOG.md)**：`v1.0.0` 至 `v1.5.2` 各版本详细演进记录与 APK 校验信息。
+
+### 9.2 立项分析与七大模块架构设计文档
 1. **[01. 可行性分析报告](./docs/01-feasibility-analysis.md)**：Android + macOS 技术可行性、三级无感连接、免 IM 原生交互及小米 ROM 避坑指南。
 2. **[02. 全景功能与高价值场景分析](./docs/02-scenarios-and-value.md)**：6 大核心价值维度、22 个具体协同场景及优先级矩阵评估。
 3. **[03. 系统顶层架构概览](./docs/03-architecture-overview.md)**：Monorepo 结构、技术选型、核心 MCP 工具集与演进路线。
-4. **[04. 模块一：设备配对、安全认证与统一通信协议](./docs/04-module-protocol-and-pairing.md)**：零账号扫码/短码绑定、Ed25519 双向挑战鉴权、8 字节优先级多路复用帧协议与断点续传。
-5. **[05. 模块二：三级自适应传输层与蓝牙空间感知](./docs/05-module-transport-and-presence.md)**：`LAN_WS` ⇄ `BT_RFCOMM` ⇄ `WAN_WEBRTC` 无缝热切换与 `AT_DESK / AWAY` 蓝牙 RSSI 滞回滤波引擎。
+4. **[04. 模块一：设备配对、安全认证与统一通信协议](./docs/04-module-protocol-and-pairing.md)**：配对绑定、双向挑战鉴权、8 字节优先级多路复用帧协议。
+5. **[05. 模块二：三级自适应传输层与蓝牙空间感知](./docs/05-module-transport-and-presence.md)**：多通道热切换与 `AT_DESK / AWAY` 蓝牙 RSSI 滞回滤波引擎。
 6. **[06. 模块三：Android 免 IM 极速投递、内置时间流与知识库联动](./docs/06-module-android-share-and-stream.md)**：截屏秒传胶囊、Direct Share 置顶目标、1×1 透明焦点窗口剪贴板同步与通勤随身听。
 7. **[07. 模块四：Android 确定性系统能力与小米 HyperOS 深度适配](./docs/07-module-android-system-capabilities.md)**：原生闹钟双保险、日历防冲突读写、受权目录白名单、L1~L3 分级通知/TTS 及小米专属权限向导。
-8. **[08. 模块五：Android 无障碍 GUI 屏幕自动化引擎与安全护栏](./docs/08-module-android-gui-agent.md)**：语义树剪枝算法、Android 11+ 静默截屏与 Set-of-Mark 合成、拟人手势注入与四项应用层安全检查。
+8. **[08. 模块五：Android 无障碍 GUI 屏幕自动化引擎与安全护栏](./docs/08-module-android-gui-agent.md)**：语义树剪枝算法、Android 11+ 静默截屏与 Set-of-Mark 合成、拟人手势注入与四项应用层安全护栏。
 9. **[09. 模块六：Mac 宿主守护进程 (`omsd`)、本地收件箱与知识库触发器](./docs/09-module-mac-daemon-and-inbox.md)**：单例 `omsd` + Unix Socket 多 Agent 并发架构、`~/.one_more_step/` 规范与在场智能路由。
 10. **[10. 模块七：Mac AI Agent 接口层（13 个 MCP Tools、CLI `oms` 与全局 Skill）](./docs/10-module-mcp-cli-and-skill.md)**：13 个 MCP 工具的 JSON Schema 契约、`oms` CLI 设计与全局 Skill 协同准则。
-11. **[11. 无数据线安装、配对与全功能体验指南](./docs/11-wireless-install-and-experience-guide.md)**：手把手完成无线安装、首次绑定、小米权限开启与 7 大核心场景实操演练。
+11. **[11. 无数据线安装、配对与全功能体验指南](./docs/11-wireless-install-and-experience-guide.md)**：手把手完成无线安装、首次绑定、小米权限开启与核心场景实操演练。
 
 ---
 
-## License
+## 10. 开源协议 (License)
 
-[MIT License](./LICENSE) © 2026 [dqrcsc](https://github.com/dqrcsc)
+本项目基于 [MIT License](./LICENSE) 开源 © 2026 [dqrcsc](https://github.com/dqrcsc)。
