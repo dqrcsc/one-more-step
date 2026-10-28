@@ -113,6 +113,7 @@ export class OmsDaemon {
 
   // AirPods Seamless Auto-Switch State
   private lastAirpodsSwitchEvent?: AirPodsStatusSnapshot["lastSwitchEvent"];
+  private suppressPhoneAirpodsClaimUntilMs = 0;
   private phoneAirpodsState: AirPodsStatusSnapshot["phone"] = {
     connected: false,
     mediaPlaying: false,
@@ -749,6 +750,10 @@ export class OmsDaemon {
             const isManual = p.reason === "manual";
             if (this.config.autoSwitchAirpods === false && !isManual) {
               reply({ result: { ok: false, ignored: true, reason: "autoSwitchAirpods disabled" } });
+              return;
+            }
+            if (!isManual && Date.now() < this.suppressPhoneAirpodsClaimUntilMs) {
+              reply({ result: { ok: false, ignored: true, reason: "suppressed during TTS / Find-My-Phone" } });
               return;
             }
             const targetMac = p.targetMac ? String(p.targetMac) : undefined;
@@ -2403,6 +2408,7 @@ export class OmsDaemon {
                 : defaultRepeat;
 
           if (speakText) {
+            this.suppressPhoneAirpodsClaimUntilMs = Date.now() + Math.max(12000, repeatCount * 4500);
             neuralTtsMeta = await this.synthesizeNeuralTts(speakText, {
               voice: params.voice ? String(params.voice) : undefined,
             });

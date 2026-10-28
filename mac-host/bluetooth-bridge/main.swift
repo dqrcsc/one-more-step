@@ -136,6 +136,7 @@ final class MacAirPodsController {
     private var pollTimer: Timer? = nil
 
     private var mediaRemoteSendCommand: (@convention(c) (UInt32, AnyObject?) -> Bool)? = nil
+    private var mediaRemoteGetIsPlaying: (@convention(c) (DispatchQueue, @escaping @convention(block) (Bool) -> Void) -> Void)? = nil
 
     init(ipc: UnixSocketLineClient) {
         self.ipc = ipc
@@ -146,10 +147,15 @@ final class MacAirPodsController {
     }
 
     private func loadMediaRemoteSymbol() {
-        if let handle = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_NOW),
-           let sym = dlsym(handle, "MRMediaRemoteSendCommand") {
-            typealias Fn = @convention(c) (UInt32, AnyObject?) -> Bool
-            self.mediaRemoteSendCommand = unsafeBitCast(sym, to: Fn.self)
+        if let handle = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_NOW) {
+            if let sym = dlsym(handle, "MRMediaRemoteSendCommand") {
+                typealias Fn = @convention(c) (UInt32, AnyObject?) -> Bool
+                self.mediaRemoteSendCommand = unsafeBitCast(sym, to: Fn.self)
+            }
+            if let symPlaying = dlsym(handle, "MRMediaRemoteGetNowPlayingApplicationIsPlaying") {
+                typealias GetIsPlayingFn = @convention(c) (DispatchQueue, @escaping @convention(block) (Bool) -> Void) -> Void
+                self.mediaRemoteGetIsPlaying = unsafeBitCast(symPlaying, to: GetIsPlayingFn.self)
+            }
         }
     }
 
@@ -415,45 +421,20 @@ final class MacAirPodsController {
         return outputs.first(where: { $0.name.localizedCaseInsensitiveContains("airpods") })
     }
 
-    // MARK: - Media Control (Explicit Pause Only)
-
-    private func postHardwarePlayPauseKey() {
-        let keyCode: Int = 16 // NX_KEYTYPE_PLAY
-        func postKey(down: Bool) {
-            let flags = down ? 0x0A00 : 0x0B00
-            let data1 = (keyCode << 16) | flags
-            if let ev = NSEvent.otherEvent(
-                with: .systemDefined,
-                location: .zero,
-                modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(flags)),
-                timestamp: ProcessInfo.processInfo.systemUptime,
-                windowNumber: 0,
-                context: nil,
-                subtype: 8,
-                data1: data1,
-                data2: -1
-            ) {
-                ev.cgEvent?.post(tap: .cghidEventTap)
-            }
-        }
-        postKey(down: true)
-        postKey(down: false)
-    }
+    // MARK: - Media Control (Explicit Pause Only, Never Launches Music.app)
 
     func pauseMacActiveMedia() {
         let defId = getDefaultOutputDevice()
-        let wasRunning = isDeviceRunning(defId)
-        // 1. Send explicit kMRPause = 1 via MediaRemote (never toggles paused media on)
-        _ = mediaRemoteSendCommand?(1, nil)
+        // Never send any media command if Mac audio output is not actively running
+        guard isDeviceRunning(defId) else { return }
 
-        // 2. If audio hardware was actively running, verify after 160ms; if still running, post NX_KEYTYPE_PLAY
-        if wasRunning {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) { [weak self] in
-                guard let self = self else { return }
-                let curId = self.getDefaultOutputDevice()
-                if self.isDeviceRunning(curId) {
-                    self.postHardwarePlayPauseKey()
-                }
+        // Only send kMRPause = 1 if MediaRemote confirms an active NowPlaying client is currently playing.
+        // We strictly avoid posting NX_KEYTYPE_PLAY or calling MRMediaRemoteSendCommand when idle,
+        // because macOS rcd/mediaremoted would otherwise auto-launch Apple Music (Music.app)!
+        if let checkPlaying = mediaRemoteGetIsPlaying {
+            checkPlaying(DispatchQueue.main) { [weak self] isPlaying in
+                guard isPlaying else { return }
+                _ = self?.mediaRemoteSendCommand?(1, nil)
             }
         }
     }

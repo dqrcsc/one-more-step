@@ -401,6 +401,8 @@ class AirPodsAutoSwitchManager(
     }
 
     fun isPhoneMediaOrCallActive(configs: List<AudioPlaybackConfiguration>? = null): Boolean {
+        // Never treat our own Find-My-Phone or TTS voice broadcast as a reason to grab AirPods from Mac!
+        if (NotificationExecutor.isSpeakingFlow.value) return false
         if (isPhoneInCall()) return true
         if (hasActiveMediaSessionPlaying()) return true
         if (hasActiveMediaPlaybackConfig(configs)) return true
