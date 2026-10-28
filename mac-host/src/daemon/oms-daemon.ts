@@ -332,7 +332,7 @@ export class OmsDaemon {
     });
 
     this.session.on("airpodsStatus", () => {
-      this.syncAirpodsConfigToBridgeAndPhone();
+      this.syncAirpodsConfigToPhoneOnly();
     });
 
     this.session.on(
@@ -666,6 +666,26 @@ export class OmsDaemon {
     });
   }
 
+  private lastSyncedPhoneAirpodsKey = "";
+
+  public syncAirpodsConfigToPhoneOnly(force = false): void {
+    if (this.session.getActiveTier() === "DISCONNECTED") return;
+    const btBridge = this.session.getBluetoothBridge();
+    const macSt = btBridge?.getAirpodsStatus();
+    const payload = {
+      autoSwitchAirpods: this.config.autoSwitchAirpods !== false,
+      pauseOtherOnAirpodsSwitch: this.config.pauseOtherOnAirpodsSwitch !== false,
+      preferredAirpodsMac: this.config.preferredAirpodsMac || "",
+      macAirpodsConnected: Boolean(macSt?.connected),
+      macAirpodsMac: macSt?.deviceMac || "",
+      macAirpodsName: macSt?.deviceName || "",
+    };
+    const key = JSON.stringify(payload);
+    if (!force && key === this.lastSyncedPhoneAirpodsKey) return;
+    this.lastSyncedPhoneAirpodsKey = key;
+    void this.session.callPhone("airpods.syncConfig", payload, 2000).catch(() => {});
+  }
+
   public syncAirpodsConfigToBridgeAndPhone(): void {
     const btBridge = this.session.getBluetoothBridge();
     btBridge?.updateAirpodsConfig({
@@ -677,23 +697,7 @@ export class OmsDaemon {
       phoneAirpodsName: this.phoneAirpodsState.deviceName,
       phoneInCall: this.phoneAirpodsState.inCall,
     });
-    if (this.session.getActiveTier() !== "DISCONNECTED") {
-      const macSt = btBridge?.getAirpodsStatus();
-      void this.session
-        .callPhone(
-          "airpods.syncConfig",
-          {
-            autoSwitchAirpods: this.config.autoSwitchAirpods !== false,
-            pauseOtherOnAirpodsSwitch: this.config.pauseOtherOnAirpodsSwitch !== false,
-            preferredAirpodsMac: this.config.preferredAirpodsMac || "",
-            macAirpodsConnected: Boolean(macSt?.connected),
-            macAirpodsMac: macSt?.deviceMac || "",
-            macAirpodsName: macSt?.deviceName || "",
-          },
-          2000
-        )
-        .catch(() => {});
-    }
+    this.syncAirpodsConfigToPhoneOnly(true);
   }
 
   public getAirpodsStatusSnapshot(): AirPodsStatusSnapshot {

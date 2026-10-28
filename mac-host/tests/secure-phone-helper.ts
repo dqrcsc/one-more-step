@@ -4,7 +4,14 @@ import {
   type DecodedFrame, type SecureHello, type SecureSession,
 } from "@oms/shared-protocol";
 
-export const simulatedStatus = { batteryPct: 88, isCharging: true, screenLocked: false, lanIps: ["127.0.0.1"], permissions: {} };
+export const simulatedStatus = {
+  batteryPct: 88,
+  isCharging: true,
+  screenLocked: false,
+  lanIps: ["127.0.0.1"],
+  pairedAirpods: [{ name: "AirPods", mac: "B4:59:76:DB:BF:81", connected: false }],
+  permissions: {},
+};
 export const simulatedFinish = { phoneName: "Simulated phone", phoneModel: "Test model", deviceSnapshot: simulatedStatus };
 export interface SimulatedPhoneOptions {
   phoneId: string;

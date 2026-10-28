@@ -108,7 +108,6 @@ struct PairedAirPodsInfo {
     let name: String
     let mac: String
     let connected: Bool
-    let device: IOBluetoothDevice
 }
 
 final class MacAirPodsController {
@@ -131,6 +130,9 @@ final class MacAirPodsController {
     private var tempMuteRestoreTimer: DispatchWorkItem? = nil
     private var connectGeneration: Int = 0
     private var lastReportedStatusKey: String = ""
+    private var lastDefaultOutputName: String = ""
+    private var cachedPairedAirpods: [PairedAirPodsInfo] = []
+    private var lastPairedAirpodsRefreshAt: Date = .distantPast
     private var pollTimer: Timer? = nil
 
     private var mediaRemoteSendCommand: (@convention(c) (UInt32, AnyObject?) -> Bool)? = nil
@@ -338,52 +340,60 @@ final class MacAirPodsController {
 
     // MARK: - IOBluetooth Paired AirPods Discovery
 
-    func listPairedAirpods() -> [PairedAirPodsInfo] {
-        guard let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] else {
-            return []
+    func listPairedAirpods(forceRefresh: Bool = false) -> [PairedAirPodsInfo] {
+        let now = Date()
+        if !forceRefresh && !cachedPairedAirpods.isEmpty && now.timeIntervalSince(lastPairedAirpodsRefreshAt) < 12.0 {
+            return cachedPairedAirpods
         }
-        let prefMac = Self.normalizeMac(preferredMac)
-        let phoneMac = Self.normalizeMac(phoneAirpodsMac)
-        var list: [PairedAirPodsInfo] = []
-        for dev in paired {
-            let name = dev.nameOrAddress ?? ""
-            let mac = Self.normalizeMac(dev.addressString)
-            guard !mac.isEmpty else { continue }
-            let isAirpods = name.localizedCaseInsensitiveContains("airpods") ||
-                (!prefMac.isEmpty && mac == prefMac) ||
-                (!phoneMac.isEmpty && mac == phoneMac)
-            if isAirpods {
-                let connected = dev.isConnected()
-                if connected {
-                    lastActiveAirpodsMac = mac
-                }
-                list.append(PairedAirPodsInfo(name: name, mac: mac, connected: connected, device: dev))
+        return autoreleasepool {
+            guard let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] else {
+                return cachedPairedAirpods
             }
-        }
-        // Sort by priority: currently connected > phoneAirpodsMac > preferredMac > exact name "AirPods" > others
-        let lastMac = Self.normalizeMac(lastActiveAirpodsMac)
-        list.sort { a, b in
-            func score(_ item: PairedAirPodsInfo) -> Int {
-                var s = 0
-                if item.connected { s += 1000 }
-                if !phoneMac.isEmpty && item.mac == phoneMac { s += 500 }
-                if !prefMac.isEmpty && item.mac == prefMac { s += 300 }
-                if !lastMac.isEmpty && item.mac == lastMac { s += 200 }
-                if item.name.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare("AirPods") == .orderedSame {
-                    s += 100
+            let prefMac = Self.normalizeMac(preferredMac)
+            let phoneMac = Self.normalizeMac(phoneAirpodsMac)
+            var list: [PairedAirPodsInfo] = []
+            for dev in paired {
+                let name = dev.nameOrAddress ?? ""
+                let mac = Self.normalizeMac(dev.addressString)
+                guard !mac.isEmpty else { continue }
+                let isAirpods = name.localizedCaseInsensitiveContains("airpods") ||
+                    (!prefMac.isEmpty && mac == prefMac) ||
+                    (!phoneMac.isEmpty && mac == phoneMac)
+                if isAirpods {
+                    let connected = dev.isConnected()
+                    if connected {
+                        lastActiveAirpodsMac = mac
+                    }
+                    list.append(PairedAirPodsInfo(name: name, mac: mac, connected: connected))
                 }
-                if item.mac == "B4:59:76:DB:BF:81" {
-                    s += 50
-                }
-                return s
             }
-            return score(a) > score(b)
+            // Sort by priority: currently connected > phoneAirpodsMac > preferredMac > exact name "AirPods" > others
+            let lastMac = Self.normalizeMac(lastActiveAirpodsMac)
+            list.sort { a, b in
+                func score(_ item: PairedAirPodsInfo) -> Int {
+                    var s = 0
+                    if item.connected { s += 1000 }
+                    if !phoneMac.isEmpty && item.mac == phoneMac { s += 500 }
+                    if !prefMac.isEmpty && item.mac == prefMac { s += 300 }
+                    if !lastMac.isEmpty && item.mac == lastMac { s += 200 }
+                    if item.name.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare("AirPods") == .orderedSame {
+                        s += 100
+                    }
+                    if item.mac == "B4:59:76:DB:BF:81" {
+                        s += 50
+                    }
+                    return s
+                }
+                return score(a) > score(b)
+            }
+            cachedPairedAirpods = list
+            lastPairedAirpodsRefreshAt = now
+            return list
         }
-        return list
     }
 
-    func selectTargetAirpods(explicitMac: String?) -> PairedAirPodsInfo? {
-        let all = listPairedAirpods()
+    func selectTargetAirpods(explicitMac: String?, forceRefresh: Bool = true) -> PairedAirPodsInfo? {
+        let all = listPairedAirpods(forceRefresh: forceRefresh)
         guard !all.isEmpty else { return nil }
         let normExplicit = Self.normalizeMac(explicitMac)
         if !normExplicit.isEmpty, let match = all.first(where: { $0.mac == normExplicit }) {
@@ -503,9 +513,11 @@ final class MacAirPodsController {
                 }
                 if self.connectGeneration != gen { return }
 
-                if let dev = IOBluetoothDevice(addressString: btAddr) ?? target.device as IOBluetoothDevice? {
-                    if !dev.isConnected() {
-                        _ = dev.openConnection(nil, withPageTimeout: 5000, authenticationRequired: false)
+                autoreleasepool {
+                    if let dev = IOBluetoothDevice(addressString: btAddr) {
+                        if !dev.isConnected() {
+                            _ = dev.openConnection(nil, withPageTimeout: 5000, authenticationRequired: false)
+                        }
                     }
                 }
 
@@ -572,18 +584,20 @@ final class MacAirPodsController {
             _ = setDefaultOutputDevice(lastNonAirpodsOutputDeviceId)
         }
 
-        let paired = listPairedAirpods()
+        let paired = listPairedAirpods(forceRefresh: true)
         let normTarget = Self.normalizeMac(targetMac)
         let toDisconnect = paired.filter { info in
             info.connected || (!normTarget.isEmpty && info.mac == normTarget)
         }
 
         btWorkQueue.async { [weak self] in
-            for item in toDisconnect {
-                let btAddr = Self.toIOBluetoothAddress(item.mac)
-                if let dev = IOBluetoothDevice(addressString: btAddr) ?? item.device as IOBluetoothDevice? {
-                    if dev.isConnected() {
-                        _ = dev.closeConnection()
+            autoreleasepool {
+                for item in toDisconnect {
+                    let btAddr = Self.toIOBluetoothAddress(item.mac)
+                    if let dev = IOBluetoothDevice(addressString: btAddr) {
+                        if dev.isConnected() {
+                            _ = dev.closeConnection()
+                        }
                     }
                 }
             }
@@ -622,7 +636,7 @@ final class MacAirPodsController {
             mElement: kAudioObjectPropertyElementMain
         )
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &defAddr, DispatchQueue.main) { [weak self] _, _ in
-            self?.onCoreAudioStateChanged()
+            self?.onCoreAudioStateChanged(forceBtRefresh: true)
         }
 
         var devListAddr = AudioObjectPropertyAddress(
@@ -631,118 +645,124 @@ final class MacAirPodsController {
             mElement: kAudioObjectPropertyElementMain
         )
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &devListAddr, DispatchQueue.main) { [weak self] _, _ in
-            self?.onCoreAudioStateChanged()
+            self?.onCoreAudioStateChanged(forceBtRefresh: true)
         }
     }
 
     private func startPollingTimer() {
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.28, repeats: true) { [weak self] _ in
-            self?.onCoreAudioStateChanged()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
+            self?.onCoreAudioStateChanged(forceBtRefresh: false)
         }
     }
 
-    private func onCoreAudioStateChanged() {
-        updateFallbackNonAirpodsSpeaker()
-        let defId = getDefaultOutputDevice()
-        let defName = getDeviceName(defId)
-        let isDefAirpods = defName.localizedCaseInsensitiveContains("airpods")
-        let running = isDeviceRunning(defId)
+    private func onCoreAudioStateChanged(forceBtRefresh: Bool = false) {
+        autoreleasepool {
+            updateFallbackNonAirpodsSpeaker()
+            let defId = getDefaultOutputDevice()
+            let defName = getDeviceName(defId)
+            let outputChanged = (defName != lastDefaultOutputName)
+            lastDefaultOutputName = defName
+            let isDefAirpods = defName.localizedCaseInsensitiveContains("airpods")
+            let running = isDeviceRunning(defId)
 
-        if isDefAirpods {
-            wasNonAirpodsAudioRunning = false
-            restoreTempMute()
-            reportStatusIfNeeded(force: false)
-            return
-        }
+            if isDefAirpods {
+                wasNonAirpodsAudioRunning = false
+                restoreTempMute()
+                reportStatusIfNeeded(force: forceBtRefresh || outputChanged)
+                return
+            }
 
-        // Check rising edge on non-AirPods output (e.g., MacBook Pro Speakers or Monitor)
-        let risingEdge = (!wasNonAirpodsAudioRunning && running)
-        wasNonAirpodsAudioRunning = running
+            // Check rising edge on non-AirPods output (e.g., MacBook Pro Speakers or Monitor)
+            let risingEdge = (!wasNonAirpodsAudioRunning && running)
+            wasNonAirpodsAudioRunning = running
 
-        if risingEdge && autoSwitchEnabled && Date() >= suppressAutoGrabUntil && !phoneInCall {
-            let paired = listPairedAirpods()
-            if !paired.isEmpty {
-                // If AirPods are currently connected on Phone, mute Mac speaker at 0ms to prevent speaker blast
-                if phoneAirpodsConnected {
-                    tempMuteDeviceIfNeeded(defId, maxDurationSec: 3.8)
-                }
-
-                // Debounce 320ms to ignore short system notification clicks/beeps
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) { [weak self] in
-                    guard let self = self else { return }
-                    let curDefId = self.getDefaultOutputDevice()
-                    let curDefName = self.getDeviceName(curDefId)
-                    let stillNonAirpods = !curDefName.localizedCaseInsensitiveContains("airpods")
-                    let stillRunning = self.isDeviceRunning(curDefId)
-
-                    guard self.autoSwitchEnabled,
-                          stillNonAirpods,
-                          stillRunning,
-                          Date() >= self.suppressAutoGrabUntil,
-                          !self.phoneInCall else {
-                        self.restoreTempMute()
-                        return
+            if risingEdge && autoSwitchEnabled && Date() >= suppressAutoGrabUntil && !phoneInCall {
+                let paired = listPairedAirpods(forceRefresh: false)
+                if !paired.isEmpty {
+                    // If AirPods are currently connected on Phone, mute Mac speaker at 0ms to prevent speaker blast
+                    if phoneAirpodsConnected {
+                        tempMuteDeviceIfNeeded(defId, maxDurationSec: 3.8)
                     }
 
-                    guard let target = self.selectTargetAirpods(explicitMac: self.phoneAirpodsMac) else {
-                        self.restoreTempMute()
-                        return
-                    }
+                    // Debounce 320ms to ignore short system notification clicks/beeps
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) { [weak self] in
+                        guard let self = self else { return }
+                        let curDefId = self.getDefaultOutputDevice()
+                        let curDefName = self.getDeviceName(curDefId)
+                        let stillNonAirpods = !curDefName.localizedCaseInsensitiveContains("airpods")
+                        let stillRunning = self.isDeviceRunning(curDefId)
 
-                    self.suppressAutoGrabUntil = Date().addingTimeInterval(4.5)
-                    self.ipc.sendJson([
-                        "type": "airpods_mac_claim_triggered",
-                        "targetMac": target.mac,
-                        "targetName": target.name,
-                        "reason": "mac_audio_started"
-                    ])
-                    self.connectAirpodsToMac(targetMac: target.mac, reqId: nil)
+                        guard self.autoSwitchEnabled,
+                              stillNonAirpods,
+                              stillRunning,
+                              Date() >= self.suppressAutoGrabUntil,
+                              !self.phoneInCall else {
+                            self.restoreTempMute()
+                            return
+                        }
+
+                        guard let target = self.selectTargetAirpods(explicitMac: self.phoneAirpodsMac, forceRefresh: true) else {
+                            self.restoreTempMute()
+                            return
+                        }
+
+                        self.suppressAutoGrabUntil = Date().addingTimeInterval(4.5)
+                        self.ipc.sendJson([
+                            "type": "airpods_mac_claim_triggered",
+                            "targetMac": target.mac,
+                            "targetName": target.name,
+                            "reason": "mac_audio_started"
+                        ])
+                        self.connectAirpodsToMac(targetMac: target.mac, reqId: nil)
+                    }
                 }
             }
-        }
 
-        reportStatusIfNeeded(force: false)
+            reportStatusIfNeeded(force: forceBtRefresh || outputChanged)
+        }
     }
 
     func reportStatusIfNeeded(force: Bool) {
-        let defId = getDefaultOutputDevice()
-        let defName = getDeviceName(defId)
-        let isDefAirpods = defName.localizedCaseInsensitiveContains("airpods")
-        let running = isDeviceRunning(defId)
-        let paired = listPairedAirpods()
-        let connectedItem = paired.first(where: { $0.connected }) ?? (isDefAirpods ? paired.first : nil)
-        let isConnected = (connectedItem != nil) || isDefAirpods
+        autoreleasepool {
+            let defId = getDefaultOutputDevice()
+            let defName = getDeviceName(defId)
+            let isDefAirpods = defName.localizedCaseInsensitiveContains("airpods")
+            let running = isDeviceRunning(defId)
+            let paired = listPairedAirpods(forceRefresh: force)
+            let connectedItem = paired.first(where: { $0.connected }) ?? (isDefAirpods ? paired.first : nil)
+            let isConnected = (connectedItem != nil) || isDefAirpods
 
-        let pairedDicts: [[String: Any]] = paired.map { item in
-            [
-                "name": item.name,
-                "mac": item.mac,
-                "connected": item.connected
+            let pairedDicts: [[String: Any]] = paired.map { item in
+                [
+                    "name": item.name,
+                    "mac": item.mac,
+                    "connected": item.connected
+                ]
+            }
+
+            let key = "\(isConnected)|\(connectedItem?.mac ?? "")|\(isDefAirpods)|\(running)|\(defName)|\(paired.map { "\($0.mac):\($0.connected)" }.joined(separator: ","))"
+            if !force && key == lastReportedStatusKey {
+                return
+            }
+            lastReportedStatusKey = key
+
+            var payload: [String: Any] = [
+                "type": "airpods_status",
+                "connected": isConnected,
+                "isDefaultOutput": isDefAirpods,
+                "macAudioRunning": running,
+                "defaultOutputName": defName,
+                "pairedAirpods": pairedDicts
             ]
+            if let conn = connectedItem {
+                payload["deviceName"] = conn.name
+                payload["deviceMac"] = conn.mac
+            } else if let first = paired.first {
+                payload["deviceName"] = first.name
+                payload["deviceMac"] = first.mac
+            }
+            ipc.sendJson(payload)
         }
-
-        let key = "\(isConnected)|\(connectedItem?.mac ?? "")|\(isDefAirpods)|\(running)|\(defName)|\(paired.map { "\($0.mac):\($0.connected)" }.joined(separator: ","))"
-        if !force && key == lastReportedStatusKey {
-            return
-        }
-        lastReportedStatusKey = key
-
-        var payload: [String: Any] = [
-            "type": "airpods_status",
-            "connected": isConnected,
-            "isDefaultOutput": isDefAirpods,
-            "macAudioRunning": running,
-            "defaultOutputName": defName,
-            "pairedAirpods": pairedDicts
-        ]
-        if let conn = connectedItem {
-            payload["deviceName"] = conn.name
-            payload["deviceMac"] = conn.mac
-        } else if let first = paired.first {
-            payload["deviceName"] = first.name
-            payload["deviceMac"] = first.mac
-        }
-        ipc.sendJson(payload)
     }
 }
 
@@ -808,7 +828,7 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
                     if let inCall = msg["phoneInCall"] as? Bool {
                         self.airpodsController.phoneInCall = inCall
                     }
-                    self.airpodsController.reportStatusIfNeeded(force: true)
+                    self.airpodsController.reportStatusIfNeeded(force: false)
                 case "airpods_connect_mac":
                     let reqId = msg["reqId"] as? String
                     let targetMac = msg["targetMac"] as? String

@@ -1129,6 +1129,13 @@ export class PhoneSessionManager extends EventEmitter {
       || Object.values(status.permissions).some((v) => typeof v !== "boolean")) throw new Error("Invalid encrypted device snapshot");
     for (const [key, value] of Object.entries(status)) {
       if (["permissions", "lanIps"].includes(key)) continue;
+      if (key === "pairedAirpods" && Array.isArray(value) && value.length <= 32 && value.every((item) =>
+        item && typeof item === "object" && !Array.isArray(item)
+        && typeof (item as Record<string, unknown>).name === "string" && ((item as Record<string, unknown>).name as string).length <= 256
+        && typeof (item as Record<string, unknown>).mac === "string" && ((item as Record<string, unknown>).mac as string).length <= 64
+        && typeof (item as Record<string, unknown>).connected === "boolean"
+      )) continue;
+      if (value === null || value === undefined) continue;
       if (typeof value === "string" && value.length <= 1024) continue;
       if (typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) continue;
       throw new Error("Invalid device snapshot field");
