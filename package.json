@@ -1,6 +1,6 @@
 {
   "name": "one-more-step",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "private": true,
   "description": "青简·咫尺 (OneMoreStep) — Bidirectional interoperability bridge between macOS local AI Agents (Codex, Antigravity, OpenCode, Claude Code) and Xiaomi Android devices (HyperOS / MIUI).",
   "license": "MIT",

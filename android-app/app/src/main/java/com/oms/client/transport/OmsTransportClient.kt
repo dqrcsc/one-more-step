@@ -55,7 +55,9 @@ import com.oms.client.otp.OtpExtractor
 import com.oms.client.otp.OtpMatch
 import com.oms.client.share.ClipboardCatcherActivity
 import com.oms.client.xiaomi.XiaomiAdaptationHelper
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -130,7 +132,9 @@ class OmsTransportClient(
         val BLE_CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, _ -> }
+    )
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val diagnostics = ConnectionDiagnostics(File(context.filesDir, "connection-diagnostics.log"))
@@ -3040,16 +3044,22 @@ class OmsTransportClient(
             // Non-blocking Latest-Frame-Wins sender coroutine
             mirrorSenderJob = scope.launch {
                 while (isActive && mirrorActive.get()) {
-                    val frameBytes = latestMirrorFrameSlot.getAndSet(null)
-                    if (frameBytes != null) {
-                        val curSrc = activeSource()
-                        if (curSrc.tier == "LAN_WS" || curSrc.tier == "WAN_WEBRTC") {
-                            sendOnSource(frameBytes, curSrc)
+                    try {
+                        val frameBytes = latestMirrorFrameSlot.getAndSet(null)
+                        if (frameBytes != null) {
+                            val curSrc = runCatching { activeSource() }.getOrNull()
+                            if (curSrc != null && (curSrc.tier == "LAN_WS" || curSrc.tier == "WAN_WEBRTC")) {
+                                sendOnSource(frameBytes, curSrc)
+                            }
+                        } else {
+                            withTimeoutOrNull(400L) {
+                                mirrorSendSignal.receive()
+                            }
                         }
-                    } else {
-                        withTimeoutOrNull(400L) {
-                            mirrorSendSignal.receive()
-                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Throwable) {
+                        delay(400L)
                     }
                 }
             }
@@ -3062,69 +3072,37 @@ class OmsTransportClient(
 
                 try {
                     while (isActive && mirrorActive.get()) {
-                        val curSrc = activeSource()
-                        if (curSrc.tier != "LAN_WS" && curSrc.tier != "WAN_WEBRTC") {
-                            delay(500L)
-                            continue
-                        }
-                        val currentSvc = OmsAccessibilityService.instance
-                        if (currentSvc == null) {
-                            delay(500L)
-                            continue
-                        }
-
-                        val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-                        val km = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-                        val screenOn = pm.isInteractive
-                        val screenLocked = km.isKeyguardLocked
-                        val dm = currentSvc.resources.displayMetrics
-                        val screenW = dm.widthPixels.coerceAtLeast(1)
-                        val screenH = dm.heightPixels.coerceAtLeast(1)
-                        val nowElapsed = SystemClock.elapsedRealtime()
-
-                        if (!screenOn) {
-                            val flags = OmsFrameProtocol.SCREEN_FLAG_SCREEN_OFF or
-                                (if (screenLocked) OmsFrameProtocol.SCREEN_FLAG_SCREEN_LOCKED else 0)
-                            if (flags != lastStatusFlags || nowElapsed - lastSentAtElapsed > 2000L) {
-                                val seq = mirrorSeq.incrementAndGet() and 0xFFFF
-                                val encoded = OmsFrameProtocol.encodeScreenFrame(
-                                    codec = OmsFrameProtocol.CODEC_STATUS_ONLY,
-                                    flags = flags,
-                                    width = screenW,
-                                    height = screenH,
-                                    seq = seq,
-                                    timestampMs = System.currentTimeMillis()
-                                )
-                                latestMirrorFrameSlot.set(encoded)
-                                mirrorSendSignal.trySend(Unit)
-                                lastStatusFlags = flags
-                                lastSentAtElapsed = nowElapsed
-                                lastHash = 0L
+                        try {
+                            val curSrc = runCatching { activeSource() }.getOrNull()
+                            if (curSrc == null || (curSrc.tier != "LAN_WS" && curSrc.tier != "WAN_WEBRTC")) {
+                                delay(500L)
+                                continue
                             }
-                            withTimeoutOrNull(500L) { mirrorWakeSignal.receive() }
-                            continue
-                        }
+                            val currentSvc = OmsAccessibilityService.instance
+                            if (currentSvc == null) {
+                                delay(500L)
+                                continue
+                            }
 
-                        val forceHeartbeat = (nowElapsed - lastSentAtElapsed) > 2800L
-                        val captured = ScreenCapturer.captureMirrorFrame(
-                            service = currentSvc,
-                            maxWidth = mirrorMaxWidth,
-                            quality = mirrorQuality,
-                            previousHash = lastHash,
-                            forceEncode = forceHeartbeat
-                        )
+                            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+                            val km = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+                            val screenOn = pm.isInteractive
+                            val screenLocked = km.isKeyguardLocked
+                            val dm = currentSvc.resources.displayMetrics
+                            val screenW = dm.widthPixels.coerceAtLeast(1)
+                            val screenH = dm.heightPixels.coerceAtLeast(1)
+                            val nowElapsed = SystemClock.elapsedRealtime()
 
-                        if (captured != null) {
-                            if (captured.isSecureWindow) {
-                                val flags = OmsFrameProtocol.SCREEN_FLAG_SECURE_WINDOW or
+                            if (!screenOn) {
+                                val flags = OmsFrameProtocol.SCREEN_FLAG_SCREEN_OFF or
                                     (if (screenLocked) OmsFrameProtocol.SCREEN_FLAG_SCREEN_LOCKED else 0)
-                                if (flags != lastStatusFlags || forceHeartbeat) {
+                                if (flags != lastStatusFlags || nowElapsed - lastSentAtElapsed > 2000L) {
                                     val seq = mirrorSeq.incrementAndGet() and 0xFFFF
                                     val encoded = OmsFrameProtocol.encodeScreenFrame(
                                         codec = OmsFrameProtocol.CODEC_STATUS_ONLY,
                                         flags = flags,
-                                        width = captured.screenWidth,
-                                        height = captured.screenHeight,
+                                        width = screenW,
+                                        height = screenH,
                                         seq = seq,
                                         timestampMs = System.currentTimeMillis()
                                     )
@@ -3132,38 +3110,76 @@ class OmsTransportClient(
                                     mirrorSendSignal.trySend(Unit)
                                     lastStatusFlags = flags
                                     lastSentAtElapsed = nowElapsed
-                                    lastHash = -1L
+                                    lastHash = 0L
                                 }
-                            } else if (!captured.unchanged && captured.bytes.isNotEmpty()) {
-                                val flags = if (screenLocked) OmsFrameProtocol.SCREEN_FLAG_SCREEN_LOCKED else 0
-                                val seq = mirrorSeq.incrementAndGet() and 0xFFFF
-                                val encoded = OmsFrameProtocol.encodeScreenFrame(
-                                    codec = OmsFrameProtocol.CODEC_WEBP,
-                                    flags = flags,
-                                    width = captured.screenWidth,
-                                    height = captured.screenHeight,
-                                    seq = seq,
-                                    timestampMs = System.currentTimeMillis(),
-                                    imageBytes = captured.bytes
-                                )
-                                latestMirrorFrameSlot.set(encoded)
-                                mirrorSendSignal.trySend(Unit)
-                                lastHash = captured.frameHash
-                                lastStatusFlags = flags
-                                lastSentAtElapsed = SystemClock.elapsedRealtime()
+                                withTimeoutOrNull(500L) { mirrorWakeSignal.receive() }
+                                continue
                             }
-                        }
 
-                        val isBoosted = SystemClock.elapsedRealtime() < mirrorBoostUntilElapsedMs.get()
-                        val waitMs = if (isBoosted) {
-                            (1000L / mirrorMaxFps.coerceIn(2, 12)).coerceIn(110L, 350L)
-                        } else {
-                            480L
-                        }
-                        if (isBoosted) {
-                            delay(waitMs)
-                        } else {
-                            withTimeoutOrNull(waitMs) { mirrorWakeSignal.receive() }
+                            val forceHeartbeat = (nowElapsed - lastSentAtElapsed) > 2800L
+                            val captured = ScreenCapturer.captureMirrorFrame(
+                                service = currentSvc,
+                                maxWidth = mirrorMaxWidth,
+                                quality = mirrorQuality,
+                                previousHash = lastHash,
+                                forceEncode = forceHeartbeat
+                            )
+
+                            if (captured != null) {
+                                if (captured.isSecureWindow) {
+                                    val flags = OmsFrameProtocol.SCREEN_FLAG_SECURE_WINDOW or
+                                        (if (screenLocked) OmsFrameProtocol.SCREEN_FLAG_SCREEN_LOCKED else 0)
+                                    if (flags != lastStatusFlags || forceHeartbeat) {
+                                        val seq = mirrorSeq.incrementAndGet() and 0xFFFF
+                                        val encoded = OmsFrameProtocol.encodeScreenFrame(
+                                            codec = OmsFrameProtocol.CODEC_STATUS_ONLY,
+                                            flags = flags,
+                                            width = captured.screenWidth,
+                                            height = captured.screenHeight,
+                                            seq = seq,
+                                            timestampMs = System.currentTimeMillis()
+                                        )
+                                        latestMirrorFrameSlot.set(encoded)
+                                        mirrorSendSignal.trySend(Unit)
+                                        lastStatusFlags = flags
+                                        lastSentAtElapsed = nowElapsed
+                                        lastHash = -1L
+                                    }
+                                } else if (!captured.unchanged && captured.bytes.isNotEmpty()) {
+                                    val flags = if (screenLocked) OmsFrameProtocol.SCREEN_FLAG_SCREEN_LOCKED else 0
+                                    val seq = mirrorSeq.incrementAndGet() and 0xFFFF
+                                    val encoded = OmsFrameProtocol.encodeScreenFrame(
+                                        codec = OmsFrameProtocol.CODEC_WEBP,
+                                        flags = flags,
+                                        width = captured.screenWidth,
+                                        height = captured.screenHeight,
+                                        seq = seq,
+                                        timestampMs = System.currentTimeMillis(),
+                                        imageBytes = captured.bytes
+                                    )
+                                    latestMirrorFrameSlot.set(encoded)
+                                    mirrorSendSignal.trySend(Unit)
+                                    lastHash = captured.frameHash
+                                    lastStatusFlags = flags
+                                    lastSentAtElapsed = SystemClock.elapsedRealtime()
+                                }
+                            }
+
+                            val isBoosted = SystemClock.elapsedRealtime() < mirrorBoostUntilElapsedMs.get()
+                            val waitMs = if (isBoosted) {
+                                (1000L / mirrorMaxFps.coerceIn(2, 12)).coerceIn(110L, 350L)
+                            } else {
+                                480L
+                            }
+                            if (isBoosted) {
+                                delay(waitMs)
+                            } else {
+                                withTimeoutOrNull(waitMs) { mirrorWakeSignal.receive() }
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Throwable) {
+                            delay(500L)
                         }
                     }
                 } finally {
