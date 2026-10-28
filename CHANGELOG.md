@@ -1,5 +1,39 @@
 # Changelog · 更新日志
 
+## 1.5.5 - 2026-10-28
+
+### 手机端 5 种随手即停交互与 Mac `Music.app` 防误唤醒修复
+
+- **手机端 5 种随手停止找手机 / 语音播报方式**：
+  1. **侧面物理按键即停**：在 `NotificationExecutor.kt` 中注册系统音量与息屏广播监听（`android.media.VOLUME_CHANGED_ACTION` / `ACTION_SCREEN_OFF`），拿到手机后随手按一下侧面音量 `+`、音量 `-` 或电源键立即停止语音与震动。
+  2. **解锁屏幕即停**：监听 `ACTION_USER_PRESENT`，指纹 / 面容 / 图案解锁进入桌面瞬间自动停声。
+  3. **通知点按或左滑划掉即停**：紧急找手机通知绑定 `setContentIntent` 与 `setDeleteIntent`，点击通知横幅或左滑清除通知立即停止播报。
+  4. **通知栏一键停止按钮**：新增 `OmsTtsStopReceiver`，在锁屏/顶部通知栏提供 **`[⏹ 我找到了 · 停止声音]`** 动作按钮。
+  5. **App 顶部醒目红条**：在 `MainActivity` 顶栏新增实时联动的红色横幅 **`🔊 正在语音播报 / 寻找手机 · [⏹ 停止声音]`**。
+- **彻底修复手机说话时 Mac 自动弹出 Apple Music (`Music.app`)**：
+  1. 在 `mac-host/bluetooth-bridge/main.swift` 的 `pauseMacMediaIfPlaying()` 中移除硬件媒体键 `NX_KEYTYPE_PLAY` 模拟，并增加 `isDeviceRunning(defId)` 与 `MRMediaRemoteGetNowPlayingApplicationIsPlaying == true` 双重守卫，杜绝向空闲的 macOS `rcd` 守护进程发送媒体键而拉起 `Music.app`。
+  2. 在 `AirPodsAutoSwitchManager.kt` 与 `oms-daemon.ts` 中豁免手机 TTS / 寻找手机播报期间的 `airpods.claimByPhone` 抢占请求。
+
+### APK
+
+- `OneMoreStep-v1.5.5.apk`：Android 11+，versionCode 29，22,818,517 bytes（沿用 Android Debug 签名，从 v1.4.x / v1.5.x 覆盖安装无需重新配对）。
+- SHA-256：`1b08b4243b686b95c176b251458b24089f6997e492c779f60b0a08d1df3bad28`。
+
+## 1.5.4 - 2026-10-28
+
+### Microsoft Edge Neural TTS 9 款真人自然音色、循环寻机播报与 SHA-256 本地缓存
+
+- **9 款 Microsoft Edge Neural TTS 真人自然语音集成**：在 Mac 守护进程 `omsd` 中内置免 Key 的神经网络语音合成引擎，提供 9 款高自然度音色（`xiaoyi` 晓伊·甜美元气女声[默认]、`xiaoxiao` 晓晓·温柔知性女声、`yunxia` 云夏·动漫元气少年音、`yunxi` 云希·阳光青年男声、`yunjian` 云健·沉稳磁性男声、`xiaobei` 晓北·东北话幽默女声、`xiaoni` 晓妮·陕西话亲切女声、`hsiaochen` 晓臻·台湾腔甜美女声、`hiugaai` 晓佳·新增粤语女声），支持中英文简称映射与 SHA-256 磁盘缓存（`~/.one_more_step/cache/tts/`）。
+- **闹钟声道 MP3 音频流循环播放与离线回退**：Android 端 `NotificationExecutor` 支持通过 `MediaPlayer` + `USAGE_ALARM` 闹钟声道突破静音播放合成的 Neural TTS 音频，支持 `repeatCount`（`1..20` 次循环播报，`oms phone find` 默认 3 次），离线时自动挑选手机本地高自然度女声 Voice 模型并优化语调（`pitch=1.06f, speechRate=1.03f`）。
+- **通勤随身听同步接入 Neural TTS**：新增 `tts.synthesize` 反向 RPC，手机端点击信息流卡片上的 `🎧 TTS朗读` 时同样自动调用 Mac 端 Neural TTS 真人音色。
+
+## 1.5.3 - 2026-10-28
+
+### WebP 硬件加速投屏与自适应 10ms 极速流控
+
+- **WebP 屏幕帧编码与全链路升级**：将实时屏幕镜像编码从 JPEG 全面升级为 `WEBP_LOSSY`（`ScreenFrameCodec.WEBP = 2`），同画质下帧体积缩减约 30%~40%，显著提升局域网与无线投屏清晰度与帧率稳定性。
+- **自适应 10ms 极速重抓与在途窗口扩容**：Android 端 `ScreenMirrorEngine` 在画面活跃变化时自动缩短重抓间隔至 `10ms`，并将 `maxInFlight` 窗口提升至 3 帧。
+
 ## 1.5.2 - 2026-10-28
 
 ### AirPods 跨生态无感自动流转、对端媒体自动暂停与实时屏幕镜像工作台

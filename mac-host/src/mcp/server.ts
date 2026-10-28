@@ -198,7 +198,7 @@ export const OMS_MCP_TOOLS = [
   {
     name: "phone_notify",
     description:
-      "向小米手机发送分级通知提醒 (silent=静默记入时间流; normal=常规通知; urgent=突破勿扰+锁屏全屏高亮+强震动+闹钟声道强制TTS语音播报)。",
+      "向小米手机发送分级通知提醒 (silent=静默记入时间流; normal=常规通知; urgent=突破勿扰+锁屏全屏高亮+强震动+闹钟声道强制 Neural TTS 真人语音播报)。",
     inputSchema: {
       type: "object",
       properties: {
@@ -212,7 +212,19 @@ export const OMS_MCP_TOOLS = [
         ttsSpeak: {
           type: "boolean",
           default: false,
-          description: "是否让手机直接用语音播报通知内容（urgent 级别下静音也能发声）",
+          description: "是否让手机直接用真人语音播报通知内容（urgent 级别下静音也能发声）",
+        },
+        voice: {
+          type: "string",
+          description:
+            "可选：Microsoft Edge Neural TTS 音色别名（xiaoyi=甜美元气女声、xiaoxiao=温柔知性女声、yunxia=动漫元气少年音、yunxi=阳光青年男声、yunjian=沉稳磁性男声、xiaobei=东北话幽默女声、xiaoni=陕西话亲切女声、hsiaochen=台湾腔甜美女声、hiugaai=粤语自然女声）",
+        },
+        repeat: {
+          type: "number",
+          minimum: 1,
+          maximum: 20,
+          default: 1,
+          description: "可选：语音重复播报次数（1~20 次）",
         },
         syncDingtalk: {
           type: "boolean",
@@ -261,7 +273,7 @@ export const OMS_MCP_TOOLS = [
   {
     name: "phone_device_control",
     description:
-      "远程操控小米手机系统能力：响铃找手机 (find_phone)、TTS 语音播报 (tts_speak / stop_tts)、调节媒体/铃声/闹钟音量或静音 (set_volume)、震动 (vibrate)、立即抓取屏幕截图并存入收件箱 (take_screenshot)、打开指定网址 (open_url)、启动常用 App (launch_app: wechat/lark/dingtalk/camera/settings/phone 等)、远程点亮屏幕并绘制 3x3 图案解锁手机 (unlock_screen)、自动解锁并拨打电话/选卡外呼 (call_phone / dial)、挂断电话 (hangup_call)、或执行系统级按键 (system_action: home/back/recents/lock_screen/notifications)。",
+      "远程操控小米手机系统能力：响铃/真人语音找手机 (find_phone)、Neural TTS 真人语音播报与停止 (tts_speak / stop_tts / tts_voices)、调节媒体/铃声/闹钟音量或静音 (set_volume)、震动 (vibrate)、立即抓取屏幕截图并存入收件箱 (take_screenshot)、打开指定网址 (open_url)、启动常用 App (launch_app: wechat/lark/dingtalk/camera/settings/phone 等)、远程点亮屏幕并绘制 3x3 图案解锁手机 (unlock_screen)、自动解锁并拨打电话/选卡外呼 (call_phone / dial)、挂断电话 (hangup_call)、或执行系统级按键 (system_action: home/back/recents/lock_screen/notifications)。",
     inputSchema: {
       type: "object",
       properties: {
@@ -271,6 +283,7 @@ export const OMS_MCP_TOOLS = [
             "status",
             "find_phone",
             "tts_speak",
+            "tts_voices",
             "stop_tts",
             "set_volume",
             "vibrate",
@@ -288,6 +301,23 @@ export const OMS_MCP_TOOLS = [
         text: {
           type: "string",
           description: "find_phone 或 tts_speak 时播报的语音文本",
+        },
+        voice: {
+          type: "string",
+          description:
+            "find_phone 或 tts_speak 时的 Neural TTS 音色别名（xiaoyi=甜美元气女声[默认]、xiaoxiao=温柔知性女声、yunxia=动漫元气少年音、yunxi=阳光青年男声、yunjian=沉稳磁性男声、xiaobei=东北话幽默女声、xiaoni=陕西话亲切女声、hsiaochen=台湾腔甜美女声、hiugaai=粤语自然女声）",
+        },
+        repeat: {
+          type: "number",
+          minimum: 1,
+          maximum: 20,
+          description:
+            "find_phone 或 tts_speak 时的语音循环播报次数（1~20 次；find_phone 默认 3 次，tts_speak 默认 1 次）",
+        },
+        saveVoice: {
+          type: "boolean",
+          default: false,
+          description: "是否将本次指定的 voice 设为默认语音音色",
         },
         useAlarmStream: {
           type: "boolean",
@@ -483,7 +513,7 @@ export class OmsMcpServer {
               },
               serverInfo: {
                 name: "one-more-step-mcp",
-                version: "1.4.0",
+                version: "1.5.5",
               },
             },
           };

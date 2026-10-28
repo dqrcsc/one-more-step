@@ -1,6 +1,6 @@
 # <img src="./docs/assets/icon-qingjian-zhichi.png" width="36" height="36" align="top" alt="QingJian ZhiChi Icon" /> 青简 · 咫尺 (OneMoreStep) — macOS 本地 AI ⇄ 小米 Android 全场景双向协同底座
 
-[![Release: v1.5.2](https://img.shields.io/badge/Release-v1.5.2-10b981?style=flat-square)](./CHANGELOG.md)
+[![Release: v1.5.5](https://img.shields.io/badge/Release-v1.5.5-10b981?style=flat-square)](./CHANGELOG.md)
 [![Runtime: Bun >= 1.1](https://img.shields.io/badge/Runtime-Bun_%E2%89%A51.1-f472b6?style=flat-square&logo=bun&logoColor=white)](https://bun.sh)
 [![macOS Host](https://img.shields.io/badge/macOS_Host-TypeScript_%2B_Swift_(CoreBluetooth_%2F_IOBluetooth)-0284c7?style=flat-square&logo=apple&logoColor=white)](./mac-host)
 [![Xiaomi Android](https://img.shields.io/badge/Xiaomi_Android-Kotlin_%2B_Compose_(HyperOS_%2F_MIUI)-ff6900?style=flat-square&logo=xiaomi&logoColor=white)](./android-app)
@@ -9,13 +9,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-f59e0b?style=flat-square)](./LICENSE)
 
 > **青简载思，咫尺通达 (`One More Step`) —— 把小米 Android 手机变成桌面 AI 智能体（Codex / Antigravity / Claude Code / OpenCode）的随身五官、移动控制台与无缝跨生态外设。**  
-> **坚持「零第三方 IM 借道、零云端中转服务器、兼容手机常驻 VPN、一机一码双向认证加密」的纯本机直连设计**——无论是手机三指截屏 1 秒喂给电脑 AI、锁屏验证码毫秒级提取上屏 `⌘V`、AirPods 在 Mac 与小米手机间像苹果全家桶一样随音频焦点无感抢占切换、还是在电脑浏览器以 12fps 实时镜像触控手机、远程九宫格解锁与双卡选卡拨号，皆在咫尺之间。
+> **坚持「零第三方 IM 借道、零云端中转服务器、兼容手机常驻 VPN、一机一码双向认证加密」的纯本机直连设计**——无论是手机三指截屏 1 秒喂给电脑 AI、锁屏验证码毫秒级提取上屏 `⌘V`、AirPods 在 Mac 与小米手机间像苹果全家桶一样随音频焦点无感抢占切换、9 款 Microsoft Edge Neural TTS 真人自然音色远程寻机播报、还是在电脑浏览器以 12fps 实时镜像触控手机、远程九宫格解锁与双卡选卡拨号，皆在咫尺之间。
 
 ---
 
-**v1.5.2 最新演进与实现边界声明**：
-- **v1.5.2 新增能力**：新增 **AirPods 跨 Mac ⇄ 小米手机蓝牙无感自动切换与对端媒体自动暂停**（`oms airpods`）、**实时低延迟手机屏幕镜像与电脑鼠标触控工作台**（`oms mirror` / `http://127.0.0.1:19527/mirror`）；包含 v1.4.9 **远程唤醒、3×3 九宫格图案解锁与双卡原生电话拨打/挂断**（`oms unlock` / `oms call` / `oms hangup`）、v1.4.6 **蓝牙 BLE 配对回退与分片流控**、v1.4.3 **企业大子网 `WifiLock` 低延迟锁屏保活**、以及 v1.4.1 **离线连接诊断引擎**（`connectionDiagnostics`）。完整变更历史见 [CHANGELOG.md](./CHANGELOG.md)。
-- **v2 安全传输与配对要求**：自 v1.4.0 起业务帧统一运行于 **P-256 ECDH + HKDF-SHA256 + 双向 AES-256-GCM** 认证加密会话内（见 [安全传输 v2](./docs/secure-transport-v2.md)）。从 v1.4.x 升级至 v1.5.2 **无需重新配对**，直接运行 `oms ota` 或覆盖安装 [`OneMoreStep-v1.5.2.apk`](./OneMoreStep-v1.5.2.apk) 即可保留全部配对密钥、收件箱与配置；从 v1.3.x 及更早版本升级需同步升级双端并执行一次 `oms pair` 重新绑定。
+**v1.5.5 最新演进与实现边界声明**：
+- **v1.5.5 新增能力**：新增 **9 款 Microsoft Edge Neural TTS 真人自然语音播报与寻机引擎**（`xiaoyi` 甜美元气女声、`xiaoxiao` 温柔知性女声、`yunxia` 动漫元气少年音、`yunxi` 阳光男声、`yunjian` 沉稳男声、`xiaobei` 东北话、`xiaoni` 陕西话、`hsiaochen` 台湾腔甜美女声、`hiugaai` 粤语女声，支持 `--voice`、`--repeat <1..20>` 循环播报与 SHA-256 本地缓存 `~/.one_more_step/cache/tts/`）、**手机端 5 种随手即停交互**（按侧面音量/电源键、解锁屏幕、点按/左滑通知、通知停止按钮、App 顶部红条一键停声），并彻底消除手机播报时触发 Mac `Music.app` 自动弹窗的问题；包含 v1.5.3 **WebP 硬件加速投屏与自适应 10ms 极速流控**、v1.5.2 **AirPods 跨 Mac ⇄ 小米手机蓝牙无感自动切换**（`oms airpods`）与 **实时手机屏幕镜像工作台**（`oms mirror`）。完整变更历史见 [CHANGELOG.md](./CHANGELOG.md)。
+- **v2 安全传输与配对要求**：自 v1.4.0 起业务帧统一运行于 **P-256 ECDH + HKDF-SHA256 + 双向 AES-256-GCM** 认证加密会话内（见 [安全传输 v2](./docs/secure-transport-v2.md)）。从 v1.4.x / v1.5.x 升级至 v1.5.5 **无需重新配对**，直接运行 `oms ota` 或覆盖安装 [`OneMoreStep-v1.5.5.apk`](./OneMoreStep-v1.5.5.apk) 即可保留全部配对密钥、收件箱与配置；从 v1.3.x 及更早版本升级需同步升级双端并执行一次 `oms pair` 重新绑定。
 - **工程实现边界**：当前已落地能力、升级兼容性及待专项真机验证项（如 WAN WebRTC DataChannel 尚未实现、当前 WAN 为可选 WebSocket 中继接入；Mac 蓝牙桥实际使用 `CoreBluetooth` BLE GATT + `IOBluetooth` 经典蓝牙音频切换；GUI 观察必须携带最新 `observationId` 等）详见 **[当前实现边界与升级验收 (`docs/implementation-status.md`)](./docs/implementation-status.md)**。
 
 ---
@@ -184,21 +184,21 @@ oms mirror
 
 ---
 
-### 场景六：⏰ 主动式助理：原生闹钟、防冲突日历、分级强提醒/TTS 与远程审批
+### 场景六：⏰ 主动式助理：原生闹钟、防冲突日历、分级强提醒/Neural TTS 与远程审批
 
 - **静默创建小米原生系统闹钟 (`oms alarm`)**：调用 `AlarmClock.ACTION_SET_ALARM` + `EXTRA_SKIP_UI=true` 配合小米后台弹出界面权限，在小米系统时钟 App 内静默建好闹钟，并附带 `AlarmManager.setAlarmClock()` 双保险。
 - **系统日历防冲突查询与写入 (`oms calendar`)**：查询时自动展开周期性重复会议（`CalendarContract.Instances`），让 AI 先检查你下午是否有会，确认无冲突后再写入新日程并配置提前 15 分钟系统日历响铃。
-- **在场感知分级通知与闹钟声道强制 TTS (`oms notify`)**：
+- **在场感知分级通知与 9 款 Microsoft Edge Neural TTS 真人语音播报 (`oms notify` / `oms phone say`)**：
   - 当你在电脑前（`AT_DESK`）时，`normal` 通知自动转为 Mac 桌面轻提示 + 手机静默入流，避免桌上手机频繁震动打扰写代码；
-  - 当遇到紧急情况（`urgent` + `--tts`）时，突破手机勿扰模式亮屏弹窗，并通过 `STREAM_ALARM`（闹钟声道）直接用中文语音开口播报（即使手机处于静音模式也能发声）。
+  - 当遇到紧急情况（`urgent` + `--tts`）或调用 `oms phone say` 时，突破手机勿扰模式亮屏弹窗，并通过 `USAGE_ALARM`（闹钟声道）直接播放 **Microsoft Edge Neural TTS 真人自然语音**（内置 `xiaoyi` 甜美元气女声、`xiaoxiao` 温柔知性女声、`yunxia` 动漫元气少年音、`yunxi` 阳光男声、`yunjian` 沉稳男声、`xiaobei` 东北话、`xiaoni` 陕西话、`hsiaochen` 台湾腔甜美女声、`hiugaai` 粤语女声，支持 `--voice` 与 `--repeat <1..20>` 循环播报，离线时自动回退手机端自然语调 TTS）。
 - **阻塞式远程交互审批 (`oms approve`)**：长耗时任务遇到关键决策点时，向手机推送含代码 Diff 的紫色审批卡片，终端阻塞挂起，直到你在手机上点击 `[批准继续]` 或 `[拒绝并中止]`。
 
 ---
 
-### 场景七：🎛️ 手机全维实时遥测、远程寻机与局域网一键 OTA
+### 场景七：🎛️ 手机全维实时遥测、真人语音远程寻机与局域网一键 OTA
 
 - **20+ 项实时硬件与系统遥测 (`oms status --live`)**：一键获取手机电量、充电接口（`AC`/`USB`/`WIRELESS`）、电池温度（`°C`）、电压、省电模式、屏幕亮灭与锁屏状态、**当前前台 App 中文名称与包名**、Wi-Fi SSID/信号强度（`dBm`）/协商速率、四声道音量百分比、可用存储（`GB`）与内存（`MB`）、AirPods 连接状态及 11 项权限健康度。
-- **远程寻机与快捷控制 (`oms phone`)**：手机不知道丢在房间哪个角落？运行 `oms phone find`，手机立即以最大闹钟声道播报语音并持续震动；还支持远程抓屏回传（`oms phone screenshot`）、调节音量、打开指定网址或直接拉起微信/飞书/钉钉/相机。
+- **真人语音远程寻机与 5 种随手即停交互 (`oms phone find`)**：手机不知道丢在房间哪个角落？运行 `oms phone find "出来吧，皮卡丘" --voice hsiaochen --repeat 10`，手机立即拉满闹钟声道音量，用指定的真人音色循环呼唤并持续震动；找到手机后，可通过**按侧面任意音量键/电源键、解锁手机屏幕、点按或左滑划掉通知横幅、点击通知上的 `[⏹ 我找到了 · 停止声音]` 按钮、或点击 App 顶部醒目红条**随手一键停声。还支持远程抓屏回传（`oms phone screenshot`）、调节音量、打开指定网址或直接拉起微信/飞书/钉钉/相机。
 - **局域网智能 OTA 升级 (`oms ota`)**：重新编译或更新 APK 后，无需插线，运行 `oms ota`（或点击手机端顶部 `🔄 检查更新`），自动校验 `versionCode` 与 `SHA-256` 并拉起无线覆盖安装。
 
 ---
@@ -286,9 +286,9 @@ flowchart TB
 
 ```text
 one_more_step/
-├── package.json                  # Bun Workspace 根配置与快捷脚本 (v1.5.2)
+├── package.json                  # Bun Workspace 根配置与快捷脚本 (v1.5.5)
 ├── bunfig.toml                   # 测试隔离配置（自动加载预置守卫，阻断测试访问真实设备或生产目录）
-├── OneMoreStep-v1.5.2.apk        # [已编译产物] 最新版小米 Android 客户端安装包 (与 OneMoreStep.apk 同步)
+├── OneMoreStep-v1.5.5.apk        # [已编译产物] 最新版小米 Android 客户端安装包 (与 OneMoreStep.apk 同步)
 ├── scripts/
 │   └── setup.ts                  # 一键编译 Swift 蓝牙桥、链接全局 `oms` 命令与安装全局 Agent Skill
 ├── skills/
@@ -364,7 +364,7 @@ oms pair
   - **方式 A（手机浏览器免线下载）**：确保手机与 Mac 在同一 Wi-Fi，用手机浏览器打开 `http://192.168.x.x:19527/install` 点击下载安装 `OneMoreStep.apk`；
   - **方式 B（推荐 · 通过 ADB 安装自动豁免受限设置）**：若手机已连接有线或无线 ADB，直接运行以下命令安装，**系统将自动豁免 Android 13/14/15 无障碍与通知使用权的「受限制的设置」解锁步骤**：
     ```bash
-    adb install -r OneMoreStep-v1.5.2.apk
+    adb install -r OneMoreStep-v1.5.5.apk
     ```
 
 ### 4.3 第二步：完成 v2 一机一码绑定与常驻 VPN 分流
@@ -422,10 +422,10 @@ oms pair
 | | `phone_clipboard_sync` | 双向读写小米手机剪贴板（`get_phone_clipboard` / `set_phone_clipboard`），支持 `includeRecentOtp: true` 附带最近验证码。 |
 | **主动式助理与远程审批** | `phone_alarm_set` | 在小米手机原生系统时钟 App 中静默创建闹钟（支持 `hour`、`minute`、`label`、`daysOfWeek` 重复周期）。 |
 | | `phone_calendar_manage` | 查询手机系统日历日程（`list_events`，自动展开重复会议防冲突），或写入（`add_event`）/ 删除（`delete_event`）日程。 |
-| | `phone_notify` | 发送分级通知：`silent`（静默入流）、`normal`（常规通知）、`urgent`（突破勿扰 + 锁屏亮屏 + 闹钟声道强制 TTS 语音播报）。 |
+| | `phone_notify` | 发送分级通知：`silent`（静默入流）、`normal`（常规通知）、`urgent`（突破勿扰 + 锁屏亮屏 + 闹钟声道强制 Neural TTS 真人语音播报，支持 `voice` 与 `repeat`）。 |
 | | `phone_request_approval` | 长耗时任务遇到高风险操作时，向手机推送含代码 `diffOrContext` 的交互式审批卡片，阻塞等待用户点击决策后返回。 |
 | **全维遥测与远程系统操控** | `phone_presence_status` | 查询是否在电脑旁（`AT_DESK` / `AWAY`）、传输通道、电量/温度、屏幕锁屏状态、前台 App 中文名、Wi-Fi 信号、AirPods 状态、存储/内存余量及权限健康度。 |
-| | `phone_device_control` | **全能远程系统控制**：<br>• `unlock_screen`：唤醒屏幕并绘制 3×3 九宫格图案（`pattern`）或 `pin` 解锁手机（支持 `savePattern`）；<br>• `call_phone` / `dial` / `hangup_call`：自动解锁并按双卡槽位（`simSlot: 1\|2\|电信\|联通`）拨打或挂断电话（支持 `speaker: true` 免提）；<br>• `find_phone` / `tts_speak` / `stop_tts`：突破静音响铃找手机或强制语音播报；<br>• `set_volume` / `vibrate` / `take_screenshot`：四声道音量调节、震动、远程抓屏入收件箱；<br>• `open_url` / `launch_app` / `system_action`：打开网址、启动常用 App（`wechat`/`lark`/`dingtalk`）或执行系统导航键（`home`/`back`/`lock_screen`）。 |
+| | `phone_device_control` | **全能远程系统控制**：<br>• `unlock_screen`：唤醒屏幕并绘制 3×3 九宫格图案（`pattern`）或 `pin` 解锁手机（支持 `savePattern`）；<br>• `call_phone` / `dial` / `hangup_call`：自动解锁并按双卡槽位（`simSlot: 1\|2\|电信\|联通`）拨打或挂断电话（支持 `speaker: true` 免提）；<br>• `find_phone` / `tts_speak` / `tts_voices` / `stop_tts`：突破静音真人语音寻机或语音播报（内置 `xiaoyi`/`xiaoxiao`/`yunxia`/`yunxi`/`yunjian`/`xiaobei`/`xiaoni`/`hsiaochen`/`hiugaai` 9 款音色与 `repeat` 循环次数）；<br>• `set_volume` / `vibrate` / `take_screenshot`：四声道音量调节、震动、远程抓屏入收件箱；<br>• `open_url` / `launch_app` / `system_action`：打开网址、启动常用 App（`wechat`/`lark`/`dingtalk`）或执行系统导航键（`home`/`back`/`lock_screen`）。 |
 | **GUI 屏幕自动化** | `phone_gui_observe` | 获取手机当前前台 App 的紧凑无障碍语义控件树（带 `#1, #2` 短编号与 `observationId`），可选附带静默截屏或 Set-of-Mark (`#ID`) 标注图。 |
 | | `phone_gui_action` | 执行 GUI 自动化操作（`click`、`long_click`、`input_text`、`scroll_down`、`scroll_up`、`swipe`、`back`、`home`、`launch_app`、`open_url`），节点动作需携带 `observationId`，支持 `requireUserConfirm` 停顿确认。 |
 
@@ -453,7 +453,7 @@ oms pair
 | | `oms call <number> [--sim 1\|2\|电信] [--speaker]` | 自动解锁手机并使用指定 SIM 卡槽发起原生电话呼叫（`oms dial` 仅打开拨号盘） |
 | | `oms hangup` | 远程挂断手机当前正在振铃或通话中的电话 |
 | **遥测与遥控** | `oms status [--live]` | 查看在场状态、传输通道、电池温度、前台应用、AirPods、权限健康度与连接诊断日志 |
-| | `oms phone <find\|say\|volume\|screenshot\|open\|launch\|lock>` | 远程响铃找手机、TTS 开口说话、调音量、远程抓屏、打开网址/App、执行系统导航与锁屏 |
+| | `oms phone <find\|say\|voices\|stop-tts\|volume\|screenshot\|open\|launch\|lock>` | 远程真人语音找手机（`--voice` / `--repeat`）、Neural TTS 开口说话、查看 9 款音色列表、调音量、远程抓屏、打开网址/App、执行系统导航与锁屏 |
 | **验证码与剪贴板**| `oms otp [--limit N] [--copy] [--ack]` | 查询手机锁屏实时同步的最新验证码（加 `--copy` 自动将纯数字写入 Mac 剪贴板） |
 | | `oms clip [get [--otp] \| set <text> \| pull \| push]` | 双向读写手机剪贴板，或与 Mac 系统剪贴板（`pbcopy` / `pbpaste`）一键互推互拉 |
 | **收件箱与媒体** | `oms inbox [--tag <tag>] [--unprocessed] [--q <kw>]` | 查询手机投递记录；支持 `show <id>`、`ack <id>`、`transcribe <id>`（SenseVoice 离线转写） |
@@ -461,11 +461,11 @@ oms pair
 | | `oms push <file\|--text\|--stdin> [--title <t>] [--tts]` | 将 Mac 文件或 Markdown 推送至手机时间流（`--tts` 开启通勤随身听语音朗读） |
 | **助理与审批** | `oms alarm <HH:MM> [--label <t>] [--days 1,2,3]` | 在小米原生系统时钟 App 中静默创建闹钟 |
 | | `oms calendar [list [--days N] \| add ... \| delete <id>]` | 防冲突查询手机未来日历日程，或写入带提前响铃提醒的新日程 |
-| | `oms notify <text> [--level silent\|normal\|urgent] [--tts]` | 发送 L1~L3 分级通知或突破勿扰的闹钟声道强制 TTS 语音播报 |
+| | `oms notify <text> [--level silent\|normal\|urgent] [--tts] [--voice <v>] [--repeat <N>]` | 发送 L1~L3 分级通知或突破勿扰的闹钟声道强制 Neural TTS 真人语音播报 |
 | | `oms approve --title <t> --summary <s> [--diff <d>]` | 向手机推送阻塞式远程审批卡片，挂起等待手机端点击决策后返回 |
 | **GUI 自动化** | `oms gui observe [--screenshot] [--som]` | 提取当前屏幕紧凑无障碍语义树（`#1, #2`）及可选 Set-of-Mark 红框标注截图 |
 | | `oms gui act <click\|input_text\|...> [#id] --observation <id>` | 按节点 `#ID` 或坐标执行无障碍自动化操作（敏感操作加 `--confirm` 触发手机端人工放行） |
-| **维护与升级** | `oms ota` / `oms prefs` / `oms daemon <restart\|logs>` | 局域网一键推送 APK 升级、配置自动复制/预览偏好、管理后台 `omsd` 守护进程 |
+| **维护与升级** | `oms ota` / `oms prefs` / `oms daemon <restart\|logs>` | 局域网一键推送 APK 升级、配置自动复制/预览/默认 TTS 音色（`--tts-voice`）偏好、管理后台 `omsd` 守护进程 |
 
 ### 6.2 常用命令行实战示例
 
@@ -505,9 +505,14 @@ oms inbox ack <itemId>
 # 将电脑上的 Markdown 报告推送到手机『🎧 通勤 TTS 随身听』
 oms push ./docs/02-scenarios-and-value.md --title "全景场景分析" --tts
 
-# ──────────────── 3. 远程控制、原生闹钟、防冲突日历与远程审批 ────────────────
-# 响铃寻找手机（突破静音走闹钟声道发声）/ 远程抓屏 / 启动微信
-oms phone find --text "正在寻找手机，我在这里！"
+# ──────────────── 3. 远程控制、真人语音寻机、原生闹钟、防冲突日历与远程审批 ────────────────
+# 真人语音寻找手机（突破静音走闹钟声道发声，支持 9 款 Neural TTS 音色与 --repeat 循环次数）
+oms phone find "皮卡丘，快回家吃饭" --voice yunxia --repeat 8
+oms phone find "出来吧，皮卡丘" --voice hsiaochen --repeat 10
+oms phone voices
+oms phone stop-tts
+
+# 远程抓屏 / 启动微信
 oms phone screenshot
 oms phone launch wechat
 
@@ -537,7 +542,9 @@ oms gui act click "#8" --observation "<observationId>" --confirm
 
 ```text
 ~/.one_more_step/
-├── config.json                   # 端口、蓝牙开关、自动复制/预览/验证码开关、AirPods 策略、保存的解锁图案 (0600)
+├── config.json                   # 端口、蓝牙开关、自动复制/预览/验证码开关、AirPods 策略、默认 TTS 音色、保存的解锁图案 (0600)
+├── cache/
+│   └── tts/                      # Microsoft Edge Neural TTS 合成音频 SHA-256 本地缓存 (*.mp3)
 ├── keystore/
 │   ├── host_identity.json        # Mac 端长期身份密钥对 (0600)
 │   └── trusted_devices.json      # 已绑定的小米手机设备 ID、派生配对密钥与信任记录 (0600)
@@ -602,7 +609,7 @@ cd android-app && ./gradlew :app:testDebugUnitTest assembleDebug
 - 🛡️ **[当前实现边界与升级验收 (`docs/implementation-status.md`)](./docs/implementation-status.md)**：当前版本真实行为、升级兼容性要求与待验证边界说明。
 - 🔐 **[安全传输 v2 规范 (`docs/secure-transport-v2.md`)](./docs/secure-transport-v2.md)**：一次性配对令牌、临时 P-256 ECDH、HKDF-SHA256 与双向 AES-256-GCM 会话设计。
 - 🩺 **[离线连接诊断规范 (`docs/connection-diagnostics.md`)](./docs/connection-diagnostics.md)**：双端最近 200 条连接事件环、错误分类码与离线排查流程。
-- 📝 **[版本更新日志 (`CHANGELOG.md`)](./CHANGELOG.md)**：`v1.0.0` 至 `v1.5.2` 各版本详细演进记录与 APK 校验信息。
+- 📝 **[版本更新日志 (`CHANGELOG.md`)](./CHANGELOG.md)**：`v1.0.0` 至 `v1.5.5` 各版本详细演进记录与 APK 校验信息。
 
 ### 9.2 立项分析与七大模块架构设计文档
 1. **[01. 可行性分析报告](./docs/01-feasibility-analysis.md)**：Android + macOS 技术可行性、三级无感连接、免 IM 原生交互及小米 ROM 避坑指南。

@@ -1688,6 +1688,7 @@ export class OmsDaemon {
           typeof params.autoSwitchAirpods === "boolean" ||
           typeof params.pauseOtherOnAirpodsSwitch === "boolean" ||
           typeof params.preferredAirpodsMac === "string" ||
+          typeof params.preferredTtsVoice === "string" ||
           typeof params.unlockPattern === "string" ||
           typeof params.unlockPin === "string" ||
           typeof params.unlockBounds === "string"
@@ -1699,6 +1700,10 @@ export class OmsDaemon {
             autoSwitchAirpods: params.autoSwitchAirpods,
             pauseOtherOnAirpodsSwitch: params.pauseOtherOnAirpodsSwitch,
             preferredAirpodsMac: params.preferredAirpodsMac,
+            preferredTtsVoice:
+              typeof params.preferredTtsVoice === "string"
+                ? this.resolveNeuralTtsVoice(params.preferredTtsVoice).alias
+                : undefined,
             unlockPattern: params.unlockPattern,
             unlockPin: params.unlockPin,
             unlockBounds: params.unlockBounds,

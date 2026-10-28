@@ -234,6 +234,12 @@ async function main() {
       const autoCopy = parseBoolFlag(flags["auto-copy"]);
       const autoPreview = parseBoolFlag(flags["auto-preview"]);
       const autoOtp = parseBoolFlag(flags["auto-otp"]);
+      const preferredTtsVoice =
+        typeof flags["tts-voice"] === "string"
+          ? flags["tts-voice"]
+          : typeof flags.voice === "string"
+            ? flags.voice
+            : undefined;
       const unlockPattern =
         typeof flags["unlock-pattern"] === "string"
           ? flags["unlock-pattern"]
@@ -250,6 +256,7 @@ async function main() {
         autoCopyTextToClipboard: autoCopy,
         autoPreviewImageOnMac: autoPreview,
         autoSyncOtpToMac: autoOtp,
+        preferredTtsVoice,
         unlockPattern,
         unlockPin,
       });
@@ -750,7 +757,7 @@ async function main() {
         console.log(JSON.stringify(res, null, 2));
       } else {
         throw new Error(
-          `Unknown phone subcommand: ${actionSub}. Supported: status | find | say | stop-tts | vibrate | volume | screenshot | open | launch | unlock | call | dial | hangup | key | home | back | lock`
+          `Unknown phone subcommand: ${actionSub}. Supported: status | find | say | voices | stop-tts | vibrate | volume | screenshot | open | launch | unlock | call | dial | hangup | key | home | back | lock`
         );
       }
       break;
@@ -797,8 +804,14 @@ Commands:
   oms status [--live]                                  Inspect live presence, transport tier, battery, temp, audio, storage & permissions
   oms airpods [status|mac|phone|auto <on|off>|pause <on|off>]
                                                        Seamless AirPods auto-switch between Mac & Android on audio output + media pause
-  oms phone <status|find|say|volume|screenshot|open|launch|unlock|call|hangup|home|back|lock>
+  oms phone <status|find|say|voices|stop-tts|volume|screenshot|open|launch|unlock|call|hangup|home|back|lock>
                                                        Inspect rich phone telemetry or remotely control phone from Mac
+  oms phone find [text] [--voice <v>] [--repeat <N>] [--save]
+                                                       Ring/speak at max alarm volume with 9 Neural TTS human voices (e.g. xiaoyi, yunxia, hsiaochen)
+  oms phone say <text> [--voice <v>] [--repeat <N>] [--save]
+                                                       Speak text on phone via Neural TTS (--voice xiaoyi|xiaoxiao|yunxia|yunxi|yunjian|xiaobei|xiaoni|hsiaochen|hiugaai)
+  oms phone voices                                     List all 9 Neural TTS human voices & current default voice
+  oms phone stop-tts                                   Stop active Find-My-Phone or TTS voice playback on phone
   oms phone unlock [pattern] [--save] [--bounds l,t,r,b] Wake screen, swipe up bouncer & draw 3x3 pattern (1~9) to unlock phone
   oms phone call <number> [--sim 1|2|电信|联通] [--dial-only] [--speaker]
                                                        Auto-unlock & place phone call (or open dialer) with dual-SIM selection
@@ -807,7 +820,8 @@ Commands:
   oms web                                              Open Mac real-time Inbox & Stream Web Dashboard (/inbox)
   oms mirror [open|start|stop|status] [--fps 12]       Open real-time Phone Screen Mirror & remote control studio (/mirror)
   oms otp [--limit N] [--copy] [--ack]                 Query latest synced verification codes (OTP) from phone
-  oms prefs [--auto-otp] [--auto-copy] [--unlock-pattern <1~9>] View or update Mac auto-OTP, clipboard, preview & unlock pattern
+  oms prefs [--auto-otp] [--auto-copy] [--tts-voice <v>] [--unlock-pattern <1~9>]
+                                                       View or update Mac auto-OTP, clipboard, preview, default TTS voice & unlock pattern
   oms inbox [latest] [--tag <tag>] [--unprocessed]     Query items sent from phone (--ack to mark read, --q <keyword>)
   oms inbox show <id> | ack <id> | transcribe <id>     Inspect item, mark processed, or run SenseVoice offline ASR
   oms media [recent] [--type screenshot|camera]        List recent screenshots/photos/videos on phone (--since <min>)
@@ -816,7 +830,8 @@ Commands:
   oms clip [get [--otp] | set <text> | push | pull]    Bidirectional clipboard sync between Mac and Xiaomi phone
   oms alarm [set] <HH:MM> [--label <t>] [--days 1,2]   Set native Xiaomi system clock alarm
   oms calendar [list [--days N] | add --title <t>]     Query conflict-free schedule or insert phone calendar event
-  oms notify <text> [--level urgent] [--tts]           Send graded notification (L1-L3) or alarm-stream voice TTS
+  oms notify <text> [--level urgent] [--tts] [--voice <v>] [--repeat <N>]
+                                                       Send graded notification (L1-L3) or alarm-stream Neural TTS voice
   oms approve --title <t> --summary <s> [--diff <d>]   Push blocking remote approval card to phone and wait for decision
   oms gui observe [--screenshot] [--som]               Extract compact Accessibility semantic tree (#1, #2) & SoM screenshot
   oms gui act <click|input_text|...> [#id] --observation <id> [--confirm] Perform GUI automation action on phone with safety guardrails

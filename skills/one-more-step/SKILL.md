@@ -151,13 +151,37 @@ oms clip push
 oms status --live
 oms phone status
 
-# 2. 远程寻找手机（闹钟声道突破静音强制响铃 + 语音播报 + 强震动）
-oms phone find --text "正在寻找手机，我在这里！"
+# 2. 远程寻找手机（闹钟声道突破静音满音量 + Microsoft Edge Neural TTS 真人自然语音 + 强震动）
+#    - 默认循环播报 3 遍（可通过 --repeat <1..20> 指定重复遍数）
+#    - 支持 --voice <音色别名> 选择 9 款真人神经网络音色，加 --save 可设为默认音色
+oms phone find "皮卡丘，快回家吃饭" --voice yunxia --repeat 8
+oms phone find "出来吧，皮卡丘" --voice hsiaochen --repeat 10
 
-# 3. 让手机直接用 TTS 开口说话（加 --alarm 可在静音模式下走闹钟声道发声）或停止朗读
-oms phone say "任务已经执行完毕，请查看结果" --alarm
+# 3. 让手机直接用 Neural TTS 真人语音开口说话（--alarm 走闹钟声道突破静音）或查看音色列表 / 停止朗读
+oms phone say "任务已经执行完毕，请查看结果" --voice xiaoyi --repeat 2 --alarm
+oms phone voices
 oms phone stop-tts
+```
 
+**内置 9 款 Microsoft Edge Neural TTS 真人自然音色（`--voice` 支持英文代号或中文简称，自动 SHA-256 本地缓存 `~/.one_more_step/cache/tts/`，离线自动回退手机端自然语调 TTS）**：
+- `xiaoyi`（默认）：**晓伊** · 甜美元气女声（支持中文简称 `晓伊` / `甜美`）
+- `xiaoxiao`：**晓晓** · 温柔知性女声（支持中文简称 `晓晓` / `温柔`）
+- `yunxia`：**云夏** · 动漫元气少年音（支持中文简称 `云夏` / `皮卡丘` / `少年`）
+- `yunxi`：**云希** · 阳光青年男声（支持中文简称 `云希` / `男声`）
+- `yunjian`：**云健** · 沉稳磁性男声（支持中文简称 `云健`）
+- `xiaobei`：**晓北** · 东北话幽默女声（支持中文简称 `晓北` / `东北` / `东北话`）
+- `xiaoni`：**晓妮** · 陕西话亲切女声（支持中文简称 `晓妮` / `陕西`）
+- `hsiaochen`：**晓臻** · 台湾腔甜美女声（支持中文简称 `晓臻` / `台湾`）
+- `hiugaai`：**晓佳** · 粤语自然女声（支持中文简称 `晓佳` / `粤语`）
+
+**拿到手机后停止找手机/语音播报的 5 种随手方式**（以及 Mac 端远程停止 `oms phone stop-tts`）：
+1. **按一下手机侧面任意物理按键**（音量 `+`、音量 `-` 或电源键息屏）立即停声；
+2. **解锁手机屏幕**（指纹 / 面容 / 图案解锁进入桌面的一瞬间自动停声）；
+3. **点击或左滑划掉锁屏/顶部的“正在寻找手机”通知横幅**立即停声；
+4. **点击通知横幅上的 `[⏹ 我找到了 · 停止声音]` 按钮**立即停声；
+5. **打开青简 App 点击顶部醒目红条 `[⏹ 停止声音]`**。
+
+```bash
 # 4. 调节手机音量或静音（--stream: music | ring | alarm | notification）
 oms phone volume up
 oms phone volume down
@@ -247,7 +271,7 @@ oms calendar add \
 oms calendar delete <eventId>
 ```
 
-### 5.4 L1~L3 分级通知与闹钟声道强制 TTS 播报 (`oms notify`)
+### 5.4 L1~L3 分级通知与闹钟声道强制 Neural TTS 播报 (`oms notify`)
 
 ```bash
 # L1 静默记录（仅记入手机时间流，不响铃不震动）
@@ -256,8 +280,8 @@ oms notify "后台索引已完成" --title "进度记录" --level silent
 # L2 常规通知（若用户在电脑旁 AT_DESK，自动转为 Mac 桌面弹窗 + 手机静默入流，避免桌上手机震动吵人）
 oms notify "单元测试已全部通过" --title "测试完成" --level normal
 
-# L3 紧急强触达（突破勿扰模式 + 锁屏全屏亮屏 + 强震动；加 --tts 走闹钟声道直接开口语音播报）
-oms notify "注意：长耗时任务遇到异常，请及时查看" --title "紧急告警" --level urgent --tts
+# L3 紧急强触达（突破勿扰模式 + 锁屏全屏亮屏 + 强震动；加 --tts 走闹钟声道直接用 Neural TTS 真人语音播报，支持 --voice 与 --repeat）
+oms notify "注意：长耗时任务遇到异常，请及时查看" --title "紧急告警" --level urgent --tts --voice xiaoyi --repeat 2
 ```
 
 ### 5.5 阻塞式远程交互审批 (`oms approve`)
@@ -331,9 +355,10 @@ oms web
 # 在 Mac 本地生成安全 v2 完整配对 URI；无线安装页仅提供 APK，不提供配对密钥
 oms pair
 
-# 查看或修改 Mac 收到手机投递时的自动联动偏好（自动复制剪贴板 / 自动打开预览 / 默认解锁图案与 PIN）
+# 查看或修改 Mac 收到手机投递时的自动联动偏好（自动复制剪贴板 / 自动打开预览 / 默认 TTS 音色 / 默认解锁图案与 PIN）
 oms prefs
 oms prefs --auto-copy true --auto-preview true
+oms prefs --tts-voice xiaoyi
 oms prefs --unlock-pattern 123698745
 
 # 当重新编译 Android APK 后，通过局域网一键向手机推送 OTA 更新
@@ -359,9 +384,9 @@ oms daemon install-launchagent
 | **双向剪贴板** | `phone_clipboard_sync` | `oms clip get [--otp] \| set <text> \| push \| pull` |
 | **原生系统闹钟** | `phone_alarm_set` | `oms alarm <HH:MM> [--label <t>] [--days 1,2,3,4,5]` |
 | **日历防冲突读写** | `phone_calendar_manage` | `oms calendar list [--days N] \| add ... \| delete <id>` |
-| **分级通知与TTS** | `phone_notify` | `oms notify <text> [--level silent\|normal\|urgent] [--tts]` |
+| **分级通知与TTS** | `phone_notify` | `oms notify <text> [--level silent\|normal\|urgent] [--tts] [--voice <v>] [--repeat <N>]` |
 | **远程阻塞审批** | `phone_request_approval` | `oms approve --title <t> --summary <s> [--diff <d>]` |
 | **全维状态遥测** | `phone_presence_status` | `oms status [--live] \| oms phone status` |
-| **远程系统操控** | `phone_device_control` | `oms phone <find\|say\|volume\|screenshot\|open\|launch\|unlock\|call\|hangup\|home\|back\|lock>` |
+| **远程系统操控** | `phone_device_control` | `oms phone <find\|say\|voices\|stop-tts\|volume\|screenshot\|open\|launch\|unlock\|call\|hangup\|home\|back\|lock>` |
 | **GUI 语义树观察** | `phone_gui_observe` | `oms gui observe [--screenshot] [--som]` |
 | **GUI 自动化执行** | `phone_gui_action` | `oms gui act <click\|input_text\|...> [#id] --observation <id> [--confirm]` |
