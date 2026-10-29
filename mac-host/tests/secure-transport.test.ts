@@ -31,6 +31,84 @@ function rawPipe(manager: any) {
   return { pipe, wire, hello };
 }
 
+test("bound RPC callers never migrate after replacement, re-pair or active route promotion", async () => {
+  for (const change of ["replacement", "re-pair", "promotion"]) {
+    const f = fixture();
+    const old = f.connect({ tier: change === "promotion" ? "WAN_WEBRTC" : "LAN_WS" });
+    const call = f.manager.bindPhoneSession();
+    let current: ReturnType<typeof secureMemoryPhone>;
+    if (change === "re-pair") {
+      const token = crypto.randomBytes(32).toString("hex");
+      f.manager.setActivePairingCredentials({ ephemeralToken: token, expiresAtMs: Date.now() + 60000 });
+      current = secureMemoryPhone(f.raw, { phoneId: "replacement_phone", macId: f.identity.deviceId, pskHex: token });
+    } else {
+      current = secureMemoryPhone(f.raw, { phoneId: "phone_secure_test", macId: f.identity.deviceId, pskHex: old.pairSecretHex, mode: "auth" });
+    }
+    // Promotion leaves the original physical pipe alive, but it is no longer the active route.
+    if (change === "promotion") expect(old.pipe.closed).not.toBe(true);
+    await expect(call("sys.control", { action: "call_phone", number: "test-only" }, 100)).rejects.toThrow("ERR_SESSION_REVOKED");
+    expect(old.messages).toHaveLength(0);
+    expect(current.messages).toHaveLength(0);
+    const fresh = f.manager.callPhone("sys.getStatus", {}, 100);
+    const req = current.messages.at(-1)!.value;
+    current.send(encodeJsonRpcFrame({ jsonrpc: "2.0", id: req.id, result: { ok: true } }));
+    expect(await fresh).toEqual({ ok: true });
+    await f.manager.stop();
+  }
+});
+
+test("timed-out and duplicate RPC replies cannot settle another request or emit phone actions", async () => {
+  const f = fixture();
+  const phone = f.connect();
+  let phoneActions = 0;
+  f.manager.on("phoneRequest", () => { phoneActions++; });
+  const expired = f.manager.callPhone("sys.getStatus", {}, 1);
+  const expiredId = phone.messages.at(-1)!.value.id;
+  await expect(expired).rejects.toThrow("RPC timeout");
+  expect(f.raw.pendingRpc.size).toBe(0);
+  expect(f.raw.outQueue.size).toBe(0); // RPCs are not retained in the application's outbound queue.
+  const late = () => phone.send(encodeJsonRpcFrame({ jsonrpc: "2.0", id: expiredId, result: { stale: true } }));
+  late();
+  let resolved = false;
+  const next = f.manager.callPhone("sys.getStatus", {}, 100).then(value => { resolved = true; return value; });
+  const nextId = phone.messages.at(-1)!.value.id;
+  late();
+  await Promise.resolve();
+  expect(resolved).toBe(false);
+  const reply = () => phone.send(encodeJsonRpcFrame({ jsonrpc: "2.0", id: nextId, result: { fresh: true } }));
+  reply();
+  expect(await next).toEqual({ fresh: true });
+  reply();
+  expect(f.raw.pendingRpc.size).toBe(0);
+  expect(phoneActions).toBe(0);
+  await f.manager.stop();
+});
+
+test("a bound caller stays revoked after the active route changes away and back", async () => {
+  const f = fixture();
+  const original = f.connect({ tier: "WAN_WEBRTC" });
+  const call = f.manager.bindPhoneSession();
+  const lan = secureMemoryPhone(f.raw, { phoneId: "phone_secure_test", macId: f.identity.deviceId, pskHex: original.pairSecretHex, mode: "auth" });
+  f.raw.onPipeClosed(lan.pipe);
+  expect(f.manager.getActiveTier()).toBe("WAN_WEBRTC");
+  expect(original.pipe.closed).not.toBe(true);
+  await expect(call("sys.control", { action: "unlock_screen" }, 100)).rejects.toThrow("ERR_SESSION_REVOKED");
+  expect(original.messages).toHaveLength(0);
+  await f.manager.stop();
+});
+
+test("closing a pipe rejects its pending RPC and does not replay it on a replacement", async () => {
+  const f = fixture();
+  const phone = f.connect();
+  const pending = f.manager.callPhone("sys.control", { action: "unlock_screen" }, 100);
+  const rejected = pending.catch((error: Error) => error);
+  const replacement = secureMemoryPhone(f.raw, { phoneId: "phone_secure_test", macId: f.identity.deviceId, pskHex: phone.pairSecretHex, mode: "auth" });
+  expect((await rejected).message).toContain("Transport closed");
+  expect(f.raw.pendingRpc.size).toBe(0);
+  expect(replacement.messages).toHaveLength(0);
+  await f.manager.stop();
+});
+
 test("connection diagnostics correlate authenticated and rejected sessions without credentials", async () => {
   const f = fixture();
   const phone = f.connect();

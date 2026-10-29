@@ -513,7 +513,7 @@ export class OmsMcpServer {
               },
               serverInfo: {
                 name: "one-more-step-mcp",
-                version: "1.5.5",
+                version: "1.5.6",
               },
             },
           };

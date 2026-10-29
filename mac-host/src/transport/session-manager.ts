@@ -136,6 +136,7 @@ export class PhoneSessionManager extends EventEmitter {
   private pendingBtPipe?: ActiveTransportPipe;
   private readonly outgoingStreams = new Map<string, { pipe: ActiveTransportPipe; resolve: () => void; reject: (err: Error) => void; timer: Timer }>();
   private activeTier: TransportTier = "DISCONNECTED";
+  private activeRouteGeneration = 0;
   private phoneStatus: PhoneDeviceStatus | null = null;
   private lastRttMs = 0;
 
@@ -255,12 +256,12 @@ export class PhoneSessionManager extends EventEmitter {
     const metaPath = path.join(apkDir, "output-metadata.json");
 
     if (!fs.existsSync(apkPath)) {
-      const defaultVer = "1.5.5";
+      const defaultVer = "1.5.6";
       const ghUrl = `https://github.com/dqrcsc/one-more-step/releases/download/v${defaultVer}/OneMoreStep-v${defaultVer}.apk`;
       return {
         available: false,
         apkPath,
-        versionCode: 29,
+        versionCode: 30,
         versionName: defaultVer,
         sha256: "",
         sizeBytes: 0,
@@ -272,8 +273,8 @@ export class PhoneSessionManager extends EventEmitter {
     }
 
     const stat = fs.statSync(apkPath);
-    let versionCode = 29;
-    let versionName = "1.5.5";
+    let versionCode = 30;
+    let versionName = "1.5.6";
     const fileMatch = path.basename(apkPath).match(/^OneMoreStep-v([\d.]+)\.apk$/);
     if (fileMatch) {
       versionName = fileMatch[1];
@@ -1032,6 +1033,7 @@ export class PhoneSessionManager extends EventEmitter {
     if (bestTier !== this.activeTier) {
       const prev = this.activeTier;
       this.activeTier = bestTier;
+      ++this.activeRouteGeneration;
       this.emit("tierChanged", { previous: prev, current: bestTier });
       if (bestTier !== "DISCONNECTED") {
         this.flushOutQueue();
@@ -1404,6 +1406,23 @@ export class PhoneSessionManager extends EventEmitter {
   }
 
   /**
+   * Capture one authenticated physical connection for a multi-step operation.
+   * A later route change or reconnect invalidates this caller; it never silently
+   * transfers an already authorized operation to another connection or phone.
+   */
+  public bindPhoneSession(): <TResult = any>(method: string, params: Record<string, unknown>, timeoutMs?: number) => Promise<TResult> {
+    const pipe = this.pipes.get(this.activeTier);
+    if (!pipe || !this.isLivePipe(pipe)) {
+      throw Object.assign(new Error("Xiaomi phone is currently disconnected across all tiers (LAN / Bluetooth / WAN)."), {
+        code: OmsErrorCode.ERR_DEVICE_OFFLINE,
+      });
+    }
+    const routeGeneration = this.activeRouteGeneration;
+    return <TResult = any>(method: string, params: Record<string, unknown>, timeoutMs?: number) =>
+      this.callPhoneOnPipe<TResult>(pipe, routeGeneration, method, params, timeoutMs);
+  }
+
+  /**
    * Call a JSON-RPC 2.0 method on the connected Xiaomi phone
    */
   public async callPhone<TResult = any>(
@@ -1411,15 +1430,22 @@ export class PhoneSessionManager extends EventEmitter {
     params: Record<string, unknown> = {},
     timeoutMs?: number
   ): Promise<TResult> {
-    const pipe = this.pipes.get(this.activeTier);
-    if (!pipe || !this.isLivePipe(pipe)) {
-      const err = new Error(
-        "Xiaomi phone is currently disconnected across all tiers (LAN / Bluetooth / WAN)."
-      ) as Error & { code?: number };
-      err.code = OmsErrorCode.ERR_DEVICE_OFFLINE;
-      throw err;
+    return this.bindPhoneSession()<TResult>(method, params, timeoutMs);
+  }
+
+  private async callPhoneOnPipe<TResult>(
+    pipe: ActiveTransportPipe,
+    routeGeneration: number,
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs?: number
+  ): Promise<TResult> {
+    // No await between this check and sendSecure: routing cannot change while
+    // preparing a dispatch. A submitted request/reply remains bound to this pipe.
+    if (routeGeneration !== this.activeRouteGeneration || !this.isLivePipe(pipe) || this.pipes.get(this.activeTier) !== pipe) {
+      throw new Error("ERR_SESSION_REVOKED: Phone connection changed; request a new operation");
     }
-    const effectiveTimeoutMs = timeoutMs ?? (this.activeTier === "BT_RFCOMM" ? 45000 : 15000);
+    const effectiveTimeoutMs = timeoutMs ?? (pipe.tier === "BT_RFCOMM" ? 45000 : 15000);
 
     const reqId = `req_${generateUuidV7()}`;
     const frame = encodeJsonRpcFrame({

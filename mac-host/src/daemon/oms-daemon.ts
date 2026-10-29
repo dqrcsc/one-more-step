@@ -1,10 +1,11 @@
-import { approvalTimeoutSec } from "./request-timeouts.js";
+import { approvalTimeoutSec, boundedControlDeadline } from "./request-timeouts.js";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import crypto from "node:crypto";
 import { execFile, execFileSync, spawn } from "node:child_process";
+import { synthesizeNeuralAudio, neuralTtsPython, type TtsFallbackReason } from "./neural-tts.js";
 import {
   AirPodsStatusSnapshot,
   ApprovalRespondParams,
@@ -96,6 +97,10 @@ export class OmsDaemon {
 
   // Real-time screen mirroring state
   private mirrorRunning = false;
+  private mirrorStartPending = false;
+  private mirrorGeneration = 0;
+  private mirrorLifecycleQueue: Promise<void> = Promise.resolve();
+  private mirrorDisposed = false;
   private mirrorMode: "native_stream" | "legacy_poll" | "stopped" = "stopped";
   private mirrorMaxWidth = 640;
   private mirrorQuality = 72;
@@ -330,7 +335,7 @@ export class OmsDaemon {
 
   public async synthesizeNeuralTts(
     rawText: string,
-    opts?: { voice?: string; rate?: string; pitch?: string }
+    opts?: { voice?: string; rate?: string; pitch?: string; onFallback?: (reason: TtsFallbackReason) => void }
   ): Promise<{
     audioBase64: string;
     voiceId: string;
@@ -344,87 +349,17 @@ export class OmsDaemon {
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, 600);
-    if (!cleanText) return null;
+    if (!cleanText) { opts?.onFallback?.("empty_text"); return null; }
 
     const resolved = this.resolveNeuralTtsVoice(opts?.voice);
     const rate = opts?.rate || "+6%";
     const pitch = opts?.pitch || "+0Hz";
-    const cacheDir = path.join(this.homeDir, "cache", "tts");
-    fs.mkdirSync(cacheDir, { recursive: true });
-    const hash = crypto
-      .createHash("sha256")
-      .update(`${resolved.voiceId}|${rate}|${pitch}|${cleanText}`)
-      .digest("hex")
-      .slice(0, 32);
-    const mp3Path = path.join(cacheDir, `${hash}.mp3`);
-
-    try {
-      if (fs.existsSync(mp3Path)) {
-        const stat = fs.statSync(mp3Path);
-        if (stat.size > 200) {
-          const buf = fs.readFileSync(mp3Path);
-          return {
-            audioBase64: buf.toString("base64"),
-            voiceId: resolved.voiceId,
-            voiceLabel: resolved.label,
-            cached: true,
-            bytes: buf.length,
-          };
-        }
-      }
-    } catch {
-      // regenerate
-    }
-
-    const studioScriptDir = path.join(
-      os.homedir(),
-      ".codex",
-      "skills",
-      "video-neural-voiceover",
-      "scripts"
-    );
-    const studioScriptFile = path.join(studioScriptDir, "neural_voiceover_studio.py");
-    if (!fs.existsSync(studioScriptFile)) {
-      return null;
-    }
-
-    const pyCode = [
-      "import sys, os",
-      `sys.path.insert(0, ${JSON.stringify(studioScriptDir)})`,
-      "from neural_voiceover_studio import synthesize_edge_tts",
-      "ca = '/etc/ssl/cert.pem' if os.path.exists('/etc/ssl/cert.pem') else None",
-      "synthesize_edge_tts(sys.argv[1], voice=sys.argv[2], out_mp3=sys.argv[3], rate=sys.argv[4], pitch=sys.argv[5], ca_file=ca)",
-    ].join("; ");
-
-    return await new Promise((resolve) => {
-      execFile(
-        "python3",
-        ["-c", pyCode, cleanText, resolved.voiceId, mp3Path, rate, pitch],
-        { timeout: 7500 },
-        (err) => {
-          if (err || !fs.existsSync(mp3Path)) {
-            resolve(null);
-            return;
-          }
-          try {
-            const buf = fs.readFileSync(mp3Path);
-            if (buf.length <= 200) {
-              resolve(null);
-              return;
-            }
-            resolve({
-              audioBase64: buf.toString("base64"),
-              voiceId: resolved.voiceId,
-              voiceLabel: resolved.label,
-              cached: false,
-              bytes: buf.length,
-            });
-          } catch {
-            resolve(null);
-          }
-        }
-      );
+    const audio = await synthesizeNeuralAudio({
+      homeDir: this.homeDir, text: cleanText, voice: resolved.voiceId, rate, pitch,
     });
+    if (!audio.ok) { opts?.onFallback?.(audio.reason); return null; }
+    return { audioBase64: audio.audioBase64, voiceId: resolved.voiceId, voiceLabel: resolved.label,
+      cached: audio.cached, bytes: audio.bytes };
   }
 
   public copyTextToMacClipboard(text: string): void {
@@ -569,14 +504,14 @@ export class OmsDaemon {
             clearTimeout(this.mirrorIdleStopTimer);
             this.mirrorIdleStopTimer = null;
           }
-          if (!this.mirrorRunning && this.session.getActiveTier() !== "DISCONNECTED") {
+          if (!this.mirrorDisposed && !this.mirrorRunning && !this.mirrorStartPending && this.session.getActiveTier() !== "DISCONNECTED") {
             void this.startMirror({}).catch(() => {});
           }
-        } else if (this.mirrorRunning) {
+        } else if (this.mirrorRunning || this.mirrorStartPending) {
           if (this.mirrorIdleStopTimer) clearTimeout(this.mirrorIdleStopTimer);
           this.mirrorIdleStopTimer = setTimeout(() => {
             this.mirrorIdleStopTimer = null;
-            if (this.session.getMirrorViewerCount() === 0 && this.mirrorRunning) {
+            if (this.session.getMirrorViewerCount() === 0 && (this.mirrorRunning || this.mirrorStartPending)) {
               void this.stopMirror().catch(() => {});
             }
           }, 25000);
@@ -795,10 +730,11 @@ export class OmsDaemon {
             const p = (req.params || {}) as Record<string, any>;
             const text = String(p.text || "").trim();
             const voice = p.voice ? String(p.voice) : undefined;
-            void this.synthesizeNeuralTts(text, { voice })
+            let fallbackReason: TtsFallbackReason | undefined;
+            void this.synthesizeNeuralTts(text, { voice, onFallback: (reason) => { fallbackReason = reason; } })
               .then((res) => {
                 if (!res) {
-                  reply({ result: { ok: false } });
+                  reply({ result: { ok: false, ttsEngine: "android_local", ttsFallbackReason: fallbackReason || "synthesis_failed" } });
                   return;
                 }
                 reply({
@@ -985,6 +921,20 @@ export class OmsDaemon {
   }
 
   public async switchAirpodsToPhone(targetMac?: string, reason = "manual"): Promise<Record<string, any>> {
+    const failure = (stage: string, message: string, phoneResult: any = null) => ({
+      ok: false,
+      direction: "MAC_TO_PHONE",
+      stage,
+      message,
+      phoneResult,
+      status: this.getAirpodsStatusSnapshot(),
+    });
+    // Do not disconnect a working Mac audio route when the destination cannot receive a command.
+    if (this.session.getActiveTier() === "DISCONNECTED") {
+      return failure("phone_unavailable", "手机离线，未释放 Mac 耳机连接");
+    }
+    const bridge = this.session.getBluetoothBridge();
+    if (!bridge) return failure("mac_release", "Mac 蓝牙桥不可用，未释放耳机连接");
     const pauseMacMedia = this.config.pauseOtherOnAirpodsSwitch !== false;
     this.lastAirpodsSwitchEvent = {
       direction: "MAC_TO_PHONE",
@@ -992,33 +942,37 @@ export class OmsDaemon {
       deviceMac: targetMac,
       atMs: Date.now(),
     };
-    await this.session
-      .getBluetoothBridge()
-      ?.releaseAirpodsFromMac({
-        pauseMedia: pauseMacMedia,
-        targetMac,
-        timeoutMs: 2500,
-      })
-      .catch(() => {});
-    let phoneRes: any = null;
-    if (this.session.getActiveTier() !== "DISCONNECTED") {
-      phoneRes = await this.session
-        .callPhone<any>(
-          "airpods.connectOnPhone",
-          {
-            targetMac: targetMac || this.config.preferredAirpodsMac,
-            reason,
-          },
-          5500
-        )
-        .catch((err) => ({ ok: false, error: err?.message || String(err) }));
-      if (phoneRes?.status) {
-        this.session.setPhoneStatus(phoneRes.status);
-        this.ingestPhoneAirpodsSnapshot(phoneRes.status);
-      }
+    const releaseResult = await bridge.releaseAirpodsFromMac({
+      pauseMedia: pauseMacMedia,
+      targetMac,
+      timeoutMs: 2500,
+    })
+      .catch((err) => ({ ok: false, message: err?.message || String(err) }));
+    if (!releaseResult?.ok) {
+      return failure("mac_release", releaseResult?.message || "Mac 耳机释放未确认");
+    }
+    if (this.session.getActiveTier() === "DISCONNECTED") {
+      return failure("phone_connect", "Mac 已释放耳机，但手机连接已断开，切换未完成");
+    }
+    const phoneRes = await this.session
+      .callPhone<any>(
+        "airpods.connectOnPhone",
+        {
+          targetMac: targetMac || this.config.preferredAirpodsMac,
+          reason,
+        },
+        5500
+      )
+      .catch((err) => ({ ok: false, error: err?.message || String(err) }));
+    if (phoneRes?.status) {
+      this.session.setPhoneStatus(phoneRes.status);
+      this.ingestPhoneAirpodsSnapshot(phoneRes.status);
+    }
+    if (!phoneRes?.ok) {
+      return failure("phone_connect", phoneRes?.error || phoneRes?.message || "手机连接耳机未确认", phoneRes);
     }
     return {
-      ok: phoneRes ? Boolean(phoneRes.ok) : true,
+      ok: true,
       direction: "MAC_TO_PHONE",
       phoneResult: phoneRes,
       status: this.getAirpodsStatusSnapshot(),
@@ -1209,8 +1163,10 @@ export class OmsDaemon {
 
   private startLegacyMirrorLoop(): void {
     this.stopLegacyMirrorLoop();
+    const generation = this.mirrorGeneration;
+    const isCurrent = () => generation === this.mirrorGeneration && this.mirrorRunning && this.mirrorMode === "legacy_poll";
     const pollOnce = async () => {
-      if (!this.mirrorRunning || this.mirrorMode !== "legacy_poll") return;
+      if (!isCurrent()) return;
       if (this.session.getActiveTier() === "DISCONNECTED") {
         this.mirrorLegacyPollTimer = setTimeout(pollOnce, 1000);
         (this.mirrorLegacyPollTimer as any).unref?.();
@@ -1228,6 +1184,7 @@ export class OmsDaemon {
             );
             streamId = res?.streamId;
           } catch (err: any) {
+            if (!isCurrent()) return;
             const msg = String(err?.message || "");
             if (msg.includes("ERR_SECURE_WINDOW_BLOCKED") || msg.includes("隐私保护")) {
               const seq = (this.mirrorSeq + 1) & 0xffff;
@@ -1246,14 +1203,15 @@ export class OmsDaemon {
                 { includeScreenshot: true, somAnnotation: false },
                 6000
               );
+              if (!isCurrent()) return;
               if (obs?.screenWidth) this.mirrorWidth = obs.screenWidth;
               if (obs?.screenHeight) this.mirrorHeight = obs.screenHeight;
               streamId = obs?.screenshotStreamId;
             }
           }
-          if (streamId && this.mirrorRunning) {
+          if (streamId && isCurrent()) {
             const comp = await this.session.waitForCompletedStream(streamId, 5000);
-            if (comp && fs.existsSync(comp.savedAbsPath)) {
+            if (comp && isCurrent() && fs.existsSync(comp.savedAbsPath)) {
               const imgBytes = new Uint8Array(fs.readFileSync(comp.savedAbsPath));
               try {
                 fs.unlinkSync(comp.savedAbsPath);
@@ -1278,10 +1236,10 @@ export class OmsDaemon {
         } catch {
           // ignore transient poll error
         } finally {
-          this.mirrorLegacyPollingInFlight = false;
+          if (generation === this.mirrorGeneration) this.mirrorLegacyPollingInFlight = false;
         }
       }
-      if (!this.mirrorRunning || this.mirrorMode !== "legacy_poll") return;
+      if (!isCurrent()) return;
       const isBoosted = Date.now() < this.mirrorLegacyBoostUntilMs;
       const delayMs = isBoosted ? 180 : 520;
       this.mirrorLegacyPollTimer = setTimeout(pollOnce, delayMs);
@@ -1291,7 +1249,17 @@ export class OmsDaemon {
     void pollOnce();
   }
 
+  private queueMirrorOperation(operation: () => Promise<MirrorStatusSnapshot>): Promise<MirrorStatusSnapshot> {
+    const result = this.mirrorLifecycleQueue.then(operation);
+    // A failed RPC must not prevent a later stop/restart from running.
+    this.mirrorLifecycleQueue = result.then(() => {}, () => {});
+    return result;
+  }
+
   public async startMirror(params: Record<string, any> = {}): Promise<MirrorStatusSnapshot> {
+    if (this.mirrorDisposed) throw new Error("Daemon stopping; mirror start rejected");
+    const generation = ++this.mirrorGeneration;
+    this.mirrorStartPending = true;
     if (this.mirrorIdleStopTimer) {
       clearTimeout(this.mirrorIdleStopTimer);
       this.mirrorIdleStopTimer = null;
@@ -1306,50 +1274,68 @@ export class OmsDaemon {
       this.mirrorMaxFps = Math.max(2, Math.min(12, Math.round(params.maxFps)));
     }
     const autoWake = params.autoWake !== false;
+    const request = {
+      maxWidth: this.mirrorMaxWidth,
+      quality: this.mirrorQuality,
+      maxFps: this.mirrorMaxFps,
+      autoWake,
+      keepScreenOn: params.keepScreenOn !== false,
+    };
 
-    try {
-      const res = await this.session.callPhone<any>(
-        "mirror.start",
-        {
-          maxWidth: this.mirrorMaxWidth,
-          quality: this.mirrorQuality,
-          maxFps: this.mirrorMaxFps,
-          autoWake,
-          keepScreenOn: params.keepScreenOn !== false,
-        },
-        6000
-      );
-      this.stopLegacyMirrorLoop();
-      this.mirrorRunning = true;
-      this.mirrorMode = "native_stream";
-      if (res?.screenWidth) this.mirrorWidth = Number(res.screenWidth);
-      if (res?.screenHeight) this.mirrorHeight = Number(res.screenHeight);
-    } catch (err: any) {
-      const msg = String(err?.message || "");
-      if (msg.includes("Unknown RPC method")) {
-        // Seamless backward-compatible fallback for APK <= v1.4.9
+    return this.queueMirrorOperation(async () => {
+      if (generation !== this.mirrorGeneration || this.mirrorDisposed) return this.getMirrorStatus();
+
+      try {
+        const res = await this.session.callPhone<any>(
+          "mirror.start",
+          request,
+          6000
+        );
+        // A stop queued while this RPC was pending owns the state now. It will also
+        // send mirror.stop after this response, so the phone cannot remain capturing.
+        if (generation !== this.mirrorGeneration || this.mirrorDisposed) return this.getMirrorStatus();
+        if (res?.ok === false) throw new Error(res.error || "Phone rejected mirror start");
+        this.stopLegacyMirrorLoop();
         this.mirrorRunning = true;
-        this.mirrorMode = "legacy_poll";
-        if (autoWake) {
-          const ps = this.session.getPhoneStatus();
-          if (ps?.screenInteractive === false) {
-            void this.session
-              .callPhone("sys.control", { action: "unlock_screen", pattern: "", bounds: "" }, 4000)
-              .catch(() => {});
+        this.mirrorMode = "native_stream";
+        if (res?.screenWidth) this.mirrorWidth = Number(res.screenWidth);
+        if (res?.screenHeight) this.mirrorHeight = Number(res.screenHeight);
+      } catch (err: any) {
+        if (generation !== this.mirrorGeneration || this.mirrorDisposed) return this.getMirrorStatus();
+        const msg = String(err?.message || "");
+        if (msg.includes("Unknown RPC method")) {
+          // Seamless backward-compatible fallback for APK <= v1.4.9
+          this.mirrorRunning = true;
+          this.mirrorMode = "legacy_poll";
+          if (autoWake) {
+            const ps = this.session.getPhoneStatus();
+            if (ps?.screenInteractive === false) {
+              void this.session
+                .callPhone("sys.control", { action: "unlock_screen", pattern: "", bounds: "" }, 4000)
+                .catch(() => {});
+            }
           }
+          this.startLegacyMirrorLoop();
+        } else {
+          this.mirrorRunning = false;
+          this.mirrorMode = "stopped";
+          this.stopLegacyMirrorLoop();
+          throw err;
         }
-        this.startLegacyMirrorLoop();
-      } else {
-        throw err;
+      } finally {
+        if (generation === this.mirrorGeneration) this.mirrorStartPending = false;
       }
-    }
 
-    const snap = this.getMirrorStatus();
-    this.session.broadcastMirrorEvent({ type: "mirror_status", status: snap });
-    return snap;
+      const snap = this.getMirrorStatus();
+      this.session.broadcastMirrorEvent({ type: "mirror_status", status: snap });
+      return snap;
+    });
   }
 
   public async stopMirror(): Promise<MirrorStatusSnapshot> {
+    const hadActiveRequest = this.mirrorRunning || this.mirrorStartPending;
+    ++this.mirrorGeneration;
+    this.mirrorStartPending = false;
     this.mirrorRunning = false;
     this.mirrorMode = "stopped";
     this.stopLegacyMirrorLoop();
@@ -1357,12 +1343,17 @@ export class OmsDaemon {
       clearTimeout(this.mirrorIdleStopTimer);
       this.mirrorIdleStopTimer = null;
     }
-    if (this.session.getActiveTier() !== "DISCONNECTED") {
-      await this.session.callPhone("mirror.stop", {}, 3000).catch(() => {});
-    }
-    const snap = this.getMirrorStatus();
-    this.session.broadcastMirrorEvent({ type: "mirror_status", status: snap });
-    return snap;
+    return this.queueMirrorOperation(async () => {
+      if (this.session.getActiveTier() !== "DISCONNECTED") {
+        const res = await this.session.callPhone<any>("mirror.stop", {}, 3000);
+        if (res?.ok === false) throw new Error(res.error || "Phone rejected mirror stop");
+      } else if (hadActiveRequest) {
+        throw new Error("Phone disconnected; mirror stop was not confirmed");
+      }
+      const snap = this.getMirrorStatus();
+      this.session.broadcastMirrorEvent({ type: "mirror_status", status: snap });
+      return snap;
+    });
   }
 
   public async sendMirrorInput(params: Record<string, any>): Promise<any> {
@@ -1374,82 +1365,28 @@ export class OmsDaemon {
         action: "unlock_screen",
         pattern: params.pattern,
         pin: params.pin,
+        bounds: params.bounds,
+        deadlineMs: params.deadlineMs,
       });
     }
 
-    const rpcPayload = {
-      ...params,
-      type: inputType,
-    };
-
+    const deadlineMs = boundedControlDeadline(params.deadlineMs, 5000);
+    const callPhone = this.session.bindPhoneSession();
     if (this.mirrorMode !== "legacy_poll") {
       try {
-        return await this.session.callPhone("mirror.input", rpcPayload, 6000);
+        return await callPhone("mirror.input", { ...params, type: inputType, deadlineMs },
+          Math.max(1, deadlineMs - Date.now()));
       } catch (err: any) {
-        if (!String(err?.message || "").includes("Unknown RPC method")) {
-          throw err;
-        }
+        if (!String(err?.message || "").includes("Unknown RPC method")) throw err;
       }
     }
-
-    // Legacy fallback input translation for APK <= v1.4.9
-    const w = this.mirrorWidth || 1080;
-    const h = this.mirrorHeight || 2400;
-    const toPxX = (norm?: number, px?: number) =>
-      typeof norm === "number" ? Math.round(norm * w) : typeof px === "number" ? Math.round(px) : Math.round(w / 2);
-    const toPxY = (norm?: number, px?: number) =>
-      typeof norm === "number" ? Math.round(norm * h) : typeof px === "number" ? Math.round(px) : Math.round(h / 2);
-
-    if (inputType === "tap" || inputType === "click" || inputType === "long_press") {
-      const x = toPxX(params.normX, params.x);
-      const y = toPxY(params.normY, params.y);
-      return await this.session.callPhone("gui.act", {
-        action: inputType === "long_press" ? "long_click" : "click",
-        x,
-        y,
-        deadlineMs: Date.now() + 10000,
-      });
-    }
-    if (inputType === "swipe" || inputType === "drag") {
-      const x1 = toPxX(params.normX1 ?? params.normX, params.x1 ?? params.x);
-      const y1 = toPxY(params.normY1 ?? params.normY, params.y1 ?? params.y);
-      const x2 = toPxX(params.normX2, params.x2);
-      const y2 = toPxY(params.normY2, params.y2);
-      return await this.session.callPhone("gui.act", {
-        action: "swipe",
-        x: x1,
-        y: y1,
-        x2,
-        y2,
-        deadlineMs: Date.now() + 10000,
-      });
-    }
-    if (inputType === "scroll" || inputType === "wheel") {
-      const dy = Number(params.deltaY ?? 120);
-      return await this.session.callPhone("gui.act", {
-        action: dy >= 0 ? "scroll_down" : "scroll_up",
-        deadlineMs: Date.now() + 10000,
-      });
-    }
-    if (inputType === "text" || inputType === "input_text") {
-      const text = String(params.text || "");
-      await this.session.callPhone("clipboard.set", { text, showToast: false }).catch(() => {});
-      return await this.session
-        .callPhone("gui.act", {
-          action: "input_text",
-          text,
-          deadlineMs: Date.now() + 10000,
-        })
-        .catch(() => ({ ok: true, clipboardFallback: true }));
-    }
-    if (inputType === "key" || inputType === "nav") {
-      const key = String(params.key || params.target || "home").toLowerCase();
-      return await this.session.callPhone("sys.control", {
-        action: "system_action",
-        target: key,
-      });
-    }
-    return { ok: false, error: `Unsupported mirror input type: ${inputType}` };
+    // Legacy input translations bypassed mirror authorization and could report
+    // clipboard delivery as successful text entry. Require the guarded endpoint.
+    return {
+      ok: false,
+      requiresApkUpdate: true,
+      error: "ERR_PHONE_UPDATE_REQUIRED: Update the Android app before mirror input; no fallback input was sent",
+    };
   }
 
   public async start(opts?: { startTransport?: boolean }): Promise<void> {
@@ -1884,10 +1821,12 @@ export class OmsDaemon {
             ? Math.max(1, Math.min(20, Math.round(params.repeat)))
             : 1;
         let neuralTts: Awaited<ReturnType<typeof this.synthesizeNeuralTts>> = null;
+        let ttsFallbackReason: TtsFallbackReason | undefined;
         if (ttsSpeak) {
           const speakContent = [title, body].filter(Boolean).join("。");
           neuralTts = await this.synthesizeNeuralTts(speakContent, {
             voice: params.voice ? String(params.voice) : undefined,
+            onFallback: (reason) => { ttsFallbackReason = reason; },
           });
         }
 
@@ -1909,7 +1848,7 @@ export class OmsDaemon {
                 voiceLabel: neuralTts.voiceLabel,
                 cached: neuralTts.cached,
               }
-            : {}),
+            : ttsSpeak ? { ttsEngine: "android_local", ttsFallbackReason } : {}),
         };
       }
 
@@ -2099,233 +2038,67 @@ export class OmsDaemon {
         }
 
         if (subAction === "unlock_screen" || subAction === "unlock") {
-          const rawPattern =
-            typeof params.pattern === "string" && params.pattern.trim()
-              ? params.pattern.trim()
-              : undefined;
-          const rawPin =
-            typeof params.pin === "string" && params.pin.trim()
-              ? params.pin.trim()
-              : undefined;
-          const rawBounds =
-            typeof params.bounds === "string" && params.bounds.trim()
-              ? params.bounds.trim()
-              : undefined;
-          if (params.savePattern && rawPattern) {
-            this.updateHostPreferences({ unlockPattern: rawPattern });
-          }
-          if (params.savePin && rawPin) {
-            this.updateHostPreferences({ unlockPin: rawPin });
-          }
-          if ((params.saveBounds || params.savePattern) && rawBounds) {
-            this.updateHostPreferences({ unlockBounds: rawBounds });
-          }
-          const effectivePattern = rawPattern || this.config.unlockPattern || "";
-          const effectivePin = rawPin || this.config.unlockPin || "";
-          const effectiveBounds = rawBounds || this.config.unlockBounds || "175,1516,1045,2386";
-          const unlockPayload = {
-            ...params,
-            action: "unlock_screen",
-            pattern: effectivePattern,
-            pin: effectivePin,
-            bounds: effectiveBounds,
-          };
+          const deadlineMs = boundedControlDeadline(params.deadlineMs, 25000);
+          const callPhone = this.session.bindPhoneSession();
+          const rawPattern = typeof params.pattern === "string" && params.pattern.trim() ? params.pattern.trim() : undefined;
+          const rawPin = typeof params.pin === "string" && params.pin.trim() ? params.pin.trim() : undefined;
+          const rawBounds = typeof params.bounds === "string" && params.bounds.trim() ? params.bounds.trim() : undefined;
+          if (params.savePattern && rawPattern) this.updateHostPreferences({ unlockPattern: rawPattern });
+          if (params.savePin && rawPin) this.updateHostPreferences({ unlockPin: rawPin });
+          if ((params.saveBounds || params.savePattern) && rawBounds) this.updateHostPreferences({ unlockBounds: rawBounds });
 
           try {
-            const cachedStatus = this.session.getPhoneStatus();
-            if (effectivePattern && cachedStatus && cachedStatus.screenInteractive === false) {
-              await this.session
-                .callPhone<any>(
-                  "sys.control",
-                  { action: "unlock_screen", pattern: "", bounds: "" },
-                  10000
-                )
-                .catch(() => {});
-              await new Promise((r) => setTimeout(r, 750));
-            }
-
-            let res = await this.session.callPhone<any>(
-              "sys.control",
-              unlockPayload,
-              25000
-            );
-            if (effectivePattern && res && res.unlocked === false && res.screenLocked === true) {
-              await new Promise((r) => setTimeout(r, 450));
-              res = await this.session.callPhone<any>(
-                "sys.control",
-                {
-                  ...params,
-                  action: "unlock_screen",
-                  pattern: effectivePattern,
-                  pin: effectivePin,
-                  bounds: "",
-                },
-                25000
-              );
-            }
-            if (res?.status) {
-              this.session.setPhoneStatus(res.status);
-            } else {
-              void this.refreshPhoneStatusLive(true);
-            }
+            // Android owns wake/unlock sequencing under one lock and one deadline.
+            // Never retry credentials or navigate a legacy phone after a failed attempt.
+            const res = await callPhone<any>("sys.control", {
+              ...params,
+              action: "unlock_screen",
+              pattern: rawPattern || this.config.unlockPattern || "",
+              pin: rawPin || this.config.unlockPin || "",
+              bounds: rawBounds || this.config.unlockBounds || "175,1516,1045,2386",
+              deadlineMs,
+            }, Math.max(1, deadlineMs - Date.now()));
+            if (res?.status) this.session.setPhoneStatus(res.status);
             return {
               ...res,
               savedPatternToMacConfig: Boolean(params.savePattern && rawPattern),
               savedBoundsToMacConfig: Boolean((params.saveBounds || params.savePattern) && rawBounds),
             };
           } catch (err: any) {
-            const msg = String(err?.message || "");
-            if (msg.includes("Unsupported sys.control action")) {
-              // APK < v1.4.7 fallback: wake screen + swipe up to bouncer, and prompt OTA update
-              await this.session
-                .callPhone("sys.control", { action: "launch_app", packageOrAlias: "oms" })
-                .catch(() => {});
-              await this.session
-                .callPhone("gui.act", { action: "scroll_down", deadlineMs: Date.now() + 15000 })
-                .catch(() => {});
-              return {
-                ok: false,
-                action: "unlock_screen",
-                bouncerOpened: true,
-                requiresApkUpdate: true,
-                savedPatternToMacConfig: Boolean(params.savePattern && rawPattern),
-                error:
-                  "已点亮屏幕并上滑唤出图案密码盘；当前手机端 APK 版本低于 v1.4.7，请运行 `oms ota` 升级手机端后即可支持连续轨迹图案自动绘制解锁。",
-              };
-            }
-            throw err;
+            if (!String(err?.message || "").includes("Unsupported sys.control action")) throw err;
+            return {
+              ok: false, action: "unlock_screen", unlocked: false, requiresApkUpdate: true,
+              error: "ERR_PHONE_UPDATE_REQUIRED: Update the Android app before remote unlock; no fallback gestures were sent",
+            };
           }
         }
 
         if (subAction === "call_phone" || subAction === "call" || subAction === "dial") {
+          const deadlineMs = boundedControlDeadline(params.deadlineMs, 25000);
           const rawNum = String(params.number || params.phoneNumber || params.text || "").trim();
           const cleanNumber = rawNum.replace(/[^\d+*#,]/g, "");
-          if (!cleanNumber) {
-            throw new Error("请提供要拨打的电话号码，例如: oms phone call 10000");
-          }
-          const dialOnly = subAction === "dial" ? true : Boolean(params.dialOnly);
-          const simSlot = params.simSlot !== undefined ? String(params.simSlot) : params.sim !== undefined ? String(params.sim) : "1";
-          const speaker = Boolean(params.speaker);
-
-          // Auto-unlock first if phone is locked
-          const cached = this.session.getPhoneStatus();
-          if (!cached || cached.screenLocked !== false || cached.screenInteractive === false) {
-            await this.handleIpcAction("phone_device_control", {
-              action: "unlock_screen",
-              pattern: params.pattern,
-              pin: params.pin,
-            }).catch(() => {});
-            await new Promise((r) => setTimeout(r, 400));
-          }
-
+          if (!cleanNumber) throw new Error("请提供要拨打的电话号码，例如: oms phone call 10000");
+          const callPhone = this.session.bindPhoneSession();
           try {
-            const res = await this.session.callPhone<any>(
-              "sys.control",
-              {
-                action: "call_phone",
-                number: cleanNumber,
-                dialOnly,
-                simSlot,
-                speaker,
-                pattern: this.config.unlockPattern,
-                pin: this.config.unlockPin,
-                bounds: this.config.unlockBounds || "175,1516,1045,2386",
-              },
-              25000
-            );
+            // A single session-bound request lets Android abort before dialing when
+            // unlock fails, the emergency stop is pressed, or authorization expires.
+            const res = await callPhone<any>("sys.control", {
+              action: "call_phone", number: cleanNumber,
+              dialOnly: subAction === "dial" || Boolean(params.dialOnly),
+              simSlot: String(params.simSlot ?? params.sim ?? "1"),
+              speaker: Boolean(params.speaker),
+              pattern: typeof params.pattern === "string" ? params.pattern : this.config.unlockPattern,
+              pin: typeof params.pin === "string" ? params.pin : this.config.unlockPin,
+              bounds: typeof params.bounds === "string" ? params.bounds : this.config.unlockBounds || "175,1516,1045,2386",
+              deadlineMs,
+            }, Math.max(1, deadlineMs - Date.now()));
             if (res?.status) this.session.setPhoneStatus(res.status);
             return res;
           } catch (err: any) {
-            if (!String(err?.message || "").includes("Unsupported sys.control action")) {
-              throw err;
-            }
-            // Seamless execution for APK <= v1.4.8 via tel:// URI + Accessibility SIM button click
-            await this.session.callPhone<any>("sys.control", {
-              action: "open_url",
-              url: `tel://${cleanNumber}`,
-            });
-            if (dialOnly) {
-              return {
-                ok: true,
-                action: "call_phone",
-                number: cleanNumber,
-                dialedOnly: true,
-                callPlaced: false,
-              };
-            }
-            await new Promise((r) => setTimeout(r, 500));
-            const obs = await this.session.callPhone<any>("gui.observe", {
-              includeScreenshot: false,
-              somAnnotation: false,
-            });
-            const nodes: any[] = Array.isArray(obs?.nodes) ? obs.nodes : [];
-            const callBtns = nodes
-              .filter(
-                (n) =>
-                  n.clickable &&
-                  (n.role === "Button" || n.role === "ImageButton") &&
-                  Array.isArray(n.bounds) &&
-                  n.bounds[1] >= 2100 &&
-                  n.bounds[0] >= 220 &&
-                  n.bounds[2] <= 1000 &&
-                  !String(n.label || "").includes("菜单") &&
-                  !String(n.label || "").includes("关闭")
-              )
-              .sort((a, b) => (a.center?.[0] || 0) - (b.center?.[0] || 0));
-
-            let chosen =
-              callBtns.find((b) => simSlot && String(b.label || "").includes(simSlot)) ||
-              (simSlot === "2" && callBtns.length >= 2 ? callBtns[1] : callBtns[0]);
-
-            if (chosen) {
-              await this.session.callPhone<any>("gui.act", {
-                action: "click",
-                targetNodeId: chosen.id,
-                observationId: obs.observationId,
-                deadlineMs: Date.now() + 15000,
-              });
-            } else {
-              const tapX = simSlot === "2" ? 781 : 438;
-              await this.session.callPhone<any>("gui.act", {
-                action: "click",
-                x: tapX,
-                y: 2344,
-                deadlineMs: Date.now() + 15000,
-              });
-            }
-
-            let speakerEnabled = false;
-            if (speaker) {
-              await new Promise((r) => setTimeout(r, 1800));
-              const inCallObs = await this.session
-                .callPhone<any>("gui.observe", { includeScreenshot: false, somAnnotation: false })
-                .catch(() => null);
-              const spkNode = (inCallObs?.nodes || []).find(
-                (n: any) =>
-                  n.clickable &&
-                  (String(n.label || "").includes("免提") ||
-                    String(n.label || "").includes("扬声器"))
-              );
-              if (spkNode) {
-                await this.session
-                  .callPhone<any>("gui.act", {
-                    action: "click",
-                    targetNodeId: spkNode.id,
-                    observationId: inCallObs.observationId,
-                    deadlineMs: Date.now() + 15000,
-                  })
-                  .catch(() => {});
-                speakerEnabled = true;
-              }
-            }
-
+            if (!String(err?.message || "").includes("Unsupported sys.control action")) throw err;
             return {
-              ok: true,
-              action: "call_phone",
-              number: cleanNumber,
-              simUsed: chosen?.label || (simSlot === "2" ? "SIM卡2" : "SIM卡1"),
-              callPlaced: true,
-              speakerEnabled,
+              ok: false, action: "call_phone", callPlaced: false, requiresApkUpdate: true,
+              error: "ERR_PHONE_UPDATE_REQUIRED: Update the Android app before remote dialing; no fallback gestures were sent",
             };
           }
         }
@@ -2343,34 +2116,11 @@ export class OmsDaemon {
             if (!String(err?.message || "").includes("Unsupported sys.control action")) {
               throw err;
             }
-            const obs = await this.session
-              .callPhone<any>("gui.observe", { includeScreenshot: false, somAnnotation: false })
-              .catch(() => null);
-            const hangupNode = (obs?.nodes || []).find(
-              (n: any) =>
-                n.clickable &&
-                (String(n.label || "").includes("挂断") ||
-                  String(n.label || "").includes("结束"))
-            );
-            if (hangupNode) {
-              await this.session.callPhone<any>("gui.act", {
-                action: "click",
-                targetNodeId: hangupNode.id,
-                observationId: obs.observationId,
-                deadlineMs: Date.now() + 15000,
-              });
-            } else {
-              await this.session.callPhone<any>("gui.act", {
-                action: "click",
-                x: 610,
-                y: 2345,
-                deadlineMs: Date.now() + 15000,
-              });
-            }
             return {
-              ok: true,
+              ok: false,
               action: "hangup_call",
-              hungUp: true,
+              hungUp: false,
+              error: "ERR_PHONE_UPDATE_REQUIRED: Phone cannot verify safe hangup; update the Android app or end the call on the phone",
             };
           }
         }
@@ -2384,6 +2134,8 @@ export class OmsDaemon {
           return {
             ok: true,
             currentVoice: current,
+            neuralTtsRuntimeInstalled: fs.existsSync(neuralTtsPython(this.homeDir)),
+            neuralTtsSetupCommand: "bun run setup:tts",
             voices: Object.entries(NEURAL_TTS_VOICE_CATALOG).map(([alias, v]) => ({
               alias,
               voiceId: v.id,
@@ -2395,6 +2147,7 @@ export class OmsDaemon {
 
         let enrichedParams: Record<string, any> = params;
         let neuralTtsMeta: Awaited<ReturnType<typeof this.synthesizeNeuralTts>> = null;
+        let ttsFallbackReason: TtsFallbackReason | undefined;
         if (subAction === "find_phone" || subAction === "tts_speak") {
           if (params.saveVoice && typeof params.voice === "string" && params.voice.trim()) {
             const resolved = this.resolveNeuralTtsVoice(params.voice);
@@ -2416,6 +2169,7 @@ export class OmsDaemon {
             this.suppressPhoneAirpodsClaimUntilMs = Date.now() + Math.max(12000, repeatCount * 4500);
             neuralTtsMeta = await this.synthesizeNeuralTts(speakText, {
               voice: params.voice ? String(params.voice) : undefined,
+              onFallback: (reason) => { ttsFallbackReason = reason; },
             });
           }
           enrichedParams = {
@@ -2456,6 +2210,9 @@ export class OmsDaemon {
               repeatCount: enrichedParams.repeatCount,
             };
           }
+          if (ttsFallbackReason && res && typeof res === "object") {
+            return { ...res, ttsEngine: "android_local", ttsFallbackReason };
+          }
           return res;
         } catch (err: any) {
           const msg = String(err?.message || "");
@@ -2465,7 +2222,7 @@ export class OmsDaemon {
           // Backward compatibility fallback for APK < v1.3.3
           if (subAction === "find_phone") {
             const text = String(enrichedParams.text || "正在寻找手机，我在这里！");
-            return await this.session.callPhone("notify.send", {
+            const fallback = await this.session.callPhone<any>("notify.send", {
               title: "🔔 Mac 正在寻找此手机",
               body: text,
               level: "urgent",
@@ -2474,10 +2231,11 @@ export class OmsDaemon {
               audioBase64: neuralTtsMeta?.audioBase64,
               repeatCount: enrichedParams.repeatCount,
             });
+            return { ...fallback, ...(ttsFallbackReason ? { ttsEngine: "android_local", ttsFallbackReason } : {}) };
           }
           if (subAction === "tts_speak") {
             const text = String(enrichedParams.text || "");
-            return await this.session.callPhone("notify.send", {
+            const fallback = await this.session.callPhone<any>("notify.send", {
               title: "🗣️ 语音播报",
               body: text,
               level: "silent",
@@ -2486,6 +2244,7 @@ export class OmsDaemon {
               audioBase64: neuralTtsMeta?.audioBase64,
               repeatCount: enrichedParams.repeatCount,
             });
+            return { ...fallback, ...(ttsFallbackReason ? { ttsEngine: "android_local", ttsFallbackReason } : {}) };
           }
           if (subAction === "open_url") {
             return await this.session.callPhone("gui.act", {
@@ -2558,11 +2317,18 @@ export class OmsDaemon {
   }
 
   public async stop(): Promise<void> {
-    this.mirrorRunning = false;
-    this.stopLegacyMirrorLoop();
-    if (this.mirrorIdleStopTimer) {
-      clearTimeout(this.mirrorIdleStopTimer);
-      this.mirrorIdleStopTimer = null;
+    this.mirrorDisposed = true;
+    // Drain an outstanding start and send its compensating stop before closing transport.
+    if (this.mirrorRunning || this.mirrorStartPending) {
+      await this.stopMirror().catch(() => {});
+    } else {
+      ++this.mirrorGeneration;
+      this.stopLegacyMirrorLoop();
+      if (this.mirrorIdleStopTimer) {
+        clearTimeout(this.mirrorIdleStopTimer);
+        this.mirrorIdleStopTimer = null;
+      }
+      await this.mirrorLifecycleQueue;
     }
     for (const [, w] of this.pendingApprovals) {
       clearTimeout(w.timer);

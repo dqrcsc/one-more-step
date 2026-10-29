@@ -8,6 +8,13 @@ const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "
 
 console.log("🚀 Setting up OneMoreStep (青简·咫尺)...");
 
+// Optional online voice provider. Failure must not prevent the local bridge from working.
+try {
+  execFileSync(process.execPath, [path.join(repoRoot, "scripts/setup-tts.ts")], { stdio: "inherit" });
+} catch {
+  console.warn("⚠️ Neural TTS unavailable; using Android local speech. Retry: bun run setup:tts");
+}
+
 // 1. Compile macOS CoreBluetooth bridge if on macOS
 if (process.platform === "darwin") {
   const btSrc = path.join(repoRoot, "mac-host/bluetooth-bridge/main.swift");

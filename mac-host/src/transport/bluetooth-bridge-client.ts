@@ -199,7 +199,7 @@ export class BluetoothBridgeServer extends EventEmitter {
     return await new Promise<Record<string, any>>((resolve) => {
       const timer = setTimeout(() => {
         this.pendingCmdWaiters.delete(reqId);
-        resolve({ ok: true, message: "已下发释放指令" });
+        resolve({ ok: false, message: "释放 AirPods 等待确认超时" });
       }, timeoutMs);
       this.pendingCmdWaiters.set(reqId, { resolve, timer });
       this.sendToBridge({

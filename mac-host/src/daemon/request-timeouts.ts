@@ -6,6 +6,14 @@ export function approvalTimeoutSec(value: unknown = 1800): number {
   return seconds;
 }
 
+/** A caller's shorter deadline survives every hop; malformed/expired actions never dispatch. */
+export function boundedControlDeadline(requested: unknown, maximumMs: number, now = Date.now()): number {
+  if (requested !== undefined && (typeof requested !== "number" || !Number.isSafeInteger(requested) || requested <= now)) {
+    throw new Error("ERR_GUI_DEADLINE: Invalid or expired action deadline");
+  }
+  return requested === undefined ? now + maximumMs : Math.min(requested as number, now + maximumMs);
+}
+
 export function ipcTimeoutForAction(action: string, params: Record<string, any>): number {
   if (action === "phone_request_approval") return (approvalTimeoutSec(params.timeoutSec ?? 1800) + 20) * 1000;
   if (action === "phone_device_control" && params.action === "system_action") return 70000;

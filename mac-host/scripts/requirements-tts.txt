@@ -1,0 +1,2 @@
+# Optional online Neural TTS provider; isolated from the system Python.
+edge-tts==7.3.1
