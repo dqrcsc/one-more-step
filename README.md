@@ -1,6 +1,6 @@
 # <img src="./docs/assets/icon-qingjian-zhichi.png" width="36" height="36" align="top" alt="QingJian ZhiChi Icon" /> 青简 · 咫尺 (OneMoreStep) — macOS 本地 AI ⇄ 小米 Android 全场景双向协同底座
 
-[![Release: v1.5.5](https://img.shields.io/badge/Release-v1.5.5-10b981?style=flat-square)](./CHANGELOG.md)
+[![Release: v1.5.6](https://img.shields.io/badge/Release-v1.5.6-10b981?style=flat-square)](./CHANGELOG.md)
 [![Runtime: Bun >= 1.1](https://img.shields.io/badge/Runtime-Bun_%E2%89%A51.1-f472b6?style=flat-square&logo=bun&logoColor=white)](https://bun.sh)
 [![macOS Host](https://img.shields.io/badge/macOS_Host-TypeScript_%2B_Swift_(CoreBluetooth_%2F_IOBluetooth)-0284c7?style=flat-square&logo=apple&logoColor=white)](./mac-host)
 [![Xiaomi Android](https://img.shields.io/badge/Xiaomi_Android-Kotlin_%2B_Compose_(HyperOS_%2F_MIUI)-ff6900?style=flat-square&logo=xiaomi&logoColor=white)](./android-app)
@@ -13,9 +13,10 @@
 
 ---
 
-**v1.5.5 最新演进与实现边界声明**：
+**v1.5.6 最新演进与实现边界声明**：
+- **v1.5.6 修复**：统一解锁、拨号与镜像的急停/期限检查，移除危险坐标回退，修复镜像启停竞态、AirPods 失败误报和紧急语音自动停止，补齐 Neural TTS 独立安装。**本轮尚未完成真机验收**，详见 [v1.5.6 更新说明](./docs/releases/v1.5.6.md)。
 - **v1.5.5 新增能力**：新增 **9 款 Microsoft Edge Neural TTS 真人自然语音播报与寻机引擎**（`xiaoyi` 甜美元气女声、`xiaoxiao` 温柔知性女声、`yunxia` 动漫元气少年音、`yunxi` 阳光男声、`yunjian` 沉稳男声、`xiaobei` 东北话、`xiaoni` 陕西话、`hsiaochen` 台湾腔甜美女声、`hiugaai` 粤语女声，支持 `--voice`、`--repeat <1..20>` 循环播报与 SHA-256 本地缓存 `~/.one_more_step/cache/tts/`）、**手机端 5 种随手即停交互**（按侧面音量/电源键、解锁屏幕、点按/左滑通知、通知停止按钮、App 顶部红条一键停声），并彻底消除手机播报时触发 Mac `Music.app` 自动弹窗的问题；包含 v1.5.3 **WebP 硬件加速投屏与自适应 10ms 极速流控**、v1.5.2 **AirPods 跨 Mac ⇄ 小米手机蓝牙无感自动切换**（`oms airpods`）与 **实时手机屏幕镜像工作台**（`oms mirror`）。完整变更历史见 [CHANGELOG.md](./CHANGELOG.md)。
-- **v2 安全传输与配对要求**：自 v1.4.0 起业务帧统一运行于 **P-256 ECDH + HKDF-SHA256 + 双向 AES-256-GCM** 认证加密会话内（见 [安全传输 v2](./docs/secure-transport-v2.md)）。从 v1.4.x / v1.5.x 升级至 v1.5.5 **无需重新配对**，直接运行 `oms ota` 或覆盖安装 [`OneMoreStep-v1.5.5.apk`](./OneMoreStep-v1.5.5.apk) 即可保留全部配对密钥、收件箱与配置；从 v1.3.x 及更早版本升级需同步升级双端并执行一次 `oms pair` 重新绑定。
+- **v2 安全传输与配对要求**：自 v1.4.0 起业务帧统一运行于 **P-256 ECDH + HKDF-SHA256 + 双向 AES-256-GCM** 认证加密会话内（见 [安全传输 v2](./docs/secure-transport-v2.md)）。从 v1.4.x / v1.5.x 升级至 v1.5.6 **无需重新配对**，直接运行 `oms ota` 或覆盖安装 [`OneMoreStep-v1.5.6.apk`](https://github.com/dqrcsc/one-more-step/releases/download/v1.5.6/OneMoreStep-v1.5.6.apk) 即可保留全部配对密钥、收件箱与配置；从 v1.3.x 及更早版本升级需同步升级双端并执行一次 `oms pair` 重新绑定。
 - **工程实现边界**：当前已落地能力、升级兼容性及待专项真机验证项（如 WAN WebRTC DataChannel 尚未实现、当前 WAN 为可选 WebSocket 中继接入；Mac 蓝牙桥实际使用 `CoreBluetooth` BLE GATT + `IOBluetooth` 经典蓝牙音频切换；GUI 观察必须携带最新 `observationId` 等）详见 **[当前实现边界与升级验收 (`docs/implementation-status.md`)](./docs/implementation-status.md)**。
 
 ---
@@ -153,7 +154,7 @@ oms mirror
 
 - **二进制高速视频帧流 (`FrameType.SCREEN_FRAME = 0x07`)**：
   - 手机端基于 `AccessibilityService.takeScreenshot` 硬件 Bitmap 管道，在端侧直接缩放并编码为紧凑 JPEG 帧，封装 16 字节二进制帧头（`[codec][flags][width][height][seq][timestampMs]`），通过 `P1_STREAM_META` 优先级通道直推 Mac；
-  - 内置在途帧背压控制（`maxInFlight = 2`）与无观看者 15 秒自动休眠机制，默认 `720p @ 12fps`，画面流畅且不阻塞控制指令。
+  - 内置在途帧背压控制（`maxInFlight = 2`）与无观看者 25 秒自动休眠机制；启动尚未完成时关闭最后一个页面也会安排停播。
 - **网页端所见即所得鼠标触控**：
   - **单击画面** ➔ 映射为手机真實物理像素坐标 `tap(x, y)`；
   - **按住鼠标拖拽** ➔ 映射为手机平滑滑动手势 `swipe(x1, y1, x2, y2)`；
@@ -282,13 +283,19 @@ flowchart TB
 #### 4) 离线可用的双端结构化连接诊断引擎 (`connectionDiagnostics`)
 - 手机与 Mac 各维护最近 200 条固定大小连接事件环（Mac 保存在 `~/.one_more_step/logs/connections.jsonl`），精确区分「Wi-Fi 不可用」、「Mac 探测不可达」、「握手超时」与「安全校验失败」，手机端断网时可直接在首页点击 **`🩺 诊断 ➔ 复制诊断`** 保留排查现场。
 
+#### v1.5.6 审查修复：远程动作边界
+
+解锁与拨号在 Android 端共享急停、串行锁、原会话校验及最多 25 秒动作期限；镜像输入最多 5 秒，调用方更短的期限不会被延长。解锁失败不继续拨号；拨号须核验号码、SIM 与呼叫按钮，不能确认时返回失败。旧版手机不再使用固定坐标或剪贴板输入兼容回退，而是提示升级。图案/PIN 输入仅在可确认的系统锁屏窗口执行，不回显真实图案序列。
+
+这些修改已通过离线回归与构建，本轮仍待真机验收；不同 OEM 的锁屏、通话按钮和双卡识别仍需真机验收。详细范围见 [审查修复验收记录](docs/review-fixes-2026-10-29.md)。
+
 ### 3.3 Monorepo 代码目录结构
 
 ```text
 one_more_step/
-├── package.json                  # Bun Workspace 根配置与快捷脚本 (v1.5.5)
+├── package.json                  # Bun Workspace 根配置与快捷脚本 (v1.5.6)
 ├── bunfig.toml                   # 测试隔离配置（自动加载预置守卫，阻断测试访问真实设备或生产目录）
-├── OneMoreStep-v1.5.5.apk        # [已编译产物] 最新版小米 Android 客户端安装包 (与 OneMoreStep.apk 同步)
+├── OneMoreStep-v1.5.6.apk        # [已编译产物] 最新版小米 Android 客户端安装包 (与 OneMoreStep.apk 同步)
 ├── scripts/
 │   └── setup.ts                  # 一键编译 Swift 蓝牙桥、链接全局 `oms` 命令与安装全局 Agent Skill
 ├── skills/
@@ -341,6 +348,16 @@ bun run setup
 oms pair
 ```
 
+Neural TTS 由仓库内 `mac-host/scripts/neural_tts.py` 提供，不依赖 Codex 的其他 Skill。
+`bun run setup` 会尝试创建 `~/.one_more_step/runtime/tts` 的独立 Python 虚拟环境并安装固定版本的
+[`edge-tts`](https://pypi.org/project/edge-tts/7.3.1/)；需要 Python 3 与可用的 pip/venv。
+安装失败不影响手机本地语音，可用 `bun run setup:tts` 重试。
+自定义服务数据目录时以 `OMS_HOME=/path/to/home bun run setup:tts` 安装，或通过 daemon 环境变量
+`OMS_TTS_PYTHON=/absolute/path/to/python3` 指定已安装 edge-tts 的解释器。
+`oms phone voices` 返回 `neuralTtsRuntimeInstalled`（仅检查解释器是否存在）；实际合成失败时，通知/播报返回
+`ttsEngine: android_local` 与 `ttsFallbackReason`，区分依赖缺失、合成失败和超时。
+Neural TTS 是在线能力，会把待播文本发送到 Microsoft Edge 语音服务；手机本地 TTS 回退不通过此服务。
+
 终端将输出无线安装页地址与 **v2 一次性加密配对 URI**：
 
 ```text
@@ -364,7 +381,7 @@ oms pair
   - **方式 A（手机浏览器免线下载）**：确保手机与 Mac 在同一 Wi-Fi，用手机浏览器打开 `http://192.168.x.x:19527/install` 点击下载安装 `OneMoreStep.apk`；
   - **方式 B（推荐 · 通过 ADB 安装自动豁免受限设置）**：若手机已连接有线或无线 ADB，直接运行以下命令安装，**系统将自动豁免 Android 13/14/15 无障碍与通知使用权的「受限制的设置」解锁步骤**：
     ```bash
-    adb install -r OneMoreStep-v1.5.5.apk
+    adb install -r OneMoreStep-v1.5.6.apk
     ```
 
 ### 4.3 第二步：完成 v2 一机一码绑定与常驻 VPN 分流
@@ -609,7 +626,7 @@ cd android-app && ./gradlew :app:testDebugUnitTest assembleDebug
 - 🛡️ **[当前实现边界与升级验收 (`docs/implementation-status.md`)](./docs/implementation-status.md)**：当前版本真实行为、升级兼容性要求与待验证边界说明。
 - 🔐 **[安全传输 v2 规范 (`docs/secure-transport-v2.md`)](./docs/secure-transport-v2.md)**：一次性配对令牌、临时 P-256 ECDH、HKDF-SHA256 与双向 AES-256-GCM 会话设计。
 - 🩺 **[离线连接诊断规范 (`docs/connection-diagnostics.md`)](./docs/connection-diagnostics.md)**：双端最近 200 条连接事件环、错误分类码与离线排查流程。
-- 📝 **[版本更新日志 (`CHANGELOG.md`)](./CHANGELOG.md)**：`v1.0.0` 至 `v1.5.5` 各版本详细演进记录与 APK 校验信息。
+- 📝 **[版本更新日志 (`CHANGELOG.md`)](./CHANGELOG.md)**：`v1.0.0` 至 `v1.5.6` 各版本详细演进记录与 APK 校验信息。
 
 ### 9.2 立项分析与七大模块架构设计文档
 1. **[01. 可行性分析报告](./docs/01-feasibility-analysis.md)**：Android + macOS 技术可行性、三级无感连接、免 IM 原生交互及小米 ROM 避坑指南。
