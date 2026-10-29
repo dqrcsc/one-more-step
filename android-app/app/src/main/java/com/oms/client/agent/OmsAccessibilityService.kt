@@ -938,7 +938,6 @@ class OmsAccessibilityService : AccessibilityService() {
                 AppLauncherHelper.openDialerWithNumber(this@OmsAccessibilityService, cleanNumber)
             }
             if (!opened) return@withGuardedPhoneAction failed("dialer_open_failed")
-            steps.pause(520L)
 
             fun dialerNodes(): List<AccessibilityNodeInfo> {
                 val result = mutableListOf<AccessibilityNodeInfo>()
@@ -957,8 +956,17 @@ class OmsAccessibilityService : AccessibilityService() {
                     value?.toString()?.filter { it.isDigit() || it in setOf('+', '*', '#', ',') } == cleanNumber
                 }
             }
-            var nodes = dialerNodes()
-            if (km.isKeyguardLocked || !hasRequestedNumber(nodes)) {
+            var nodes = emptyList<AccessibilityNodeInfo>()
+            val numberReady = DialerReadiness.awaitVerifiedNumber(
+                isLocked = { km.isKeyguardLocked },
+                numberMatches = {
+                    nodes = dialerNodes()
+                    hasRequestedNumber(nodes)
+                },
+                checkAuthorization = { steps.check() },
+                pause = { steps.pause(it) }
+            )
+            if (!numberReady) {
                 return@withGuardedPhoneAction failed("dialer_number_not_verified")
             }
             if (dialOnly) return@withGuardedPhoneAction JSONObject().apply {
