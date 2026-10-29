@@ -19,6 +19,7 @@ final class UnixSocketLineClient {
     private let writeLock = NSLock()
     var onMessage: (([String: Any]) -> Void)?
     var onConnected: (() -> Void)?
+    var onDisconnected: (() -> Void)?
 
     init(socketPath: String) {
         self.socketPath = socketPath
@@ -33,6 +34,7 @@ final class UnixSocketLineClient {
                         self.onConnected?()
                     }
                     self.readLoop()
+                    DispatchQueue.main.async { self.onDisconnected?() }
                 }
                 Thread.sleep(forTimeInterval: 2.0)
             }
@@ -128,7 +130,8 @@ final class MacAirPodsController {
     private var lastNonAirpodsOutputDeviceId: AudioDeviceID = 0
     private var tempMutedDeviceId: AudioDeviceID = 0
     private var tempMuteRestoreTimer: DispatchWorkItem? = nil
-    private var connectGeneration: Int = 0
+    private var airpodsOperation: AirPodsOperation?
+    private var nativeAirpodsRequest: AirPodsNativeRequest?
     private var lastReportedStatusKey: String = ""
     private var lastDefaultOutputName: String = ""
     private var cachedPairedAirpods: [PairedAirPodsInfo] = []
@@ -196,6 +199,17 @@ final class MacAirPodsController {
         let status = AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &unmanagedName)
         guard status == noErr, let cfStr = unmanagedName?.takeRetainedValue() else { return "" }
         return cfStr as String
+    }
+
+    func getDeviceUID(_ id: AudioDeviceID) -> String {
+        var value: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID,
+                                              mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value) == noErr,
+              let uid = value?.takeRetainedValue() else { return "" }
+        return uid as String
     }
 
     func isDeviceRunning(_ id: AudioDeviceID) -> Bool {
@@ -402,28 +416,29 @@ final class MacAirPodsController {
         let all = listPairedAirpods(forceRefresh: forceRefresh)
         guard !all.isEmpty else { return nil }
         let normExplicit = Self.normalizeMac(explicitMac)
-        if !normExplicit.isEmpty, let match = all.first(where: { $0.mac == normExplicit }) {
-            return match
+        if !normExplicit.isEmpty {
+            return all.first(where: { $0.mac == normExplicit })
         }
         return all.first
     }
 
-    func findAirpodsCoreAudioDevice(preferredName: String?) -> (id: AudioDeviceID, name: String)? {
+    func findAirpodsCoreAudioDevice(preferredName: String?, targetMac: String? = nil) -> (id: AudioDeviceID, name: String)? {
         let outputs = listOutputDevices()
+        if let mac = targetMac, !mac.isEmpty {
+            let matches = outputs.filter { AirPodsOperation.matchesDeviceUID(getDeviceUID($0.id), mac: mac) }
+            return matches.count == 1 ? matches[0] : nil
+        }
         if let pref = preferredName, !pref.isEmpty {
-            if let exact = outputs.first(where: { $0.name.caseInsensitiveCompare(pref) == .orderedSame }) {
-                return exact
-            }
-            if let partial = outputs.first(where: { $0.name.localizedCaseInsensitiveContains(pref) || pref.localizedCaseInsensitiveContains($0.name) }) {
-                return partial
-            }
+            let exact = outputs.filter { $0.name.caseInsensitiveCompare(pref) == .orderedSame }
+            if exact.count == 1 { return exact[0] }
+            return nil
         }
         return outputs.first(where: { $0.name.localizedCaseInsensitiveContains("airpods") })
     }
 
     // MARK: - Media Control (Explicit Pause Only, Never Launches Music.app)
 
-    func pauseMacActiveMedia() {
+    func pauseMacActiveMedia(operation: AirPodsOperation? = nil) {
         let defId = getDefaultOutputDevice()
         // Never send any media command if Mac audio output is not actively running
         guard isDeviceRunning(defId) else { return }
@@ -433,7 +448,7 @@ final class MacAirPodsController {
         // because macOS rcd/mediaremoted would otherwise auto-launch Apple Music (Music.app)!
         if let checkPlaying = mediaRemoteGetIsPlaying {
             checkPlaying(DispatchQueue.main) { [weak self] isPlaying in
-                guard isPlaying else { return }
+                guard isPlaying, operation == nil || operation!.remainingMs > 0 else { return }
                 _ = self?.mediaRemoteSendCommand?(1, nil)
             }
         }
@@ -441,161 +456,144 @@ final class MacAirPodsController {
 
     // MARK: - Connect & Release Operations
 
-    func connectAirpodsToMac(targetMac: String?, reqId: String?) {
-        connectGeneration &+= 1
-        let gen = connectGeneration
-        suppressAutoGrabUntil = Date().addingTimeInterval(5.0)
-
-        guard let target = selectTargetAirpods(explicitMac: targetMac) else {
-            restoreTempMute()
-            if let reqId = reqId {
-                ipc.sendJson([
-                    "type": "airpods_cmd_result",
-                    "reqId": reqId,
-                    "ok": false,
-                    "action": "connect_mac",
-                    "message": "Mac 蓝牙配对列表中未找到 AirPods"
-                ])
+    private func finishOperation(_ op: AirPodsOperation, ok: Bool, message: String,
+                                 deviceName: String? = nil, deviceMac: String? = nil) {
+        guard let confirmed = op.finish(success: ok) else { return }
+        op.record("finished", ["ok": confirmed, "message": message])
+        if airpodsOperation === op {
+            if let request = nativeAirpodsRequest, request.isRunning {
+                op.record("worker_cancel_requested", ["pid": Int(request.pid)])
+                request.cancel()
             }
-            return
-        }
-
-        lastActiveAirpodsMac = target.mac
-        let targetName = target.name
-        let targetMacNorm = target.mac
-        let btAddr = Self.toIOBluetoothAddress(targetMacNorm)
-
-        // If already in CoreAudio output list and connected, switch immediately
-        if target.connected, let audioDev = findAirpodsCoreAudioDevice(preferredName: targetName) {
-            _ = setDefaultOutputDevice(audioDev.id)
+            nativeAirpodsRequest = nil
+            airpodsOperation = nil
             restoreTempMute()
             reportStatusIfNeeded(force: true)
-            if let reqId = reqId {
-                ipc.sendJson([
-                    "type": "airpods_cmd_result",
-                    "reqId": reqId,
-                    "ok": true,
-                    "action": "connect_mac",
-                    "deviceName": targetName,
-                    "deviceMac": targetMacNorm
-                ])
-            }
-            return
         }
-
-        btWorkQueue.async { [weak self] in
-            guard let self = self else { return }
-            var connectedSuccess = false
-
-            for attempt in 0..<3 {
-                if self.connectGeneration != gen { return }
-                if attempt > 0 {
-                    Thread.sleep(forTimeInterval: 0.45)
-                }
-                if self.connectGeneration != gen { return }
-
-                autoreleasepool {
-                    if let dev = IOBluetoothDevice(addressString: btAddr) {
-                        if !dev.isConnected() {
-                            _ = dev.openConnection(nil, withPageTimeout: 5000, authenticationRequired: false)
-                        }
-                    }
-                }
-
-                // Poll up to 1.6s for CoreAudio output device to appear and become selectable
-                let pollDeadline = Date().addingTimeInterval(1.6)
-                while Date() < pollDeadline {
-                    if self.connectGeneration != gen { return }
-                    if let audioDev = self.findAirpodsCoreAudioDevice(preferredName: targetName) {
-                        _ = self.setDefaultOutputDevice(audioDev.id)
-                        connectedSuccess = true
-                        break
-                    }
-                    Thread.sleep(forTimeInterval: 0.12)
-                }
-
-                if connectedSuccess {
-                    break
-                }
-            }
-
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                if self.connectGeneration == gen {
-                    if let audioDev = self.findAirpodsCoreAudioDevice(preferredName: targetName) {
-                        _ = self.setDefaultOutputDevice(audioDev.id)
-                        connectedSuccess = true
-                    }
-                    self.restoreTempMute()
-                    self.reportStatusIfNeeded(force: true)
-                }
-                if let reqId = reqId {
-                    self.ipc.sendJson([
-                        "type": "airpods_cmd_result",
-                        "reqId": reqId,
-                        "ok": connectedSuccess,
-                        "action": "connect_mac",
-                        "deviceName": targetName,
-                        "deviceMac": targetMacNorm,
-                        "message": connectedSuccess ? "已连接到 Mac 并切为默认音频输出" : "AirPods 连接超时，请确认耳机在盒外且已佩戴"
-                    ])
-                }
-            }
+        if let reqId = op.reqId {
+            var result: [String: Any] = ["type": "airpods_cmd_result", "reqId": reqId,
+                                        "ok": confirmed, "action": op.action, "diagnostics": op.diagnostics,
+                                        "message": confirmed ? message : (ok ? "AirPods 请求已过期" : message)]
+            if let name = deviceName { result["deviceName"] = name }
+            if let mac = deviceMac { result["deviceMac"] = mac }
+            ipc.sendJson(result)
         }
     }
 
-    func releaseAirpodsFromMac(pauseMedia: Bool, targetMac: String?, reqId: String?) {
-        connectGeneration &+= 1
-        suppressAutoGrabUntil = Date().addingTimeInterval(6.0)
-        updateFallbackNonAirpodsSpeaker()
+    func cancelAirpodsOperation(reqId: String? = nil) {
+        guard let op = airpodsOperation, reqId == nil || op.reqId == reqId else { return }
+        finishOperation(op, ok: false, message: "AirPods 请求已取消或被新请求替代")
+    }
 
-        // Temporarily mute fallback speaker for 1.0s so disconnecting AirPods never leaks audio
-        if lastNonAirpodsOutputDeviceId != 0 {
-            tempMuteDeviceIfNeeded(lastNonAirpodsOutputDeviceId, maxDurationSec: 1.0)
+    private func beginOperation(reqId: String?, action: String, deadlineMs: Double?, capMs: Int) -> AirPodsOperation {
+        cancelAirpodsOperation()
+        let remaining = deadlineMs.map { $0 - Date().timeIntervalSince1970 * 1000 } ?? Double(capMs)
+        let budget = Int(min(Double(capMs), max(0, remaining)))
+        let op = AirPodsOperation(reqId: reqId, action: action, budgetMs: budget)
+        airpodsOperation = op
+        op.record("started", ["budgetMs": budget])
+        suppressAutoGrabUntil = Date().addingTimeInterval(Double(budget + 1000) / 1000)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(budget)) { [weak self] in
+            self?.finishOperation(op, ok: false, message: "AirPods 操作超时，后续步骤已停止")
         }
+        return op
+    }
 
-        if pauseMedia {
-            pauseMacActiveMedia()
+    func connectAirpodsToMac(targetMac: String?, reqId: String?, deadlineMs: Double? = nil) {
+        let op = beginOperation(reqId: reqId, action: "connect_mac", deadlineMs: deadlineMs, capMs: 22000)
+        guard op.remainingMs > 0 else {
+            finishOperation(op, ok: false, message: "AirPods 请求已过期")
+            return
         }
-
-        // Switch default output away from AirPods to fallback speaker first so CoreAudio releases A2DP
-        let defId = getDefaultOutputDevice()
-        let defName = getDeviceName(defId)
-        if defName.localizedCaseInsensitiveContains("airpods") && lastNonAirpodsOutputDeviceId != 0 {
-            _ = setDefaultOutputDevice(lastNonAirpodsOutputDeviceId)
+        guard let target = selectTargetAirpods(explicitMac: targetMac) else {
+            finishOperation(op, ok: false, message: "Mac 配对列表中未找到指定 AirPods")
+            return
         }
+        lastActiveAirpodsMac = target.mac
+        op.record("target_selected", ["name": target.name, "connected": target.connected])
+        requestAirpodsConnection(op, target: target)
+    }
 
+    private func requestAirpodsConnection(_ op: AirPodsOperation, target: PairedAirPodsInfo) {
+        guard op.remainingMs > 0 else { return }
+        if let device = IOBluetoothDevice(addressString: Self.toIOBluetoothAddress(target.mac)), device.isConnected() {
+            pollAirpodsOutput(op, target: target, until: ProcessInfo.processInfo.systemUptime + 2.0)
+            return
+        }
+        let worker = AirPodsNativeRequest(executable: CommandLine.arguments[0],
+            arguments: ["--airpods-connect-worker", target.mac, String(op.remainingMs)]) { [weak self] status, native in
+            guard let self = self else { return }
+            var fields = native ?? [:]
+            fields["exitStatus"] = Int(status)
+            fields["late"] = op.remainingMs == 0
+            op.record("worker_exited", fields)
+            self.ipc.sendJson(["type": "airpods_diagnostics", "diagnostics": op.diagnostics])
+            guard op.remainingMs > 0, self.airpodsOperation === op else { return }
+            self.nativeAirpodsRequest = nil
+            self.pollAirpodsOutput(op, target: target, until: ProcessInfo.processInfo.systemUptime + 2.0)
+        }
+        nativeAirpodsRequest = worker
+        do {
+            try worker.start()
+            op.record("worker_started", ["pid": Int(worker.pid), "remainingMs": op.remainingMs])
+        } catch {
+            finishOperation(op, ok: false, message: "无法启动原生蓝牙连接进程")
+        }
+    }
+
+    private func pollAirpodsOutput(_ op: AirPodsOperation, target: PairedAirPodsInfo, until: TimeInterval) {
+        guard op.remainingMs > 0 else { return }
+        let routed = op.performIfActive {
+            guard let device = IOBluetoothDevice(addressString: Self.toIOBluetoothAddress(target.mac)), device.isConnected(),
+                  let audio = findAirpodsCoreAudioDevice(preferredName: target.name, targetMac: target.mac) else { return false }
+            return setDefaultOutputDevice(audio.id) && getDefaultOutputDevice() == audio.id
+        }
+        if routed {
+            finishOperation(op, ok: true, message: "已连接指定 AirPods 并确认 Mac 默认音频输出", deviceName: target.name, deviceMac: target.mac)
+        } else if ProcessInfo.processInfo.systemUptime < until {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                self?.pollAirpodsOutput(op, target: target, until: until)
+            }
+        } else {
+            finishOperation(op, ok: false, message: "AirPods 连接或默认音频输出未确认")
+        }
+    }
+
+    func releaseAirpodsFromMac(pauseMedia: Bool, targetMac: String?, reqId: String?, deadlineMs: Double? = nil) {
+        let op = beginOperation(reqId: reqId, action: "release_mac", deadlineMs: deadlineMs, capMs: 7000)
+        // Allow the phone's following 12-second connect stage without immediately grabbing back.
+        suppressAutoGrab(durationMs: 22000)
+        guard op.remainingMs > 0 else { finishOperation(op, ok: false, message: "AirPods 请求已过期"); return }
         let paired = listPairedAirpods(forceRefresh: true)
         let normTarget = Self.normalizeMac(targetMac)
-        let toDisconnect = paired.filter { info in
-            info.connected || (!normTarget.isEmpty && info.mac == normTarget)
+        let targets = paired.filter { normTarget.isEmpty ? $0.connected : $0.mac == normTarget }
+        updateFallbackNonAirpodsSpeaker()
+        if pauseMedia { pauseMacActiveMedia(operation: op) }
+        let defaultUID = getDeviceUID(getDefaultOutputDevice())
+        if targets.contains(where: { AirPodsOperation.matchesDeviceUID(defaultUID, mac: $0.mac) }), lastNonAirpodsOutputDeviceId != 0 {
+            tempMuteDeviceIfNeeded(lastNonAirpodsOutputDeviceId, maxDurationSec: 1.0)
+            _ = setDefaultOutputDevice(lastNonAirpodsOutputDeviceId)
         }
-
         btWorkQueue.async { [weak self] in
-            autoreleasepool {
-                for item in toDisconnect {
-                    let btAddr = Self.toIOBluetoothAddress(item.mac)
-                    if let dev = IOBluetoothDevice(addressString: btAddr) {
-                        if dev.isConnected() {
-                            _ = dev.closeConnection()
-                        }
-                    }
+            guard let self = self else { return }
+            for item in targets {
+                guard op.remainingMs > 0 else { return }
+                if let dev = IOBluetoothDevice(addressString: Self.toIOBluetoothAddress(item.mac)), dev.isConnected() {
+                    op.record("close_connection")
+                    let code = dev.closeConnection()
+                    op.record("close_returned", ["returnCode": Int(code), "returnHex": String(format: "0x%08x", code)])
                 }
             }
-            Thread.sleep(forTimeInterval: 0.25)
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                self.reportStatusIfNeeded(force: true)
-                if let reqId = reqId {
-                    self.ipc.sendJson([
-                        "type": "airpods_cmd_result",
-                        "reqId": reqId,
-                        "ok": true,
-                        "action": "release_mac",
-                        "deviceName": toDisconnect.first?.name ?? paired.first?.name ?? "AirPods",
-                        "deviceMac": toDisconnect.first?.mac ?? paired.first?.mac ?? ""
-                    ])
+            while op.remainingMs > 0 {
+                let released = targets.allSatisfy { item in
+                    guard let dev = IOBluetoothDevice(addressString: Self.toIOBluetoothAddress(item.mac)) else { return false }
+                    return !dev.isConnected()
                 }
+                if released {
+                    DispatchQueue.main.async { self.finishOperation(op, ok: true, message: "Mac 已确认释放指定 AirPods", deviceName: targets.first?.name, deviceMac: targets.first?.mac) }
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.1)
             }
         }
     }
@@ -771,6 +769,8 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
             self.airpodsController.reportStatusIfNeeded(force: true)
         }
 
+        ipc.onDisconnected = { [weak self] in self?.airpodsController.cancelAirpodsOperation() }
+
         ipc.onMessage = { [weak self] msg in
             DispatchQueue.main.async {
                 guard let self = self, let type = msg["type"] as? String else { return }
@@ -813,12 +813,14 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
                 case "airpods_connect_mac":
                     let reqId = msg["reqId"] as? String
                     let targetMac = msg["targetMac"] as? String
-                    self.airpodsController.connectAirpodsToMac(targetMac: targetMac, reqId: reqId)
+                    self.airpodsController.connectAirpodsToMac(targetMac: targetMac, reqId: reqId, deadlineMs: msg["deadlineMs"] as? Double)
                 case "airpods_release_mac":
                     let reqId = msg["reqId"] as? String
                     let pauseMedia = (msg["pauseMedia"] as? Bool) ?? true
                     let targetMac = msg["targetMac"] as? String
-                    self.airpodsController.releaseAirpodsFromMac(pauseMedia: pauseMedia, targetMac: targetMac, reqId: reqId)
+                    self.airpodsController.releaseAirpodsFromMac(pauseMedia: pauseMedia, targetMac: targetMac, reqId: reqId, deadlineMs: msg["deadlineMs"] as? Double)
+                case "airpods_cancel":
+                    if let reqId = msg["reqId"] as? String { self.airpodsController.cancelAirpodsOperation(reqId: reqId) }
                 case "airpods_suppress_grab":
                     let durationMs = (msg["durationMs"] as? Int) ?? 2500
                     self.airpodsController.suppressAutoGrab(durationMs: durationMs)
@@ -1001,6 +1003,26 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
             }
         }
     }
+}
+
+// Internal connection worker: no IPC server, audio routing or retry loop.
+// The parent owns the deadline and reaps this process on cancellation.
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "--airpods-connect-worker" {
+    let args = CommandLine.arguments
+    guard args.count == 4, args[2].range(of: "^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$", options: .regularExpression) != nil,
+          let budget = Int(args[3]), budget > 0, budget <= 22000,
+          let device = IOBluetoothDevice(addressString: args[2].replacingOccurrences(of: ":", with: "-")), device.isPaired() else { exit(2) }
+    let lifetime = AirPodsWorkerLifetime.start(budgetMs: budget)
+    withExtendedLifetime(lifetime) {
+        let started = ProcessInfo.processInfo.systemUptime
+        let code = device.openConnection(nil, withPageTimeout: AirPodsOperation.pageTimeoutSlots(remainingMs: budget), authenticationRequired: false)
+        let result: [String: Any] = ["returnCode": Int(code), "returnHex": String(format: "0x%08x", code),
+            "nativeElapsedMs": Int((ProcessInfo.processInfo.systemUptime - started) * 1000), "connected": device.isConnected()]
+        if let data = try? JSONSerialization.data(withJSONObject: result) {
+            FileHandle.standardOutput.write(data)
+        }
+    }
+    exit(0)
 }
 
 var socketPath = "\(NSHomeDirectory())/.one_more_step/run/bt.sock"

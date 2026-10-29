@@ -270,6 +270,7 @@ export interface PairedAirPodsDevice {
 }
 
 export interface AirPodsStatusSnapshot {
+  diagnostics?: { mac?: Record<string, unknown>; phone?: Record<string, unknown> };
   autoSwitchEnabled: boolean;
   pauseOtherOnSwitch: boolean;
   preferredAirpodsMac?: string;

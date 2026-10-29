@@ -770,10 +770,10 @@ async function main() {
         const res = await ipc.call("airpods.status", { refresh: true, force: Boolean(flags.live) });
         console.log(JSON.stringify(res, null, 2));
       } else if (actionSub === "mac" || actionSub === "to-mac" || actionSub === "connect-mac") {
-        const res = await ipc.call("airpods.switch_to_mac", { targetMac }, 15000);
+        const res = await ipc.call("airpods.switch_to_mac", { targetMac }, 35000);
         console.log(JSON.stringify(res, null, 2));
       } else if (actionSub === "phone" || actionSub === "to-phone" || actionSub === "connect-phone") {
-        const res = await ipc.call("airpods.switch_to_phone", { targetMac }, 15000);
+        const res = await ipc.call("airpods.switch_to_phone", { targetMac }, 35000);
         console.log(JSON.stringify(res, null, 2));
       } else if (actionSub === "auto" || actionSub === "config") {
         const toggleVal = parseBoolFlag(positional[1] ?? flags.enable ?? flags.auto);

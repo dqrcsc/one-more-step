@@ -119,6 +119,8 @@ export class OmsDaemon {
   // AirPods Seamless Auto-Switch State
   private lastAirpodsSwitchEvent?: AirPodsStatusSnapshot["lastSwitchEvent"];
   private suppressPhoneAirpodsClaimUntilMs = 0;
+  private airpodsHandoffInFlight = false;
+  private airpodsDiagnostics: { mac?: Record<string, any>; phone?: Record<string, any> } = {};
   private phoneAirpodsState: AirPodsStatusSnapshot["phone"] = {
     connected: false,
     mediaPlaying: false,
@@ -436,6 +438,10 @@ export class OmsDaemon {
       this.syncAirpodsConfigToBridgeAndPhone();
     });
 
+    this.session.on("airpodsDiagnostics", (diagnostics) => {
+      this.recordAirpodsDiagnostics("mac", diagnostics);
+    });
+
     this.session.on("airpodsStatus", () => {
       this.syncAirpodsConfigToPhoneOnly();
     });
@@ -461,8 +467,9 @@ export class OmsDaemon {
                 pausePhoneMedia: this.config.pauseOtherOnAirpodsSwitch !== false,
                 disconnectOnPhone: true,
                 reason: evt.reason || "mac_audio_started",
+                deadlineMs: Date.now() + 3000,
               },
-              3500
+              4000
             )
             .catch(() => {});
         }
@@ -702,18 +709,21 @@ export class OmsDaemon {
               deviceMac: targetMac,
               atMs: Date.now(),
             };
-            void this.session
-              .getBluetoothBridge()
-              ?.releaseAirpodsFromMac({
-                pauseMedia: pauseMacMedia,
-                targetMac,
-                timeoutMs: 2200,
+            if (this.airpodsHandoffInFlight) {
+              reply({ result: { ok: false, released: false, reason: "manual handoff in progress" } });
+              return;
+            }
+            const bridge = this.session.getBluetoothBridge();
+            if (!bridge) {
+              reply({ result: { ok: false, released: false, reason: "Bluetooth bridge unavailable" } });
+              return;
+            }
+            void bridge.releaseAirpodsFromMac({ pauseMedia: pauseMacMedia, targetMac, timeoutMs: 8000 })
+              .then((result) => {
+                reply({ result: { ok: Boolean(result.ok), released: Boolean(result.ok), message: result.message } });
               })
-              .then(() => {
-                reply({ result: { ok: true, released: true, pausedMacMedia: pauseMacMedia } });
-              })
-              .catch(() => {
-                reply({ result: { ok: true, released: true } });
+              .catch((err) => {
+                reply({ result: { ok: false, released: false, message: err?.message || String(err) } });
               });
           } else if (req.method === "airpods.statusReport") {
             const p = (req.params || {}) as Record<string, any>;
@@ -834,6 +844,18 @@ export class OmsDaemon {
     this.syncAirpodsConfigToPhoneOnly(true);
   }
 
+  private recordAirpodsDiagnostics(side: "mac" | "phone", diagnostics: any): void {
+    if (!diagnostics || typeof diagnostics !== "object") return;
+    const record = { atMs: Date.now(), ...diagnostics };
+    this.airpodsDiagnostics[side] = record;
+    try {
+      const file = path.join(this.homeDir, "logs", "airpods-operations.jsonl");
+      const lines = fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean) : [];
+      lines.push(JSON.stringify({ side, ...record }));
+      fs.writeFileSync(file, lines.slice(-200).join("\n") + "\n");
+    } catch { /* Diagnostics must not break an otherwise completed handoff. */ }
+  }
+
   public getAirpodsStatusSnapshot(): AirPodsStatusSnapshot {
     const macSt = this.session.getBluetoothBridge()?.getAirpodsStatus() || {
       connected: false,
@@ -877,10 +899,18 @@ export class OmsDaemon {
         ...this.phoneAirpodsState,
       },
       lastSwitchEvent: this.lastAirpodsSwitchEvent,
+      diagnostics: this.airpodsDiagnostics,
     };
   }
 
   public async switchAirpodsToMac(targetMac?: string, reason = "manual"): Promise<Record<string, any>> {
+    if (this.airpodsHandoffInFlight) return { ok: false, direction: "PHONE_TO_MAC", stage: "busy", message: "已有 AirPods 切换正在进行，请等待结果" };
+    this.airpodsHandoffInFlight = true;
+    try { return await this.performAirpodsSwitchToMac(targetMac, reason); }
+    finally { this.airpodsHandoffInFlight = false; }
+  }
+
+  private async performAirpodsSwitchToMac(targetMac?: string, reason = "manual"): Promise<Record<string, any>> {
     const pausePhoneMedia = this.config.pauseOtherOnAirpodsSwitch !== false;
     this.lastAirpodsSwitchEvent = {
       direction: "PHONE_TO_MAC",
@@ -889,20 +919,19 @@ export class OmsDaemon {
       atMs: Date.now(),
     };
     if (this.session.getActiveTier() !== "DISCONNECTED") {
-      await this.session
-        .callPhone(
-          "airpods.handoffToMac",
-          {
-            targetMac,
-            pausePhoneMedia,
-            disconnectOnPhone: true,
-            reason,
-          },
-          2500
-        )
-        .catch(() => {});
+      const release = await this.session.bindPhoneSession()(
+        "airpods.handoffToMac",
+        { targetMac, pausePhoneMedia, disconnectOnPhone: true, reason, deadlineMs: Date.now() + 3000 },
+        4000
+      ).catch((err) => ({ ok: false, message: err?.message || String(err) }));
+      this.recordAirpodsDiagnostics("phone", release?.diagnostics);
+      if (!release?.ok) return {
+        ok: false, direction: "PHONE_TO_MAC", stage: "phone_release",
+        message: release?.message || "手机耳机释放未确认", status: this.getAirpodsStatusSnapshot(),
+      };
     }
     const res = await this.session.getBluetoothBridge()?.connectAirpodsToMac(targetMac);
+    this.recordAirpodsDiagnostics("mac", res?.diagnostics);
     if (res?.deviceName || res?.deviceMac) {
       this.lastAirpodsSwitchEvent = {
         direction: "PHONE_TO_MAC",
@@ -915,12 +944,20 @@ export class OmsDaemon {
     return {
       ok: Boolean(res?.ok),
       direction: "PHONE_TO_MAC",
+      diagnostics: res?.diagnostics,
       message: res?.message || (res?.ok ? "已切换到 Mac" : "切换到 Mac 失败"),
       status: this.getAirpodsStatusSnapshot(),
     };
   }
 
   public async switchAirpodsToPhone(targetMac?: string, reason = "manual"): Promise<Record<string, any>> {
+    if (this.airpodsHandoffInFlight) return { ok: false, direction: "MAC_TO_PHONE", stage: "busy", message: "已有 AirPods 切换正在进行，请等待结果" };
+    this.airpodsHandoffInFlight = true;
+    try { return await this.performAirpodsSwitchToPhone(targetMac, reason); }
+    finally { this.airpodsHandoffInFlight = false; }
+  }
+
+  private async performAirpodsSwitchToPhone(targetMac?: string, reason = "manual"): Promise<Record<string, any>> {
     const failure = (stage: string, message: string, phoneResult: any = null) => ({
       ok: false,
       direction: "MAC_TO_PHONE",
@@ -935,6 +972,7 @@ export class OmsDaemon {
     }
     const bridge = this.session.getBluetoothBridge();
     if (!bridge) return failure("mac_release", "Mac 蓝牙桥不可用，未释放耳机连接");
+    const callPhone = this.session.bindPhoneSession();
     const pauseMacMedia = this.config.pauseOtherOnAirpodsSwitch !== false;
     this.lastAirpodsSwitchEvent = {
       direction: "MAC_TO_PHONE",
@@ -942,28 +980,30 @@ export class OmsDaemon {
       deviceMac: targetMac,
       atMs: Date.now(),
     };
-    const releaseResult = await bridge.releaseAirpodsFromMac({
+    const releaseResult: Record<string, any> = await bridge.releaseAirpodsFromMac({
       pauseMedia: pauseMacMedia,
       targetMac,
-      timeoutMs: 2500,
+      timeoutMs: 8000,
     })
       .catch((err) => ({ ok: false, message: err?.message || String(err) }));
+    this.recordAirpodsDiagnostics("mac", releaseResult?.diagnostics);
     if (!releaseResult?.ok) {
       return failure("mac_release", releaseResult?.message || "Mac 耳机释放未确认");
     }
     if (this.session.getActiveTier() === "DISCONNECTED") {
       return failure("phone_connect", "Mac 已释放耳机，但手机连接已断开，切换未完成");
     }
-    const phoneRes = await this.session
-      .callPhone<any>(
+    const phoneRes = await callPhone<any>(
         "airpods.connectOnPhone",
         {
           targetMac: targetMac || this.config.preferredAirpodsMac,
           reason,
+          deadlineMs: Date.now() + 14000,
         },
-        5500
+        16000
       )
       .catch((err) => ({ ok: false, error: err?.message || String(err) }));
+    this.recordAirpodsDiagnostics("phone", phoneRes?.diagnostics);
     if (phoneRes?.status) {
       this.session.setPhoneStatus(phoneRes.status);
       this.ingestPhoneAirpodsSnapshot(phoneRes.status);
@@ -1397,17 +1437,19 @@ export class OmsDaemon {
       );
       const btBin = path.join(macHostRoot, "bin", "oms-bt-bridge");
       const btSrc = path.join(macHostRoot, "bluetooth-bridge", "main.swift");
+      const btOperationSrc = path.join(macHostRoot, "bluetooth-bridge", "AirPodsOperation.swift");
+      const btNativeRequestSrc = path.join(macHostRoot, "bluetooth-bridge", "AirPodsNativeRequest.swift");
       const btStat = fs.existsSync(btBin) ? fs.statSync(btBin) : null;
       const srcStat = fs.existsSync(btSrc) ? fs.statSync(btSrc) : null;
       if (
         this.config.enableBluetoothBridge &&
         process.platform === "darwin" &&
         srcStat &&
-        (!btStat || srcStat.mtimeMs > btStat.mtimeMs)
+        (!btStat || srcStat.mtimeMs > btStat.mtimeMs || fs.statSync(btOperationSrc).mtimeMs > btStat.mtimeMs || fs.statSync(btNativeRequestSrc).mtimeMs > btStat.mtimeMs)
       ) {
         try {
           fs.mkdirSync(path.dirname(btBin), { recursive: true });
-          execFileSync("swiftc", [btSrc, "-o", btBin], { timeout: 30000, stdio: "ignore" });
+          execFileSync("swiftc", [btOperationSrc, btNativeRequestSrc, btSrc, "-o", btBin], { timeout: 30000, stdio: "ignore" });
         } catch {
           // ignore if swiftc / Xcode CLT is unavailable
         }

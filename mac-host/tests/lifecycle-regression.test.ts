@@ -218,3 +218,121 @@ test("mirror input carries an absolute deadline and preserves shorter caller lim
   await expect(f.daemon.sendMirrorInput({ type: "tap", deadlineMs: 1 })).rejects.toThrow("ERR_GUI_DEADLINE");
   expect(sent).toHaveLength(2);
 });
+
+test("AirPods bridge supplies a native deadline and cancels a timed-out request", async () => {
+  const bridge = new BluetoothBridgeServer({ socketPath: "/unused", macId: "test", lanIps: [], lanPort: 0 });
+  const packets: any[] = [];
+  (bridge as any).activeClient = {};
+  (bridge as any).sendToBridge = (packet: any) => packets.push(packet);
+  const started = Date.now();
+  const result = await bridge.connectAirpodsToMac("AA:BB:CC:DD:EE:FF", 10);
+  expect(result.ok).toBe(false);
+  expect(packets[0].deadlineMs).toBeGreaterThanOrEqual(started);
+  expect(packets[0].deadlineMs).toBeLessThanOrEqual(started + 10);
+  expect(packets[1]).toEqual({ type: "airpods_cancel", reqId: packets[0].reqId });
+  (bridge as any).handleBridgeMessage({ type: "airpods_cmd_result", reqId: packets[0].reqId, ok: true });
+  expect((bridge as any).pendingCmdWaiters.size).toBe(0);
+  expect(result.ok).toBe(false);
+});
+
+test("AirPods native budget ends before the bridge caller and confirms native result", async () => {
+  const bridge = new BluetoothBridgeServer({ socketPath: "/unused", macId: "test", lanIps: [], lanPort: 0 });
+  (bridge as any).activeClient = {};
+  let request: any;
+  (bridge as any).sendToBridge = (packet: any) => {
+    request = packet;
+    queueMicrotask(() => (bridge as any).handleBridgeMessage({ type: "airpods_cmd_result", reqId: packet.reqId, ok: true }));
+  };
+  const start = Date.now();
+  expect((await bridge.connectAirpodsToMac()).ok).toBe(true);
+  expect(request.deadlineMs - start).toBeGreaterThanOrEqual(22000);
+  expect(request.deadlineMs - start).toBeLessThan(23000);
+});
+
+test("phone release failure prevents a Mac connection attempt", async () => {
+  const f = fixture();
+  let connections = 0;
+  f.s.callPhone = async () => ({ ok: false, message: "release not confirmed" });
+  f.s.getBluetoothBridge = () => ({ connectAirpodsToMac: async () => { connections++; return { ok: true }; } });
+  const result = await f.daemon.switchAirpodsToMac("AA:BB:CC:DD:EE:FF");
+  expect(result.ok).toBe(false);
+  expect(result.stage).toBe("phone_release");
+  expect(connections).toBe(0);
+});
+
+test("phone handoff stays bound to the original phone session during Mac release", async () => {
+  const f = fixture();
+  let newSessionCalls = 0;
+  f.s.bindPhoneSession = () => async () => { throw new Error("session revoked"); };
+  f.s.callPhone = async () => { newSessionCalls++; return { ok: true }; };
+  f.s.getBluetoothBridge = () => ({ releaseAirpodsFromMac: async () => ({ ok: true }) });
+  const result = await f.daemon.switchAirpodsToPhone();
+  expect(result.ok).toBe(false);
+  expect(result.stage).toBe("phone_connect");
+  expect(newSessionCalls).toBe(0);
+});
+
+test("phone connection deadline leaves time for its response", async () => {
+  const f = fixture();
+  f.s.getBluetoothBridge = () => ({ releaseAirpodsFromMac: async () => ({ ok: true }) });
+  f.s.callPhone = async (_method: string, params: any, timeoutMs: number) => {
+    expect(timeoutMs).toBe(16000);
+    expect(params.deadlineMs - Date.now()).toBeGreaterThan(13900);
+    expect(params.deadlineMs - Date.now()).toBeLessThanOrEqual(14000);
+    return { ok: true };
+  };
+  expect((await f.daemon.switchAirpodsToPhone()).ok).toBe(true);
+});
+
+test("overlapping handoffs do not dispatch interleaved phone and Mac effects", async () => {
+  const f = fixture();
+  const released = deferred<any>();
+  let macConnections = 0;
+  f.s.getBluetoothBridge = () => ({
+    releaseAirpodsFromMac: () => released.promise,
+    connectAirpodsToMac: async () => { macConnections++; return { ok: true }; },
+  });
+  const first = f.daemon.switchAirpodsToPhone();
+  const second = await f.daemon.switchAirpodsToMac();
+  expect(second.stage).toBe("busy");
+  expect(second.ok).toBe(false);
+  expect(macConnections).toBe(0);
+  released.resolve({ ok: false, message: "timeout" });
+  expect((await first).ok).toBe(false);
+  expect((await f.daemon.switchAirpodsToMac()).ok).toBe(true);
+  expect(macConnections).toBe(1);
+});
+
+test("automatic phone claims never acknowledge unavailable or failed Mac release", async () => {
+  const f = fixture();
+  for (const release of [null, async () => ({ ok: false, message: "timeout" }), async () => { throw new Error("closed"); }]) {
+    f.s.getBluetoothBridge = () => release ? { releaseAirpodsFromMac: release } : null;
+    const response: any = await new Promise(resolve => f.s.emit("phoneRequest", {
+      method: "airpods.claimByPhone", params: { targetMac: "AA:BB:CC:DD:EE:FF", reason: "phone_audio_started" },
+    }, resolve));
+    expect(response.result.ok).toBe(false);
+    expect(response.result.released).toBe(false);
+  }
+});
+
+test("AirPods IPC budget covers phone handoff and native connection plus response margin", async () => {
+  const { ipcTimeoutForAction } = await import("../src/daemon/request-timeouts.js");
+  expect(ipcTimeoutForAction("airpods.switch_to_mac", {})).toBeGreaterThan(4000 + 23000);
+  expect(ipcTimeoutForAction("airpods.switch_to_phone", {})).toBeGreaterThan(8000 + 16000);
+});
+
+
+test("late native AirPods diagnostics remain observable without completing another request", () => {
+  const bridge = new BluetoothBridgeServer({ socketPath: "/unused", macId: "test", lanIps: [], lanPort: 0 });
+  const seen: unknown[] = [];
+  bridge.on("airpodsDiagnostics", (d) => seen.push(d));
+  const diagnostics = { operationId: "expired", finished: true, events: [{ stage: "connection_callback", late: true }] };
+  let resolved = false;
+  (bridge as any).pendingCmdWaiters.set("new", { resolve: () => { resolved = true; } });
+  (bridge as any).handleBridgeMessage({ type: "airpods_diagnostics", diagnostics });
+  expect(seen).toEqual([diagnostics]);
+  expect(resolved).toBe(false);
+  expect((bridge as any).pendingCmdWaiters.has("new")).toBe(true);
+  (bridge as any).handleBridgeMessage({ type: "airpods_diagnostics", diagnostics: [] });
+  expect(seen).toHaveLength(1);
+});

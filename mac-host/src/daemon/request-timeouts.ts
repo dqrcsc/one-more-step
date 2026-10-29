@@ -15,6 +15,7 @@ export function boundedControlDeadline(requested: unknown, maximumMs: number, no
 }
 
 export function ipcTimeoutForAction(action: string, params: Record<string, any>): number {
+  if (action === "airpods.switch_to_mac" || action === "airpods.switch_to_phone") return 35000;
   if (action === "phone_request_approval") return (approvalTimeoutSec(params.timeoutSec ?? 1800) + 20) * 1000;
   if (action === "phone_device_control" && params.action === "system_action") return 70000;
   if (action === "phone_gui_action" || action === "phone_file_push") return 70000;

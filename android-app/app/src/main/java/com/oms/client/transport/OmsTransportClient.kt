@@ -2535,20 +2535,22 @@ class OmsTransportClient(
                         airpodsManager.handleHandoffToMac(
                             targetMac = params.optString("targetMac", ""),
                             pausePhoneMedia = params.optBoolean("pausePhoneMedia", true),
-                            disconnectOnPhone = params.optBoolean("disconnectOnPhone", true)
+                            disconnectOnPhone = params.optBoolean("disconnectOnPhone", true),
+                            deadlineMs = params.optLong("deadlineMs", System.currentTimeMillis() + 3000L),
+                            sessionStillValid = sessionStillValid
                         )
                     }
                     "airpods.connectOnPhone" -> {
                         val targetMac = params.optString("targetMac", "")
-                        val def = CompletableDeferred<Pair<Boolean, String>>()
-                        airpodsManager.connectAirpodsOnPhone(targetMac) { ok, msg ->
-                            def.complete(ok to msg)
-                        }
-                        val (ok, msg) = withTimeoutOrNull(4200L) { def.await() }
-                            ?: (false to "连接 AirPods 等待超时")
+                        val (ok, msg, diagnostics) = airpodsManager.connectAirpodsOnPhone(
+                            targetMac,
+                            params.optLong("deadlineMs", System.currentTimeMillis() + 12000L),
+                            sessionStillValid
+                        )
                         JSONObject().apply {
                             put("ok", ok)
                             put("message", msg)
+                            put("diagnostics", diagnostics)
                             put("status", collectDeviceSnapshot())
                         }
                     }

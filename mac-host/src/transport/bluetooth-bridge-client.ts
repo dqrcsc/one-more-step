@@ -115,6 +115,11 @@ export class BluetoothBridgeServer extends EventEmitter {
         socket.on("close", () => {
           if (this.activeClient === socket) {
             this.activeClient = null;
+            for (const waiter of this.pendingCmdWaiters.values()) {
+              clearTimeout(waiter.timer);
+              waiter.resolve({ ok: false, message: "蓝牙桥连接已断开" });
+            }
+            this.pendingCmdWaiters.clear();
           }
         });
       });
@@ -167,7 +172,7 @@ export class BluetoothBridgeServer extends EventEmitter {
     });
   }
 
-  public async connectAirpodsToMac(targetMac?: string, timeoutMs = 6500): Promise<Record<string, any>> {
+  public async connectAirpodsToMac(targetMac?: string, timeoutMs = 23000): Promise<Record<string, any>> {
     if (!this.activeClient) {
       return { ok: false, message: "oms-bt-bridge 未连接" };
     }
@@ -175,12 +180,14 @@ export class BluetoothBridgeServer extends EventEmitter {
     return await new Promise<Record<string, any>>((resolve) => {
       const timer = setTimeout(() => {
         this.pendingCmdWaiters.delete(reqId);
+        this.sendToBridge({ type: "airpods_cancel", reqId });
         resolve({ ok: false, message: "连接 AirPods 等待超时" });
       }, timeoutMs);
       this.pendingCmdWaiters.set(reqId, { resolve, timer });
       this.sendToBridge({
         type: "airpods_connect_mac",
         reqId,
+        deadlineMs: Date.now() + Math.max(0, Math.min(22000, timeoutMs - 1000)),
         targetMac: targetMac || undefined,
       });
     });
@@ -195,16 +202,18 @@ export class BluetoothBridgeServer extends EventEmitter {
       return { ok: false, message: "oms-bt-bridge 未连接" };
     }
     const reqId = `ap_rel_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const timeoutMs = opts?.timeoutMs ?? 3000;
+    const timeoutMs = opts?.timeoutMs ?? 8000;
     return await new Promise<Record<string, any>>((resolve) => {
       const timer = setTimeout(() => {
         this.pendingCmdWaiters.delete(reqId);
+        this.sendToBridge({ type: "airpods_cancel", reqId });
         resolve({ ok: false, message: "释放 AirPods 等待确认超时" });
       }, timeoutMs);
       this.pendingCmdWaiters.set(reqId, { resolve, timer });
       this.sendToBridge({
         type: "airpods_release_mac",
         reqId,
+        deadlineMs: Date.now() + Math.max(0, Math.min(7000, timeoutMs - 1000)),
         pauseMedia: opts?.pauseMedia !== false,
         targetMac: opts?.targetMac || undefined,
       });
@@ -306,6 +315,11 @@ export class BluetoothBridgeServer extends EventEmitter {
           reason: String(msg.reason || "mac_audio_started"),
         });
         break;
+      case "airpods_diagnostics":
+        if (msg.diagnostics && typeof msg.diagnostics === "object" && !Array.isArray(msg.diagnostics)) {
+          this.emit("airpodsDiagnostics", msg.diagnostics);
+        }
+        break;
       case "airpods_cmd_result": {
         const reqId = String(msg.reqId || "");
         const waiter = this.pendingCmdWaiters.get(reqId);
@@ -320,7 +334,8 @@ export class BluetoothBridgeServer extends EventEmitter {
   }
 
   public async stop(): Promise<void> {
-    for (const [, w] of this.pendingCmdWaiters) {
+    for (const [reqId, w] of this.pendingCmdWaiters) {
+      this.sendToBridge({ type: "airpods_cancel", reqId });
       clearTimeout(w.timer);
       w.resolve({ ok: false, message: "stopped" });
     }

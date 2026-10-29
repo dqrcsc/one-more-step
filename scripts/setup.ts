@@ -22,7 +22,7 @@ if (process.platform === "darwin") {
   const btBin = path.join(btBinDir, "oms-bt-bridge");
   try {
     fs.mkdirSync(btBinDir, { recursive: true });
-    execFileSync("swiftc", [btSrc, "-o", btBin], { stdio: "inherit" });
+    execFileSync("swiftc", [path.join(path.dirname(btSrc), "AirPodsOperation.swift"), path.join(path.dirname(btSrc), "AirPodsNativeRequest.swift"), btSrc, "-o", btBin], { stdio: "inherit" });
     console.log(`✅ Compiled macOS CoreBluetooth bridge: ${btBin}`);
   } catch (err: any) {
     console.warn(`⚠️ Skipping Bluetooth binary compilation (${err?.message || err})`);

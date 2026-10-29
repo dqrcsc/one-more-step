@@ -32,12 +32,13 @@ import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import org.lsposed.hiddenapibypass.HiddenApiBypass
-import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
 data class PairedAirPodsEntry(
@@ -63,10 +64,6 @@ class AirPodsAutoSwitchManager(
     private val onStatusChanged: (JSONObject) -> Unit
 ) {
     companion object {
-        private val AAP_UUID = UUID.fromString("74ec2172-0bad-4d01-8f77-997b2be0722a")
-        private val HFP_UUID = UUID.fromString("0000111e-0000-1000-8000-00805f9b34fb")
-        private val A2DP_SINK_UUID = UUID.fromString("0000110b-0000-1000-8000-00805f9b34fb")
-
         fun normalizeMac(raw: String?): String {
             if (raw.isNullOrBlank()) return ""
             return raw.trim().replace("-", ":").uppercase()
@@ -274,18 +271,9 @@ class AirPodsAutoSwitchManager(
                     (it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
                         it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
                         it.type == AudioDeviceInfo.TYPE_BLE_HEADSET) &&
-                        (normalizeMac(it.address) == mac ||
-                            it.productName.toString().contains("airpods", ignoreCase = true))
+                        normalizeMac(it.address) == mac
                 }
             ) {
-                return true
-            }
-        } catch (_: Throwable) {
-        }
-        try {
-            val m = BluetoothDevice::class.java.getDeclaredMethod("isConnected")
-            m.isAccessible = true
-            if (m.invoke(device) as? Boolean == true) {
                 return true
             }
         } catch (_: Throwable) {
@@ -331,7 +319,7 @@ class AirPodsAutoSwitchManager(
         if (list.isEmpty()) return null
         val norm = normalizeMac(explicitMac)
         if (norm.isNotEmpty()) {
-            list.firstOrNull { it.mac == norm }?.let { return it }
+            return list.firstOrNull { it.mac == norm }
         }
         return list.first()
     }
@@ -477,7 +465,7 @@ class AirPodsAutoSwitchManager(
                     suppressAutoGrabUntilElapsed = SystemClock.elapsedRealtime() + 5000L
                     val reason = if (isPhoneInCall()) "phone_call_started" else "phone_audio_started"
                     onClaimByPhone(target.mac, target.name, reason)
-                    connectAirpodsOnPhone(target.mac)
+                    scope.launch { connectAirpodsOnPhone(target.mac) }
                 }, 320L)
             }
         }
@@ -542,198 +530,171 @@ class AirPodsAutoSwitchManager(
         }
     }
 
-    private fun invokeProfileConnect(proxy: Any?, device: BluetoothDevice): Boolean {
-        if (proxy == null) return false
-        try {
-            val setPolicy = proxy.javaClass.methods.firstOrNull {
-                it.name == "setConnectionPolicy" && it.parameterTypes.size == 2
-            }
-            setPolicy?.isAccessible = true
-            setPolicy?.invoke(proxy, device, 100)
-        } catch (_: Throwable) {
-        }
+    private fun traceCall(trace: AirPodsAttemptTrace?, stage: String, body: () -> Any?): Any? {
         return try {
-            val m = proxy.javaClass.getDeclaredMethod("connect", BluetoothDevice::class.java)
-            m.isAccessible = true
-            (m.invoke(proxy, device) as? Boolean) == true
-        } catch (_: Throwable) {
-            false
+            body().also { trace?.record(stage, mapOf("result" to (it?.toString() ?: "null"))) }
+        } catch (e: Throwable) {
+            val cause = (e as? java.lang.reflect.InvocationTargetException)?.targetException ?: e
+            trace?.record(stage, mapOf("error" to cause.javaClass.simpleName, "message" to (cause.message ?: "").take(300)))
+            null
         }
     }
 
-    private fun invokeProfileDisconnect(proxy: Any?, device: BluetoothDevice): Boolean {
-        if (proxy == null) return false
+    private fun invokeProfileConnect(proxy: Any?, device: BluetoothDevice, trace: AirPodsAttemptTrace? = null): Boolean {
+        val kind = proxy?.javaClass?.simpleName ?: "profile_unavailable"
+        if (proxy == null) { trace?.record(kind); return false }
+        return traceCall(trace, "$kind.connect") {
+            proxy.javaClass.getDeclaredMethod("connect", BluetoothDevice::class.java)
+                .apply { isAccessible = true }.invoke(proxy, device)
+        } == true
+    }
+
+    private fun invokeProfileDisconnect(proxy: Any?, device: BluetoothDevice, trace: AirPodsAttemptTrace? = null): Boolean {
+        if (proxy == null) { trace?.record("disconnect_profile_unavailable"); return false }
+        return traceCall(trace, "${proxy.javaClass.simpleName}.disconnect") {
+            proxy.javaClass.getDeclaredMethod("disconnect", BluetoothDevice::class.java)
+                .apply { isAccessible = true }.invoke(proxy, device)
+        } == true
+    }
+
+    private fun invokeDeviceDisconnect(device: BluetoothDevice, trace: AirPodsAttemptTrace? = null): Boolean {
+        val result = traceCall(trace, "BluetoothDevice.disconnect") {
+            BluetoothDevice::class.java.getDeclaredMethod("disconnect").apply { isAccessible = true }.invoke(device)
+        }
+        return result == true || result == 0
+    }
+
+    private fun invokeSetActiveDevice(device: BluetoothDevice, trace: AirPodsAttemptTrace? = null) {
+        val proxy: Any = (if (isPhoneInCall()) headsetProxy else a2dpProxy) ?: return
+        traceCall(trace, "${proxy.javaClass.simpleName}.setActiveDevice") {
+            proxy.javaClass.getDeclaredMethod("setActiveDevice", BluetoothDevice::class.java)
+                .apply { isAccessible = true }.invoke(proxy, device)
+        }
+    }
+
+    private fun desiredProfileState(device: BluetoothDevice): Int = try {
+        if (isPhoneInCall()) headsetProxy?.getConnectionState(device) ?: -1
+        else a2dpProxy?.getConnectionState(device) ?: -1
+    } catch (_: Throwable) { -1 }
+
+    private fun isTargetActive(device: BluetoothDevice): Boolean {
+        val mac = normalizeMac(device.address)
+        // A connected ACL or an available audio output is not proof of the active route.
+        val proxy: Any = (if (isPhoneInCall()) headsetProxy else a2dpProxy) ?: return false
         return try {
-            val m = proxy.javaClass.getDeclaredMethod("disconnect", BluetoothDevice::class.java)
-            m.isAccessible = true
-            (m.invoke(proxy, device) as? Boolean) == true
-        } catch (_: Throwable) {
-            false
-        }
+            val active = proxy.javaClass.getMethod("getActiveDevice").invoke(proxy) as? BluetoothDevice
+            active != null && normalizeMac(active.address) == mac
+        } catch (_: Throwable) { false }
     }
 
-    private fun invokeDeviceConnect(device: BluetoothDevice): Boolean {
-        return try {
-            val m = BluetoothDevice::class.java.getDeclaredMethod("connect")
-            m.isAccessible = true
-            val res = m.invoke(device)
-            (res as? Boolean == true) || (res as? Int == 0)
-        } catch (_: Throwable) {
-            false
-        }
-    }
-
-    private fun invokeDeviceDisconnect(device: BluetoothDevice): Boolean {
-        return try {
-            val m = BluetoothDevice::class.java.getDeclaredMethod("disconnect")
-            m.isAccessible = true
-            val res = m.invoke(device)
-            (res as? Boolean == true) || (res as? Int == 0)
-        } catch (_: Throwable) {
-            false
-        }
-    }
-
-    private fun invokeSetActiveDevice(device: BluetoothDevice) {
-        try {
-            val a2dp = a2dpProxy
-            if (a2dp != null) {
-                val m = a2dp.javaClass.getDeclaredMethod("setActiveDevice", BluetoothDevice::class.java)
-                m.isAccessible = true
-                m.invoke(a2dp, device)
-            }
-        } catch (_: Throwable) {
-        }
-        try {
-            val adapter = bluetoothAdapter ?: return
-            val m = adapter.javaClass.getDeclaredMethod(
-                "setActiveDevice",
-                BluetoothDevice::class.java,
-                Int::class.javaPrimitiveType
-            )
-            m.isAccessible = true
-            m.invoke(adapter, device, 0) // ACTIVE_DEVICE_ALL = 0
-        } catch (_: Throwable) {
-        }
-    }
-
-    private fun wakeAirpodsAclViaRfcomm(device: BluetoothDevice) {
-        for (uuid in listOf(AAP_UUID, HFP_UUID, A2DP_SINK_UUID)) {
-            var sock: android.bluetooth.BluetoothSocket? = null
-            try {
-                sock = device.createInsecureRfcommSocketToServiceRecord(uuid)
-                sock.connect()
-                Thread.sleep(150L)
-                sock.close()
-                return
-            } catch (_: Throwable) {
-                try { sock?.close() } catch (_: Throwable) {}
-            }
-        }
-    }
-
-    fun connectAirpodsOnPhone(explicitMac: String? = null, onResult: ((Boolean, String) -> Unit)? = null) {
+    suspend fun connectAirpodsOnPhone(
+        explicitMac: String? = null,
+        deadlineMs: Long = System.currentTimeMillis() + 12000L,
+        sessionStillValid: () -> Boolean = { true }
+    ): Triple<Boolean, String, JSONObject> {
+        val trace = AirPodsAttemptTrace { SystemClock.elapsedRealtime() }
         val gen = connectGeneration.incrementAndGet()
-        suppressAutoGrabUntilElapsed = SystemClock.elapsedRealtime() + 5000L
-
+        trace.record("started", mapOf("generation" to gen, "permission" to hasBtConnectPermission()))
+        val budget = (deadlineMs - System.currentTimeMillis()).coerceIn(0L, 12000L)
+        val deadlineElapsed = SystemClock.elapsedRealtime() + budget
+        suppressAutoGrabUntilElapsed = deadlineElapsed + 1000L
         val target = selectTargetAirpods(explicitMac)
         if (target == null) {
             restoreTempMuteOnPhone()
-            onResult?.invoke(false, "手机已配对蓝牙列表中未找到 AirPods")
-            return
+            trace.record("target_not_found")
+            return Triple(false, "手机已配对蓝牙列表中未找到指定 AirPods", JSONObject(trace.snapshot()))
         }
-
         lastActiveAirpodsMac = target.mac
-        if (target.connected) {
-            invokeSetActiveDevice(target.device)
-            restoreTempMuteOnPhone()
-            reportStatusIfChanged(force = true)
-            onResult?.invoke(true, "AirPods 已连接在手机上")
-            return
+        var previousProfileState: Int? = null
+        fun observedProfileState(): Int {
+            val state = desiredProfileState(target.device)
+            if (state != previousProfileState) {
+                trace.record("profile_state", mapOf("state" to state))
+                previousProfileState = state
+            }
+            return state
         }
-
-        scope.launch {
-            var connected = false
-            val waitDelays = listOf(120L, 550L, 750L, 900L)
-            for ((idx, delayMs) in waitDelays.withIndex()) {
-                if (connectGeneration.get() != gen) return@launch
-                delay(delayMs)
-                if (connectGeneration.get() != gen) return@launch
-
-                if (isDeviceConnectedOnPhone(target.device)) {
-                    connected = true
-                    break
-                }
-
-                val c1 = invokeProfileConnect(a2dpProxy, target.device)
-                val c2 = invokeProfileConnect(headsetProxy, target.device)
-                val c3 = invokeDeviceConnect(target.device)
-
-                if (!c1 && !c2 && !c3 && idx >= 1) {
-                    wakeAirpodsAclViaRfcomm(target.device)
-                }
-
-                // Poll briefly for connection state
-                repeat(4) {
-                    delay(140L)
-                    if (isDeviceConnectedOnPhone(target.device)) {
-                        connected = true
-                        return@repeat
-                    }
-                }
-                if (connected) break
-            }
-
-            if (connectGeneration.get() == gen) {
-                if (connected || isDeviceConnectedOnPhone(target.device)) {
-                    connected = true
-                    invokeSetActiveDevice(target.device)
-                }
-                restoreTempMuteOnPhone()
-                reportStatusIfChanged(force = true)
-                onResult?.invoke(
-                    connected,
-                    if (connected) "已将 ${target.name} 切换到手机" else "已请求连接 ${target.name}，请确认耳机在耳中"
-                )
-            }
+        return try {
+            val ok = AirPodsConnectionAttempt.run(
+                budgetMs = (deadlineElapsed - SystemClock.elapsedRealtime()).coerceAtLeast(0L),
+                now = { SystemClock.elapsedRealtime() },
+                stillValid = { connectGeneration.get() == gen && sessionStillValid() },
+                connected = { observedProfileState() == BluetoothProfile.STATE_CONNECTED },
+                active = { isTargetActive(target.device) },
+                connect = {
+                    trace.record("connect_requested", mapOf("profileState" to desiredProfileState(target.device), "active" to isTargetActive(target.device)))
+                    // Request only the relevant profile; policy changes/device-wide calls
+                    // require privileged system permissions and are not connection fallbacks.
+                    invokeProfileConnect(if (isPhoneInCall()) headsetProxy else a2dpProxy, target.device, trace)
+                },
+                activate = { invokeSetActiveDevice(target.device, trace) },
+                pause = { delay(it) },
+                connecting = { observedProfileState() == BluetoothProfile.STATE_CONNECTING }
+            )
+            trace.record("finished", mapOf("ok" to ok, "sessionValid" to sessionStillValid(), "generationValid" to (gen == connectGeneration.get()), "connected" to isDeviceConnectedOnPhone(target.device), "active" to isTargetActive(target.device)))
+            Triple(ok, if (ok) "已将 ${target.name} 切换到手机并确认活动音频设备"
+                else "AirPods 切换未确认，请查看连接诊断", JSONObject(trace.snapshot()))
+        } finally {
+            if (connectGeneration.get() == gen) restoreTempMuteOnPhone()
+            reportStatusIfChanged(force = true)
         }
     }
 
-    fun handleHandoffToMac(
+    suspend fun handleHandoffToMac(
         targetMac: String?,
         pausePhoneMedia: Boolean,
-        disconnectOnPhone: Boolean
+        disconnectOnPhone: Boolean,
+        deadlineMs: Long = System.currentTimeMillis() + 3000L,
+        sessionStillValid: () -> Boolean = { true }
     ): JSONObject {
-        connectGeneration.incrementAndGet()
-        suppressAutoGrabUntilElapsed = SystemClock.elapsedRealtime() + 6000L
+        val trace = AirPodsAttemptTrace { SystemClock.elapsedRealtime() }
+        val gen = connectGeneration.incrementAndGet()
+        trace.record("handoff_started", mapOf("generation" to gen))
+        val deadline = SystemClock.elapsedRealtime() +
+            (deadlineMs - System.currentTimeMillis()).coerceIn(0L, 3000L)
+        fun valid() = gen == connectGeneration.get() && sessionStillValid() &&
+            SystemClock.elapsedRealtime() < deadline
+        suppressAutoGrabUntilElapsed = SystemClock.elapsedRealtime() + 26000L
         restoreTempMuteOnPhone()
-
-        if (pausePhoneMedia && pauseOtherOnSwitch) {
-            pausePhoneActiveMedia()
-        }
-
-        var disconnectedAny = false
-        if (disconnectOnPhone) {
-            val paired = listPairedAirpods()
-            val norm = normalizeMac(targetMac)
-            val targets = paired.filter { it.connected || (norm.isNotEmpty() && it.mac == norm) }
-            scope.launch {
-                for (item in targets) {
-                    val d1 = invokeProfileDisconnect(a2dpProxy, item.device)
-                    val d2 = invokeProfileDisconnect(headsetProxy, item.device)
-                    val d3 = invokeDeviceDisconnect(item.device)
-                    if (d1 || d2 || d3) disconnectedAny = true
+        val norm = normalizeMac(targetMac)
+        val targets = listPairedAirpods().filter { if (norm.isNotEmpty()) it.mac == norm else it.connected }
+        var disconnected = !disconnectOnPhone
+        try {
+            currentCoroutineContext().ensureActive()
+            if (valid()) {
+                if (pausePhoneMedia && pauseOtherOnSwitch) pausePhoneActiveMedia()
+                if (disconnectOnPhone) {
+                    for (item in targets) {
+                        currentCoroutineContext().ensureActive()
+                        if (!valid()) break
+                        invokeProfileDisconnect(a2dpProxy, item.device, trace)
+                        invokeProfileDisconnect(headsetProxy, item.device, trace)
+                        invokeDeviceDisconnect(item.device, trace)
+                    }
+                    while (valid()) {
+                        currentCoroutineContext().ensureActive()
+                        val released = hasBtConnectPermission() && targets.all { item ->
+                            try {
+                                a2dpProxy?.getConnectionState(item.device) == BluetoothProfile.STATE_DISCONNECTED &&
+                                    headsetProxy?.getConnectionState(item.device) == BluetoothProfile.STATE_DISCONNECTED
+                            } catch (_: Throwable) { false }
+                        }
+                        if (released) {
+                            disconnected = true
+                            break
+                        }
+                        delay(100L)
+                    }
                 }
-                delay(300L)
-                reportStatusIfChanged(force = true)
             }
-        }
-
-        return JSONObject().apply {
-            put("ok", true)
-            put("pausedMedia", pausePhoneMedia && pauseOtherOnSwitch)
-            put("disconnected", disconnectedAny || disconnectOnPhone)
-        }
+            return JSONObject().apply {
+                trace.record("handoff_finished", mapOf("ok" to (valid() && disconnected), "disconnected" to disconnected))
+                put("diagnostics", JSONObject(trace.snapshot()))
+                put("ok", valid() && disconnected)
+                put("disconnected", disconnected)
+                put("message", if (disconnected) "手机音频连接已释放" else "手机音频连接释放未确认")
+            }
+        } finally { reportStatusIfChanged(force = true) }
     }
 
     fun updateSyncConfig(params: JSONObject) {
