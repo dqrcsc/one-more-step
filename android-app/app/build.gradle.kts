@@ -11,8 +11,8 @@ android {
         applicationId = "com.oms.client"
         minSdk = 30
         targetSdk = 34
-        versionCode = 33
-        versionName = "1.5.8"
+        versionCode = 35
+        versionName = "1.5.9"
     }
 
     buildTypes {
