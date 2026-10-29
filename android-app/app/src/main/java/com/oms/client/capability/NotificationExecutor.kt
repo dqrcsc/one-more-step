@@ -342,7 +342,18 @@ object NotificationExecutor {
             if (level == "urgent") {
                 builder.setPriority(NotificationCompat.PRIORITY_MAX)
                 builder.setCategory(NotificationCompat.CATEGORY_ALARM)
-                builder.setFullScreenIntent(pi, true)
+                // Full-screen display may be launched by Android without a user tap.
+                // Give it a distinct PendingIntent identity (extras alone are ignored)
+                // and never attach the content-click stop command to this path.
+                val displayIntent = Intent(context, MainActivity::class.java).apply {
+                    action = "com.oms.client.ACTION_DISPLAY_URGENT_NOTIFICATION"
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                }
+                val displayPi = PendingIntent.getActivity(
+                    context, notificationId, displayIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                builder.setFullScreenIntent(displayPi, true)
                 triggerUrgentVibration(context)
             }
 

@@ -42,15 +42,20 @@ internal class GuiSessionGuard(initiallyStopped: Boolean = false) {
         requiresObservation: Boolean,
         sessionAuthorized: Boolean = true
     ) {
-        check(sessionAuthorized) { "ERR_SESSION_REVOKED: Originating connection is no longer authorized" }
-        check(!stopped) { "ERR_USER_INTERRUPTED: Resume GUI access on the phone first" }
-        check(now < deadline) { "ERR_GUI_DEADLINE: Action expired" }
+        checkAuthorization(now, deadline, sessionAuthorized)
         check(revision == expectedRevision) { "ERR_STALE_OBSERVATION: Screen changed ($invalidationReason); observe again" }
         if (requiresObservation || !suppliedObservation.isNullOrBlank()) {
             check(!suppliedObservation.isNullOrBlank() && suppliedObservation == observationId && window == observedWindow) {
                 "ERR_STALE_OBSERVATION: Missing or outdated observationId; observe again"
             }
         }
+    }
+
+    /** Recheck after a gesture without treating its own window updates as stale input. */
+    fun checkAuthorization(now: Long, deadline: Long, sessionAuthorized: Boolean) {
+        check(sessionAuthorized) { "ERR_SESSION_REVOKED: Originating connection is no longer authorized" }
+        check(!stopped) { "ERR_USER_INTERRUPTED: Resume GUI access on the phone first" }
+        check(now < deadline) { "ERR_GUI_DEADLINE: Action expired" }
     }
 
     companion object {

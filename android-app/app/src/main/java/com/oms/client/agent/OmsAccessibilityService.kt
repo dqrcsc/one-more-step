@@ -12,6 +12,7 @@ import android.graphics.PointF
 import android.graphics.Rect
 import android.os.Bundle
 import android.os.PowerManager
+import android.telecom.TelecomManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
@@ -698,7 +699,8 @@ class OmsAccessibilityService : AccessibilityService() {
             val txt = node.text?.toString()?.trim() ?: ""
             val desc = node.contentDescription?.toString()?.trim() ?: ""
             val viewId = node.viewIdResourceName ?: ""
-            if (txt == targetStr || desc == targetStr || desc.startsWith("$targetStr ") || viewId.endsWith("key$targetStr")) {
+            if (node.packageName?.toString() == "com.android.systemui" && node.isVisibleToUser && node.isEnabled &&
+                (txt == targetStr || desc == targetStr || desc.startsWith("$targetStr ") || viewId.endsWith("key$targetStr"))) {
                 val r = Rect()
                 node.getBoundsInScreen(r)
                 if (r.width() > 20 && r.height() > 20 && r.centerY() > screenH * 0.30) {
@@ -712,16 +714,41 @@ class OmsAccessibilityService : AccessibilityService() {
         return null
     }
 
+    private suspend fun <T> withGuardedPhoneAction(
+        params: JSONObject,
+        sessionStillValid: () -> Boolean,
+        action: suspend GuardedRemoteAction.Steps.() -> T
+    ): T = withContext(Dispatchers.Main.immediate) {
+        GuardedRemoteAction(guard, guiMutex).run(
+            requestedDeadline = if (params.has("deadlineMs")) params.optLong("deadlineMs") else null,
+            sessionValid = sessionStillValid,
+            activeJob = { activeAction = it },
+            action = action
+        )
+    }
+
     suspend fun performScreenUnlock(params: JSONObject, sessionStillValid: () -> Boolean): JSONObject =
-        withContext(Dispatchers.Main.immediate) {
+        withGuardedPhoneAction(params, sessionStillValid) { performScreenUnlockLocked(params, this) }
+
+    private suspend fun performScreenUnlockLocked(
+        params: JSONObject,
+        steps: GuardedRemoteAction.Steps
+    ): JSONObject {
+            steps.check()
             val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             val dm = resources.displayMetrics
             val screenW = dm.widthPixels
             val screenH = dm.heightPixels
+            fun requireKeyguardInputSurface() {
+                check(km.isKeyguardLocked) { "ERR_UNLOCK_STATE_CHANGED: Keyguard is no longer locked" }
+                check(rootInActiveWindow?.packageName?.toString() == "com.android.systemui") {
+                    "ERR_KEYGUARD_SURFACE_UNAVAILABLE: No active system keyguard surface"
+                }
+            }
 
             if (pm.isInteractive && !km.isKeyguardLocked) {
-                return@withContext JSONObject().apply {
+                return JSONObject().apply {
                     put("ok", true)
                     put("action", "unlock_screen")
                     put("unlocked", true)
@@ -734,17 +761,17 @@ class OmsAccessibilityService : AccessibilityService() {
 
             // 1. Wake up screen if off
             if (!pm.isInteractive) {
-                AppLauncherHelper.wakeScreenIfNeeded(this@OmsAccessibilityService)
+                steps.effect { AppLauncherHelper.wakeScreenIfNeeded(this@OmsAccessibilityService) }
                 var waited = 0
                 while (!pm.isInteractive && waited < 700) {
-                    delay(70)
+                    steps.pause(70)
                     waited += 70
                 }
-                delay(220)
+                steps.pause(220)
             }
 
             if (!km.isKeyguardLocked) {
-                return@withContext JSONObject().apply {
+                return JSONObject().apply {
                     put("ok", true)
                     put("action", "unlock_screen")
                     put("unlocked", true)
@@ -764,20 +791,21 @@ class OmsAccessibilityService : AccessibilityService() {
                 detectedGrid.source in setOf("accessibility_children_9", "accessibility_node", "accessibility_square_heuristic")
             var swipedUp = false
             if (!isBouncerAlreadyShowing) {
-                check(sessionStillValid()) { "Session closed" }
-                injectBezierSwipeGesture(
+                steps.check()
+                requireKeyguardInputSurface()
+                steps.effect { injectBezierSwipeGesture(
                     screenW / 2,
                     (screenH * 0.78).toInt(),
                     screenW / 2,
                     (screenH * 0.24).toInt(),
                     240L
-                )
+                ) }
                 swipedUp = true
-                delay(460)
+                steps.pause(460)
             }
 
             if (!km.isKeyguardLocked) {
-                return@withContext JSONObject().apply {
+                return JSONObject().apply {
                     put("ok", true)
                     put("action", "unlock_screen")
                     put("unlocked", true)
@@ -789,6 +817,7 @@ class OmsAccessibilityService : AccessibilityService() {
 
             // 3. Pattern unlock execution
             if (rawPattern.isNotEmpty()) {
+                requireKeyguardInputSurface()
                 val cells = parsePatternCells(rawPattern)
                 require(cells.size >= 4) {
                     "图案密码至少需要 4 个点（1~9 对应九宫格左上到右下，如 '14789'）"
@@ -796,23 +825,22 @@ class OmsAccessibilityService : AccessibilityService() {
                 val grid = resolvePatternGridCenters(screenW, screenH, customBounds)
                     ?: fallbackHyperOsPatternGrid(screenW, screenH)
                 val pathPoints = cells.map { idx -> grid.centers[idx] }
-                check(sessionStillValid()) { "Session closed" }
-                val gestureDispatched = injectPatternGesture(pathPoints)
+                steps.check()
+                val gestureDispatched = steps.effect { injectPatternGesture(pathPoints) }
 
                 var waitUnlockMs = 0
                 while (km.isKeyguardLocked && waitUnlockMs < 1200) {
-                    delay(100)
+                    steps.pause(100)
                     waitUnlockMs += 100
                 }
                 val unlocked = !km.isKeyguardLocked
-                return@withContext JSONObject().apply {
+                return JSONObject().apply {
                     put("ok", unlocked)
                     put("action", "unlock_screen")
                     put("unlocked", unlocked)
                     put("gestureDispatched", gestureDispatched)
                     put("swipedUp", swipedUp)
                     put("method", "pattern")
-                    put("patternCells", cells.map { it + 1 }.joinToString("-"))
                     put("gridSource", grid.source)
                     put("gridBounds", JSONObject().apply {
                         put("left", grid.bounds.left)
@@ -823,29 +851,31 @@ class OmsAccessibilityService : AccessibilityService() {
                     put("screenLocked", km.isKeyguardLocked)
                     put("screenInteractive", pm.isInteractive)
                     if (!unlocked) {
-                        put("error", "已绘制图案 (${cells.map { it + 1 }.joinToString("-")}) 但手机仍处于锁屏状态，请确认图案顺序或九宫格坐标区域")
+                        put("error", "已尝试图案解锁但手机仍处于锁屏状态，请在手机上确认解锁方式或九宫格坐标区域")
                     }
                 }
             }
 
             // 4. Optional PIN unlock execution
             if (rawPin.isNotEmpty()) {
+                require(rawPin.all { it in '0'..'9' }) { "PIN must contain decimal digits only" }
                 for (ch in rawPin) {
-                    if (!ch.isDigit()) continue
-                    check(sessionStillValid()) { "Session closed" }
+                    steps.check()
+                    requireKeyguardInputSurface()
                     val pt = findPinDigitNodeCenter(ch, screenW, screenH)
-                    if (pt != null) {
-                        injectTapGesture(pt.x.toInt(), pt.y.toInt(), 65L)
-                        delay(110)
+                        ?: throw IllegalStateException("ERR_PIN_TARGET_UNAVAILABLE: No verified keyguard digit target")
+                    check(steps.effect { injectTapGesture(pt.x.toInt(), pt.y.toInt(), 65L) }) {
+                        "ERR_PIN_INPUT_FAILED: Keyguard input was not accepted"
                     }
+                    steps.pause(110)
                 }
                 var waitUnlockMs = 0
                 while (km.isKeyguardLocked && waitUnlockMs < 1100) {
-                    delay(100)
+                    steps.pause(100)
                     waitUnlockMs += 100
                 }
                 val unlocked = !km.isKeyguardLocked
-                return@withContext JSONObject().apply {
+                return JSONObject().apply {
                     put("ok", unlocked)
                     put("action", "unlock_screen")
                     put("unlocked", unlocked)
@@ -856,7 +886,7 @@ class OmsAccessibilityService : AccessibilityService() {
             }
 
             // 5. Neither pattern nor PIN provided -> woke screen and swiped up to bouncer
-            JSONObject().apply {
+            return JSONObject().apply {
                 put("ok", !km.isKeyguardLocked)
                 put("action", "unlock_screen")
                 put("unlocked", !km.isKeyguardLocked)
@@ -868,167 +898,202 @@ class OmsAccessibilityService : AccessibilityService() {
         }
 
     suspend fun performPhoneCall(params: JSONObject, sessionStillValid: () -> Boolean): JSONObject =
-        withContext(Dispatchers.Main.immediate) {
+        withGuardedPhoneAction(params, sessionStillValid) {
+            val steps = this
             val rawNumber = params.optString("number", params.optString("phoneNumber", params.optString("text", ""))).trim()
             val cleanNumber = rawNumber.filter { it.isDigit() || it in setOf('+', '*', '#', ',') }
             require(cleanNumber.isNotEmpty()) { "请提供要拨打的电话号码" }
-
             val dialOnly = params.optBoolean("dialOnly", false)
             val enableSpeaker = params.optBoolean("speaker", false)
-            val simPref = params.optString("simSlot", params.optString("sim", "1")).trim()
-
+            val simPref = params.optString("simSlot", params.optString("sim", "")).trim()
             val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-            if (km.isKeyguardLocked) {
-                performScreenUnlock(params, sessionStillValid)
-                delay(350)
+            val telecom = getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+            fun isInCall(): Boolean? = try { telecom?.isInCall } catch (_: SecurityException) { null }
+            fun failed(reason: String, requested: Boolean = false) = JSONObject().apply {
+                put("ok", false)
+                put("action", "call_phone")
+                put("callPlaced", false)
+                put("callRequested", requested)
+                put("reason", reason)
             }
 
-            val (opened, errMsg) = AppLauncherHelper.openDialerWithNumber(this@OmsAccessibilityService, cleanNumber)
-            if (!opened) {
-                return@withContext JSONObject().apply {
-                    put("ok", false)
-                    put("action", "call_phone")
-                    put("number", cleanNumber)
-                    put("error", errMsg ?: "无法唤起系统拨号盘")
+            steps.requireUnlocked {
+                if (!km.isKeyguardLocked) true
+                else performScreenUnlockLocked(params, steps).optBoolean("unlocked", false) && !km.isKeyguardLocked
+            }
+            if (!dialOnly && isInCall() != false) {
+                return@withGuardedPhoneAction failed("call_state_unavailable_or_already_active")
+            }
+
+            val dialerIntent = android.content.Intent(android.content.Intent.ACTION_DIAL,
+                android.net.Uri.fromParts("tel", cleanNumber, null))
+            val dialerPackages = setOfNotNull(
+                try { telecom?.defaultDialerPackage } catch (_: SecurityException) { null },
+                dialerIntent.resolveActivity(packageManager)?.packageName
+            ).filterNot { it in setOf("android", "com.android.intentresolver") }.toSet()
+            if (dialerPackages.isEmpty()) return@withGuardedPhoneAction failed("dialer_unavailable")
+
+            val (opened, _) = steps.effect {
+                check(!km.isKeyguardLocked) { "ERR_UNLOCK_FAILED: Phone locked before opening dialer" }
+                AppLauncherHelper.openDialerWithNumber(this@OmsAccessibilityService, cleanNumber)
+            }
+            if (!opened) return@withGuardedPhoneAction failed("dialer_open_failed")
+            steps.pause(520L)
+
+            fun dialerNodes(): List<AccessibilityNodeInfo> {
+                val result = mutableListOf<AccessibilityNodeInfo>()
+                val queue = ArrayDeque<AccessibilityNodeInfo>()
+                collectApplicationRoots().filter { it.packageName?.toString() in dialerPackages }
+                    .forEach { queue.addLast(it) }
+                while (queue.isNotEmpty()) {
+                    val n = queue.removeFirst()
+                    if (n.packageName?.toString() in dialerPackages && n.isVisibleToUser) result.add(n)
+                    for (i in 0 until n.childCount) n.getChild(i)?.let { queue.addLast(it) }
+                }
+                return result
+            }
+            fun hasRequestedNumber(nodes: List<AccessibilityNodeInfo>): Boolean = nodes.any { node ->
+                listOf(node.text, node.contentDescription).any { value ->
+                    value?.toString()?.filter { it.isDigit() || it in setOf('+', '*', '#', ',') } == cleanNumber
                 }
             }
-
-            if (dialOnly) {
-                delay(350)
-                return@withContext JSONObject().apply {
-                    put("ok", true)
-                    put("action", "call_phone")
-                    put("number", cleanNumber)
-                    put("dialedOnly", true)
-                    put("callPlaced", false)
-                }
+            var nodes = dialerNodes()
+            if (km.isKeyguardLocked || !hasRequestedNumber(nodes)) {
+                return@withGuardedPhoneAction failed("dialer_number_not_verified")
             }
-
-            delay(520)
-            check(sessionStillValid()) { "Session closed" }
-
-            val dm = resources.displayMetrics
-            val screenW = dm.widthPixels
-            val screenH = dm.heightPixels
-            val roots = collectAllWindowRoots()
-            val queue = ArrayDeque<AccessibilityNodeInfo>()
-            roots.forEach { queue.addLast(it) }
-
-            data class CallBtnCandidate(val node: AccessibilityNodeInfo, val label: String, val rect: Rect)
-            val candidates = mutableListOf<CallBtnCandidate>()
-
-            while (queue.isNotEmpty()) {
-                val n = queue.removeFirst()
-                val cls = n.className?.toString() ?: ""
-                val lbl = (n.text?.toString() ?: n.contentDescription?.toString() ?: "").trim()
-                val r = Rect()
-                n.getBoundsInScreen(r)
-                if (n.isVisibleToUser && n.isClickable &&
-                    (cls.endsWith("Button") || cls.endsWith("ImageButton") || lbl.contains("电信") || lbl.contains("联通") || lbl.contains("移动") || lbl.contains("拨打") || lbl.contains("呼叫")) &&
-                    !lbl.contains("菜单") && !lbl.contains("关闭") && !lbl.contains("删除") &&
-                    r.centerY() in (screenH * 0.74).toInt()..(screenH * 0.93).toInt() &&
-                    r.centerX() in (screenW * 0.18).toInt()..(screenW * 0.82).toInt()
-                ) {
-                    candidates.add(CallBtnCandidate(n, lbl, r))
-                }
-                for (i in 0 until n.childCount) {
-                    n.getChild(i)?.let { queue.addLast(it) }
-                }
-            }
-
-            val sorted = candidates.sortedBy { it.rect.centerX() }
-            val chosen = when {
-                sorted.isEmpty() -> null
-                simPref.isNotEmpty() && sorted.any { it.label.contains(simPref, ignoreCase = true) } ->
-                    sorted.first { it.label.contains(simPref, ignoreCase = true) }
-                simPref == "2" && sorted.size >= 2 -> sorted[1]
-                else -> sorted.first()
-            }
-
-            var clicked = false
-            var simLabel = chosen?.label ?: "默认SIM卡"
-            if (chosen != null) {
-                clicked = chosen.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                if (!clicked) {
-                    clicked = injectTapGesture(chosen.rect.centerX(), chosen.rect.centerY(), 75L)
-                }
-            } else {
-                // Fallback tap on Xiaomi dual-SIM button 1 or button 2 coordinates
-                val targetX = if (simPref == "2") (screenW * 0.64).toInt() else (screenW * 0.36).toInt()
-                val targetY = (screenH * 0.864).toInt()
-                clicked = injectTapGesture(targetX, targetY, 75L)
-                simLabel = if (simPref == "2") "SIM卡2" else "SIM卡1"
-            }
-
-            var speakerEnabled = false
-            if (clicked && enableSpeaker) {
-                delay(1800)
-                val callRoots = collectAllWindowRoots()
-                val q2 = ArrayDeque<AccessibilityNodeInfo>()
-                callRoots.forEach { q2.addLast(it) }
-                while (q2.isNotEmpty()) {
-                    val n = q2.removeFirst()
-                    val lbl = (n.text?.toString() ?: n.contentDescription?.toString() ?: "").trim()
-                    if (n.isVisibleToUser && (lbl.contains("免提") || lbl.contains("扬声器") || lbl.contains("Speaker", ignoreCase = true))) {
-                        val r = Rect()
-                        n.getBoundsInScreen(r)
-                        speakerEnabled = n.performAction(AccessibilityNodeInfo.ACTION_CLICK) ||
-                            injectTapGesture(r.centerX(), r.centerY(), 75L)
-                        break
-                    }
-                    for (i in 0 until n.childCount) {
-                        n.getChild(i)?.let { q2.addLast(it) }
-                    }
-                }
-            }
-
-            delay(400)
-            JSONObject().apply {
-                put("ok", clicked)
+            if (dialOnly) return@withGuardedPhoneAction JSONObject().apply {
+                put("ok", true)
                 put("action", "call_phone")
                 put("number", cleanNumber)
-                put("simUsed", simLabel)
-                put("callPlaced", clicked)
+                put("dialedOnly", true)
+                put("callPlaced", false)
+            }
+
+            fun label(node: AccessibilityNodeInfo) =
+                (node.text?.toString() ?: node.contentDescription?.toString() ?: "").trim()
+            fun isCallButton(node: AccessibilityNodeInfo): Boolean =
+                node.packageName?.toString() in dialerPackages && node.isVisibleToUser &&
+                    node.isEnabled && node.isClickable &&
+                    DialerTargetPolicy.isCallControl(label(node), node.viewIdResourceName ?: "")
+            fun matchesSim(node: AccessibilityNodeInfo): Boolean =
+                DialerTargetPolicy.matchesSim(label(node), node.viewIdResourceName ?: "", simPref)
+            val candidates = nodes.filter { isCallButton(it) && matchesSim(it) }
+            if (candidates.size != 1) return@withGuardedPhoneAction failed("call_target_or_sim_not_verified")
+            val chosen = candidates.single()
+            val clicked = steps.effect {
+                nodes = dialerNodes()
+                !km.isKeyguardLocked && isInCall() == false && hasRequestedNumber(nodes) &&
+                    chosen.refresh() && isCallButton(chosen) && matchesSim(chosen) &&
+                    chosen.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            }
+            if (!clicked) return@withGuardedPhoneAction failed("call_action_rejected")
+
+            var callConfirmed = false
+            for (attempt in 0 until 15) {
+                steps.pause(100L)
+                val state = isInCall()
+                if (state == true) { callConfirmed = true; break }
+                if (state == null) break
+            }
+            if (!callConfirmed) return@withGuardedPhoneAction failed("call_not_confirmed", requested = true)
+
+            var speakerEnabled = false
+            if (enableSpeaker) {
+                steps.pause(500L)
+                val audio = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                speakerEnabled = audio?.isSpeakerphoneOn == true
+                if (!speakerEnabled && isInCall() == true) {
+                    val callPackages = dialerPackages + setOf("com.android.incallui", "com.miui.incallui")
+                    val queue = ArrayDeque<AccessibilityNodeInfo>()
+                    collectApplicationRoots().filter { it.packageName?.toString() in callPackages }
+                        .forEach { queue.addLast(it) }
+                    var speakerNode: AccessibilityNodeInfo? = null
+                    while (queue.isNotEmpty() && speakerNode == null) {
+                        val n = queue.removeFirst()
+                        if (n.packageName?.toString() in callPackages && n.isVisibleToUser && n.isEnabled &&
+                            n.isClickable && label(n).lowercase() in setOf("免提", "扬声器", "speaker")) speakerNode = n
+                        else for (i in 0 until n.childCount) n.getChild(i)?.let { queue.addLast(it) }
+                    }
+                    speakerNode?.let { node ->
+                        steps.effect {
+                            if (isInCall() == true && node.refresh() && node.isVisibleToUser && node.isEnabled &&
+                                node.packageName?.toString() in callPackages && label(node).lowercase() in setOf("免提", "扬声器", "speaker")) {
+                                node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                            }
+                        }
+                        steps.pause(150L)
+                        speakerEnabled = audio?.isSpeakerphoneOn == true
+                    }
+                }
+            }
+            JSONObject().apply {
+                put("ok", true)
+                put("action", "call_phone")
+                put("number", cleanNumber)
+                put("simUsed", label(chosen))
+                put("callRequested", true)
+                put("callPlaced", true)
                 put("speakerEnabled", speakerEnabled)
             }
         }
 
     suspend fun performHangupCall(sessionStillValid: () -> Boolean): JSONObject =
         withContext(Dispatchers.Main.immediate) {
-            check(sessionStillValid()) { "Session closed" }
-            val dm = resources.displayMetrics
-            val screenW = dm.widthPixels
-            val screenH = dm.heightPixels
-            val roots = collectAllWindowRoots()
-            val queue = ArrayDeque<AccessibilityNodeInfo>()
-            roots.forEach { queue.addLast(it) }
-
-            var hungUp = false
-            while (queue.isNotEmpty()) {
-                val n = queue.removeFirst()
-                val lbl = (n.text?.toString() ?: n.contentDescription?.toString() ?: "").trim()
-                val vid = n.viewIdResourceName?.lowercase() ?: ""
-                if (n.isVisibleToUser && (lbl.contains("挂断") || lbl.contains("结束通话") || vid.contains("endbutton") || vid.contains("hangup") || vid.contains("end_call"))) {
-                    val r = Rect()
-                    n.getBoundsInScreen(r)
-                    hungUp = n.performAction(AccessibilityNodeInfo.ACTION_CLICK) ||
-                        injectTapGesture(r.centerX(), r.centerY(), 75L)
-                    if (hungUp) break
+            val deadline = System.currentTimeMillis() + 5000L
+            val queuedRevision = guard.revision
+            withTimeout(5000L) { guiMutex.withLock {
+                guard.check(System.currentTimeMillis(), deadline, windowIdentity(), queuedRevision,
+                    null, false, sessionStillValid())
+                activeAction = currentCoroutineContext()[Job]
+                try {
+                    val telecom = getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+                    fun isInCall(): Boolean? = try { telecom?.isInCall } catch (_: SecurityException) { null }
+                    val dialerPackage = try { telecom?.defaultDialerPackage } catch (_: SecurityException) { null }
+                    val trustedPackages = setOfNotNull(dialerPackage, "com.android.incallui", "com.miui.incallui")
+                    val result = HangupCallVerifier.execute(
+                        isInCall = ::isInCall,
+                        clickVerifiedTarget = {
+                            guard.checkAuthorization(System.currentTimeMillis(), deadline, sessionStillValid())
+                            val queue = ArrayDeque<AccessibilityNodeInfo>()
+                            collectApplicationRoots().filter { it.packageName?.toString() in trustedPackages }
+                                .forEach { queue.addLast(it) }
+                            fun isHangupTarget(node: AccessibilityNodeInfo): Boolean {
+                                val label = (node.text?.toString() ?: node.contentDescription?.toString() ?: "")
+                                    .trim().lowercase()
+                                val viewId = node.viewIdResourceName?.substringAfterLast('/')?.lowercase() ?: ""
+                                val isHangup = label in setOf("挂断", "结束通话", "end call", "hang up") ||
+                                    viewId in setOf("endbutton", "hangup", "end_call", "end_call_button", "endcallbutton")
+                                return node.packageName?.toString() in trustedPackages && node.isVisibleToUser &&
+                                    node.isEnabled && node.isClickable && isHangup
+                            }
+                            var target: AccessibilityNodeInfo? = null
+                            while (queue.isNotEmpty() && target == null) {
+                                val node = queue.removeFirst()
+                                if (isHangupTarget(node)) {
+                                    target = node
+                                } else {
+                                    for (i in 0 until node.childCount) node.getChild(i)?.let { queue.addLast(it) }
+                                }
+                            }
+                            target?.let { it.refresh() && isHangupTarget(it) && isInCall() == true &&
+                                it.performAction(AccessibilityNodeInfo.ACTION_CLICK) } ?: false
+                        },
+                        awaitStateUpdate = {
+                            delay(150L)
+                            guard.checkAuthorization(System.currentTimeMillis(), deadline, sessionStillValid())
+                        }
+                    )
+                    JSONObject().apply {
+                        put("ok", result.hungUp)
+                        put("action", "hangup_call")
+                        put("hungUp", result.hungUp)
+                        put("hangupRequested", result.requested)
+                        put("reason", result.reason)
+                    }
+                } finally {
+                    activeAction = null
                 }
-                for (i in 0 until n.childCount) {
-                    n.getChild(i)?.let { queue.addLast(it) }
-                }
-            }
-
-            if (!hungUp) {
-                hungUp = injectTapGesture(screenW / 2, (screenH * 0.865).toInt(), 75L)
-            }
-            delay(300)
-            JSONObject().apply {
-                put("ok", hungUp)
-                put("action", "hangup_call")
-                put("hungUp", hungUp)
-            }
+            } }
         }
 
     private fun findFocusedEditableNode(): AccessibilityNodeInfo? {
@@ -1058,14 +1123,35 @@ class OmsAccessibilityService : AccessibilityService() {
 
     /**
      * Direct, low-latency human input injection for Mac Live Screen Mirroring (L1/L2).
-     * Bypasses AI safety pill & 400ms semantic tree settle wait so mouse clicks, drags,
-     * wheel scrolls, and keyboard typing feel instantaneous (< 20ms).
+     * Skips the semantic settle delay, but shares GUI serialization, session revocation
+     * and the phone's durable emergency-stop latch with automated input.
      */
     suspend fun executeMirrorInput(
         params: JSONObject,
         sessionStillValid: () -> Boolean
     ): JSONObject = withContext(Dispatchers.Main.immediate) {
-        check(sessionStillValid()) { "Session closed" }
+        val now = System.currentTimeMillis()
+        val deadline = minOf(now + 5000L, params.optLong("deadlineMs", now + 5000L))
+        val queuedRevision = guard.revision
+        guard.checkAuthorization(now, deadline, sessionStillValid())
+        withTimeout((deadline - now).coerceAtLeast(1L)) {
+            guiMutex.withLock {
+                guard.check(System.currentTimeMillis(), deadline, windowIdentity(), queuedRevision,
+                    null, false, sessionStillValid())
+                activeAction = currentCoroutineContext()[Job]
+                try {
+                    val result = executeMirrorInputLocked(params)
+                    currentCoroutineContext().ensureActive()
+                    guard.checkAuthorization(System.currentTimeMillis(), deadline, sessionStillValid())
+                    result
+                } finally {
+                    activeAction = null
+                }
+            }
+        }
+    }
+
+    private suspend fun executeMirrorInputLocked(params: JSONObject): JSONObject {
         val dm = resources.displayMetrics
         val screenW = dm.widthPixels.coerceAtLeast(1)
         val screenH = dm.heightPixels.coerceAtLeast(1)
@@ -1195,7 +1281,7 @@ class OmsAccessibilityService : AccessibilityService() {
         }
 
         onMirrorUiEvent?.invoke()
-        JSONObject().apply {
+        return JSONObject().apply {
             put("ok", ok)
             put("type", type)
             put("screenWidth", screenW)

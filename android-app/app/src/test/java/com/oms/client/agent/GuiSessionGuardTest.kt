@@ -76,4 +76,23 @@ class GuiSessionGuardTest {
         val observation = guard.observe("app")
         guard.check(1, 100, "app", guard.revision, observation, true, sessionAuthorized = false)
     }
+    @Test fun queuedMirrorInputCannotSurviveEmergencyStopAndResume() {
+        val guard = GuiSessionGuard()
+        val queuedRevision = guard.revision
+        guard.stop()
+        rejected { guard.checkAuthorization(100, 200, true) }
+        guard.resumeOnPhone()
+        rejected { guard.check(100, 200, "app", queuedRevision, null, false, true) }
+        guard.check(100, 200, "app", guard.revision, null, false, true)
+    }
+
+    @Test fun mirrorGestureRecheckAllowsItsOwnWindowChangeButNotRevocationOrExpiry() {
+        val guard = GuiSessionGuard()
+        guard.invalidate("own gesture changed screen")
+        guard.checkAuthorization(100, 200, true)
+        rejected { guard.checkAuthorization(100, 200, false) }
+        rejected { guard.checkAuthorization(200, 200, true) }
+        guard.stop()
+        rejected { guard.checkAuthorization(100, 200, true) }
+    }
 }
