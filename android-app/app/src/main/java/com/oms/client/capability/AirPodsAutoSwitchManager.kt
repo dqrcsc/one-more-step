@@ -29,6 +29,7 @@ import android.view.KeyEvent
 import androidx.core.content.ContextCompat
 import com.oms.client.otp.OmsNotificationListenerService
 import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -60,7 +61,7 @@ data class PairedAirPodsEntry(
 @SuppressLint("MissingPermission")
 class AirPodsAutoSwitchManager(
     private val context: Context,
-    private val onClaimByPhone: (targetMac: String, targetName: String, reason: String) -> Unit,
+    private val onClaimByPhone: suspend (targetMac: String, targetName: String, reason: String) -> (() -> Boolean),
     private val onStatusChanged: (JSONObject) -> Unit
 ) {
     companion object {
@@ -114,6 +115,11 @@ class AirPodsAutoSwitchManager(
     @Volatile
     private var tempMutedMusicStream: Boolean = false
 
+    private val autoSwitchTrace = AirPodsAttemptTrace { SystemClock.elapsedRealtime() }
+    @Volatile private var playbackCallbackCount = 0L
+    @Volatile private var lastPlaybackCallbackElapsed = 0L
+    @Volatile private var lastAutoDecision = "not_evaluated"
+
     private val connectGeneration = AtomicInteger(0)
     private var lastReportedSignature: String = ""
     private var started = false
@@ -143,7 +149,9 @@ class AirPodsAutoSwitchManager(
 
     private val playbackCallback = object : AudioManager.AudioPlaybackCallback() {
         override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>?) {
-            evaluatePhoneAudioState(configs)
+            playbackCallbackCount += 1
+            lastPlaybackCallbackElapsed = SystemClock.elapsedRealtime()
+            evaluatePhoneAudioState()
         }
     }
 
@@ -388,14 +396,12 @@ class AirPodsAutoSwitchManager(
         return false
     }
 
-    fun isPhoneMediaOrCallActive(configs: List<AudioPlaybackConfiguration>? = null): Boolean {
+    fun isPhoneMediaOrCallActive(): Boolean {
         // Never treat our own Find-My-Phone or TTS voice broadcast as a reason to grab AirPods from Mac!
-        if (NotificationExecutor.isSpeakingFlow.value) return false
-        if (isPhoneInCall()) return true
-        if (hasActiveMediaSessionPlaying()) return true
-        if (hasActiveMediaPlaybackConfig(configs)) return true
-        if (audioManager.isMusicActive) return true
-        return false
+        return AirPodsMediaActivity.isActive(
+            NotificationExecutor.isSpeakingFlow.value, isPhoneInCall(),
+            hasActiveMediaSessionPlaying(), audioManager.isMusicActive
+        )
     }
 
     private fun tempMutePhoneMusicIfNeeded(maxDurationMs: Long = 2600L) {
@@ -425,10 +431,55 @@ class AirPodsAutoSwitchManager(
         }
     }
 
-    private fun evaluatePhoneAudioState(configs: List<AudioPlaybackConfiguration>?) {
-        val currentlyPlaying = isPhoneMediaOrCallActive(configs)
+    private fun autoSwitchDiagnostics(): JSONObject = JSONObject().apply {
+        put("sampledAtMs", System.currentTimeMillis())
+        put("mediaSessionPlaying", hasActiveMediaSessionPlaying())
+        put("playbackConfigActive", hasActiveMediaPlaybackConfig(null))
+        put("musicActive", runCatching { audioManager.isMusicActive }.getOrDefault(false))
+        put("inCall", isPhoneInCall())
+        put("omsSpeaking", NotificationExecutor.isSpeakingFlow.value)
+        put("callbackCount", playbackCallbackCount)
+        put("lastCallbackAgeMs", if (lastPlaybackCallbackElapsed == 0L) -1L else SystemClock.elapsedRealtime() - lastPlaybackCallbackElapsed)
+        put("lastDecision", lastAutoDecision)
+        put("lastEvaluatedPlaying", wasPhonePlayingAudio)
+        put("suppressionRemainingMs", (suppressAutoGrabUntilElapsed - SystemClock.elapsedRealtime()).coerceAtLeast(0L))
+        put("macConnected", macAirpodsConnected)
+        put("trace", JSONObject(autoSwitchTrace.snapshot()))
+        try {
+            val sessions = context.getSystemService(MediaSessionManager::class.java)
+                ?.getActiveSessions(ComponentName(context, OmsNotificationListenerService::class.java)) ?: emptyList()
+            put("sessions", JSONArray().apply {
+                sessions.take(16).forEach { ctrl -> put(JSONObject().apply {
+                    put("package", ctrl.packageName)
+                    put("state", ctrl.playbackState?.state ?: -1)
+                }) }
+            })
+        } catch (e: Exception) { put("sessionReadError", e.javaClass.simpleName) }
+        try {
+            put("players", JSONArray().apply {
+                audioManager.activePlaybackConfigurations.take(16).forEach { cfg -> put(JSONObject().apply {
+                    put("usage", cfg.audioAttributes.usage)
+                    try {
+                        val method = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getPlayerState").apply { isAccessible = true }
+                        put("state", method.invoke(cfg) as? Int ?: -1)
+                    } catch (e: Exception) { put("stateReadError", e.javaClass.simpleName) }
+                }) }
+            })
+        } catch (e: Exception) { put("playerReadError", e.javaClass.simpleName) }
+    }
+
+    private fun evaluatePhoneAudioState() {
+        val currentlyPlaying = isPhoneMediaOrCallActive()
         val risingEdge = (!wasPhonePlayingAudio && currentlyPlaying)
         wasPhonePlayingAudio = currentlyPlaying
+        lastAutoDecision = when {
+            !currentlyPlaying -> "not_playing"
+            !risingEdge -> "no_rising_edge"
+            !autoSwitchEnabled -> "disabled"
+            SystemClock.elapsedRealtime() < suppressAutoGrabUntilElapsed -> "suppressed"
+            else -> "rising_edge"
+        }
+        autoSwitchTrace.record(lastAutoDecision, mapOf("playing" to currentlyPlaying, "callbackCount" to playbackCallbackCount))
 
         if (risingEdge &&
             autoSwitchEnabled &&
@@ -436,6 +487,10 @@ class AirPodsAutoSwitchManager(
         ) {
             val paired = listPairedAirpods()
             val alreadyConnectedOnPhone = paired.any { it.connected }
+            if (paired.isEmpty() || alreadyConnectedOnPhone) {
+                lastAutoDecision = if (paired.isEmpty()) "no_paired_target" else "already_connected"
+                autoSwitchTrace.record(lastAutoDecision)
+            }
             if (paired.isNotEmpty() && !alreadyConnectedOnPhone) {
                 // If AirPods are currently connected on Mac, immediately mute phone speaker to prevent leakage
                 if (macAirpodsConnected) {
@@ -444,7 +499,7 @@ class AirPodsAutoSwitchManager(
 
                 // Debounce 320ms to confirm sustained media/call playback (ignores brief notification chimes)
                 mainHandler.postDelayed({
-                    val stillPlaying = isPhoneMediaOrCallActive(null)
+                    val stillPlaying = isPhoneMediaOrCallActive()
                     val curPaired = listPairedAirpods()
                     val nowConnected = curPaired.any { it.connected }
                     if (!autoSwitchEnabled ||
@@ -452,20 +507,49 @@ class AirPodsAutoSwitchManager(
                         nowConnected ||
                         SystemClock.elapsedRealtime() < suppressAutoGrabUntilElapsed
                     ) {
+                        lastAutoDecision = "debounce_cancelled"
+                        autoSwitchTrace.record(lastAutoDecision, mapOf("stillPlaying" to stillPlaying, "connected" to nowConnected))
                         if (!nowConnected) restoreTempMuteOnPhone()
                         return@postDelayed
                     }
 
                     val target = selectTargetAirpods(macAirpodsMac.ifBlank { preferredAirpodsMac })
                     if (target == null) {
+                        lastAutoDecision = "target_not_found"
+                        autoSwitchTrace.record(lastAutoDecision)
                         restoreTempMuteOnPhone()
                         return@postDelayed
                     }
 
                     suppressAutoGrabUntilElapsed = SystemClock.elapsedRealtime() + 5000L
                     val reason = if (isPhoneInCall()) "phone_call_started" else "phone_audio_started"
-                    onClaimByPhone(target.mac, target.name, reason)
-                    scope.launch { connectAirpodsOnPhone(target.mac) }
+                    lastAutoDecision = "claim_sent"
+                    autoSwitchTrace.record(lastAutoDecision, mapOf("reason" to reason))
+                    val claimGeneration = connectGeneration.incrementAndGet()
+                    scope.launch {
+                        try {
+                            val ok = AirPodsAutoClaim.run(
+                                stillWanted = {
+                                    connectGeneration.get() == claimGeneration && autoSwitchEnabled &&
+                                        isPhoneMediaOrCallActive()
+                                },
+                                release = { onClaimByPhone(target.mac, target.name, reason) },
+                                connect = { valid ->
+                                    connectAirpodsOnPhone(target.mac, sessionStillValid = valid,
+                                        reservedGeneration = claimGeneration).first
+                                }
+                            )
+                            lastAutoDecision = if (ok) "claim_connected" else "claim_cancelled_or_unconfirmed"
+                            autoSwitchTrace.record(lastAutoDecision)
+                        } catch (e: Exception) {
+                            lastAutoDecision = "claim_failed"
+                            autoSwitchTrace.record(lastAutoDecision, mapOf("error" to e.javaClass.simpleName,
+                                "message" to (e.message ?: "").take(200)))
+                            if (e is CancellationException) throw e
+                        } finally {
+                            if (connectGeneration.get() == claimGeneration) restoreTempMuteOnPhone()
+                        }
+                    }
                 }, 320L)
             }
         }
@@ -590,10 +674,15 @@ class AirPodsAutoSwitchManager(
     suspend fun connectAirpodsOnPhone(
         explicitMac: String? = null,
         deadlineMs: Long = System.currentTimeMillis() + 12000L,
-        sessionStillValid: () -> Boolean = { true }
+        sessionStillValid: () -> Boolean = { true },
+        reservedGeneration: Int? = null
     ): Triple<Boolean, String, JSONObject> {
         val trace = AirPodsAttemptTrace { SystemClock.elapsedRealtime() }
-        val gen = connectGeneration.incrementAndGet()
+        val gen = reservedGeneration ?: connectGeneration.incrementAndGet()
+        if (connectGeneration.get() != gen || !sessionStillValid()) {
+            trace.record("cancelled_before_connect")
+            return Triple(false, "AirPods 请求已失效", JSONObject(trace.snapshot()))
+        }
         trace.record("started", mapOf("generation" to gen, "permission" to hasBtConnectPermission()))
         val budget = (deadlineMs - System.currentTimeMillis()).coerceIn(0L, 12000L)
         val deadlineElapsed = SystemClock.elapsedRealtime() + budget
@@ -727,7 +816,7 @@ class AirPodsAutoSwitchManager(
         val paired = listPairedAirpods()
         val connectedEntry = paired.firstOrNull { it.connected }
         val firstEntry = connectedEntry ?: paired.firstOrNull()
-        val mediaPlaying = isPhoneMediaOrCallActive(null)
+        val mediaPlaying = isPhoneMediaOrCallActive()
         val inCall = isPhoneInCall()
 
         val pairedArr = JSONArray()
@@ -743,6 +832,7 @@ class AirPodsAutoSwitchManager(
 
         return JSONObject().apply {
             put("autoSwitchEnabled", autoSwitchEnabled)
+            put("autoSwitchDiagnostics", autoSwitchDiagnostics())
             put("connected", connectedEntry != null)
             put("deviceName", firstEntry?.name ?: "")
             put("deviceMac", firstEntry?.mac ?: "")

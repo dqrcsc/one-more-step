@@ -244,20 +244,25 @@ class OmsTransportClient(
     val airpodsManager = AirPodsAutoSwitchManager(
         context = context,
         onClaimByPhone = { targetMac, targetName, reason ->
-            scope.launch {
-                val req = JSONObject().apply {
-                    put("jsonrpc", "2.0")
-                    put("id", "ap_claim_${UUID.randomUUID()}")
-                    put("method", "airpods.claimByPhone")
-                    put("params", JSONObject().apply {
-                        put("targetMac", targetMac)
-                        put("targetName", targetName)
-                        put("reason", reason)
-                        put("pauseMacMedia", true)
-                    })
-                }
-                sendRawFrame(OmsFrameProtocol.encodeJsonRpc(req))
+            val source = activeSource()
+            val link = secureLinks[source] ?: error("Connection unavailable")
+            val req = JSONObject().apply {
+                put("jsonrpc", "2.0")
+                put("id", "ap_claim_${UUID.randomUUID()}")
+                put("method", "airpods.claimByPhone")
+                put("params", JSONObject().apply {
+                    put("targetMac", targetMac)
+                    put("targetName", targetName)
+                    put("reason", reason)
+                    put("pauseMacMedia", true)
+                })
             }
+            val result = requestHost(req, source, 10_000L)
+            check(result.optBoolean("ok") && result.optBoolean("released")) {
+                result.optString("reason", result.optString("message", "Mac release not confirmed"))
+            }
+            val sessionStillValid = { secureLinks[source] === link && sourceAuthenticated(source) }
+            sessionStillValid
         },
         onStatusChanged = { statusJson ->
             scope.launch {
@@ -2272,7 +2277,11 @@ class OmsTransportClient(
             link.phase = SecurePhase.FINISH
             val finish = JSONObject().put("jsonrpc", "2.0").put("id", "secure_finish").put("method", "secure.finish")
                 .put("params", JSONObject().put("phoneName", Build.MODEL.take(256))
-                    .put("phoneModel", "${Build.MANUFACTURER} ${Build.MODEL}".take(256)).put("deviceSnapshot", collectDeviceSnapshot()))
+                    .put("phoneModel", "${Build.MANUFACTURER} ${Build.MODEL}".take(256)).put("deviceSnapshot", collectDeviceSnapshot().apply {
+                        // Optional structured diagnostics belong to authenticated status RPC,
+                        // not the backwards-compatible connection handshake.
+                        remove("airpodsAutoSwitchDiagnostics")
+                    }))
             val finishBytes = OmsFrameProtocol.encodeJsonRpc(finish)
             check(finishBytes.size <= 32 * 1024) { "Finish metadata exceeds limit" }
             check(writeTransport(requireNotNull(link.session).seal(finishBytes), source))
@@ -3009,6 +3018,7 @@ class OmsTransportClient(
             put("pendingOutboxCount", queuedCount)
             put("updatedAtMs", System.currentTimeMillis())
             put("airpodsAutoSwitchEnabled", apSnap.optBoolean("autoSwitchEnabled", true))
+            put("airpodsAutoSwitchDiagnostics", apSnap.optJSONObject("autoSwitchDiagnostics"))
             put("airpodsConnected", apSnap.optBoolean("connected", false))
             put("airpodsName", apSnap.optString("deviceName", ""))
             put("airpodsMac", apSnap.optString("deviceMac", ""))
