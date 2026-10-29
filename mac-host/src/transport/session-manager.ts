@@ -1132,7 +1132,11 @@ export class PhoneSessionManager extends EventEmitter {
       || !Array.isArray(status.lanIps) || status.lanIps.length > 16 || status.lanIps.some((ip) => typeof ip !== "string" || ip.length > 128)
       || !status.permissions || typeof status.permissions !== "object" || Array.isArray(status.permissions)
       || Object.values(status.permissions).some((v) => typeof v !== "boolean")) throw new Error("Invalid encrypted device snapshot");
-    for (const [key, value] of Object.entries(status)) {
+    // Diagnostic extensions are fetched over authenticated RPC. They are not
+    // trusted handshake metadata; discard this optional field while retaining
+    // the full envelope limit and all required snapshot validation.
+    const { airpodsAutoSwitchDiagnostics: _diagnostics, ...handshakeStatus } = status;
+    for (const [key, value] of Object.entries(handshakeStatus)) {
       if (["permissions", "lanIps"].includes(key)) continue;
       if (key === "pairedAirpods" && Array.isArray(value) && value.length <= 32 && value.every((item) =>
         item && typeof item === "object" && !Array.isArray(item)
@@ -1145,7 +1149,8 @@ export class PhoneSessionManager extends EventEmitter {
       if (typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) continue;
       throw new Error("Invalid device snapshot field");
     }
-    return p as unknown as { phoneName: string; phoneModel: string; deviceSnapshot: PhoneDeviceStatus };
+    return { phoneName: p.phoneName as string, phoneModel: p.phoneModel as string,
+      deviceSnapshot: handshakeStatus as unknown as PhoneDeviceStatus };
   }
 
   private handleSecureFinish(pipe: ActiveTransportPipe, req: JsonRpcRequest): void {

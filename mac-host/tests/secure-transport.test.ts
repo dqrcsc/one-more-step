@@ -331,3 +331,19 @@ test("failed trust rollback closes old sessions and requires explicit re-pair", 
   expect(f.manager.getSecurityStatus().requiresRePair).toBe(false);
   await f.manager.stop();
 });
+
+
+test("optional AirPods diagnostics are discarded from the authenticated handshake without relaxing snapshot validation", async () => {
+  const f = fixture();
+  const withDiagnostics = { ...simulatedFinish, deviceSnapshot: {
+    ...simulatedFinish.deviceSnapshot,
+    airpodsAutoSwitchDiagnostics: { players: [{ usage: 1, state: 2 }], trace: { events: [] } },
+  } };
+  f.connect({ finish: withDiagnostics });
+  expect(f.manager.getPhoneStatus()?.batteryPct).toBe(88);
+  expect((f.manager.getPhoneStatus() as any)?.airpodsAutoSwitchDiagnostics).toBeUndefined();
+  expect(() => f.raw.validateFinish({ ...withDiagnostics, deviceSnapshot: { ...withDiagnostics.deviceSnapshot, batteryPct: "bad" } })).toThrow("Invalid encrypted device snapshot");
+  expect(() => f.raw.validateFinish({ ...withDiagnostics, deviceSnapshot: { ...withDiagnostics.deviceSnapshot, otherExtension: {} } })).toThrow("Invalid device snapshot field");
+  expect(() => f.raw.validateFinish({ ...withDiagnostics, deviceSnapshot: { ...withDiagnostics.deviceSnapshot, airpodsAutoSwitchDiagnostics: "x".repeat(40000) } })).toThrow("Invalid finish metadata");
+  await f.manager.stop();
+});

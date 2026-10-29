@@ -710,7 +710,7 @@ export class OmsDaemon {
               atMs: Date.now(),
             };
             if (this.airpodsHandoffInFlight) {
-              reply({ result: { ok: false, released: false, reason: "manual handoff in progress" } });
+              reply({ result: { ok: false, released: false, reason: "handoff in progress" } });
               return;
             }
             const bridge = this.session.getBluetoothBridge();
@@ -718,13 +718,19 @@ export class OmsDaemon {
               reply({ result: { ok: false, released: false, reason: "Bluetooth bridge unavailable" } });
               return;
             }
-            void bridge.releaseAirpodsFromMac({ pauseMedia: pauseMacMedia, targetMac, timeoutMs: 8000 })
-              .then((result) => {
-                reply({ result: { ok: Boolean(result.ok), released: Boolean(result.ok), message: result.message } });
-              })
-              .catch((err) => {
-                reply({ result: { ok: false, released: false, message: err?.message || String(err) } });
-              });
+            this.airpodsHandoffInFlight = true;
+            void (async () => {
+              let response;
+              try {
+                const result = await bridge.releaseAirpodsFromMac({ pauseMedia: pauseMacMedia, targetMac, timeoutMs: 8000 });
+                response = { ok: Boolean(result.ok), released: Boolean(result.ok), message: result.message };
+              } catch (err: any) {
+                response = { ok: false, released: false, message: err?.message || String(err) };
+              } finally {
+                this.airpodsHandoffInFlight = false;
+              }
+              reply({ result: response });
+            })();
           } else if (req.method === "airpods.statusReport") {
             const p = (req.params || {}) as Record<string, any>;
             this.ingestPhoneAirpodsSnapshot({

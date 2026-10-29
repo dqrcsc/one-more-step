@@ -315,6 +315,26 @@ test("automatic phone claims never acknowledge unavailable or failed Mac release
   }
 });
 
+test("automatic release excludes concurrent automatic and manual handoffs and unlocks after failure", async () => {
+  const f = fixture();
+  const released = deferred<any>();
+  let releases = 0;
+  f.s.getBluetoothBridge = () => ({
+    releaseAirpodsFromMac: () => { releases++; return released.promise; },
+  });
+  const claim = () => new Promise<any>(resolve => f.s.emit("phoneRequest", {
+    method: "airpods.claimByPhone", params: { targetMac: "AA:BB:CC:DD:EE:FF", reason: "phone_audio_started" },
+  }, resolve));
+  const first = claim();
+  expect((await claim()).result.released).toBe(false);
+  expect((await f.daemon.switchAirpodsToMac()).stage).toBe("busy");
+  expect(releases).toBe(1);
+  released.reject(new Error("native release failed"));
+  expect((await first).result.ok).toBe(false);
+  f.s.getBluetoothBridge = () => ({ releaseAirpodsFromMac: async () => ({ ok: true }) });
+  expect((await claim()).result.released).toBe(true);
+});
+
 test("AirPods IPC budget covers phone handoff and native connection plus response margin", async () => {
   const { ipcTimeoutForAction } = await import("../src/daemon/request-timeouts.js");
   expect(ipcTimeoutForAction("airpods.switch_to_mac", {})).toBeGreaterThan(4000 + 23000);
