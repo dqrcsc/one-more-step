@@ -385,7 +385,24 @@ export const OMS_MCP_TOOLS = [
         speaker: {
           type: "boolean",
           default: false,
-          description: "call_phone 时拨通后是否自动开启免提扬声器",
+          description: "call_phone 时拨通后是否自动开启免提扬声器（当指定 say 语音通话播报时默认开启）",
+        },
+        say: {
+          type: "string",
+          description:
+            "call_phone 时可选的电话接通后自动播报话术：手机会自动监测对方接听（通话计时器 00:00/00:01），接通后用指定 Neural TTS 音色在手机端直接讲出该内容",
+        },
+        hangupAfter: {
+          type: "boolean",
+          default: false,
+          description: "call_phone 配合 say 使用时，播报完指定话术后是否自动挂断电话",
+        },
+        waitAnswerSec: {
+          type: "number",
+          default: 35,
+          minimum: 5,
+          maximum: 65,
+          description: "call_phone 配合 say 使用时，最长等待对方接听的秒数（超时未接听会自动挂断）",
         },
         target: {
           type: "string",

@@ -44,6 +44,8 @@ export interface OmsHostConfig {
   pauseOtherOnAirpodsSwitch?: boolean;
   preferredAirpodsMac?: string;
   preferredTtsVoice?: string;
+  preferredSimSlot?: string;
+  contacts?: Record<string, { number: string; sim?: string; note?: string }>;
   unlockPattern?: string;
   unlockPin?: string;
   unlockBounds?: string;
@@ -352,6 +354,7 @@ export class OmsDaemon {
       .trim()
       .slice(0, 600);
     if (!cleanText) { opts?.onFallback?.("empty_text"); return null; }
+    if (!this.homeDir) { opts?.onFallback?.("runtime_not_installed"); return null; }
 
     const resolved = this.resolveNeuralTtsVoice(opts?.voice);
     const rate = opts?.rate || "+6%";
@@ -362,6 +365,56 @@ export class OmsDaemon {
     if (!audio.ok) { opts?.onFallback?.(audio.reason); return null; }
     return { audioBase64: audio.audioBase64, voiceId: resolved.voiceId, voiceLabel: resolved.label,
       cached: audio.cached, bytes: audio.bytes };
+  }
+
+  public resolveContactTarget(
+    rawTarget: string,
+    explicitSim?: string
+  ): { cleanNumber: string; simSlot: string; matchedContact?: string } {
+    const trimmed = String(rawTarget || "").trim();
+    const contacts = this.config?.contacts || {};
+    const exactEntry = contacts[trimmed];
+    const matchedEntry =
+      exactEntry ||
+      Object.entries(contacts).find(([k]) => k.toLowerCase() === trimmed.toLowerCase())?.[1];
+    const matchedName = exactEntry
+      ? trimmed
+      : Object.keys(contacts).find((k) => k.toLowerCase() === trimmed.toLowerCase());
+
+    if (matchedEntry?.number) {
+      const cleanNumber = String(matchedEntry.number).replace(/[^\d+*#,]/g, "");
+      const simSlot = String(explicitSim ?? matchedEntry.sim ?? this.config?.preferredSimSlot ?? "1");
+      return { cleanNumber, simSlot, matchedContact: matchedName };
+    }
+
+    const cleanNumber = trimmed.replace(/[^\d+*#,]/g, "");
+    const simSlot = String(explicitSim ?? this.config?.preferredSimSlot ?? "1");
+    return { cleanNumber, simSlot };
+  }
+
+  public async playNeuralAudioOnMacSpeaker(audioBase64: string, repeatCount = 1): Promise<boolean> {
+    if (!audioBase64 || process.env.OMS_DISABLE_OSASCRIPT === "1") return false;
+    try {
+      const cacheDir = path.join(this.homeDir || os.tmpdir(), "cache", "tts");
+      fs.mkdirSync(cacheDir, { recursive: true });
+      const mp3Path = path.join(cacheDir, "mac_speaker_active.mp3");
+      fs.writeFileSync(mp3Path, Buffer.from(audioBase64, "base64"));
+      const count = Math.max(1, Math.min(10, Math.round(repeatCount)));
+      for (let i = 0; i < count; i++) {
+        await new Promise<void>((resolve, reject) => {
+          execFile("afplay", [mp3Path], { timeout: 45000 }, (err) => {
+            if (err) reject(err);
+            else resolve();
+          });
+        });
+        if (i < count - 1) {
+          await new Promise((r) => setTimeout(r, 420));
+        }
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   public copyTextToMacClipboard(text: string): void {
@@ -1982,13 +2035,11 @@ export class OmsDaemon {
       case "phone_ota_update": {
         const ips = PhoneSessionManager.getLocalLanIps();
         const meta = this.session.getApkMetadata();
-        const isBle = this.session.getActiveTier() === "BT_RFCOMM";
         const lanUrl = `http://${ips[0]}:${this.config.lanPort}/OneMoreStep.apk?t=${Date.now()}`;
-        const url = isBle ? meta.githubDownloadUrl : lanUrl;
         return await this.session.callPhone("sys.otaUpdate", {
           ip: ips[0],
           port: this.config.lanPort,
-          url,
+          url: lanUrl,
           githubDownloadUrl: meta.githubDownloadUrl,
         });
       }
@@ -2121,27 +2172,183 @@ export class OmsDaemon {
           }
         }
 
+        if (subAction === "contacts" || subAction === "contact") {
+          const op = String(params.op || "list").toLowerCase();
+          this.config.contacts = this.config.contacts || {};
+          if (op === "set" || op === "add") {
+            const name = String(params.name || "").trim();
+            const num = String(params.number || "").replace(/[^\d+*#,]/g, "");
+            if (!name || !num) {
+              throw new Error("Usage: oms contacts set <name> <number> [--sim 1|2] [--note <text>]");
+            }
+            const sim = params.sim ? String(params.sim).trim() : undefined;
+            const note = params.note ? String(params.note).trim() : undefined;
+            this.config.contacts[name] = { number: num, ...(sim ? { sim } : {}), ...(note ? { note } : {}) };
+            if (this.configPath) {
+              fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), { encoding: "utf8", mode: 0o600 });
+            }
+          } else if (op === "remove" || op === "delete" || op === "rm") {
+            const name = String(params.name || "").trim();
+            delete this.config.contacts[name];
+            if (this.configPath) {
+              fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), { encoding: "utf8", mode: 0o600 });
+            }
+          }
+          return {
+            ok: true,
+            contacts: this.config.contacts,
+            preferredSimSlot: this.config.preferredSimSlot || "1",
+          };
+        }
+
         if (subAction === "call_phone" || subAction === "call" || subAction === "dial") {
-          const deadlineMs = boundedControlDeadline(params.deadlineMs, 25000);
+          const dialOnly = subAction === "dial" || Boolean(params.dialOnly);
+          const sayText = dialOnly
+            ? ""
+            : String(params.say ?? params.sayText ?? params.ttsText ?? "").trim();
+          const macSayText = dialOnly
+            ? ""
+            : String(params.macSay ?? params.macSayText ?? "").trim();
+          const aiCallText = dialOnly
+            ? ""
+            : String(params.aiCall ?? params.aiCallText ?? "").trim();
+          const hasAnyPostAnswerTask = Boolean(sayText || macSayText || aiCallText || params.waitForAnswer);
+          const maxBudgetMs = hasAnyPostAnswerTask ? 90000 : 25000;
+          // Validate caller deadline upfront before any synthesis or session work
+          boundedControlDeadline(params.deadlineMs, maxBudgetMs);
           const rawNum = String(params.number || params.phoneNumber || params.text || "").trim();
-          const cleanNumber = rawNum.replace(/[^\d+*#,]/g, "");
-          if (!cleanNumber) throw new Error("请提供要拨打的电话号码，例如: oms phone call 10000");
+          const { cleanNumber, simSlot, matchedContact } = this.resolveContactTarget(
+            rawNum,
+            params.simSlot ?? params.sim
+          );
+          if (!cleanNumber) {
+            throw new Error(
+              `未找到联系人或有效电话号码 "${rawNum}"；可用 oms contacts set <姓名> <号码> [--sim 1|2] 保存常用联系人，或直接传入号码`
+            );
+          }
           const callPhone = this.session.bindPhoneSession();
+
+          let callTtsMeta: Awaited<ReturnType<typeof this.synthesizeNeuralTts>> = null;
+          let callTtsFallbackReason: TtsFallbackReason | undefined;
+          const repeatCount =
+            typeof params.repeat === "number" && Number.isFinite(params.repeat)
+              ? Math.max(1, Math.min(10, Math.round(params.repeat)))
+              : typeof params.repeatCount === "number" && Number.isFinite(params.repeatCount)
+                ? Math.max(1, Math.min(10, Math.round(params.repeatCount)))
+                : 1;
+
+          const ttsSourceText = sayText || macSayText;
+          if (ttsSourceText) {
+            if (params.saveVoice && typeof params.voice === "string" && params.voice.trim()) {
+              const resolved = this.resolveNeuralTtsVoice(params.voice);
+              this.updateHostPreferences({ preferredTtsVoice: resolved.alias });
+            }
+            this.suppressPhoneAirpodsClaimUntilMs = Date.now() + 90000;
+            callTtsMeta = await this.synthesizeNeuralTts(ttsSourceText, {
+              voice: params.voice ? String(params.voice) : undefined,
+              onFallback: (reason) => { callTtsFallbackReason = reason; },
+            });
+          }
+
+          const deadlineMs = boundedControlDeadline(params.deadlineMs, maxBudgetMs);
+          const speakerEnabled =
+            params.speaker !== undefined
+              ? Boolean(params.speaker)
+              : Boolean(sayText || macSayText);
           try {
             // A single session-bound request lets Android abort before dialing when
             // unlock fails, the emergency stop is pressed, or authorization expires.
             const res = await callPhone<any>("sys.control", {
               action: "call_phone", number: cleanNumber,
-              dialOnly: subAction === "dial" || Boolean(params.dialOnly),
-              simSlot: String(params.simSlot ?? params.sim ?? "1"),
-              speaker: Boolean(params.speaker),
+              dialOnly,
+              simSlot,
+              speaker: speakerEnabled,
               pattern: typeof params.pattern === "string" ? params.pattern : this.config.unlockPattern,
               pin: typeof params.pin === "string" ? params.pin : this.config.unlockPin,
               bounds: typeof params.bounds === "string" ? params.bounds : this.config.unlockBounds || "175,1516,1045,2386",
               deadlineMs,
+              ...(hasAnyPostAnswerTask
+                ? {
+                    ...(sayText ? { sayText } : {}),
+                    ...(aiCallText ? { aiCallText } : {}),
+                    ...(macSayText && !sayText && !aiCallText ? { waitForAnswer: true } : {}),
+                    repeatCount,
+                    hangupAfter: Boolean(params.hangupAfter ?? params.autoHangup),
+                    waitAnswerSec:
+                      typeof params.waitAnswerSec === "number" && Number.isFinite(params.waitAnswerSec)
+                        ? Math.max(5, Math.min(65, Math.round(params.waitAnswerSec)))
+                        : 35,
+                    postAnswerDelayMs:
+                      typeof params.postAnswerDelayMs === "number" && Number.isFinite(params.postAnswerDelayMs)
+                        ? Math.max(150, Math.min(4000, Math.round(params.postAnswerDelayMs)))
+                        : 650,
+                    useAlarmStream: params.useAlarmStream !== false,
+                    ...(sayText && callTtsMeta
+                      ? {
+                          audioBase64: callTtsMeta.audioBase64,
+                          voiceId: callTtsMeta.voiceId,
+                          voiceLabel: callTtsMeta.voiceLabel,
+                        }
+                      : {}),
+                  }
+                : {}),
             }, Math.max(1, deadlineMs - Date.now()));
             if (res?.status) this.session.setPhoneStatus(res.status);
-            return res;
+            if (macSayText && res && typeof res === "object" && res.callAnswered) {
+              const postDelay =
+                typeof params.postAnswerDelayMs === "number" && Number.isFinite(params.postAnswerDelayMs)
+                  ? Math.max(150, Math.min(4000, Math.round(params.postAnswerDelayMs)))
+                  : 650;
+              await new Promise((r) => setTimeout(r, postDelay));
+              const playedOnMac = callTtsMeta
+                ? await this.playNeuralAudioOnMacSpeaker(callTtsMeta.audioBase64, repeatCount)
+                : false;
+              let hungUpAfter = false;
+              if (Boolean(params.hangupAfter ?? params.autoHangup) && playedOnMac) {
+                try {
+                  const hRes = await this.session.callPhone<any>("sys.control", { action: "hangup_call" }, 10000);
+                  hungUpAfter = Boolean(hRes?.hungUp);
+                } catch {}
+              }
+              return {
+                ...res,
+                ...(matchedContact ? { matchedContact } : {}),
+                spoken: playedOnMac,
+                spokenText: macSayText,
+                ttsEngine: playedOnMac ? "mac_speaker_edge_neural" : "mac_speaker_failed",
+                ...(callTtsMeta
+                  ? {
+                      voiceId: callTtsMeta.voiceId,
+                      voiceLabel: callTtsMeta.voiceLabel,
+                      cached: callTtsMeta.cached,
+                      audioBytes: callTtsMeta.bytes,
+                    }
+                  : {}),
+                ...(Boolean(params.hangupAfter ?? params.autoHangup) ? { hungUpAfter } : {}),
+              };
+            }
+            if (sayText && res && typeof res === "object") {
+              if (callTtsMeta) {
+                return {
+                  ...res,
+                  ...(matchedContact ? { matchedContact } : {}),
+                  ttsEngine: "edge_neural",
+                  voiceId: callTtsMeta.voiceId,
+                  voiceLabel: callTtsMeta.voiceLabel,
+                  cached: callTtsMeta.cached,
+                  audioBytes: callTtsMeta.bytes,
+                };
+              }
+              if (callTtsFallbackReason) {
+                return {
+                  ...res,
+                  ...(matchedContact ? { matchedContact } : {}),
+                  ttsEngine: "android_local",
+                  ttsFallbackReason: callTtsFallbackReason,
+                };
+              }
+            }
+            return matchedContact && res && typeof res === "object" ? { ...res, matchedContact } : res;
           } catch (err: any) {
             if (!String(err?.message || "").includes("Unsupported sys.control action")) throw err;
             return {

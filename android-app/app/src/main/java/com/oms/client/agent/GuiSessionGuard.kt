@@ -59,9 +59,9 @@ internal class GuiSessionGuard(initiallyStopped: Boolean = false) {
     }
 
     companion object {
-        fun boundedDeadline(now: Long, requested: Long): Long {
+        fun boundedDeadline(now: Long, requested: Long, maxDurationMs: Long = 60_000L): Long {
             require(requested > now) { "ERR_GUI_DEADLINE: Missing or expired deadlineMs" }
-            return minOf(requested, now + 60_000L)
+            return minOf(requested, now + maxDurationMs)
         }
     }
 }

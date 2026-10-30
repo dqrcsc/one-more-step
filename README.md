@@ -1,6 +1,6 @@
 # <img src="./docs/assets/icon-qingjian-zhichi.png" width="36" height="36" align="top" alt="QingJian ZhiChi Icon" /> 青简 · 咫尺 (OneMoreStep) — macOS 本地 AI ⇄ 小米 Android 全场景双向协同底座
 
-[![Version: v1.5.9](https://img.shields.io/badge/Version-v1.5.9-10b981?style=flat-square)](./CHANGELOG.md)
+[![Version: v1.6.0](https://img.shields.io/badge/Version-v1.6.0-10b981?style=flat-square)](./CHANGELOG.md)
 [![Runtime: Bun >= 1.1](https://img.shields.io/badge/Runtime-Bun_%E2%89%A51.1-f472b6?style=flat-square&logo=bun&logoColor=white)](https://bun.sh)
 [![macOS Host](https://img.shields.io/badge/macOS_Host-TypeScript_%2B_Swift_(CoreBluetooth_%2F_IOBluetooth)-0284c7?style=flat-square&logo=apple&logoColor=white)](./mac-host)
 [![Xiaomi Android](https://img.shields.io/badge/Xiaomi_Android-Kotlin_%2B_Compose_(HyperOS_%2F_MIUI)-ff6900?style=flat-square&logo=xiaomi&logoColor=white)](./android-app)
@@ -13,13 +13,14 @@
 
 ---
 
-**v1.5.9 更新与实现边界声明**：
+**v1.6.0 更新与实现边界声明**：
+- **v1.6.0 新增能力与修复**：新增联系人姓名速查表（`oms contacts`）与直接按姓名拨号（`oms call <姓名>`）；支持拨号后自动检测接通（兼容小米 HyperOS 中文秒数计时器 `"7秒"` / `"SIM卡2 · 7秒"`）并执行免提 + Mac 扬声器 Neural TTS 代聊（`--mac-say`）、小米系统 `AI通话` 注入代聊（`--ai-call`）或手机本地 TTS 播报（`--say`）；修复小米 HyperOS 通话界面 `Switch` 嵌套子 `ImageButton` 的免提/挂断点击、免 `READ_PHONE_STATE` 权限通话状态判定、小米画报锁屏自动退出以及 `oms daemon restart` 后 BLE centralId 自动恢复。见 [v1.6.0 更新说明](./docs/releases/v1.6.0.md)。
 - **v1.5.9 修复**：修正抖音暂停信号误判导致的自动切换漏触发，自动接管等待 Mac 释放确认，并补齐会话失效保护和媒体诊断。同一运行进程内两轮播放自动切换及用户听感确认通过；见 [v1.5.9 更新说明](./docs/releases/v1.5.9.md)。
 - **v1.5.8 修复**：原生连接进程隔离、手机 A2DP 去重与有界等待、两端底层诊断。同一服务进程的合盖超时→出盒恢复已在本机通过，最终连接手机；长期稳定性仍待验证，见 [v1.5.8 更新说明](./docs/releases/v1.5.8.md)。
 - **v1.5.7 候选修复**：拨号盘冷启动就绪轮询；统一 AirPods 两端期限、取消和目标音频路由确认。两端已部署，基础真机复测通过；扩展测试发现 AirPods 超时后的自动恢复仍不稳定，尚未发布 GitHub，见 [v1.5.7 更新说明](./docs/releases/v1.5.7.md)。
 - **v1.5.6 修复**：统一解锁、拨号与镜像的急停/期限检查，移除危险坐标回退，修复镜像启停竞态、AirPods 失败误报和紧急语音自动停止，补齐 Neural TTS 独立安装。**本轮尚未完成真机验收**，详见 [v1.5.6 更新说明](./docs/releases/v1.5.6.md)。
 - **v1.5.5 新增能力**：新增 **9 款 Microsoft Edge Neural TTS 真人自然语音播报与寻机引擎**（`xiaoyi` 甜美元气女声、`xiaoxiao` 温柔知性女声、`yunxia` 动漫元气少年音、`yunxi` 阳光男声、`yunjian` 沉稳男声、`xiaobei` 东北话、`xiaoni` 陕西话、`hsiaochen` 台湾腔甜美女声、`hiugaai` 粤语女声，支持 `--voice`、`--repeat <1..20>` 循环播报与 SHA-256 本地缓存 `~/.one_more_step/cache/tts/`）、**手机端 5 种随手即停交互**（按侧面音量/电源键、解锁屏幕、点按/左滑通知、通知停止按钮、App 顶部红条一键停声），并彻底消除手机播报时触发 Mac `Music.app` 自动弹窗的问题；包含 v1.5.3 **WebP 硬件加速投屏与自适应 10ms 极速流控**、v1.5.2 **AirPods 跨 Mac ⇄ 小米手机蓝牙无感自动切换**（`oms airpods`）与 **实时手机屏幕镜像工作台**（`oms mirror`）。完整变更历史见 [CHANGELOG.md](./CHANGELOG.md)。
-- **v2 安全传输与配对要求**：自 v1.4.0 起业务帧统一运行于 **P-256 ECDH + HKDF-SHA256 + 双向 AES-256-GCM** 认证加密会话内（见 [安全传输 v2](./docs/secure-transport-v2.md)）。从 v1.4.x / v1.5.x 升级至 v1.5.9 **无需重新配对**，直接运行 `oms ota` 或覆盖安装 [`OneMoreStep-v1.5.9.apk`](https://github.com/dqrcsc/one-more-step/releases/download/v1.5.9/OneMoreStep-v1.5.9.apk) 即可保留全部配对密钥、收件箱与配置；从 v1.3.x 及更早版本升级需同步升级双端并执行一次 `oms pair` 重新绑定。
+- **v2 安全传输与配对要求**：自 v1.4.0 起业务帧统一运行于 **P-256 ECDH + HKDF-SHA256 + 双向 AES-256-GCM** 认证加密会话内（见 [安全传输 v2](./docs/secure-transport-v2.md)）。从 v1.4.x / v1.5.x 升级至 v1.6.0 **无需重新配对**，直接运行 `oms ota` 或覆盖安装 [`OneMoreStep-v1.6.0.apk`](https://github.com/dqrcsc/one-more-step/releases/download/v1.6.0/OneMoreStep-v1.6.0.apk) 即可保留全部配对密钥、收件箱与配置；从 v1.3.x 及更早版本升级需同步升级双端并执行一次 `oms pair` 重新绑定。
 - **工程实现边界**：当前已落地能力、升级兼容性及待专项真机验证项（如 WAN WebRTC DataChannel 尚未实现、当前 WAN 为可选 WebSocket 中继接入；Mac 蓝牙桥实际使用 `CoreBluetooth` BLE GATT + `IOBluetooth` 经典蓝牙音频切换；GUI 观察必须携带最新 `observationId` 等）详见 **[当前实现边界与升级验收 (`docs/implementation-status.md`)](./docs/implementation-status.md)**。
 
 ---

@@ -591,10 +591,69 @@ async function main() {
       break;
     }
 
+    case "contacts":
+    case "contact": {
+      const op = (positional[0] || "list").toLowerCase();
+      if (op === "set" || op === "add") {
+        const name = (flags.name as string) || positional[1];
+        const number = (flags.number as string) || positional[2];
+        const res = await ipc.call("phone_device_control", {
+          action: "contacts",
+          op: "set",
+          name,
+          number,
+          sim: flags.sim !== undefined ? String(flags.sim) : undefined,
+          note: typeof flags.note === "string" ? flags.note : undefined,
+        });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "remove" || op === "delete" || op === "rm") {
+        const name = (flags.name as string) || positional[1];
+        const res = await ipc.call("phone_device_control", {
+          action: "contacts",
+          op: "remove",
+          name,
+        });
+        console.log(JSON.stringify(res, null, 2));
+      } else {
+        const res = await ipc.call("phone_device_control", { action: "contacts", op: "list" });
+        console.log(JSON.stringify(res, null, 2));
+      }
+      break;
+    }
+
     case "call":
     case "dial": {
       const number = (flags.number as string) || positional[0];
-      if (!number) throw new Error("Usage: oms call <phone-number> [--sim 1|2|电信|联通] [--dial-only] [--speaker]");
+      if (!number) {
+        throw new Error(
+          "Usage: oms call <name-or-number> [--sim 1|2] [--say <text> | --mac-say <text> | --ai-call <text>] [--voice <v>] [--repeat <N>] [--hangup-after] [--wait-answer <sec>] [--dial-only] [--speaker|--no-speaker]"
+        );
+      }
+      const sayText =
+        typeof flags.say === "string"
+          ? flags.say
+          : typeof flags.tts === "string"
+            ? flags.tts
+            : typeof flags.speak === "string"
+              ? flags.speak
+              : positional.length > 1
+                ? positional.slice(1).join(" ")
+                : undefined;
+      const macSayText =
+        typeof flags["mac-say"] === "string"
+          ? flags["mac-say"]
+          : typeof flags["mac-tts"] === "string"
+            ? flags["mac-tts"]
+            : undefined;
+      const aiCallText =
+        typeof flags["ai-call"] === "string"
+          ? flags["ai-call"]
+          : typeof flags.ai === "string"
+            ? flags.ai
+            : undefined;
+      const speakerFlag =
+        flags["no-speaker"] ? false : flags.speaker !== undefined ? Boolean(flags.speaker) : undefined;
+      const hasSpeechTask = Boolean(sayText || macSayText || aiCallText);
       const res = await ipc.call(
         "phone_device_control",
         {
@@ -602,9 +661,18 @@ async function main() {
           number,
           simSlot: flags.sim !== undefined ? String(flags.sim) : undefined,
           dialOnly: cmd === "dial" || Boolean(flags["dial-only"]),
-          speaker: Boolean(flags.speaker),
+          speaker: speakerFlag,
+          say: sayText,
+          macSay: macSayText,
+          aiCall: aiCallText,
+          voice: typeof flags.voice === "string" ? flags.voice : undefined,
+          repeat: flags.repeat !== undefined ? Number(flags.repeat) : undefined,
+          hangupAfter: Boolean(flags["hangup-after"] || flags["auto-hangup"] || flags.hangup),
+          waitAnswerSec: flags["wait-answer"] !== undefined ? Number(flags["wait-answer"]) : undefined,
+          postAnswerDelayMs: flags["speak-delay"] !== undefined ? Number(flags["speak-delay"]) : undefined,
+          saveVoice: Boolean(flags.save),
         },
-        35000
+        hasSpeechTask ? 95000 : 35000
       );
       console.log(JSON.stringify(res, null, 2));
       break;
@@ -726,9 +794,34 @@ async function main() {
         const number = (flags.number as string) || positional[1];
         if (!number) {
           throw new Error(
-            "Usage: oms phone call <phone-number> [--sim 1|2|电信|联通] [--dial-only] [--speaker]"
+            "Usage: oms phone call <name-or-number> [--sim 1|2] [--say <text> | --mac-say <text> | --ai-call <text>] [--voice <v>] [--repeat <N>] [--hangup-after] [--wait-answer <sec>] [--dial-only] [--speaker|--no-speaker]"
           );
         }
+        const sayText =
+          typeof flags.say === "string"
+            ? flags.say
+            : typeof flags.tts === "string"
+              ? flags.tts
+              : typeof flags.speak === "string"
+                ? flags.speak
+                : positional.length > 2
+                  ? positional.slice(2).join(" ")
+                  : undefined;
+        const macSayText =
+          typeof flags["mac-say"] === "string"
+            ? flags["mac-say"]
+            : typeof flags["mac-tts"] === "string"
+              ? flags["mac-tts"]
+              : undefined;
+        const aiCallText =
+          typeof flags["ai-call"] === "string"
+            ? flags["ai-call"]
+            : typeof flags.ai === "string"
+              ? flags.ai
+              : undefined;
+        const speakerFlag =
+          flags["no-speaker"] ? false : flags.speaker !== undefined ? Boolean(flags.speaker) : undefined;
+        const hasSpeechTask = Boolean(sayText || macSayText || aiCallText);
         const res = await ipc.call(
           "phone_device_control",
           {
@@ -736,9 +829,18 @@ async function main() {
             number,
             simSlot: flags.sim !== undefined ? String(flags.sim) : undefined,
             dialOnly: actionSub === "dial" || Boolean(flags["dial-only"]),
-            speaker: Boolean(flags.speaker),
+            speaker: speakerFlag,
+            say: sayText,
+            macSay: macSayText,
+            aiCall: aiCallText,
+            voice: typeof flags.voice === "string" ? flags.voice : undefined,
+            repeat: flags.repeat !== undefined ? Number(flags.repeat) : undefined,
+            hangupAfter: Boolean(flags["hangup-after"] || flags["auto-hangup"] || flags.hangup),
+            waitAnswerSec: flags["wait-answer"] !== undefined ? Number(flags["wait-answer"]) : undefined,
+            postAnswerDelayMs: flags["speak-delay"] !== undefined ? Number(flags["speak-delay"]) : undefined,
+            saveVoice: Boolean(flags.save),
           },
-          35000
+          hasSpeechTask ? 95000 : 35000
         );
         console.log(JSON.stringify(res, null, 2));
       } else if (actionSub === "hangup" || actionSub === "end-call" || actionSub === "hangup_call") {
@@ -813,8 +915,8 @@ Commands:
   oms phone voices                                     List all 9 Neural TTS human voices & current default voice
   oms phone stop-tts                                   Stop active Find-My-Phone or TTS voice playback on phone
   oms phone unlock [pattern] [--save] [--bounds l,t,r,b] Wake screen, swipe up bouncer & draw 3x3 pattern (1~9) to unlock phone
-  oms phone call <number> [--sim 1|2|电信|联通] [--dial-only] [--speaker]
-                                                       Auto-unlock & place phone call (or open dialer) with dual-SIM selection
+  oms phone call <number> [--sim 1|2|电信|联通] [--say <text>] [--voice <v>] [--repeat <N>] [--hangup-after] [--speaker]
+                                                       Auto-unlock, place phone call, wait for answer & speak with Neural TTS voice
   oms phone hangup                                     Hang up / end active or dialing phone call on Xiaomi phone
   oms pair [--json]                                    Generate v2 pairing URI & local wireless install URL (/install)
   oms web                                              Open Mac real-time Inbox & Stream Web Dashboard (/inbox)

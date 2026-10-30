@@ -29,4 +29,16 @@ class DialerTargetPolicyTest {
         assertFalse(DialerTargetPolicy.matchesSim("中国电信", "dialButton", "联通"))
         assertTrue(DialerTargetPolicy.matchesSim("拨打", "dialButton", ""))
     }
+
+    @Test fun speakerAndHangupControlsAreRecognizedAcrossMiuiAndAosp() {
+        assertTrue(DialerTargetPolicy.isSpeakerControl("免提", ""))
+        assertTrue(DialerTargetPolicy.isSpeakerControl("扬声器", ""))
+        assertTrue(DialerTargetPolicy.isSpeakerControl("", "com.android.incallui:id/audioButton"))
+        assertFalse(DialerTargetPolicy.isSpeakerControl("静音", "com.android.incallui:id/muteButton"))
+
+        assertTrue(DialerTargetPolicy.isHangupControl("挂断", ""))
+        assertTrue(DialerTargetPolicy.isHangupControl("结束通话", ""))
+        assertTrue(DialerTargetPolicy.isHangupControl("", "com.miui.incallui:id/end_call_button"))
+        assertFalse(DialerTargetPolicy.isHangupControl("拨打", "com.android.contacts:id/dialButton"))
+    }
 }

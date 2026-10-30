@@ -109,6 +109,13 @@ class AirPodsAutoSwitchManager(
     @Volatile
     private var suppressAutoGrabUntilElapsed: Long = 0L
 
+    fun suppressAutoGrab(durationMs: Long) {
+        val target = SystemClock.elapsedRealtime() + durationMs.coerceAtLeast(0L)
+        if (target > suppressAutoGrabUntilElapsed) {
+            suppressAutoGrabUntilElapsed = target
+        }
+    }
+
     @Volatile
     private var wasPhonePlayingAudio: Boolean = false
 

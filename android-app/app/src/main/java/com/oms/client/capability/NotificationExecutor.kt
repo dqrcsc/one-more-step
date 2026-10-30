@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.os.Build
@@ -23,6 +24,8 @@ import android.util.Base64
 import androidx.core.app.NotificationCompat
 import com.oms.client.R
 import com.oms.client.ui.MainActivity
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -84,11 +87,13 @@ object NotificationExecutor {
     private var ttsReady = false
     @Volatile
     private var ttsInitializing = false
+    @Volatile
+    private var ignoreHardwareStopForInCallSpeech = false
 
     private val hardwareStopReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent?) {
             val action = intent?.action ?: return
-            if (!_isSpeakingFlow.value) return
+            if (!_isSpeakingFlow.value || ignoreHardwareStopForInCallSpeech) return
             val elapsedSinceStart = SystemClock.elapsedRealtime() - playbackStartedElapsedMs
             when (action) {
                 Intent.ACTION_USER_PRESENT -> {
@@ -392,7 +397,7 @@ object NotificationExecutor {
         speechRate: Float = 1.0f,
         audioBase64: String? = null,
         repeatCount: Int = 1
-    ) {
+    ): Int {
         val cleanText = rawText
             .replace(Regex("```[\\s\\S]*?```"), "，代码片段已略过，")
             .replace(Regex("[#*`>|\\[\\]]"), " ")
@@ -429,15 +434,88 @@ object NotificationExecutor {
                     _speakingTextFlow.value = ""
                 }
             }
-            return
+            return gen
         }
 
         if (cleanText.isEmpty()) {
             _isSpeakingFlow.value = false
             _speakingTextFlow.value = ""
-            return
+            return 0
         }
         enqueueLocalSpeech(context, cleanText, useAlarmStream, speechRate, repeatCount)
+        return gen
+    }
+
+    /**
+     * Speak text on the phone (typically over USAGE_ALARM + built-in speaker for in-call speech)
+     * and suspend until playback finishes or [shouldContinue] returns false.
+     */
+    suspend fun speakTextAndAwait(
+        context: Context,
+        rawText: String,
+        useAlarmStream: Boolean = true,
+        speechRate: Float = 1.0f,
+        audioBase64: String? = null,
+        repeatCount: Int = 1,
+        maxWaitMs: Long = 45_000L,
+        ignoreHardwareStop: Boolean = true,
+        shouldContinue: () -> Boolean = { true }
+    ): Boolean {
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        val savedAlarmVolume = try {
+            if (useAlarmStream && am != null) am.getStreamVolume(AudioManager.STREAM_ALARM) else null
+        } catch (_: Throwable) {
+            null
+        }
+        try {
+            if (useAlarmStream && am != null) {
+                try {
+                    val maxVol = am.getStreamMaxVolume(AudioManager.STREAM_ALARM)
+                    val targetVol = (maxVol * 0.85f).toInt().coerceAtLeast(1)
+                    if (am.getStreamVolume(AudioManager.STREAM_ALARM) < targetVol) {
+                        am.setStreamVolume(AudioManager.STREAM_ALARM, targetVol, 0)
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            ignoreHardwareStopForInCallSpeech = ignoreHardwareStop
+            val gen = speakText(
+                context = context,
+                rawText = rawText,
+                useAlarmStream = useAlarmStream,
+                speechRate = speechRate,
+                audioBase64 = audioBase64,
+                repeatCount = repeatCount
+            )
+            if (gen == 0) return false
+            val startedAt = SystemClock.elapsedRealtime()
+            while (SystemClock.elapsedRealtime() - startedAt < maxWaitMs) {
+                delay(100L)
+                if (!shouldContinue()) {
+                    stopSpeaking(context)
+                    return false
+                }
+                if (playbackGeneration.get() != gen) {
+                    return false
+                }
+                if (!_isSpeakingFlow.value) {
+                    return shouldContinue()
+                }
+            }
+            stopSpeaking(context)
+            return false
+        } catch (e: CancellationException) {
+            stopSpeaking(context)
+            throw e
+        } finally {
+            ignoreHardwareStopForInCallSpeech = false
+            if (savedAlarmVolume != null && am != null) {
+                try {
+                    am.setStreamVolume(AudioManager.STREAM_ALARM, savedAlarmVolume, 0)
+                } catch (_: Throwable) {
+                }
+            }
+        }
     }
 
     private fun playNeuralAudioInternal(
@@ -462,6 +540,18 @@ object NotificationExecutor {
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build()
             player.setAudioAttributes(audioAttrs)
+            if (useAlarmStream) {
+                try {
+                    val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                    val speakerDev = am
+                        ?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                        ?.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                    if (speakerDev != null) {
+                        player.setPreferredDevice(speakerDev)
+                    }
+                } catch (_: Throwable) {
+                }
+            }
             FileInputStream(cacheFile).use { fis ->
                 player.setDataSource(fis.fd)
             }

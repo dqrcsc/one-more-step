@@ -2802,6 +2802,24 @@ class OmsTransportClient(
                 if (subAction == "dial" && !params.has("dialOnly")) {
                     params.put("dialOnly", true)
                 }
+                val hasInCallSpeech = !params.optBoolean("dialOnly", false) && (
+                    params.optString("sayText", params.optString("say", "")).isNotBlank() ||
+                        params.optString("audioBase64", "").isNotBlank()
+                    )
+                if (hasInCallSpeech) {
+                    airpodsManager.suppressAutoGrab(90_000L)
+                    if (params.optBoolean("disconnectBluetoothForSpeech", true)) {
+                        runCatching {
+                            airpodsManager.handleHandoffToMac(
+                                targetMac = "",
+                                pausePhoneMedia = true,
+                                disconnectOnPhone = true,
+                                deadlineMs = System.currentTimeMillis() + 2500L,
+                                sessionStillValid = sessionStillValid
+                            )
+                        }
+                    }
+                }
                 val res = svc.performPhoneCall(params, sessionStillValid)
                 res.put("status", collectDeviceSnapshot())
                 res

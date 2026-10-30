@@ -110,3 +110,29 @@ test("mirror unlock forwards the caller deadline without extending it", async ()
   expect(f.calls[0].params.deadlineMs).toBe(deadlineMs);
   expect(f.calls).toHaveLength(1);
 });
+
+test("call with say forwards speech options, enables speaker by default, and uses extended deadline budget", async () => {
+  const f = fixture(async () => ({ ok: true, callPlaced: true, callAnswered: true, spoken: true }));
+  const result = await f.daemon.handleIpcAction("phone_device_control", {
+    action: "call",
+    number: "10086",
+    say: "你好，我是智能语音助手，帮主人转达一句话。",
+    repeat: 2,
+    hangupAfter: true,
+    waitAnswerSec: 30,
+  });
+  expect(result.ok).toBe(true);
+  expect(f.calls).toHaveLength(1);
+  expect(f.calls[0].params).toMatchObject({
+    action: "call_phone",
+    number: "10086",
+    dialOnly: false,
+    speaker: true,
+    sayText: "你好，我是智能语音助手，帮主人转达一句话。",
+    repeatCount: 2,
+    hangupAfter: true,
+    waitAnswerSec: 30,
+    useAlarmStream: true,
+  });
+  expect(f.calls[0].timeout).toBeGreaterThan(25000);
+});

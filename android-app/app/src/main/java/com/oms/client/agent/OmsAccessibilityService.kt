@@ -4,6 +4,7 @@ import android.app.KeyguardManager
 import android.app.Notification
 import android.content.Context
 import com.oms.client.capability.AppLauncherHelper
+import com.oms.client.capability.NotificationExecutor
 import com.oms.client.otp.OtpExtractor
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
@@ -717,9 +718,10 @@ class OmsAccessibilityService : AccessibilityService() {
     private suspend fun <T> withGuardedPhoneAction(
         params: JSONObject,
         sessionStillValid: () -> Boolean,
+        maxDurationMs: Long = 25_000L,
         action: suspend GuardedRemoteAction.Steps.() -> T
     ): T = withContext(Dispatchers.Main.immediate) {
-        GuardedRemoteAction(guard, guiMutex).run(
+        GuardedRemoteAction(guard, guiMutex, maxDurationMs = maxDurationMs).run(
             requestedDeadline = if (params.has("deadlineMs")) params.optLong("deadlineMs") else null,
             sessionValid = sessionStillValid,
             activeJob = { activeAction = it },
@@ -786,6 +788,10 @@ class OmsAccessibilityService : AccessibilityService() {
             val customBounds = params.optString("bounds", "").trim()
 
             // 2. Check if pattern bouncer is already visible; if not, swipe up to reveal bouncer
+            if (km.isKeyguardLocked && rootInActiveWindow?.packageName?.toString() == "com.mfashiongallery.emag") {
+                steps.effect { performGlobalAction(GLOBAL_ACTION_BACK) }
+                steps.pause(350)
+            }
             var detectedGrid = resolvePatternGridCenters(screenW, screenH, customBounds)
             val isBouncerAlreadyShowing = detectedGrid != null &&
                 detectedGrid.source in setOf("accessibility_children_9", "accessibility_node", "accessibility_square_heuristic")
@@ -897,18 +903,242 @@ class OmsAccessibilityService : AccessibilityService() {
             }
         }
 
-    suspend fun performPhoneCall(params: JSONObject, sessionStillValid: () -> Boolean): JSONObject =
-        withGuardedPhoneAction(params, sessionStillValid) {
+    private fun findClickableCallControl(
+        roots: List<AccessibilityNodeInfo>,
+        allowedPackages: Set<String>,
+        predicate: (label: String, viewId: String) -> Boolean
+    ): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        roots.filter { it.packageName?.toString() in allowedPackages }
+            .forEach { queue.addLast(it) }
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            val pkg = n.packageName?.toString() ?: ""
+            if (pkg in allowedPackages && n.isVisibleToUser && n.isEnabled) {
+                val lbl = (n.text?.toString() ?: n.contentDescription?.toString() ?: "").trim()
+                val viewId = n.viewIdResourceName ?: ""
+                if (predicate(lbl, viewId)) {
+                    if (n.isClickable) return n
+                    // On Xiaomi HyperOS com.android.incallui, outer Switch ("免提" / "挂断电话") has
+                    // clickable=false while its direct child ImageButton/ImageView has clickable=true and label=""
+                    val childQueue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+                    for (i in 0 until n.childCount) {
+                        n.getChild(i)?.let { childQueue.addLast(it to 1) }
+                    }
+                    while (childQueue.isNotEmpty()) {
+                        val (child, d) = childQueue.removeFirst()
+                        if (child.packageName?.toString() in allowedPackages &&
+                            child.isVisibleToUser && child.isEnabled && child.isClickable
+                        ) {
+                            return child
+                        }
+                        if (d < 2) {
+                            for (j in 0 until child.childCount) {
+                                child.getChild(j)?.let { childQueue.addLast(it to (d + 1)) }
+                            }
+                        }
+                    }
+                    var parent = n.parent
+                    var depth = 0
+                    while (parent != null && depth < 3) {
+                        if (parent.packageName?.toString() in allowedPackages &&
+                            parent.isVisibleToUser && parent.isEnabled && parent.isClickable
+                        ) {
+                            return parent
+                        }
+                        parent = parent.parent
+                        depth += 1
+                    }
+                }
+            }
+            for (i in 0 until n.childCount) {
+                n.getChild(i)?.let { queue.addLast(it) }
+            }
+        }
+        return null
+    }
+
+    private fun findSpeakerSwitchCheckedState(
+        roots: List<AccessibilityNodeInfo>,
+        allowedPackages: Set<String>
+    ): Boolean? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        roots.filter { it.packageName?.toString() in allowedPackages }
+            .forEach { queue.addLast(it) }
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            val pkg = n.packageName?.toString() ?: ""
+            if (pkg in allowedPackages && n.isVisibleToUser) {
+                val lbl = (n.text?.toString() ?: n.contentDescription?.toString() ?: "").trim()
+                val viewId = n.viewIdResourceName ?: ""
+                if (DialerTargetPolicy.isSpeakerControl(lbl, viewId) && n.isCheckable) {
+                    return n.isChecked
+                }
+            }
+            for (i in 0 until n.childCount) {
+                n.getChild(i)?.let { queue.addLast(it) }
+            }
+        }
+        return null
+    }
+
+    private suspend fun ensureSpeakerphoneEnabled(
+        steps: GuardedRemoteAction.Steps,
+        callPackages: Set<String>,
+        isInCall: () -> Boolean?
+    ): Boolean {
+        val audio = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+        fun isSpeakerActive(): Boolean {
+            val uiChecked = findSpeakerSwitchCheckedState(collectAllWindowRoots(), callPackages)
+            if (uiChecked != null) return uiChecked
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                if (audio?.communicationDevice?.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
+                    return true
+                }
+            }
+            @Suppress("DEPRECATION")
+            return audio?.isSpeakerphoneOn == true
+        }
+        if (isSpeakerActive()) return true
+        if (isInCall() != true) return false
+
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            try {
+                val speakerDev = audio?.availableCommunicationDevices?.firstOrNull {
+                    it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                }
+                if (speakerDev != null) {
+                    audio.setCommunicationDevice(speakerDev)
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        if (isSpeakerActive()) return true
+
+        val speakerNode = findClickableCallControl(
+            roots = collectAllWindowRoots(),
+            allowedPackages = callPackages,
+            predicate = DialerTargetPolicy::isSpeakerControl
+        )
+        speakerNode?.let { node ->
+            steps.effect {
+                if (isInCall() == true && node.refresh() && node.isVisibleToUser && node.isEnabled &&
+                    node.packageName?.toString() in callPackages && node.isClickable
+                ) {
+                    val clicked = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    if (!clicked) {
+                        val b = Rect()
+                        node.getBoundsInScreen(b)
+                        injectTapGesture(b.centerX(), b.centerY(), 75L)
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                }
+            }
+            steps.pause(250L)
+            if (!isSpeakerActive() && isInCall() == true) {
+                // If a Bluetooth audio-routing popup sheet opened, click the explicit "扬声器 / 免提" item
+                val popupItem = findClickableCallControl(
+                    roots = collectAllWindowRoots(),
+                    allowedPackages = callPackages,
+                    predicate = { lbl, _ ->
+                        val t = lbl.trim().lowercase()
+                        t in setOf("扬声器", "免提", "外放", "speaker", "speakerphone")
+                    }
+                )
+                popupItem?.let { item ->
+                    steps.effect {
+                        if (isInCall() == true && item.refresh() && item.isVisibleToUser &&
+                            item.isEnabled && item.isClickable
+                        ) {
+                            item.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                        }
+                    }
+                    steps.pause(200L)
+                }
+            }
+        }
+        if (isSpeakerActive()) return true
+        try {
+            @Suppress("DEPRECATION")
+            audio?.isSpeakerphoneOn = true
+        } catch (_: Throwable) {
+        }
+        return isSpeakerActive()
+    }
+
+    private suspend fun executeVerifiedHangup(
+        trustedPackages: Set<String>,
+        isInCall: () -> Boolean?,
+        checkAuth: suspend () -> Unit,
+        pause: suspend (Long) -> Unit
+    ): HangupCallVerifier.Result {
+        checkAuth()
+        return HangupCallVerifier.execute(
+            isInCall = isInCall,
+            clickVerifiedTarget = {
+                AppLauncherHelper.wakeScreenIfNeeded(this@OmsAccessibilityService)
+                val target = findClickableCallControl(
+                    roots = collectAllWindowRoots(),
+                    allowedPackages = trustedPackages,
+                    predicate = DialerTargetPolicy::isHangupControl
+                )
+                target?.let {
+                    !guard.stopped && it.refresh() && it.isVisibleToUser && it.isEnabled && it.isClickable &&
+                        it.packageName?.toString() in trustedPackages && isInCall() == true &&
+                        it.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                } ?: false
+            },
+            awaitStateUpdate = {
+                pause(150L)
+                checkAuth()
+            }
+        )
+    }
+
+    suspend fun performPhoneCall(params: JSONObject, sessionStillValid: () -> Boolean): JSONObject {
+        val dialOnly = params.optBoolean("dialOnly", false)
+        val sayText = params.optString("sayText", params.optString("say", "")).trim()
+        val aiCallText = params.optString("aiCallText", params.optString("aiCall", "")).trim()
+        val waitForAnswerOnly = params.optBoolean("waitForAnswer", false)
+        val audioBase64 = params.optString("audioBase64", "").takeIf { it.isNotBlank() }
+        val hasInCallSpeech = !dialOnly && (sayText.isNotEmpty() || audioBase64 != null || aiCallText.isNotEmpty() || waitForAnswerOnly)
+        return withGuardedPhoneAction(
+            params = params,
+            sessionStillValid = sessionStillValid,
+            maxDurationMs = if (hasInCallSpeech) 90_000L else 25_000L
+        ) {
             val steps = this
             val rawNumber = params.optString("number", params.optString("phoneNumber", params.optString("text", ""))).trim()
             val cleanNumber = rawNumber.filter { it.isDigit() || it in setOf('+', '*', '#', ',') }
             require(cleanNumber.isNotEmpty()) { "请提供要拨打的电话号码" }
-            val dialOnly = params.optBoolean("dialOnly", false)
-            val enableSpeaker = params.optBoolean("speaker", false)
+            val enableSpeaker = if (params.has("speaker")) {
+                params.optBoolean("speaker", false)
+            } else {
+                !dialOnly && (sayText.isNotEmpty() || audioBase64 != null || waitForAnswerOnly)
+            }
             val simPref = params.optString("simSlot", params.optString("sim", "")).trim()
             val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
             val telecom = getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
-            fun isInCall(): Boolean? = try { telecom?.isInCall } catch (_: SecurityException) { null }
+            val audio = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+            val inCallUiPkgs = setOf("com.android.incallui", "com.miui.incallui")
+            fun isInCall(): Boolean? {
+                try {
+                    val tc = telecom?.isInCall
+                    if (tc != null) return tc
+                } catch (_: SecurityException) {
+                }
+                val mode = audio?.mode
+                if (mode == android.media.AudioManager.MODE_IN_CALL ||
+                    mode == android.media.AudioManager.MODE_IN_COMMUNICATION ||
+                    mode == android.media.AudioManager.MODE_RINGTONE
+                ) {
+                    return true
+                }
+                return collectAllWindowRoots().any { it.packageName?.toString() in inCallUiPkgs }
+            }
             fun failed(reason: String, requested: Boolean = false) = JSONObject().apply {
                 put("ok", false)
                 put("action", "call_phone")
@@ -986,8 +1216,12 @@ class OmsAccessibilityService : AccessibilityService() {
             fun matchesSim(node: AccessibilityNodeInfo): Boolean =
                 DialerTargetPolicy.matchesSim(label(node), node.viewIdResourceName ?: "", simPref)
             val candidates = nodes.filter { isCallButton(it) && matchesSim(it) }
-            if (candidates.size != 1) return@withGuardedPhoneAction failed("call_target_or_sim_not_verified")
-            val chosen = candidates.single()
+            val chosen = when {
+                candidates.size == 1 -> candidates.single()
+                candidates.size > 1 && simPref.isEmpty() -> candidates.first()
+                else -> return@withGuardedPhoneAction failed("call_target_or_sim_not_verified")
+            }
+            val chosenSimLabel = label(chosen)
             val clicked = steps.effect {
                 nodes = dialerNodes()
                 !km.isKeyguardLocked && isInCall() == false && hasRequestedNumber(nodes) &&
@@ -1005,45 +1239,299 @@ class OmsAccessibilityService : AccessibilityService() {
             }
             if (!callConfirmed) return@withGuardedPhoneAction failed("call_not_confirmed", requested = true)
 
+            val callPackages = dialerPackages + setOf("com.android.incallui", "com.miui.incallui")
             var speakerEnabled = false
             if (enableSpeaker) {
                 steps.pause(500L)
-                val audio = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
-                speakerEnabled = audio?.isSpeakerphoneOn == true
-                if (!speakerEnabled && isInCall() == true) {
-                    val callPackages = dialerPackages + setOf("com.android.incallui", "com.miui.incallui")
-                    val queue = ArrayDeque<AccessibilityNodeInfo>()
-                    collectApplicationRoots().filter { it.packageName?.toString() in callPackages }
-                        .forEach { queue.addLast(it) }
-                    var speakerNode: AccessibilityNodeInfo? = null
-                    while (queue.isNotEmpty() && speakerNode == null) {
-                        val n = queue.removeFirst()
-                        if (n.packageName?.toString() in callPackages && n.isVisibleToUser && n.isEnabled &&
-                            n.isClickable && label(n).lowercase() in setOf("免提", "扬声器", "speaker")) speakerNode = n
-                        else for (i in 0 until n.childCount) n.getChild(i)?.let { queue.addLast(it) }
-                    }
-                    speakerNode?.let { node ->
-                        steps.effect {
-                            if (isInCall() == true && node.refresh() && node.isVisibleToUser && node.isEnabled &&
-                                node.packageName?.toString() in callPackages && label(node).lowercase() in setOf("免提", "扬声器", "speaker")) {
-                                node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                            }
+                speakerEnabled = ensureSpeakerphoneEnabled(steps, callPackages, ::isInCall)
+            }
+
+            if (!hasInCallSpeech) {
+                return@withGuardedPhoneAction JSONObject().apply {
+                    put("ok", true)
+                    put("action", "call_phone")
+                    put("number", cleanNumber)
+                    put("simUsed", chosenSimLabel)
+                    put("callRequested", true)
+                    put("callPlaced", true)
+                    put("speakerEnabled", speakerEnabled)
+                }
+            }
+
+            // Wait for the remote party to answer the call before playing Neural TTS speech
+            val waitAnswerMs = (params.optInt("waitAnswerSec", 35).coerceIn(5, 65) * 1000L)
+            val postAnswerDelayMs = params.optLong("postAnswerDelayMs", 650L).coerceIn(150L, 4000L)
+            val repeatCount = params.optInt("repeatCount", params.optInt("repeat", 1)).coerceIn(1, 10)
+            val hangupAfter = params.optBoolean("hangupAfter", false)
+            val useAlarmStream = params.optBoolean("useAlarmStream", true)
+
+            fun collectCallWindowSnapshots(): List<CallAnswerDetector.NodeSnapshot> {
+                val list = mutableListOf<CallAnswerDetector.NodeSnapshot>()
+                val queue = ArrayDeque<AccessibilityNodeInfo>()
+                collectAllWindowRoots().filter { it.packageName?.toString() in callPackages }
+                    .forEach { queue.addLast(it) }
+                while (queue.isNotEmpty()) {
+                    val n = queue.removeFirst()
+                    if (n.packageName?.toString() in callPackages && n.isVisibleToUser) {
+                        val txt = n.text?.toString()?.trim() ?: ""
+                        val desc = n.contentDescription?.toString()?.trim() ?: ""
+                        val vid = n.viewIdResourceName ?: ""
+                        if (txt.isNotEmpty() || desc.isNotEmpty() || vid.isNotEmpty()) {
+                            list.add(CallAnswerDetector.NodeSnapshot(txt, desc, vid))
                         }
-                        steps.pause(150L)
-                        speakerEnabled = audio?.isSpeakerphoneOn == true
+                    }
+                    for (i in 0 until n.childCount) {
+                        n.getChild(i)?.let { queue.addLast(it) }
+                    }
+                }
+                return list
+            }
+
+            val answerResult = CallAnswerDetector.awaitCallAnswered(
+                maxWaitMs = waitAnswerMs,
+                pollIntervalMs = 250L,
+                isInCall = ::isInCall,
+                observeInCallNodes = ::collectCallWindowSnapshots,
+                checkAuthorization = { steps.check() },
+                pause = { ms ->
+                    AppLauncherHelper.wakeScreenIfNeeded(this@OmsAccessibilityService)
+                    steps.pause(ms)
+                }
+            )
+
+            if (!answerResult.answered) {
+                var hungUpOnTimeout = false
+                if (answerResult.reason == "answer_timeout" && isInCall() == true) {
+                    hungUpOnTimeout = executeVerifiedHangup(
+                        trustedPackages = callPackages,
+                        isInCall = ::isInCall,
+                        checkAuth = { steps.check() },
+                        pause = { steps.pause(it) }
+                    ).hungUp
+                }
+                return@withGuardedPhoneAction JSONObject().apply {
+                    put("ok", false)
+                    put("action", "call_phone")
+                    put("number", cleanNumber)
+                    put("simUsed", chosenSimLabel)
+                    put("callRequested", true)
+                    put("callPlaced", true)
+                    put("speakerEnabled", speakerEnabled)
+                    put("callAnswered", false)
+                    put("answerWaitMs", answerResult.waitedMs)
+                    put("spoken", false)
+                    put("hungUpOnTimeout", hungUpOnTimeout)
+                    put("reason", answerResult.reason)
+                }
+            }
+
+            // Ensure speakerphone is enabled after call is connected (some ROMs only allow toggling after answer)
+            if (enableSpeaker && !speakerEnabled) {
+                speakerEnabled = ensureSpeakerphoneEnabled(steps, callPackages, ::isInCall)
+            }
+
+            if (waitForAnswerOnly && sayText.isEmpty() && audioBase64 == null && aiCallText.isEmpty()) {
+                return@withGuardedPhoneAction JSONObject().apply {
+                    put("ok", true)
+                    put("action", "call_phone")
+                    put("number", cleanNumber)
+                    put("simUsed", chosenSimLabel)
+                    put("callRequested", true)
+                    put("callPlaced", true)
+                    put("speakerEnabled", speakerEnabled)
+                    put("callAnswered", true)
+                    put("answerWaitMs", answerResult.waitedMs)
+                    if (answerResult.matchedTimer != null) {
+                        put("matchedCallTimer", answerResult.matchedTimer)
                     }
                 }
             }
+
+            steps.pause(postAnswerDelayMs)
+            if (isInCall() != true) {
+                return@withGuardedPhoneAction JSONObject().apply {
+                    put("ok", false)
+                    put("action", "call_phone")
+                    put("number", cleanNumber)
+                    put("simUsed", chosenSimLabel)
+                    put("callRequested", true)
+                    put("callPlaced", true)
+                    put("speakerEnabled", speakerEnabled)
+                    put("callAnswered", true)
+                    put("answerWaitMs", answerResult.waitedMs)
+                    put("spoken", false)
+                    put("reason", "call_ended_before_speech")
+                }
+            }
+
+            val spokenOk = if (aiCallText.isNotEmpty()) {
+                performXiaomiAiCallSpeech(steps, callPackages, aiCallText, ::isInCall)
+            } else {
+                NotificationExecutor.speakTextAndAwait(
+                    context = this@OmsAccessibilityService,
+                    rawText = sayText,
+                    useAlarmStream = useAlarmStream,
+                    speechRate = 1.0f,
+                    audioBase64 = audioBase64,
+                    repeatCount = repeatCount,
+                    maxWaitMs = 45_000L,
+                    ignoreHardwareStop = true,
+                    shouldContinue = { !guard.stopped && sessionStillValid() && isInCall() == true }
+                )
+            }
+
+            var hungUpAfter = false
+            var hangupReason = "not_requested"
+            if (hangupAfter) {
+                if (spokenOk && isInCall() == true) {
+                    steps.pause(600L)
+                }
+                if (isInCall() == true) {
+                    val hangupRes = executeVerifiedHangup(
+                        trustedPackages = callPackages,
+                        isInCall = ::isInCall,
+                        checkAuth = { steps.check() },
+                        pause = { steps.pause(it) }
+                    )
+                    hungUpAfter = hangupRes.hungUp
+                    hangupReason = hangupRes.reason
+                } else {
+                    hungUpAfter = true
+                    hangupReason = "remote_already_ended"
+                }
+            }
+
             JSONObject().apply {
-                put("ok", true)
+                put("ok", spokenOk)
                 put("action", "call_phone")
                 put("number", cleanNumber)
-                put("simUsed", label(chosen))
+                put("simUsed", chosenSimLabel)
                 put("callRequested", true)
                 put("callPlaced", true)
                 put("speakerEnabled", speakerEnabled)
+                put("callAnswered", true)
+                put("answerWaitMs", answerResult.waitedMs)
+                put("matchedCallTimer", answerResult.matchedTimer)
+                put("spoken", spokenOk)
+                put("spokenText", if (aiCallText.isNotEmpty()) aiCallText else sayText)
+                put("ttsEngine", when {
+                    aiCallText.isNotEmpty() -> "xiaomi_ai_call"
+                    audioBase64 != null -> "edge_neural"
+                    else -> "android_local"
+                })
+                put("repeatCount", repeatCount)
+                put("hangupAfterRequested", hangupAfter)
+                put("hungUpAfter", hungUpAfter)
+                put("hangupReason", hangupReason)
+                if (!spokenOk) {
+                    put("reason", if (isInCall() == false) "call_ended_during_speech" else "speech_interrupted_or_failed")
+                }
             }
         }
+    }
+
+    private suspend fun performXiaomiAiCallSpeech(
+        steps: GuardedRemoteAction.Steps,
+        callPackages: Set<String>,
+        textToSend: String,
+        isInCall: () -> Boolean?
+    ): Boolean {
+        val aiAllowedPkgs = callPackages + setOf(
+            "com.xiaomi.aiasst.service",
+            "com.xiaomi.aiasst.vision",
+            "com.miui.voiceassist"
+        )
+        val aiButton = findClickableCallControl(
+            roots = collectAllWindowRoots(),
+            allowedPackages = aiAllowedPkgs,
+            predicate = { lbl, vid ->
+                lbl.contains("AI通话", ignoreCase = true) ||
+                    lbl.contains("AI代接", ignoreCase = true) ||
+                    vid.lowercase().contains("ai_call") ||
+                    vid.lowercase().contains("aicall")
+            }
+        )
+        if (aiButton != null) {
+            steps.effect {
+                if (isInCall() == true && aiButton.refresh() && aiButton.isVisibleToUser && aiButton.isClickable) {
+                    aiButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                }
+            }
+            steps.pause(600L)
+        }
+
+        var editableNode: AccessibilityNodeInfo? = null
+        var clickedKeyboardToggle = false
+        for (attempt in 0 until 14) {
+            if (isInCall() != true) return false
+            val roots = collectAllWindowRoots()
+            val queue = ArrayDeque<AccessibilityNodeInfo>()
+            roots.forEach { queue.addLast(it) }
+            while (queue.isNotEmpty()) {
+                val n = queue.removeFirst()
+                if (n.isVisibleToUser && n.isEditable && n.isEnabled) {
+                    editableNode = n
+                    break
+                }
+                for (i in 0 until n.childCount) {
+                    n.getChild(i)?.let { queue.addLast(it) }
+                }
+            }
+            if (editableNode != null) break
+            if (!clickedKeyboardToggle) {
+                val kbBtn = findClickableCallControl(
+                    roots = roots,
+                    allowedPackages = aiAllowedPkgs,
+                    predicate = { lbl, vid ->
+                        val t = lbl.trim()
+                        t in setOf("打字", "键盘", "输入", "文字输入", "手动输入") ||
+                            vid.lowercase().contains("keyboard") ||
+                            vid.lowercase().contains("input_switch")
+                    }
+                )
+                if (kbBtn != null) {
+                    clickedKeyboardToggle = true
+                    steps.effect {
+                        if (kbBtn.refresh() && kbBtn.isClickable) {
+                            kbBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                        }
+                    }
+                }
+            }
+            steps.pause(250L)
+        }
+
+        val targetEdit = editableNode ?: return false
+        val textFilled = steps.effect {
+            if (isInCall() != true || !targetEdit.refresh() || !targetEdit.isEditable) {
+                false
+            } else {
+                targetEdit.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                val args = Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, textToSend)
+                }
+                targetEdit.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            }
+        }
+        if (!textFilled) return false
+        steps.pause(250L)
+
+        val sendBtn = findClickableCallControl(
+            roots = collectAllWindowRoots(),
+            allowedPackages = aiAllowedPkgs,
+            predicate = { lbl, vid ->
+                val t = lbl.trim()
+                t in setOf("发送", "播报", "朗读", "确定", "Send") ||
+                    vid.lowercase().contains("send")
+            }
+        ) ?: return false
+
+        return steps.effect {
+            isInCall() == true && sendBtn.refresh() && sendBtn.isVisibleToUser &&
+                sendBtn.isEnabled && sendBtn.isClickable &&
+                sendBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        }
+    }
 
     suspend fun performHangupCall(sessionStillValid: () -> Boolean): JSONObject =
         withContext(Dispatchers.Main.immediate) {
@@ -1055,41 +1543,32 @@ class OmsAccessibilityService : AccessibilityService() {
                 activeAction = currentCoroutineContext()[Job]
                 try {
                     val telecom = getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
-                    fun isInCall(): Boolean? = try { telecom?.isInCall } catch (_: SecurityException) { null }
+                    val audio = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                    val inCallUiPkgs = setOf("com.android.incallui", "com.miui.incallui")
+                    fun isInCall(): Boolean? {
+                        try {
+                            val tc = telecom?.isInCall
+                            if (tc != null) return tc
+                        } catch (_: SecurityException) {
+                        }
+                        val mode = audio?.mode
+                        if (mode == android.media.AudioManager.MODE_IN_CALL ||
+                            mode == android.media.AudioManager.MODE_IN_COMMUNICATION ||
+                            mode == android.media.AudioManager.MODE_RINGTONE
+                        ) {
+                            return true
+                        }
+                        return collectAllWindowRoots().any { it.packageName?.toString() in inCallUiPkgs }
+                    }
                     val dialerPackage = try { telecom?.defaultDialerPackage } catch (_: SecurityException) { null }
                     val trustedPackages = setOfNotNull(dialerPackage, "com.android.incallui", "com.miui.incallui")
-                    val result = HangupCallVerifier.execute(
+                    val result = executeVerifiedHangup(
+                        trustedPackages = trustedPackages,
                         isInCall = ::isInCall,
-                        clickVerifiedTarget = {
+                        checkAuth = {
                             guard.checkAuthorization(System.currentTimeMillis(), deadline, sessionStillValid())
-                            val queue = ArrayDeque<AccessibilityNodeInfo>()
-                            collectApplicationRoots().filter { it.packageName?.toString() in trustedPackages }
-                                .forEach { queue.addLast(it) }
-                            fun isHangupTarget(node: AccessibilityNodeInfo): Boolean {
-                                val label = (node.text?.toString() ?: node.contentDescription?.toString() ?: "")
-                                    .trim().lowercase()
-                                val viewId = node.viewIdResourceName?.substringAfterLast('/')?.lowercase() ?: ""
-                                val isHangup = label in setOf("挂断", "结束通话", "end call", "hang up") ||
-                                    viewId in setOf("endbutton", "hangup", "end_call", "end_call_button", "endcallbutton")
-                                return node.packageName?.toString() in trustedPackages && node.isVisibleToUser &&
-                                    node.isEnabled && node.isClickable && isHangup
-                            }
-                            var target: AccessibilityNodeInfo? = null
-                            while (queue.isNotEmpty() && target == null) {
-                                val node = queue.removeFirst()
-                                if (isHangupTarget(node)) {
-                                    target = node
-                                } else {
-                                    for (i in 0 until node.childCount) node.getChild(i)?.let { queue.addLast(it) }
-                                }
-                            }
-                            target?.let { it.refresh() && isHangupTarget(it) && isInCall() == true &&
-                                it.performAction(AccessibilityNodeInfo.ACTION_CLICK) } ?: false
                         },
-                        awaitStateUpdate = {
-                            delay(150L)
-                            guard.checkAuthorization(System.currentTimeMillis(), deadline, sessionStillValid())
-                        }
+                        pause = { delay(it) }
                     )
                     JSONObject().apply {
                         put("ok", result.hungUp)

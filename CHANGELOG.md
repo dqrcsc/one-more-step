@@ -1,5 +1,27 @@
 # Changelog · 更新日志
 
+## 1.6.0 - 2026-10-30
+
+新增自动电话拨打 + 接通检测 + 多模式智能语音传话（`--mac-say` / `--ai-call` / `--say`）与常用联系人速查表（`oms contacts`），并修复小米 HyperOS 通话界面免提/挂断嵌套控件点击、免 `READ_PHONE_STATE` 权限通话状态判定、小米画报锁屏自动退出以及蓝牙桥重连恢复。
+
+### 新增能力与修复
+
+- **常用联系人速查与按姓名极速拨号（`oms contacts` & `oms call <姓名>`）**：支持将常用联系人姓名、号码与默认 SIM 卡槽保存在 `~/.one_more_step/config.json` 中，`oms call 老婆` 直接 0ms 解析号码与卡槽，无需先打开手机通讯录 UI 搜索。
+- **自动接通检测（`CallAnswerDetector`）**：轮询通话界面无障碍节点，识别拨号/振铃到接通计时器（同时兼容标准 `00:01` 与小米 HyperOS 中文秒数格式 `"7秒"`、`"SIM卡2 · 7秒"`、`"1分12秒"`），支持接通后可选自动挂断（`--hangup-after`）或保持通话。
+- **通话传话三模式（应对高通/小米硬件级回声消除 AEC）**：
+  - **方案 A（`--mac-say "<文本>" --voice <音色>`）**：手机自动开免提并在检测到接通瞬间由 Mac 扬声器播放指定 Edge Neural TTS 真人音色（如 `hsiaochen` 台湾女声），作为外部声源喂给手机远场麦克风，不被手机本机 DAC 硬件回声参考抵消；
+  - **方案 B（`--ai-call "<文本>"`）**：检测到对方接通后自动点击小米通话界面右上角系统原生「AI通话」按钮，填入文字并发送，由系统直接注入蜂窝基带上行；
+  - **本机播报（`--say "<文本>"`）**：手机端 `NotificationExecutor.speakTextAndAwait` 走 `USAGE_ALARM` + `TYPE_BUILTIN_SPEAKER` 播放并等待完成。
+- **小米 HyperOS 免提/挂断嵌套按钮修复**：针对小米 `com.android.incallui` 底部按钮外层 `Switch`（`label="免提"`，`clickable=false`，`checkable=true`）嵌套内层无文本 `ImageButton`（`clickable=true`）的结构，支持向下穿透查找可点击子控件并直接读取 `Switch.isChecked` 验证免提开关状态。
+- **免 `READ_PHONE_STATE` 权限通话状态判定与双卡默认回退**：当 `TelecomManager.isInCall` 因缺少运行时权限返回 `null` 时，自动回退使用 `AudioManager.mode` 与 `incallui` 窗口检测；双卡未显式指定 `--sim` 时默认选择首张卡，不再报错中断。
+- **小米画报锁屏自动退出与 BLE 重连恢复**：解锁遇到 `com.mfashiongallery.emag`（小米画报）时自动先发送 `BACK` 退回系统锁屏再上滑绘制图案；修复 `oms daemon restart` 后 BLE GATT 写入帧自动恢复 `activeCentralId`。
+
+### 安装与兼容性
+
+- APK：`OneMoreStep-v1.6.0.apk`，Android 11+，包名 `com.oms.client`，versionName **1.6.0** / versionCode **36**；沿用既有 Android Debug 签名，可覆盖安装。
+- 从 v1.4.x / v1.5.x 升级无需卸载、清除数据或重新配对。
+- APK SHA-256：`6acffb51ec25678f829db2655cfdfc8d70f6a2fb3f53d53303b044a27c88481d`。
+
 ## 1.5.9 - 2026-10-30
 
 修复抖音播放后 AirPods 未自动从 Mac 切到手机的问题，并补齐自动交接确认和媒体信号诊断。Mac 与 Android 请配套更新；已经安装 v1.5.9 build35 的用户无需再次安装。

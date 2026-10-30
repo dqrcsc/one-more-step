@@ -276,14 +276,23 @@ export class BluetoothBridgeServer extends EventEmitter {
         this.emit("phoneDisconnected", { centralId: msg.centralId });
         break;
       case "rssi":
+        if (typeof msg.centralId === "string" && msg.centralId) {
+          this.connectedCentralId = msg.centralId;
+        }
         if (typeof msg.rssi === "number") {
           this.emit("rssi", msg.rssi);
         }
         break;
       case "oob_announce":
+        if (typeof msg.centralId === "string" && msg.centralId) {
+          this.connectedCentralId = msg.centralId;
+        }
         this.emit("oobAnnounce", msg.data);
         break;
       case "frame_rx":
+        if (typeof msg.centralId === "string" && msg.centralId) {
+          this.connectedCentralId = msg.centralId;
+        }
         if (typeof msg.base64 === "string") {
           const bytes = new Uint8Array(Buffer.from(msg.base64, "base64"));
           this.emit("frame", bytes);

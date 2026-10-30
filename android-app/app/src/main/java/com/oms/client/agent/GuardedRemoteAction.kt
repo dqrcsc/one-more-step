@@ -12,6 +12,7 @@ import kotlinx.coroutines.withTimeout
 internal class GuardedRemoteAction(
     private val guard: GuiSessionGuard,
     private val mutex: Mutex,
+    private val maxDurationMs: Long = 25_000L,
     private val now: () -> Long = System::currentTimeMillis
 ) {
     class Steps internal constructor(
@@ -46,8 +47,8 @@ internal class GuardedRemoteAction(
         action: suspend Steps.() -> T
     ): T {
         val started = now()
-        val deadline = minOf(started + 25_000L,
-            GuiSessionGuard.boundedDeadline(started, requestedDeadline ?: started + 25_000L))
+        val deadline = minOf(started + maxDurationMs,
+            GuiSessionGuard.boundedDeadline(started, requestedDeadline ?: (started + maxDurationMs), maxDurationMs))
         val queuedRevision = guard.revision
         val steps = Steps(guard, deadline, sessionValid, now)
         steps.check()

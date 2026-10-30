@@ -16,6 +16,11 @@ description: 青简·咫尺 (OneMoreStep / oms) —— macOS 本地 AI Agent 与
 
 > 开发分支升级注意：v1.4.0 主机和手机同时升级，旧配对需使用 Mac 本地完整链接重新配对；禁止通过旧 OMS 明文通道或 HTTP 页面传递新凭据。GUI 节点动作必须携带最新 observationId；文件推送等待对端落盘 ACK。v2 使用认证加密业务帧且拒绝明文回退；HTTP 安装页、BLE/WAN 与完整断点恢复的边界见 [implementation-status](../../docs/implementation-status.md)。
 
+## 0. ⚡ 极速执行铁律（Fast Execution Rules）
+
+- **直接执行全局 CLI，严禁翻阅源码**：当用户要求打电话、解锁、找手机、语音播报、同步剪贴板、拉取截图或操控手机时，**直接调用一条 `oms <subcommand>` 命令立即执行**，严禁在执行前去 `grep` 或阅读 `mac-host/`、`android-app/` 的代码文件。
+- **联系人速查优先**：打电话给某人（如“老婆”）时，直接运行 `oms call 老婆 ...`（已内置常用联系人速查表 `oms contacts`），无需手动解锁再去点开手机通讯录 App 搜索号码；若遇到新联系人首次查到号码后，立即用 `oms contacts set <姓名> <号码> --sim <1|2>` 存入本地速查表。
+
 ## 1. 调用方式与架构约定
 
 v1.4.1 起，手机首页“连接诊断 → 复制诊断”离线可用，Mac 的 `oms status` 包含 `connectionDiagnostics`，最近 200 条事件保存在 `~/.one_more_step/logs/connections.jsonl`。离线时 `phoneStatus` 可能是旧快照，务必核对更新时间；先保留诊断，再决定是否重启。连接超时不等于 AP 隔离，安全校验失败不等于密钥丢失，不应直接让用户重新配对。v1.4.0 → v1.4.1 不改变 v2 配对。
@@ -205,13 +210,20 @@ oms phone unlock
 oms unlock
 oms phone unlock --bounds "175,1516,1045,2386" --save
 
-# 8. 原生电话拨打与挂断（若手机锁屏会自动先唤醒并绘制图案解锁，支持双卡 SIM 1 / SIM 2 / 电信 / 联通 / 移动选择、免提扬声器与仅打开拨号盘）
-oms phone call 10000
-oms phone call 10000 --sim 1
-oms phone call 10010 --sim 联通 --speaker
+# 8. 常用联系人速查表与原生电话拨打、接通后自动代聊、挂断
+#    - 支持直接按联系人姓名拨打（自动匹配 ~/.one_more_step/config.json 中的号码与默认 SIM 卡）
+#    - 支持双卡选择 (--sim 1|2|电信|联通|移动)、免提 (--speaker)、仅打开拨号盘 (--dial-only)
+#    - 接通后自动传话支持两种实测不被手机硬件回声消除屏蔽的方案：
+#      * 方案 A (--mac-say "<文本>" --voice <音色>)：手机自动开免提并在检测到对方接通后，由 Mac 扬声器播放指定 Edge Neural TTS 音色（如 hsiaochen 台湾女声）喂给手机远场麦克风
+#      * 方案 B (--ai-call "<文本>")：检测到对方接通后，自动点击小米通话界面右上角系统原生「AI通话」按钮填入文字直接注入基带上行
+#      * 可选加 --hangup-after 说完自动挂断；不加则播报完保持通话
+oms contacts
+oms contacts set "老婆" "18356106150" --sim 2
+oms call 老婆 --speaker
+oms call 老婆 --mac-say "你好，我是机主的智能语音助手，帮机主转达一句话：他已经在开家长会了，你放心" --voice hsiaochen
+oms call 老婆 --ai-call "你好，我是机主的智能语音助手，帮机主转达一句话：他已经在开家长会了，你放心"
+oms phone call 10086 --sim 2 --speaker
 oms phone call 13800138000 --dial-only
-oms phone hangup
-oms call 10000
 oms hangup
 
 # 9. 执行系统级导航与锁屏动作（home | back | recents | lock | notifications）

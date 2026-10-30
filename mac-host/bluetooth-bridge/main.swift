@@ -934,9 +934,7 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
         for req in requests {
-            if !subscribedCentrals.contains(where: { $0.identifier == req.central.identifier }) {
-                subscribedCentrals.append(req.central)
-            }
+            announceCentralIfNeeded(req.central, reason: "write")
             if req.characteristic.uuid == CHAR_FRAME_PIPE_UUID, let val = req.value {
                 if let first = val.first, first == 0x7B,
                    let obj = try? JSONSerialization.jsonObject(with: val) as? [String: Any] {
