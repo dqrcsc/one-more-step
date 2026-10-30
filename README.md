@@ -54,7 +54,7 @@
 
 **青简 · 咫尺 (`OneMoreStep` / `oms`)** 是一套专为 **macOS + 小米 Android（HyperOS / MIUI）** 双持开发者与知识工作者打造的**跨端双向 AI 协同与硬件互操作底座**。
 
-它与浏览器端的 **[青简 · 译读 (`QingJian Translator`)](../translator_plugin)**、ESP32-S3 桌面物理中控端的 **[青简 · 灵枢 (`QingJian LingShu`)](../ai_agent)** 共同构成「青简」个人智能体工具链。通过一套部署在 Mac 本地的轻量级守护进程（`omsd` + 原生 Swift 蓝牙桥接器 `oms-bt-bridge`）与小米手机端的原生 Kotlin 客户端（`OneMoreStep.apk`），它一次性打通了**六大跨端断层**：
+通过一套部署在 Mac 本地的轻量级守护进程（`omsd` + 原生 Swift 蓝牙桥接器 `oms-bt-bridge`）与小米手机端的原生 Kotlin 客户端（`OneMoreStep.apk`），它一次性打通了**六大跨端断层**：
 
 1. **📥 手机 ➔ Mac 极速输入流**：三指截屏 3.5 秒悬浮胶囊秒传、系统分享三大置顶入口直达本地知识库、控制中心磁贴秒同步剪贴板、手机原生语音录制 + Mac 本机 **SenseVoiceSmall 离线自动转写**；
 2. **🔑 锁屏验证码零触碰接力**：四通道穿透监听手机短信与 App 验证码，抗干扰提取 4~8 位纯数字验证码直接写入 Mac 剪贴板（电脑直接 `⌘V` 粘贴）并弹出桌面通知；
