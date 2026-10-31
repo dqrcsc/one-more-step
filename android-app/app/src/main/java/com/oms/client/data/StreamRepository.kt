@@ -4,11 +4,19 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.util.Base64
 import com.oms.client.transport.OmsFrameProtocol
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.KeyStore
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
 data class StreamItemModel(
     val itemId: String,
@@ -83,6 +91,82 @@ class StreamRepository(context: Context) :
         return id
     }
 
+    private companion object {
+        private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
+        private const val PAIR_SECRET_KEY_ALIAS = "oms_pair_secret_aes_key_v1"
+    }
+
+    private fun getOrCreateSecretKey(): SecretKey? {
+        return try {
+            val ks = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
+            val existing = (ks.getEntry(PAIR_SECRET_KEY_ALIAS, null) as? KeyStore.SecretKeyEntry)?.secretKey
+            if (existing != null) return existing
+            val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE_PROVIDER)
+            val spec = KeyGenParameterSpec.Builder(
+                PAIR_SECRET_KEY_ALIAS,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(256)
+                .build()
+            keyGenerator.init(spec)
+            keyGenerator.generateKey()
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun encryptPairSecret(plainHex: String): String? {
+        if (plainHex.isBlank()) return ""
+        return try {
+            val key = getOrCreateSecretKey() ?: return null
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, key)
+            val ivB64 = Base64.encodeToString(cipher.iv, Base64.NO_WRAP)
+            val ctB64 = Base64.encodeToString(cipher.doFinal(plainHex.toByteArray(Charsets.UTF_8)), Base64.NO_WRAP)
+            "v1:$ivB64:$ctB64"
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun decryptPairSecret(encoded: String): String? {
+        if (encoded.isBlank()) return ""
+        if (!encoded.startsWith("v1:")) return null
+        return try {
+            val parts = encoded.split(':')
+            if (parts.size != 3) return null
+            val iv = Base64.decode(parts[1], Base64.NO_WRAP)
+            val ct = Base64.decode(parts[2], Base64.NO_WRAP)
+            val key = getOrCreateSecretKey() ?: return null
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
+            String(cipher.doFinal(ct), Charsets.UTF_8)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun readStoredPairSecretHex(): String {
+        val enc = prefs.getString("pair_secret_enc", null)
+        if (!enc.isNullOrBlank()) {
+            val decrypted = decryptPairSecret(enc)
+            if (!decrypted.isNullOrBlank()) return decrypted
+        }
+        val legacyPlain = prefs.getString("pair_secret_hex", "") ?: ""
+        if (legacyPlain.isNotBlank()) {
+            val wrapped = encryptPairSecret(legacyPlain)
+            if (!wrapped.isNullOrBlank()) {
+                prefs.edit()
+                    .putString("pair_secret_enc", wrapped)
+                    .remove("pair_secret_hex")
+                    .apply()
+            }
+        }
+        return legacyPlain
+    }
+
     @Synchronized
     fun savePairedMac(config: PairedMacConfig) {
         val existingMacId = prefs.getString("mac_id", null)
@@ -94,12 +178,12 @@ class StreamRepository(context: Context) :
             if (sameMac) prefs.getString("wan_room_id", "") ?: "" else ""
         }
         val effectivePairSecret = config.pairSecretHex.ifBlank {
-            if (sameMac) prefs.getString("pair_secret_hex", "") ?: "" else ""
+            if (sameMac) readStoredPairSecretHex() else ""
         }
         val effectiveRelay = config.wanRelayWssUrl ?: if (sameMac) prefs.getString("wan_relay_url", null) else null
 
         val ipsArr = JSONArray(config.lanIps)
-        prefs.edit()
+        val editor = prefs.edit()
             .putString("mac_id", config.macId)
             .putString("mac_name", config.macName)
             .putString("lan_ips", ipsArr.toString())
@@ -107,9 +191,15 @@ class StreamRepository(context: Context) :
             .putString("mac_pub_key", effectivePubKey)
             .putString("wan_room_id", effectiveWanRoom)
             .putString("wan_relay_url", effectiveRelay)
-            .putString("pair_secret_hex", effectivePairSecret)
             .putInt("pairing_version", config.pairingVersion)
-            .commit().also { check(it) { "Unable to persist pairing configuration" } }
+
+        val encryptedSecret = encryptPairSecret(effectivePairSecret)
+        if (encryptedSecret != null) {
+            editor.putString("pair_secret_enc", encryptedSecret).remove("pair_secret_hex")
+        } else {
+            editor.putString("pair_secret_hex", effectivePairSecret)
+        }
+        editor.commit().also { check(it) { "Unable to persist pairing configuration" } }
     }
 
     /** Discovery may refresh routing, never restore a stale pairing credential or security version. */
@@ -136,6 +226,7 @@ class StreamRepository(context: Context) :
             .remove("wan_room_id")
             .remove("wan_relay_url")
             .remove("pair_secret_hex")
+            .remove("pair_secret_enc")
             .remove("pairing_version")
             .apply()
     }
@@ -157,7 +248,7 @@ class StreamRepository(context: Context) :
             macPubKeyBase64Url = prefs.getString("mac_pub_key", "") ?: "",
             wanRoomId = prefs.getString("wan_room_id", "") ?: "",
             wanRelayWssUrl = prefs.getString("wan_relay_url", null),
-            pairSecretHex = prefs.getString("pair_secret_hex", "") ?: "",
+            pairSecretHex = readStoredPairSecretHex(),
             pairingVersion = prefs.getInt("pairing_version", 0)
         )
     }

@@ -70,7 +70,10 @@ export class BluetoothBridgeServer extends EventEmitter {
 
   public async start(): Promise<void> {
     const dir = path.dirname(this.opts.socketPath);
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try {
+      fs.chmodSync(dir, 0o700);
+    } catch {}
     if (fs.existsSync(this.opts.socketPath)) {
       try {
         fs.unlinkSync(this.opts.socketPath);
@@ -84,6 +87,9 @@ export class BluetoothBridgeServer extends EventEmitter {
         this.activeClient = socket;
         let buffer = "";
         socket.setEncoding("utf8");
+        socket.on("error", () => {
+          // Ignore broken pipe / reset on local bridge socket
+        });
 
         // Immediately send latest Mac LAN info & AirPods config
         this.sendToBridge({
@@ -125,7 +131,12 @@ export class BluetoothBridgeServer extends EventEmitter {
       });
 
       this.server.once("error", reject);
-      this.server.listen(this.opts.socketPath, () => resolve());
+      this.server.listen(this.opts.socketPath, () => {
+        try {
+          fs.chmodSync(this.opts.socketPath, 0o600);
+        } catch {}
+        resolve();
+      });
     });
 
     if (this.opts.autoSpawnBinary && this.opts.binaryPath && fs.existsSync(this.opts.binaryPath)) {

@@ -41,11 +41,51 @@ data class ExtractedSemanticNode(
  */
 object SemanticTreeExtractor {
     private val nodeRefCache = ConcurrentHashMap<String, AccessibilityNodeInfo>()
+    @Volatile
+    private var lastExtractedNodes: List<ExtractedSemanticNode> = emptyList()
 
     fun getNodeById(shortId: String): AccessibilityNodeInfo? {
         val normalized = if (shortId.startsWith("#")) shortId else "#$shortId"
         return nodeRefCache[normalized]
     }
+
+    fun firstNonBlank(vararg values: CharSequence?): String =
+        values.firstNotNullOfOrNull { it?.toString()?.trim()?.takeIf { s -> s.isNotEmpty() } } ?: ""
+
+    fun extractNodeLabel(node: AccessibilityNodeInfo?): String {
+        if (node == null) return ""
+        val direct = firstNonBlank(node.text, node.contentDescription, node.hintText)
+        if (direct.isNotEmpty()) return direct
+        val childTexts = mutableListOf<String>()
+        fun collect(n: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 6 || childTexts.size >= 5) return
+            val own = firstNonBlank(n.text, n.contentDescription)
+            if (own.isNotEmpty()) childTexts.add(own)
+            for (i in 0 until n.childCount) {
+                val child = n.getChild(i) ?: continue
+                if (!child.isClickable && !child.isEditable) {
+                    collect(child, depth + 1)
+                }
+            }
+        }
+        collect(node, 0)
+        return childTexts.distinct().joinToString(" · ").take(80)
+    }
+
+    fun findSmallestNodeAt(
+        x: Int,
+        y: Int,
+        nodes: List<ExtractedSemanticNode> = lastExtractedNodes
+    ): ExtractedSemanticNode? =
+        nodes
+            .filter {
+                val b = it.bounds
+                b.left < b.right && b.top < b.bottom && x >= b.left && x < b.right && y >= b.top && y < b.bottom
+            }
+            .minByOrNull {
+                val b = it.bounds
+                (b.right - b.left).toLong().coerceAtLeast(0L) * (b.bottom - b.top).toLong().coerceAtLeast(0L)
+            }
 
     fun extractCompactTree(
         root: AccessibilityNodeInfo?,
@@ -66,26 +106,13 @@ object SemanticTreeExtractor {
         maxDepth: Int = 32
     ): List<ExtractedSemanticNode> {
         nodeRefCache.clear()
+        lastExtractedNodes = emptyList()
         if (roots.isEmpty()) return emptyList()
 
         val screenRect = Rect(0, 0, screenWidth, screenHeight)
         val result = mutableListOf<ExtractedSemanticNode>()
         val seenBoundsLabels = HashSet<String>()
         var nextIndex = 1
-
-        fun collectChildTexts(node: AccessibilityNodeInfo, depth: Int, acc: MutableList<String>) {
-            if (depth > 6 || acc.size >= 5) return
-            val ownText = (node.text?.toString() ?: node.contentDescription?.toString() ?: "").trim()
-            if (ownText.isNotEmpty()) {
-                acc.add(ownText)
-            }
-            for (i in 0 until node.childCount) {
-                val child = node.getChild(i) ?: continue
-                if (!child.isClickable && !child.isEditable) {
-                    collectChildTexts(child, depth + 1, acc)
-                }
-            }
-        }
 
         fun traverse(node: AccessibilityNodeInfo, depth: Int) {
             if (depth > maxDepth || result.size >= 85) return
@@ -103,16 +130,11 @@ object SemanticTreeExtractor {
                 val scrollable = node.isScrollable
                 val checkable = node.isCheckable
 
-                var label = (node.text?.toString()
-                    ?: node.contentDescription?.toString()
-                    ?: node.hintText?.toString()
-                    ?: "").trim()
+                var label = firstNonBlank(node.text, node.contentDescription, node.hintText)
 
                 // Step 2: Child Text Aggregation for interactive containers without direct text
                 if (label.isEmpty() && (clickable || checkable)) {
-                    val childTexts = mutableListOf<String>()
-                    collectChildTexts(node, 0, childTexts)
-                    label = childTexts.distinct().joinToString(" · ").take(80)
+                    label = extractNodeLabel(node)
                 }
 
                 val hasMeaning = clickable || editable || scrollable || checkable || label.isNotEmpty()
@@ -149,6 +171,7 @@ object SemanticTreeExtractor {
         for (root in roots) {
             traverse(root, 0)
         }
+        lastExtractedNodes = result.toList()
         return result
     }
 }

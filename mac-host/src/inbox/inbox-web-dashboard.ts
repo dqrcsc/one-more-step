@@ -62,11 +62,16 @@ export async function handleDashboardHttpRequest(
     );
   }
 
+  const dashboardCsp =
+    "default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; frame-src 'self'; object-src 'none'; base-uri 'none'";
+
   if (url.pathname === "/inbox" || url.pathname === "/dashboard") {
     return new Response(renderDashboardHtml(), {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Content-Security-Policy": dashboardCsp,
+        "X-Content-Type-Options": "nosniff",
       },
     });
   }
@@ -76,6 +81,8 @@ export async function handleDashboardHttpRequest(
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Content-Security-Policy": dashboardCsp,
+        "X-Content-Type-Options": "nosniff",
       },
     });
   }
@@ -823,7 +830,12 @@ function escapeHtml(str) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function encodeUrlParam(str) {
+  return encodeURIComponent(String(str || '')).replace(/'/g, '%27');
 }
 
 function setTag(tag) {
@@ -1198,35 +1210,34 @@ async function fetchInbox() {
     lastRenderSignature = sig;
 
     const container = document.getElementById('itemsContainer');
+    window.__inboxItemsById = new Map(items.map(i => [String(i.itemId || ''), i]));
     if (items.length === 0) {
       container.innerHTML = '<div class="empty-state">📭 当前筛选条件下暂无手机投递记录<br/><span style="font-size:12px;">在小米手机上发送消息、语音、截屏、分享文件或收到验证码后，这里会自动实时显示</span></div>';
       return;
     }
 
     container.innerHTML = items.map(item => {
+      const safeItemId = escapeHtml(item.itemId);
       const timeStr = new Date(item.createdAtMs).toLocaleString('zh-CN', { hour12: false });
       const contentToCopy = item.textContent || item.voiceTranscript || item.title || '';
       const otpCode = item.otpCode || '';
       const otpSender = item.otpSender || '';
-      const firstFilePath = (item.files && item.files[0]) ? item.files[0].absPath : '';
-      const aiPrompt = firstFilePath
-        ? ('请查看我从手机投递的文件 "' + firstFilePath + '"' + (contentToCopy ? ('，附言：' + contentToCopy) : ''))
-        : ('请处理我从手机发来的内容：' + contentToCopy);
 
-      const filesHtml = (item.files || []).map(f => {
+      const filesHtml = (item.files || []).map((f, fileIdx) => {
         const isImg = (f.mimeType || '').startsWith('image/') || /\\.(png|jpe?g|webp|gif)$/i.test(f.fileName);
         const isAudio = (f.mimeType || '').startsWith('audio/') || /\\.(m4a|mp3|wav|ogg|aac)$/i.test(f.fileName);
-        const fileUrl = '/api/inbox/file?itemId=' + encodeURIComponent(item.itemId) + '&file=' + encodeURIComponent(f.fileName);
+        const fileUrl = '/api/inbox/file?itemId=' + encodeUrlParam(item.itemId) + '&file=' + encodeUrlParam(f.fileName);
+        const safeFileUrl = escapeHtml(fileUrl);
         const kb = Math.max(1, Math.round((f.sizeBytes || 0) / 1024));
         return '<div class="attachment-box">' +
-          (isImg ? ('<img class="attachment-img" src="' + fileUrl + '" onclick="openLightbox(\\'' + fileUrl + '\\')" title="点击放大查看原图"/>') : '') +
-          (isAudio ? ('<audio controls src="' + fileUrl + '" style="width:100%;margin-bottom:8px;"></audio>') : '') +
+          (isImg ? ('<img class="attachment-img" src="' + safeFileUrl + '" data-item-action="lightbox" data-file-url="' + safeFileUrl + '" title="点击放大查看原图"/>') : '') +
+          (isAudio ? ('<audio controls src="' + safeFileUrl + '" style="width:100%;margin-bottom:8px;"></audio>') : '') +
           '<div class="attachment-meta">📎 ' + escapeHtml(f.fileName) + ' (' + kb + ' KB)<br/><code>' + escapeHtml(f.absPath) + '</code></div>' +
           '<div class="action-row">' +
-            (isAudio ? ('<button class="btn" onclick="transcribeItem(\\'' + item.itemId + '\\')">🎙️ 离线语音转写</button>') : '') +
-            '<button class="btn" onclick="openOnMac(\\'' + item.itemId + '\\', ' + JSON.stringify(f.absPath).replace(/"/g, '&quot;') + ', false)">👁️ Mac 打开</button>' +
-            '<button class="btn btn-secondary" onclick="openOnMac(\\'' + item.itemId + '\\', ' + JSON.stringify(f.absPath).replace(/"/g, '&quot;') + ', true)">📂 Finder 定位</button>' +
-            '<button class="btn btn-secondary" onclick="copyText(' + JSON.stringify(f.absPath).replace(/"/g, '&quot;') + ', \\'文件路径\\')">📋 复制路径</button>' +
+            (isAudio ? ('<button class="btn" data-item-action="transcribe" data-item-id="' + safeItemId + '">🎙️ 离线语音转写</button>') : '') +
+            '<button class="btn" data-item-action="open-mac" data-item-id="' + safeItemId + '" data-file-idx="' + fileIdx + '" data-reveal="0">👁️ Mac 打开</button>' +
+            '<button class="btn btn-secondary" data-item-action="open-mac" data-item-id="' + safeItemId + '" data-file-idx="' + fileIdx + '" data-reveal="1">📂 Finder 定位</button>' +
+            '<button class="btn btn-secondary" data-item-action="copy-file-path" data-item-id="' + safeItemId + '" data-file-idx="' + fileIdx + '">📋 复制路径</button>' +
           '</div>' +
         '</div>';
       }).join('');
@@ -1237,7 +1248,7 @@ async function fetchInbox() {
               '<span style="font-size:18px;font-weight:800;color:#4ADE80;letter-spacing:1.5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">🔑 ' + escapeHtml(otpCode) + '</span>' +
               (otpSender ? ('<span class="badge" style="color:#FBBF24;border-color:rgba(251,191,36,0.4);">【' + escapeHtml(otpSender) + '】</span>') : '') +
             '</div>' +
-            '<button class="btn btn-green" onclick="copyText(' + JSON.stringify(otpCode).replace(/"/g, '&quot;') + ', \\'验证码 ' + escapeHtml(otpCode) + '\\')">🔑 复制纯验证码 (' + escapeHtml(otpCode) + ')</button>' +
+            '<button class="btn btn-green" data-item-action="copy-otp" data-item-id="' + safeItemId + '">🔑 复制纯验证码 (' + escapeHtml(otpCode) + ')</button>' +
           '</div>')
         : '';
 
@@ -1249,11 +1260,11 @@ async function fetchInbox() {
             '<span>' + (item.processed ? '✅ 已处理' : '🔵 未处理') + '</span>' +
           '</div>' +
           '<div class="action-row" style="margin:0;">' +
-            (otpCode ? '<button class="btn btn-green" onclick="copyText(' + JSON.stringify(otpCode).replace(/"/g, '&quot;') + ', \\'验证码 ' + escapeHtml(otpCode) + '\\')">🔑 复制验证码</button>' : '') +
-            (contentToCopy ? '<button class="btn btn-secondary" onclick="copyText(' + JSON.stringify(contentToCopy).replace(/"/g, '&quot;') + ', \\'正文内容\\')">📋 复制全文</button>' : '') +
-            '<button class="btn btn-secondary" onclick="copyText(' + JSON.stringify(aiPrompt).replace(/"/g, '&quot;') + ', \\'AI 提示词\\')">🤖 复制 AI 提示词</button>' +
-            '<button class="btn btn-secondary" onclick="markItem(\\'' + item.itemId + '\\', ' + (!item.processed) + ')">' + (item.processed ? '设为未读' : '✓ 标为已处理') + '</button>' +
-            '<button class="btn btn-danger" onclick="deleteItem(\\'' + item.itemId + '\\')">🗑️</button>' +
+            (otpCode ? '<button class="btn btn-green" data-item-action="copy-otp" data-item-id="' + safeItemId + '">🔑 复制验证码</button>' : '') +
+            (contentToCopy ? '<button class="btn btn-secondary" data-item-action="copy-content" data-item-id="' + safeItemId + '">📋 复制全文</button>' : '') +
+            '<button class="btn btn-secondary" data-item-action="copy-prompt" data-item-id="' + safeItemId + '">🤖 复制 AI 提示词</button>' +
+            '<button class="btn btn-secondary" data-item-action="mark-item" data-item-id="' + safeItemId + '">' + (item.processed ? '设为未读' : '✓ 标为已处理') + '</button>' +
+            '<button class="btn btn-danger" data-item-action="delete-item" data-item-id="' + safeItemId + '">🗑️</button>' +
           '</div>' +
         '</div>' +
         (item.title ? '<div class="item-title">' + escapeHtml(item.title) + '</div>' : '') +
@@ -1267,6 +1278,55 @@ async function fetchInbox() {
     // ignore transient poll error
   }
 }
+
+document.getElementById('itemsContainer').addEventListener('click', (e) => {
+  const el = e.target && e.target.closest ? e.target.closest('[data-item-action]') : null;
+  if (!el) return;
+  const act = el.getAttribute('data-item-action');
+  if (act === 'lightbox') {
+    const fileUrl = el.getAttribute('data-file-url') || el.getAttribute('src');
+    if (fileUrl) openLightbox(fileUrl);
+    return;
+  }
+  const itemId = el.getAttribute('data-item-id') || '';
+  const item = window.__inboxItemsById ? window.__inboxItemsById.get(itemId) : null;
+  if (!item) return;
+  const fileIdx = Number(el.getAttribute('data-file-idx') || '0');
+  const file = (item.files && item.files[fileIdx]) ? item.files[fileIdx] : null;
+  const contentToCopy = item.textContent || item.voiceTranscript || item.title || '';
+
+  switch (act) {
+    case 'transcribe':
+      transcribeItem(item.itemId);
+      break;
+    case 'open-mac':
+      if (file) openOnMac(item.itemId, file.absPath, el.getAttribute('data-reveal') === '1');
+      break;
+    case 'copy-file-path':
+      if (file) copyText(file.absPath, '文件路径');
+      break;
+    case 'copy-otp':
+      if (item.otpCode) copyText(item.otpCode, '验证码 ' + item.otpCode);
+      break;
+    case 'copy-content':
+      if (contentToCopy) copyText(contentToCopy, '正文内容');
+      break;
+    case 'copy-prompt': {
+      const firstFilePath = (item.files && item.files[0]) ? item.files[0].absPath : '';
+      const aiPrompt = firstFilePath
+        ? ('请查看我从手机投递的文件 "' + firstFilePath + '"' + (contentToCopy ? ('，附言：' + contentToCopy) : ''))
+        : ('请处理我从手机发来的内容：' + contentToCopy);
+      copyText(aiPrompt, 'AI 提示词');
+      break;
+    }
+    case 'mark-item':
+      markItem(item.itemId, !item.processed);
+      break;
+    case 'delete-item':
+      deleteItem(item.itemId);
+      break;
+  }
+});
 
 fetchInbox();
 setInterval(fetchInbox, 2000);

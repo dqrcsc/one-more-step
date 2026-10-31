@@ -61,8 +61,13 @@ class VoiceIdeaActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        intent?.getStringExtra("screenshot_uri")?.let { screenshotUri = Uri.parse(it) }
-        intent?.getStringExtra("intent_tag")?.let { intentTag = it }
+        intent?.getStringExtra("screenshot_uri")?.let { raw ->
+            val parsed = runCatching { Uri.parse(raw) }.getOrNull()
+            if (ShareInputPolicy.isSafeExternalStreamUri(parsed, applicationInfo?.dataDir)) {
+                screenshotUri = parsed
+            }
+        }
+        intentTag = ShareInputPolicy.resolveVoiceIdeaTag(intent?.getStringExtra("intent_tag"))
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

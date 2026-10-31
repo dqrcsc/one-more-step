@@ -72,6 +72,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.oms.client.OmsApplication
 import com.oms.client.R
+import com.oms.client.agent.OmsAccessibilityService
 import com.oms.client.capability.NotificationExecutor
 import com.oms.client.capability.VoiceRecorderHelper
 import com.oms.client.data.StreamItemModel
@@ -80,7 +81,9 @@ import com.oms.client.otp.OtpMatch
 import com.oms.client.service.OmsCoreForegroundService
 import com.oms.client.transport.OtaCheckResult
 import com.oms.client.xiaomi.XiaomiAdaptationHelper
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -104,6 +107,10 @@ class MainActivity : ComponentActivity() {
         if (intent?.getBooleanExtra(NotificationExecutor.EXTRA_STOP_TTS, false) == true) {
             NotificationExecutor.stopSpeaking(this)
         }
+        intent?.getStringExtra("alarm_label")?.takeIf { it.isNotBlank() }?.let { label ->
+            Toast.makeText(this, "⏰ 系统闹钟需要手动确认：$label", Toast.LENGTH_LONG).show()
+            intent?.removeExtra("alarm_label")
+        }
         requestRuntimePermissionsIfNeeded()
         startForegroundCoreService()
 
@@ -124,6 +131,10 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         if (intent.getBooleanExtra(NotificationExecutor.EXTRA_STOP_TTS, false)) {
             NotificationExecutor.stopSpeaking(this)
+        }
+        intent.getStringExtra("alarm_label")?.takeIf { it.isNotBlank() }?.let { label ->
+            Toast.makeText(this, "⏰ 系统闹钟需要手动确认：$label", Toast.LENGTH_LONG).show()
+            intent.removeExtra("alarm_label")
         }
     }
 
@@ -257,7 +268,18 @@ fun OneMoreStepMainScreen() {
         }
     }
 
-    val installedVerName = remember { app.transportClient.getInstalledApkInfo().first }
+    val installedVerName = remember { app.transportClient.getInstalledApkInfo(includeSha256 = false).first }
+    var isGuiEmergencyStopped by remember { mutableStateOf(OmsAccessibilityService.instance?.isEmergencyStopped() == true) }
+
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            app.transportClient.getInstalledApkInfo(includeSha256 = true)
+        }
+        while (true) {
+            isGuiEmergencyStopped = OmsAccessibilityService.instance?.isEmergencyStopped() == true
+            delay(1000L)
+        }
+    }
 
     val macCount = remember(streamItems) { streamItems.count { it.direction == "MAC_TO_PHONE" } }
     val phoneCount = remember(streamItems) { streamItems.count { it.direction == "PHONE_TO_MAC" } }
@@ -361,6 +383,49 @@ fun OneMoreStepMainScreen() {
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
+        if (isGuiEmergencyStopped) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 10.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF7F1D1D)),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                        Text(
+                            "🛑 AI 界面自动化已急停锁死",
+                            color = Color(0xFFFCA5A5),
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp
+                        )
+                        Text(
+                            "已拦截所有远程点击与手势，仅允许手机本地恢复",
+                            color = Color.White,
+                            fontSize = 11.sp
+                        )
+                    }
+                    Button(
+                        onClick = {
+                            OmsAccessibilityService.instance?.resumeFromPhoneUi()
+                            isGuiEmergencyStopped = false
+                            Toast.makeText(context, "✅ 已解除急停，恢复 Mac AI 界面协助", Toast.LENGTH_SHORT).show()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF16A34A)),
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                    ) {
+                        Text("▶️ 恢复 AI 操作", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+
         if (isSpeakingTts) {
             Card(
                 modifier = Modifier

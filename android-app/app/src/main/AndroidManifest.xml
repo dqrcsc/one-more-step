@@ -74,7 +74,7 @@
 
     <application
         android:name=".OmsApplication"
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
@@ -132,7 +132,7 @@
             android:name=".service.OmsCoreForegroundService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="dataSync|connectedDevice" />
 
         <!-- 6. Xiaomi Control Center Quick Settings Tile -->
         <service
@@ -178,7 +178,7 @@
             android:exported="true"
             android:permission="android.permission.BROADCAST_SMS">
             <intent-filter android:priority="999">
-                <action android:name="android.provider.Telephony.Sms.Intents.SMS_RECEIVED_ACTION" />
+                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
             </intent-filter>
         </receiver>
 

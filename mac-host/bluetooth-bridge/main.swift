@@ -41,16 +41,33 @@ final class UnixSocketLineClient {
         }
     }
 
+    private func currentFd() -> Int32 {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        return fd
+    }
+
+    private func closeFd() {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        if fd >= 0 {
+            close(fd)
+            fd = -1
+        }
+    }
+
     private func connectOnce() -> Bool {
-        if fd >= 0 { close(fd); fd = -1 }
-        fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return false }
+        closeFd()
+        let sock = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+        var noSigPipe: Int32 = 1
+        _ = setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = socketPath.utf8CString
         guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else {
-            close(fd); fd = -1
+            close(sock)
             return false
         }
         withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
@@ -63,14 +80,17 @@ final class UnixSocketLineClient {
         let len = socklen_t(MemoryLayout<sockaddr_un>.size)
         let res = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(fd, $0, len)
+                Darwin.connect(sock, $0, len)
             }
         }
         if res == 0 {
+            writeLock.lock()
+            fd = sock
+            writeLock.unlock()
             sendJson(["type": "bridge_ready", "pid": ProcessInfo.processInfo.processIdentifier])
             return true
         } else {
-            close(fd); fd = -1
+            close(sock)
             return false
         }
     }
@@ -78,8 +98,10 @@ final class UnixSocketLineClient {
     private func readLoop() {
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 8192)
-        while fd >= 0 {
-            let n = Darwin.read(fd, &chunk, chunk.count)
+        while true {
+            let activeFd = currentFd()
+            guard activeFd >= 0 else { break }
+            let n = Darwin.read(activeFd, &chunk, chunk.count)
             if n <= 0 { break }
             buffer.append(contentsOf: chunk[0..<n])
             while let newlineIdx = buffer.firstIndex(of: 0x0A) {
@@ -90,7 +112,7 @@ final class UnixSocketLineClient {
                 }
             }
         }
-        if fd >= 0 { close(fd); fd = -1 }
+        closeFd()
     }
 
     func sendJson(_ dict: [String: Any]) {
@@ -398,9 +420,6 @@ final class MacAirPodsController {
                     if !lastMac.isEmpty && item.mac == lastMac { s += 200 }
                     if item.name.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare("AirPods") == .orderedSame {
                         s += 100
-                    }
-                    if item.mac == "B4:59:76:DB:BF:81" {
-                        s += 50
                     }
                     return s
                 }
@@ -922,7 +941,9 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
             let central = request.central
             if request.offset == 0 {
                 announcedCentrals.remove(central.identifier)
-                txQueue.removeAll()
+                if subscribedCentrals.count <= 1 && subscribedCentrals.first?.identifier == central.identifier {
+                    txQueue.removeAll()
+                }
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
                 self?.announceCentralIfNeeded(central, reason: "readFallback")
@@ -1002,6 +1023,8 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
         }
     }
 }
+
+signal(SIGPIPE, SIG_IGN)
 
 // Internal connection worker: no IPC server, audio routing or retry loop.
 // The parent owns the deadline and reaps this process on cancellation.

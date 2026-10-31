@@ -221,4 +221,17 @@ describe("dashboard request and canonical attachment boundaries", () => {
     expect(opened).toEqual([]);
     expect(fs.existsSync(path.join(dir, "inbox"))).toBe(true);
   });
+
+  test("dashboard HTML sets Content-Security-Policy and uses data-item-action delegation instead of inline item onclick", async () => {
+    const { daemon } = dashboardFixture();
+    const req = new Request("http://127.0.0.1:19527/inbox");
+    const res = (await handleDashboardHttpRequest(daemon, req, new URL(req.url), "127.0.0.1"))!;
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Security-Policy")).toContain("default-src 'self'");
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    const html = await res.text();
+    expect(html).toContain("data-item-action=");
+    expect(html).not.toContain("onclick=\"doAction('open_preview'");
+    expect(html).not.toContain("onclick=\"doAction('copy_mac_clipboard'");
+  });
 });

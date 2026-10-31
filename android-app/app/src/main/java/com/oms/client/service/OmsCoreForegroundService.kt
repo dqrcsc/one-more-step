@@ -105,11 +105,19 @@ class OmsCoreForegroundService : Service() {
         try {
             val notif = buildStatusNotification(statusText)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                startForeground(
-                    FG_NOTIFICATION_ID,
-                    notif,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                )
+                try {
+                    startForeground(
+                        FG_NOTIFICATION_ID,
+                        notif,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                    )
+                } catch (_: SecurityException) {
+                    startForeground(
+                        FG_NOTIFICATION_ID,
+                        notif,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                    )
+                }
             } else {
                 startForeground(FG_NOTIFICATION_ID, notif)
             }

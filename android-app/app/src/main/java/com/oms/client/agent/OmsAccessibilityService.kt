@@ -38,20 +38,15 @@ class OmsAccessibilityService : AccessibilityService() {
         @Volatile
         var instance: OmsAccessibilityService? = null
             private set
+    }
 
-        private val BLOCKED_FINANCIAL_PACKAGES = setOf(
-            "com.eg.android.AlipayGphone", // Alipay
-            "com.unionpay",                // UnionPay
-            "com.icbc",
-            "com.chinamworld.main",
-            "cmb.pb",
-            "com.android.packageinstaller",
-            "com.miui.packageinstaller"
-        )
+    fun isEmergencyStopped(): Boolean = ::guard.isInitialized && guard.stopped
 
-        private val SENSITIVE_ACTION_KEYWORDS = listOf(
-            "提交", "发送", "发布", "删除", "付款", "确认转账", "立即支付", "确认删除"
-        )
+    fun resumeFromPhoneUi() {
+        if (!::guard.isInitialized) return
+        guard.resumeOnPhone()
+        stopPreferences.edit().putBoolean("stopped", false).apply()
+        safetyOverlay?.hideActivePill()
     }
 
     @Volatile
@@ -172,18 +167,20 @@ class OmsAccessibilityService : AccessibilityService() {
     private fun windowIdentity(roots: List<AccessibilityNodeInfo> = collectApplicationRoots()): String =
         GuiWindowTracker.identityOf(applicationWindows(roots))
 
-    private fun isBlockedFinancialOrPasswordWindow(root: AccessibilityNodeInfo?): Boolean {
-        if (BLOCKED_FINANCIAL_PACKAGES.contains(currentPackageName)) return true
-        val actLower = currentActivityName.lowercase()
-        if (actLower.contains("pay") || actLower.contains("password") || actLower.contains("wallet")) {
-            return true
+    private fun isBlockedFinancialOrPasswordWindow(
+        root: AccessibilityNodeInfo?,
+        allRoots: List<AccessibilityNodeInfo> = emptyList()
+    ): Boolean {
+        val candidateRoots = if (allRoots.isNotEmpty()) allRoots else listOfNotNull(root)
+        val hasFocusedPassword = candidateRoots.any { r ->
+            r.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.isPassword == true
         }
-        if (root != null) {
-            // Check if focused node is a password field
-            val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-            if (focused?.isPassword == true) return true
-        }
-        return false
+        return SensitiveActionPolicy.isBlockedWindowSet(
+            currentPackageName = currentPackageName,
+            currentActivityName = currentActivityName,
+            rootPackages = candidateRoots.map { it.packageName?.toString() },
+            hasFocusedPasswordInput = hasFocusedPassword
+        )
     }
 
     /**
@@ -240,7 +237,7 @@ class OmsAccessibilityService : AccessibilityService() {
         windowTracker.track(applicationWindows(roots))
         val observationId = guard.observe(windowIdentity(roots))
 
-        if (isBlockedFinancialOrPasswordWindow(primaryRoot)) {
+        if (isBlockedFinancialOrPasswordWindow(primaryRoot, roots)) {
             SemanticTreeExtractor.extractCompactTreeFromRoots(emptyList(), screenW, screenH)
             return@withLock JSONObject().apply {
                 put("observationId", observationId)
@@ -324,14 +321,17 @@ class OmsAccessibilityService : AccessibilityService() {
         val initialWindow = windowIdentity(initialRoots)
         val initialRevision = guard.revision
         val targetNodeId = params.optString("targetNodeId", "")
+        val hasCoordinates = params.has("x") && params.has("y")
+        val requiresObservationId = SensitiveActionPolicy.requiresObservationId(action, targetNodeId, hasCoordinates)
         val observationId = params.optString("observationId", "").takeIf { it.isNotBlank() }
         suspend fun checkReady() {
             currentCoroutineContext().ensureActive()
-            val currentWindow = windowIdentity()
+            val currentRoots = collectApplicationRoots()
+            val currentWindow = windowIdentity(currentRoots)
             check(currentWindow == initialWindow) { "ERR_STALE_OBSERVATION: Window or package changed" }
             guard.check(System.currentTimeMillis(), deadline, currentWindow, initialRevision,
-                observationId, targetNodeId.isNotBlank(), sessionStillValid())
-            if (!isSafeExitAction && isBlockedFinancialOrPasswordWindow(rootInActiveWindow)) {
+                observationId, requiresObservationId, sessionStillValid())
+            if (!isSafeExitAction && isBlockedFinancialOrPasswordWindow(rootInActiveWindow, currentRoots)) {
                 throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password safety policy")
             }
         }
@@ -342,7 +342,7 @@ class OmsAccessibilityService : AccessibilityService() {
         }
 
         val root = rootInActiveWindow
-        if (!isSafeExitAction && isBlockedFinancialOrPasswordWindow(root)) {
+        if (!isSafeExitAction && isBlockedFinancialOrPasswordWindow(root, initialRoots)) {
             safetyOverlay?.hideActivePill()
             throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password safety policy")
         }
@@ -359,12 +359,25 @@ class OmsAccessibilityService : AccessibilityService() {
         if (targetNodeId.isNotBlank() && (targetNode == null || !targetNode.refresh())) {
             throw IllegalStateException("ERR_STALE_OBSERVATION: Target node unavailable; observe again")
         }
+        if (targetNode?.isPassword == true) {
+            safetyOverlay?.hideActivePill()
+            throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Password field interaction is blocked")
+        }
 
-        // Guardrail #3 & #4: Check if target node label contains sensitive keywords ("提交", "发送", "删除", etc.)
-        val targetLabel = (targetNode?.text?.toString() ?: targetNode?.contentDescription?.toString() ?: "").trim()
-        val hitsSensitiveKeyword = SENSITIVE_ACTION_KEYWORDS.any { kw -> targetLabel.contains(kw) }
+        val hitNodeForCoords = if (targetNode == null && hasCoordinates && action in setOf("click", "long_click")) {
+            SemanticTreeExtractor.findSmallestNodeAt(params.optInt("x"), params.optInt("y"))
+        } else {
+            null
+        }
 
-        if (requireConfirm || (action in setOf("click", "long_click") && hitsSensitiveKeyword)) {
+        // Guardrail #3 & #4: Check aggregated node label or coordinate hit-tested node label for sensitive keywords
+        val targetLabel = when {
+            targetNode != null -> SemanticTreeExtractor.extractNodeLabel(targetNode)
+            hitNodeForCoords != null -> hitNodeForCoords.label.trim()
+            else -> ""
+        }
+
+        if (SensitiveActionPolicy.requiresUserConfirmation(action, requireConfirm, targetLabel)) {
             val confirmed = safetyOverlay?.awaitUserConfirmForSensitiveAction(
                 if (targetLabel.isNotEmpty()) "点击「$targetLabel」" else "执行 $action"
             ) ?: false
@@ -725,7 +738,14 @@ class OmsAccessibilityService : AccessibilityService() {
             requestedDeadline = if (params.has("deadlineMs")) params.optLong("deadlineMs") else null,
             sessionValid = sessionStillValid,
             activeJob = { activeAction = it },
-            action = action
+            action = {
+                safetyOverlay?.showActivePill()
+                try {
+                    action()
+                } finally {
+                    if (!guard.stopped) safetyOverlay?.hideActivePill()
+                }
+            }
         )
     }
 
@@ -1208,7 +1228,7 @@ class OmsAccessibilityService : AccessibilityService() {
             }
 
             fun label(node: AccessibilityNodeInfo) =
-                (node.text?.toString() ?: node.contentDescription?.toString() ?: "").trim()
+                SemanticTreeExtractor.firstNonBlank(node.text, node.contentDescription)
             fun isCallButton(node: AccessibilityNodeInfo): Boolean =
                 node.packageName?.toString() in dialerPackages && node.isVisibleToUser &&
                     node.isEnabled && node.isClickable &&
@@ -1216,11 +1236,8 @@ class OmsAccessibilityService : AccessibilityService() {
             fun matchesSim(node: AccessibilityNodeInfo): Boolean =
                 DialerTargetPolicy.matchesSim(label(node), node.viewIdResourceName ?: "", simPref)
             val candidates = nodes.filter { isCallButton(it) && matchesSim(it) }
-            val chosen = when {
-                candidates.size == 1 -> candidates.single()
-                candidates.size > 1 && simPref.isEmpty() -> candidates.first()
-                else -> return@withGuardedPhoneAction failed("call_target_or_sim_not_verified")
-            }
+            val chosen = candidates.singleOrNull()
+                ?: return@withGuardedPhoneAction failed("call_target_or_sim_not_verified")
             val chosenSimLabel = label(chosen)
             val clicked = steps.effect {
                 nodes = dialerNodes()
@@ -1541,6 +1558,7 @@ class OmsAccessibilityService : AccessibilityService() {
                 guard.check(System.currentTimeMillis(), deadline, windowIdentity(), queuedRevision,
                     null, false, sessionStillValid())
                 activeAction = currentCoroutineContext()[Job]
+                safetyOverlay?.showActivePill()
                 try {
                     val telecom = getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
                     val audio = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
@@ -1579,6 +1597,7 @@ class OmsAccessibilityService : AccessibilityService() {
                     }
                 } finally {
                     activeAction = null
+                    if (!guard.stopped) safetyOverlay?.hideActivePill()
                 }
             } }
         }
@@ -1626,6 +1645,7 @@ class OmsAccessibilityService : AccessibilityService() {
                 guard.check(System.currentTimeMillis(), deadline, windowIdentity(), queuedRevision,
                     null, false, sessionStillValid())
                 activeAction = currentCoroutineContext()[Job]
+                safetyOverlay?.showActivePill()
                 try {
                     val result = executeMirrorInputLocked(params)
                     currentCoroutineContext().ensureActive()
@@ -1633,6 +1653,7 @@ class OmsAccessibilityService : AccessibilityService() {
                     result
                 } finally {
                     activeAction = null
+                    if (!guard.stopped) safetyOverlay?.hideActivePill()
                 }
             }
         }
@@ -1656,6 +1677,12 @@ class OmsAccessibilityService : AccessibilityService() {
         }
 
         var ok = false
+        val typeLower = type.lowercase()
+        val isSafeMirrorNav = typeLower in setOf("key", "nav") &&
+            params.optString("key", params.optString("target", "home")).lowercase() in setOf("home", "back", "lock", "lock_screen")
+        if (!isSafeMirrorNav && isBlockedFinancialOrPasswordWindow(rootInActiveWindow, collectApplicationRoots())) {
+            throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password safety policy")
+        }
         when (type) {
             "tap", "click" -> {
                 val tx = resolveCoord("normX", "x", screenW, screenW / 2)
@@ -1708,6 +1735,9 @@ class OmsAccessibilityService : AccessibilityService() {
                 val append = params.optBoolean("append", false)
                 val submit = params.optBoolean("submit", false)
                 val node = findFocusedEditableNode()
+                if (node?.isPassword == true) {
+                    throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Password field input is blocked")
+                }
                 if (node != null) {
                     val existing = if (append && !node.isShowingHintText) {
                         node.text?.toString() ?: ""
@@ -1729,6 +1759,9 @@ class OmsAccessibilityService : AccessibilityService() {
             }
             "backspace" -> {
                 val node = findFocusedEditableNode()
+                if (node?.isPassword == true) {
+                    throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Password field input is blocked")
+                }
                 if (node != null && !node.isShowingHintText) {
                     val cur = node.text?.toString() ?: ""
                     if (cur.isNotEmpty()) {
@@ -1802,6 +1835,9 @@ class OmsAccessibilityService : AccessibilityService() {
                     if (continuation.isActive) continuation.resume(true)
                 }
                 override fun onCancelled(gestureDescription: GestureDescription?) {
+                    if (activeAction != null) {
+                        setStopped("gesture_cancelled_by_touch")
+                    }
                     if (continuation.isActive) continuation.resume(false)
                 }
             }, null)

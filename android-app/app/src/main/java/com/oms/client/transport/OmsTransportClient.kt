@@ -54,6 +54,7 @@ import com.oms.client.data.StreamRepository
 import com.oms.client.otp.OtpExtractor
 import com.oms.client.otp.OtpMatch
 import com.oms.client.share.ClipboardCatcherActivity
+import com.oms.client.share.ShareInputPolicy
 import com.oms.client.xiaomi.XiaomiAdaptationHelper
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -994,7 +995,10 @@ class OmsTransportClient(
 
                 val client = buildLanOkHttpClient()
                 val req = Request.Builder().url("ws://$targetIp:$targetPort/?tier=lan").build()
-                if (generation != lanGeneration.get()) return@launch
+                if (generation != lanGeneration.get()) {
+                    if (lanWebSocket == null) isConnectingLan.set(false)
+                    return@launch
+                }
                 client.newWebSocket(req, secureSocketListener("LAN_WS", generation))
             } catch (_: Throwable) {
                 isConnectingLan.set(false)
@@ -1042,6 +1046,9 @@ class OmsTransportClient(
                 }
                 replaced?.let { closeSecureSource(it, "Connection replaced") }
                 if (!accepted) {
+                    if (tier == "LAN_WS" && pairing == null && lanWebSocket == null) {
+                        isConnectingLan.set(false)
+                    }
                     webSocket.close(4003, "Stale or invalid secure connection")
                     reportPairing(pairing, false)
                 }
@@ -1088,24 +1095,28 @@ class OmsTransportClient(
                     }
                 }
                 reportPairing(pairing, false)
-                if (tier == "LAN_WS" && pairing == null && generation == lanGeneration.get()) {
-                    if (!isSourceAuthenticated("BT_RFCOMM", null)) {
-                        startBleNearFieldScanner()
+                if (tier == "LAN_WS" && pairing == null) {
+                    if (lanWebSocket == null) {
+                        isConnectingLan.set(false)
                     }
-                    if (!didOpen) {
-                        if (preferDefaultSocketFactory) {
-                            preferDefaultSocketFactory = false
-                            cachedLanHttpClient = null
+                    if (generation == lanGeneration.get()) {
+                        if (!isSourceAuthenticated("BT_RFCOMM", null)) {
+                            startBleNearFieldScanner()
                         }
-                        val paired = repo.getPairedMac()
-                        if (paired != null) {
-                            scope.launch {
-                                discoverMacOnLan(paired.lanPort, paired.macId, allowSubnetScan = false)
+                        if (!didOpen) {
+                            if (preferDefaultSocketFactory) {
+                                preferDefaultSocketFactory = false
+                                cachedLanHttpClient = null
+                            }
+                            val paired = repo.getPairedMac()
+                            if (paired != null) {
+                                scope.launch {
+                                    discoverMacOnLan(paired.lanPort, paired.macId, allowSubnetScan = false)
+                                }
                             }
                         }
+                        scheduleLanReconnect(3000L)
                     }
-                    isConnectingLan.set(false)
-                    scheduleLanReconnect(3000L)
                 }
             }
         }
@@ -1532,6 +1543,9 @@ class OmsTransportClient(
         if (source.gatt != null) runCatching { source.gatt.disconnect(); source.gatt.close() }
         runCatching { source.socket?.close(4003, reason.take(100)) }
         recomputeFallbackTier()
+        if (mirrorActive.get() && _activeTierFlow.value !in setOf("LAN_WS", "WAN_WEBRTC")) {
+            stopScreenMirror()
+        }
         if (_activeTierFlow.value == "DISCONNECTED") {
             mainHandler.postDelayed({
                 if (_activeTierFlow.value == "DISCONNECTED" && !isSourceAuthenticated("BT_RFCOMM", null)) {
@@ -1645,6 +1659,9 @@ class OmsTransportClient(
     private fun readUriBytesAndMime(uriStr: String, itemIdSuffix: String, prefix: String = "mobile"): Triple<ByteArray, String, String>? {
         return try {
             val uri = Uri.parse(uriStr)
+            if (!ShareInputPolicy.isSafeInternalOrContentUri(uri, listOf(context.filesDir, context.cacheDir))) {
+                return null
+            }
             val bytes = if (uri.scheme == "file" && uri.path != null) {
                 File(uri.path!!).takeIf { it.exists() }?.inputStream()?.use { DeliveryPolicy.readBounded(it) }
             } else {
@@ -1788,18 +1805,35 @@ class OmsTransportClient(
         }
     }
 
-    fun getInstalledApkInfo(): Triple<String, Int, String> {
+    @Volatile
+    private var cachedApkInfoKey: String = ""
+    @Volatile
+    private var cachedApkInfo: Triple<String, Int, String>? = null
+
+    fun getInstalledApkInfo(includeSha256: Boolean = true): Triple<String, Int, String> {
         return try {
             val pkgInfo = context.packageManager.getPackageInfo(context.packageName, 0)
             val verName = pkgInfo.versionName ?: "1.1.0"
             val verCode = pkgInfo.longVersionCode.toInt()
+            if (!includeSha256) {
+                val cached = cachedApkInfo
+                return Triple(verName, verCode, cached?.third ?: "")
+            }
             val srcFile = File(context.applicationInfo.sourceDir)
+            val cacheKey = "${verName}:${verCode}:${srcFile.lastModified()}:${srcFile.length()}"
+            val existing = cachedApkInfo
+            if (existing != null && cachedApkInfoKey == cacheKey && existing.third.isNotEmpty()) {
+                return existing
+            }
             val sha = if (srcFile.exists()) {
                 OmsFrameProtocol.sha256Hex(srcFile.readBytes())
             } else {
                 ""
             }
-            Triple(verName, verCode, sha)
+            val computed = Triple(verName, verCode, sha)
+            cachedApkInfoKey = cacheKey
+            cachedApkInfo = computed
+            computed
         } catch (_: Throwable) {
             Triple("1.1.0", 2, "")
         }
@@ -2068,6 +2102,14 @@ class OmsTransportClient(
         check(sendOnSource(OmsFrameProtocol.encodeStreamStart(startHeader), source)) { "Stream start send failed" }
 
         for (i in 0 until totalChunks) {
+            val ws = source.socket
+            if (ws != null) {
+                var waitedMs = 0L
+                while (isSourceCurrent(source) && ws.queueSize() > 4L * 1024L * 1024L && waitedMs < 15_000L) {
+                    Thread.sleep(25L)
+                    waitedMs += 25L
+                }
+            }
             val start = i * chunkSize
             val end = (start + chunkSize).coerceAtMost(bytes.size)
             val slice = bytes.copyOfRange(start, end)
@@ -2223,6 +2265,7 @@ class OmsTransportClient(
                         activeBlePairingAttempt = null
                         lanGeneration.incrementAndGet()
                         wanGeneration.incrementAndGet()
+                        isConnectingLan.set(false)
                         if (source.tier == "LAN_WS") {
                             lanWebSocket = source.socket
                         }
@@ -2746,6 +2789,8 @@ class OmsTransportClient(
                 }
             }
             "open_url" -> {
+                check(sessionStillValid()) { "Session is no longer valid" }
+                check(OmsAccessibilityService.instance?.isEmergencyStopped() != true) { "ERR_USER_INTERRUPTED: GUI emergency stop is active" }
                 val url = params.optString("url", "").trim()
                 val (ok, errMsg) = AppLauncherHelper.openUrl(context, url)
                 delay(350)
@@ -2757,6 +2802,8 @@ class OmsTransportClient(
                 }
             }
             "launch_app" -> {
+                check(sessionStillValid()) { "Session is no longer valid" }
+                check(OmsAccessibilityService.instance?.isEmergencyStopped() != true) { "ERR_USER_INTERRUPTED: GUI emergency stop is active" }
                 val rawTarget = params.optString("packageOrAlias", params.optString("text", "")).trim()
                 val res = AppLauncherHelper.launchApp(context, rawTarget)
                 delay(350)
@@ -2980,7 +3027,7 @@ class OmsTransportClient(
         val fgPkg = OmsAccessibilityService.instance?.currentPackageName ?: ""
         val fgAct = OmsAccessibilityService.instance?.currentActivityName ?: ""
         val fgLabel = resolveFriendlyAppName(fgPkg)
-        val (verName, verCode, _) = getInstalledApkInfo()
+        val (verName, verCode, _) = getInstalledApkInfo(includeSha256 = false)
         val health = XiaomiAdaptationHelper.inspectAll(context)
         val apSnap = airpodsManager.buildStatusJson()
         val queuedCount = try {
@@ -3141,7 +3188,13 @@ class OmsTransportClient(
                         if (frameBytes != null) {
                             val curSrc = runCatching { activeSource() }.getOrNull()
                             if (curSrc != null && (curSrc.tier == "LAN_WS" || curSrc.tier == "WAN_WEBRTC")) {
-                                sendOnSource(frameBytes, curSrc)
+                                val ws = curSrc.socket
+                                if (ws != null && ws.queueSize() > 1536L * 1024L) {
+                                    // Drop mirror frame on backpressure instead of overflowing the WebSocket send queue
+                                    delay(60L)
+                                } else {
+                                    sendOnSource(frameBytes, curSrc)
+                                }
                             }
                         } else {
                             withTimeoutOrNull(400L) {

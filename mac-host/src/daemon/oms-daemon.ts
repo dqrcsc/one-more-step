@@ -132,16 +132,21 @@ export class OmsDaemon {
 
   constructor(customHomeDir?: string) {
     this.homeDir = customHomeDir || path.join(os.homedir(), ".one_more_step");
-    fs.mkdirSync(path.join(this.homeDir, "keystore"), { recursive: true });
-    fs.mkdirSync(path.join(this.homeDir, "run"), { recursive: true });
-    fs.mkdirSync(path.join(this.homeDir, "logs"), { recursive: true });
-    fs.mkdirSync(path.join(this.homeDir, "cache", "tts"), { recursive: true });
+    this.ensureSecureDir(this.homeDir);
+    this.ensureSecureDir(path.join(this.homeDir, "keystore"));
+    this.ensureSecureDir(path.join(this.homeDir, "run"));
+    this.ensureSecureDir(path.join(this.homeDir, "logs"));
+    this.ensureSecureDir(path.join(this.homeDir, "cache"));
+    this.ensureSecureDir(path.join(this.homeDir, "cache", "tts"));
 
     this.configPath = path.join(this.homeDir, "config.json");
     this.identityPath = path.join(this.homeDir, "keystore", "host_identity.json");
     this.trustedDevicesPath = path.join(this.homeDir, "keystore", "trusted_devices.json");
     this.ipcSocketPath = path.join(this.homeDir, "run", "omsd.sock");
     this.btSocketPath = path.join(this.homeDir, "run", "bt.sock");
+
+    this.rotateLogFileIfNeeded(path.join(this.homeDir, "logs", "omsd.log"));
+    this.rotateLogFileIfNeeded(path.join(this.homeDir, "logs", "connections.jsonl"));
 
     this.config = this.loadOrInitConfig();
     this.identity = this.loadOrInitIdentity();
@@ -168,22 +173,65 @@ export class OmsDaemon {
     });
   }
 
-  private loadOrInitConfig(): OmsHostConfig {
-    if (fs.existsSync(this.configPath)) {
-      try {
-        const parsed = JSON.parse(fs.readFileSync(this.configPath, "utf8")) as OmsHostConfig;
-        return {
-          autoCopyTextToClipboard: true,
-          autoPreviewImageOnMac: true,
-          autoSyncOtpToMac: true,
-          autoSwitchAirpods: true,
-          pauseOtherOnAirpodsSwitch: true,
-          ...parsed,
-        };
-      } catch {
-        // fallback to default
-      }
+  private ensureSecureDir(dirPath: string): void {
+    fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+    try {
+      fs.chmodSync(dirPath, 0o700);
+    } catch {
+      // ignore on platforms/filesystems without POSIX chmod
     }
+  }
+
+  private writeSecureFileAtomic(filePath: string, content: string): void {
+    const tempPath = `${filePath}.${generateUuidV7()}.tmp`;
+    let descriptor: number | undefined;
+    try {
+      descriptor = fs.openSync(tempPath, "wx", 0o600);
+      fs.writeFileSync(descriptor, content, "utf8");
+      fs.fsyncSync(descriptor);
+      fs.closeSync(descriptor);
+      descriptor = undefined;
+      fs.renameSync(tempPath, filePath);
+      try {
+        fs.chmodSync(filePath, 0o600);
+      } catch {
+        // ignore
+      }
+    } catch (err) {
+      if (descriptor !== undefined) {
+        try { fs.closeSync(descriptor); } catch {}
+      }
+      if (fs.existsSync(tempPath)) {
+        try { fs.unlinkSync(tempPath); } catch {}
+      }
+      throw err;
+    }
+  }
+
+  private saveConfig(): void {
+    if (!this.configPath) return;
+    this.writeSecureFileAtomic(this.configPath, JSON.stringify(this.config, null, 2));
+  }
+
+  private rotateLogFileIfNeeded(logPath: string, maxBytes = 2 * 1024 * 1024, keepBytes = 512 * 1024): void {
+    try {
+      if (!fs.existsSync(logPath)) return;
+      try {
+        fs.chmodSync(logPath, 0o600);
+      } catch {}
+      const stat = fs.statSync(logPath);
+      if (stat.size <= maxBytes) return;
+      const buf = fs.readFileSync(logPath);
+      const slice = buf.subarray(Math.max(0, buf.byteLength - keepBytes));
+      const firstNewline = slice.indexOf(0x0a);
+      const aligned = firstNewline !== -1 && firstNewline + 1 < slice.byteLength ? slice.subarray(firstNewline + 1) : slice;
+      fs.writeFileSync(logPath, aligned, { mode: 0o600 });
+    } catch {
+      // ignore log rotation error
+    }
+  }
+
+  private loadOrInitConfig(): OmsHostConfig {
     const defaultCfg: OmsHostConfig = {
       lanPort: OMS_DEFAULT_LAN_PORT,
       enableBluetoothBridge: true,
@@ -194,7 +242,27 @@ export class OmsDaemon {
       pauseOtherOnAirpodsSwitch: true,
       dingtalk: { enabled: false },
     };
-    fs.writeFileSync(this.configPath, JSON.stringify(defaultCfg, null, 2), "utf8");
+    if (fs.existsSync(this.configPath)) {
+      try {
+        fs.chmodSync(this.configPath, 0o600);
+      } catch {}
+      try {
+        const parsed = JSON.parse(fs.readFileSync(this.configPath, "utf8")) as OmsHostConfig;
+        return {
+          ...defaultCfg,
+          ...parsed,
+        };
+      } catch {
+        // Back up corrupted config without overwriting the original file so user credentials/contacts are never lost
+        try {
+          const backupPath = `${this.configPath}.corrupt.${Date.now()}.bak`;
+          fs.copyFileSync(this.configPath, backupPath);
+          fs.chmodSync(backupPath, 0o600);
+        } catch {}
+        return defaultCfg;
+      }
+    }
+    this.writeSecureFileAtomic(this.configPath, JSON.stringify(defaultCfg, null, 2));
     return defaultCfg;
   }
 
@@ -282,10 +350,7 @@ export class OmsDaemon {
       const cleaned = prefs.unlockBounds.trim();
       this.config.unlockBounds = cleaned || undefined;
     }
-    fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), {
-      encoding: "utf8",
-      mode: 0o600,
-    });
+    this.saveConfig();
     this.syncAirpodsConfigToBridgeAndPhone();
     return this.getHostPreferences();
   }
@@ -441,20 +506,24 @@ export class OmsDaemon {
   private loadOrInitIdentity(): Ed25519Identity {
     if (fs.existsSync(this.identityPath)) {
       try {
+        fs.chmodSync(this.identityPath, 0o600);
+      } catch {}
+      try {
         return JSON.parse(fs.readFileSync(this.identityPath, "utf8")) as Ed25519Identity;
       } catch {
         // regenerate
       }
     }
     const id = generateEd25519Identity("mac");
-    fs.writeFileSync(this.identityPath, JSON.stringify(id, null, 2), {
-      mode: 0o600,
-    });
+    this.writeSecureFileAtomic(this.identityPath, JSON.stringify(id, null, 2));
     return id;
   }
 
   private loadTrustedDevices(): TrustedPhoneDevice[] {
     if (!fs.existsSync(this.trustedDevicesPath)) return [];
+    try {
+      fs.chmodSync(this.trustedDevicesPath, 0o600);
+    } catch {}
     try {
       return JSON.parse(fs.readFileSync(this.trustedDevicesPath, "utf8")) as TrustedPhoneDevice[];
     } catch {
@@ -463,20 +532,7 @@ export class OmsDaemon {
   }
 
   private saveTrustedDevices(devices: TrustedPhoneDevice[]): void {
-    const tempPath = `${this.trustedDevicesPath}.${generateUuidV7()}.tmp`;
-    let descriptor: number | undefined;
-    try {
-      descriptor = fs.openSync(tempPath, "wx", 0o600);
-      fs.writeFileSync(descriptor, JSON.stringify(devices, null, 2), "utf8");
-      fs.fsyncSync(descriptor);
-      fs.closeSync(descriptor);
-      descriptor = undefined;
-      fs.renameSync(tempPath, this.trustedDevicesPath);
-    } catch (err) {
-      if (descriptor !== undefined) fs.closeSync(descriptor);
-      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-      throw err;
-    }
+    this.writeSecureFileAtomic(this.trustedDevicesPath, JSON.stringify(devices, null, 2));
   }
 
   private wireSessionEvents(): void {
@@ -1190,7 +1246,7 @@ export class OmsDaemon {
   private async refreshPhoneStatusLive(force = false): Promise<void> {
     if (this.session.getActiveTier() === "DISCONNECTED") return;
     const now = Date.now();
-    if (!force && now - this.lastStatusRefreshMs < 2500) return;
+    if (!force && now - this.lastStatusRefreshMs < 8000) return;
     this.lastStatusRefreshMs = now;
     const waitMs = this.session.getActiveTier() === "BT_RFCOMM" ? 3500 : 1500;
     try {
@@ -1533,6 +1589,18 @@ export class OmsDaemon {
       this.ipcServer = net.createServer((socket) => {
         let buffer = "";
         socket.setEncoding("utf8");
+        socket.on("error", () => {
+          // Ignore client disconnect / EPIPE on local IPC socket
+        });
+        const safeWrite = (payload: string) => {
+          if (!socket.destroyed && socket.writable) {
+            try {
+              socket.write(payload);
+            } catch {
+              // ignore broken pipe
+            }
+          }
+        };
         socket.on("data", async (chunk: string) => {
           buffer += chunk;
           let idx: number;
@@ -1540,18 +1608,20 @@ export class OmsDaemon {
             const line = buffer.slice(0, idx).trim();
             buffer = buffer.slice(idx + 1);
             if (!line) continue;
+            let reqId = "err";
             try {
               const req = JSON.parse(line) as {
                 id: string;
                 action: string;
                 params?: Record<string, any>;
               };
+              if (req?.id) reqId = req.id;
               const result = await this.handleIpcAction(req.action, req.params ?? {});
-              socket.write(JSON.stringify({ id: req.id, ok: true, result }) + "\n");
+              safeWrite(JSON.stringify({ id: req.id, ok: true, result }) + "\n");
             } catch (err: any) {
-              socket.write(
+              safeWrite(
                 JSON.stringify({
-                  id: "err",
+                  id: reqId,
                   ok: false,
                   error: {
                     code: err?.code ?? -32000,
@@ -1565,13 +1635,17 @@ export class OmsDaemon {
       });
 
       this.ipcServer.once("error", reject);
-      this.ipcServer.listen(this.ipcSocketPath, () => resolve());
+      this.ipcServer.listen(this.ipcSocketPath, () => {
+        try {
+          fs.chmodSync(this.ipcSocketPath, 0o600);
+        } catch {}
+        resolve();
+      });
     });
 
-    fs.writeFileSync(
+    this.writeSecureFileAtomic(
       path.join(this.homeDir, "run", "omsd.pid"),
-      String(process.pid),
-      "utf8"
+      String(process.pid)
     );
   }
 
@@ -2184,15 +2258,11 @@ export class OmsDaemon {
             const sim = params.sim ? String(params.sim).trim() : undefined;
             const note = params.note ? String(params.note).trim() : undefined;
             this.config.contacts[name] = { number: num, ...(sim ? { sim } : {}), ...(note ? { note } : {}) };
-            if (this.configPath) {
-              fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), { encoding: "utf8", mode: 0o600 });
-            }
+            this.saveConfig();
           } else if (op === "remove" || op === "delete" || op === "rm") {
             const name = String(params.name || "").trim();
             delete this.config.contacts[name];
-            if (this.configPath) {
-              fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), { encoding: "utf8", mode: 0o600 });
-            }
+            this.saveConfig();
           }
           return {
             ok: true,

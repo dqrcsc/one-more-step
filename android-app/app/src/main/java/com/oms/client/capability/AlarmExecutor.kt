@@ -63,13 +63,24 @@ object AlarmExecutor {
             }
         } catch (e: Throwable) {
             // Fallback Path: AlarmManager.setAlarmClock()
-            scheduleFallbackExactAlarm(context, hour, minute, label)
-            JSONObject().apply {
-                put("ok", true)
-                put("mode", "alarm_manager_fallback")
-                put("hour", hour)
-                put("minute", minute)
-                put("label", label)
+            return try {
+                scheduleFallbackExactAlarm(context, hour, minute, label)
+                JSONObject().apply {
+                    put("ok", true)
+                    put("mode", "alarm_manager_fallback")
+                    put("hour", hour)
+                    put("minute", minute)
+                    put("label", label)
+                }
+            } catch (fallbackErr: Throwable) {
+                JSONObject().apply {
+                    put("ok", false)
+                    put("mode", "failed")
+                    put("hour", hour)
+                    put("minute", minute)
+                    put("label", label)
+                    put("error", fallbackErr.message ?: e.message ?: "无法设置系统闹钟")
+                }
             }
         }
     }

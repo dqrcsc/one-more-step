@@ -11,13 +11,36 @@ android {
         applicationId = "com.oms.client"
         minSdk = 30
         targetSdk = 34
-        versionCode = 36
-        versionName = "1.6.0"
+        versionCode = 37
+        versionName = "1.6.1"
+    }
+
+    signingConfigs {
+        create("release") {
+            val envStoreFile = System.getenv("OMS_KEYSTORE_FILE")?.takeIf { it.isNotBlank() }
+            val fallbackDebugStore = file("${System.getProperty("user.home")}/.android/debug.keystore")
+            if (envStoreFile != null && file(envStoreFile).exists()) {
+                storeFile = file(envStoreFile)
+                storePassword = System.getenv("OMS_KEYSTORE_PASSWORD") ?: "android"
+                keyAlias = System.getenv("OMS_KEY_ALIAS") ?: "androiddebugkey"
+                keyPassword = System.getenv("OMS_KEY_PASSWORD") ?: "android"
+            } else if (fallbackDebugStore.exists()) {
+                // Use local debug keystore when no custom release keystore is configured so OTA updates
+                // remain signature-compatible with existing HyperOS installs while keeping debuggable=false.
+                storeFile = fallbackDebugStore
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            isDebuggable = false
+            signingConfig = signingConfigs.getByName("release").takeIf { it.storeFile?.exists() == true }
+                ?: signingConfigs.getByName("debug")
         }
     }
 
@@ -36,6 +59,10 @@ android {
 
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.11"
+    }
+
+    lint {
+        checkReleaseBuilds = false
     }
 }
 

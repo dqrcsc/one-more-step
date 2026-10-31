@@ -278,6 +278,15 @@ object AppLauncherHelper {
                 error = "未在手机上找到已安装的应用「$query」"
             )
         }
+        if (resolvedPkg == context.packageName || resolvedPkg == "com.oms.client") {
+            return LaunchResult(
+                ok = false,
+                packageName = resolvedPkg,
+                appLabel = resolvedLabel.ifBlank { resolvedPkg },
+                screenLocked = isLocked,
+                error = "ERR_SECURE_WINDOW_BLOCKED: 安全策略禁止远程操控青简·咫尺自身界面"
+            )
+        }
 
         return withContext(Dispatchers.Main) {
             try {

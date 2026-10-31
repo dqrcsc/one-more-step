@@ -48,8 +48,12 @@ export class InboxManager {
     this.pkbQueuePath = path.join(inboxRootDir, "pkb_pending.jsonl");
     this.uiBugQueuePath = path.join(inboxRootDir, "ui_bug_pending.jsonl");
 
-    fs.mkdirSync(this.inboxRootDir, { recursive: true });
-    fs.mkdirSync(path.join(this.inboxRootDir, "pulled_cache"), { recursive: true });
+    fs.mkdirSync(this.inboxRootDir, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(path.join(this.inboxRootDir, "pulled_cache"), { recursive: true, mode: 0o700 });
+    try {
+      fs.chmodSync(this.inboxRootDir, 0o700);
+      fs.chmodSync(path.join(this.inboxRootDir, "pulled_cache"), 0o700);
+    } catch {}
     this.loadExistingIndex();
     this.writeDerivedViews();
   }
@@ -88,7 +92,7 @@ export class InboxManager {
     // UUIDv7 idempotent deduplication check
     const existing = this.itemsMap.get(params.clientItemId);
     if (existing) {
-      this.writeDerivedViews();
+      this.writeDerivedViews([existing.itemId]);
       return existing;
     }
 
@@ -118,7 +122,11 @@ export class InboxManager {
     const now = new Date();
     const dateFolder = now.toISOString().slice(0, 10); // YYYY-MM-DD
     const itemDir = path.join(this.inboxRootDir, dateFolder, params.clientItemId);
-    fs.mkdirSync(itemDir, { recursive: true });
+    fs.mkdirSync(itemDir, { recursive: true, mode: 0o700 });
+    try {
+      fs.chmodSync(path.join(this.inboxRootDir, dateFolder), 0o700);
+      fs.chmodSync(itemDir, 0o700);
+    } catch {}
 
     const storedFiles: StoredInboxFile[] = [];
     const usedNames = new Set(["meta.json"]);
@@ -134,7 +142,10 @@ export class InboxManager {
       }
       usedNames.add(safeName.toLowerCase());
       const destAbsPath = path.join(itemDir, safeName);
-      fs.writeFileSync(destAbsPath, bytes);
+      fs.writeFileSync(destAbsPath, bytes, { mode: 0o600 });
+      try {
+        fs.chmodSync(destAbsPath, 0o600);
+      } catch {}
       storedFiles.push({
         fileName: safeName,
         absPath: destAbsPath,
@@ -172,7 +183,7 @@ export class InboxManager {
 
     const next = new Map(this.itemsMap);
     next.set(stored.itemId, stored);
-    this.rewriteIndex(next);
+    this.rewriteIndex(next, [stored.itemId]);
 
     return stored;
   }
@@ -220,7 +231,10 @@ export class InboxManager {
       for (const item of result) {
         next.set(item.itemId, { ...item, processed: true });
       }
-      this.rewriteIndex(next);
+      this.rewriteIndex(
+        next,
+        result.map((item) => item.itemId)
+      );
       return result.map((item) => this.itemsMap.get(item.itemId)!);
     }
 
@@ -236,7 +250,7 @@ export class InboxManager {
     if (!item) return false;
     const next = new Map(this.itemsMap);
     next.set(itemId, { ...item, processed });
-    this.rewriteIndex(next);
+    this.rewriteIndex(next, [itemId]);
     return true;
   }
 
@@ -246,7 +260,7 @@ export class InboxManager {
     const updated = { ...item, voiceTranscript, textContent: item.textContent || voiceTranscript };
     const next = new Map(this.itemsMap);
     next.set(itemId, updated);
-    this.rewriteIndex(next);
+    this.rewriteIndex(next, [itemId]);
     return updated;
   }
 
@@ -254,7 +268,7 @@ export class InboxManager {
     const next = new Map(this.itemsMap);
     const existed = next.delete(itemId);
     if (existed) {
-      this.rewriteIndex(next);
+      this.rewriteIndex(next, []);
     }
     return existed;
   }
@@ -269,7 +283,7 @@ export class InboxManager {
       }
     }
     if (removed > 0) {
-      this.rewriteIndex(next);
+      this.rewriteIndex(next, []);
     }
     return removed;
   }
@@ -278,9 +292,12 @@ export class InboxManager {
     const tempPath = `${filePath}.${crypto.randomUUID()}.tmp`;
     fs.writeFileSync(tempPath, content, { encoding: "utf8", mode: 0o600 });
     fs.renameSync(tempPath, filePath);
+    try {
+      fs.chmodSync(filePath, 0o600);
+    } catch {}
   }
 
-  private rewriteIndex(next: Map<string, StoredInboxItem>): void {
+  private rewriteIndex(next: Map<string, StoredInboxItem>, changedItemIds?: Iterable<string>): void {
     const lines = Array.from(next.values())
       .map((i) => JSON.stringify(i))
       .join("\n");
@@ -288,10 +305,10 @@ export class InboxManager {
     this.atomicWrite(this.indexJsonlPath, lines ? lines + "\n" : "");
     this.itemsMap.clear();
     for (const [id, item] of next) this.itemsMap.set(id, item);
-    this.writeDerivedViews();
+    this.writeDerivedViews(changedItemIds);
   }
 
-  private writeDerivedViews(): void {
+  private writeDerivedViews(changedItemIds?: Iterable<string>): void {
     const items = Array.from(this.itemsMap.values());
     const pending = items.filter((item) => !item.processed);
     const jsonLines = (list: StoredInboxItem[]) => list.map((item) => JSON.stringify(item) + "\n").join("");
@@ -299,7 +316,13 @@ export class InboxManager {
     this.atomicWrite(this.latestJsonPath, JSON.stringify(latest, null, 2));
     this.atomicWrite(this.pkbQueuePath, jsonLines(pending.filter((item) => item.intentTag === "pkb_vault" || item.intentTag === "voice_idea")));
     this.atomicWrite(this.uiBugQueuePath, jsonLines(pending.filter((item) => item.intentTag === "ui_bug")));
-    for (const item of items) {
+    const targetItems =
+      changedItemIds !== undefined
+        ? Array.from(changedItemIds)
+            .map((id) => this.itemsMap.get(id))
+            .filter((item): item is StoredInboxItem => Boolean(item))
+        : items;
+    for (const item of targetItems) {
       const dateFolder = item.receivedAt.slice(0, 10);
       if (!/^\d{4}-\d{2}-\d{2}$/.test(dateFolder)) continue;
       const itemDir = path.join(this.inboxRootDir, dateFolder, item.itemId);

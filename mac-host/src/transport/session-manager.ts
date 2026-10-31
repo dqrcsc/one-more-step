@@ -192,7 +192,10 @@ export class PhoneSessionManager extends EventEmitter {
     this.streamDownloadDir = opts.streamDownloadDir;
     this.presence = new PresenceEngine(opts.presenceOptions);
     this.customHttpHandler = opts.customHttpHandler;
-    fs.mkdirSync(this.streamDownloadDir, { recursive: true });
+    fs.mkdirSync(this.streamDownloadDir, { recursive: true, mode: 0o700 });
+    try {
+      fs.chmodSync(this.streamDownloadDir, 0o700);
+    } catch {}
 
     for (const dev of opts.trustedDevices ?? []) {
       this.trustedDevices.set(dev.phoneId, dev);
@@ -235,7 +238,17 @@ export class PhoneSessionManager extends EventEmitter {
       path.dirname(new URL(import.meta.url).pathname),
       "../../.."
     );
-    const apkDir = path.join(repoRoot, "android-app/app/build/outputs/apk/debug");
+    const releaseApkDir = path.join(repoRoot, "android-app/app/build/outputs/apk/release");
+    const debugApkDir = path.join(repoRoot, "android-app/app/build/outputs/apk/debug");
+    let pkgVersion = "1.6.1";
+    try {
+      const pkgRaw = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+      if (typeof pkgRaw?.version === "string" && pkgRaw.version.trim()) {
+        pkgVersion = pkgRaw.version.trim();
+      }
+    } catch {
+      // ignore
+    }
     let rootReleaseApks: string[] = [];
     try {
       rootReleaseApks = fs
@@ -247,21 +260,34 @@ export class PhoneSessionManager extends EventEmitter {
     } catch {
       // ignore
     }
+    const buildOutputCandidates = [
+      path.join(releaseApkDir, "app-release.apk"),
+      path.join(debugApkDir, "app-debug.apk"),
+    ].filter((p) => fs.existsSync(p));
+    buildOutputCandidates.sort((a, b) => {
+      try {
+        return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
+      } catch {
+        return 0;
+      }
+    });
     const candidatePaths = [
-      path.join(apkDir, "app-debug.apk"),
+      ...buildOutputCandidates,
       ...rootReleaseApks,
       path.join(os.homedir(), ".one_more_step", "OneMoreStep.apk"),
+      path.join(releaseApkDir, "app-release.apk"),
+      path.join(debugApkDir, "app-debug.apk"),
     ];
     const apkPath = candidatePaths.find((p) => fs.existsSync(p)) || candidatePaths[0];
-    const metaPath = path.join(apkDir, "output-metadata.json");
+    const metaPath = path.join(path.dirname(apkPath), "output-metadata.json");
 
     if (!fs.existsSync(apkPath)) {
-      const defaultVer = "1.5.8";
+      const defaultVer = pkgVersion;
       const ghUrl = `https://github.com/dqrcsc/one-more-step/releases/download/v${defaultVer}/OneMoreStep-v${defaultVer}.apk`;
       return {
         available: false,
         apkPath,
-        versionCode: 33,
+        versionCode: 37,
         versionName: defaultVer,
         sha256: "",
         sizeBytes: 0,
@@ -273,8 +299,8 @@ export class PhoneSessionManager extends EventEmitter {
     }
 
     const stat = fs.statSync(apkPath);
-    let versionCode = 33;
-    let versionName = "1.5.8";
+    let versionCode = 37;
+    let versionName = pkgVersion;
     const fileMatch = path.basename(apkPath).match(/^OneMoreStep-v([\d.]+)\.apk$/);
     if (fileMatch) {
       versionName = fileMatch[1];
@@ -431,7 +457,9 @@ export class PhoneSessionManager extends EventEmitter {
         const url = new URL(req.url);
         const clientIp = server.requestIP(req)?.address || "unknown";
         const normalizedIp = clientIp.replace(/^::ffff:/i, "");
-        console.log(`[omsd][http] ${req.method} ${url.pathname} from ${clientIp}`);
+        if (url.pathname !== "/api/inbox" && url.pathname !== "/api/inbox/mirror/frame") {
+          console.log(`[omsd][http] ${req.method} ${url.pathname} from ${clientIp}`);
+        }
 
         // Localhost-only WebSocket for real-time screen mirroring in Mac browser (/ws/mirror)
         if (url.pathname === "/ws/mirror") {
@@ -1369,8 +1397,11 @@ export class PhoneSessionManager extends EventEmitter {
     const safeName = path.basename(h.fileName || `${streamId}.bin`);
     const savedAbsPath = path.join(this.streamDownloadDir, `${streamId}_${safeName}`);
     try {
-      fs.writeFileSync(savedAbsPath + ".partial", totalBuf);
+      fs.writeFileSync(savedAbsPath + ".partial", totalBuf, { mode: 0o600 });
       fs.renameSync(savedAbsPath + ".partial", savedAbsPath);
+      try {
+        fs.chmodSync(savedAbsPath, 0o600);
+      } catch {}
       const completed: CompletedFileTransfer = { header: h, savedAbsPath, sha256Actual: actualSha256 };
       this.incomingStreams.delete(streamId);
       while (this.completedStreams.size >= 128) {

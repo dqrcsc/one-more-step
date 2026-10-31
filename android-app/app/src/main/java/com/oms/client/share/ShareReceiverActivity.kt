@@ -62,26 +62,27 @@ class ShareReceiverActivity : Activity() {
         val client = OmsApplication.instance?.transportClient ?: return
 
         val shortcutId = intent.getStringExtra(Intent.EXTRA_SHORTCUT_ID) ?: ""
-        val intentTag = when {
-            shortcutId.contains("pkb_vault") -> "pkb_vault"
-            shortcutId.contains("ui_bug") -> "ui_bug"
-            else -> intent.getStringExtra("oms_intent_tag") ?: "default_inbox"
-        }
+        val intentTag = ShareInputPolicy.resolveDirectShareTag(shortcutId)
 
         val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
         val sharedSubject = intent.getStringExtra(Intent.EXTRA_SUBJECT)
+        val appDataDir = applicationInfo?.dataDir
 
         when (intent.action) {
             Intent.ACTION_SEND -> {
                 @Suppress("DEPRECATION")
-                val streamUri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+                val rawStreamUri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+                if (rawStreamUri != null && !ShareInputPolicy.isSafeExternalStreamUri(rawStreamUri, appDataDir)) {
+                    Toast.makeText(this, "⚠️ 已拦截不受信任的分享附件 URI", Toast.LENGTH_SHORT).show()
+                    return
+                }
                 client.submitItemToMacOrQueue(
                     intentTag = intentTag,
-                    itemType = if (streamUri != null) "FILE" else "TEXT",
+                    itemType = if (rawStreamUri != null) "FILE" else "TEXT",
                     title = sharedSubject ?: "手机系统分享 ($intentTag)",
                     textContent = sharedText,
                     voiceTranscript = null,
-                    fileUri = streamUri
+                    fileUri = rawStreamUri
                 )
                 Toast.makeText(
                     this,
@@ -91,7 +92,12 @@ class ShareReceiverActivity : Activity() {
             }
             Intent.ACTION_SEND_MULTIPLE -> {
                 @Suppress("DEPRECATION")
-                val uris = intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM) ?: emptyList()
+                val uris = (intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM) ?: emptyList())
+                    .filter { ShareInputPolicy.isSafeExternalStreamUri(it, appDataDir) }
+                if (uris.isEmpty() && sharedText.isNullOrBlank()) {
+                    Toast.makeText(this, "⚠️ 无有效可分享文件", Toast.LENGTH_SHORT).show()
+                    return
+                }
                 for ((idx, u) in uris.withIndex()) {
                     client.submitItemToMacOrQueue(
                         intentTag = intentTag,

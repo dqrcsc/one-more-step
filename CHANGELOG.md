@@ -1,5 +1,29 @@
 # Changelog · 更新日志
 
+## 1.6.1 - 2026-10-31
+
+完成双端代码诊断报告的 4 批次全栈安全加固、GUI Agent 防绕过护栏、Keystore 密钥保护、传输背压控制与主线程 I/O 性能优化。
+
+### 核心升级与修复
+
+- **Mac 宿主端安全加固与性能治理**：
+  - 修复 Web Dashboard 存储型 XSS（补齐单引号转义、移除卡片动态内联 `onclick` 拼接、改用 `data-item-action` 事件委托，并注入 `Content-Security-Policy` 与 `X-Content-Type-Options: nosniff`）。
+  - 收紧 `~/.one_more_step` 目录（`0700`）、`config.json`（`0600`）与 Unix Socket（`0600`）权限；`config.json` 原子写入且解析异常时自动备份为 `.corrupt.<ts>.bak` 不丢数据；IPC Socket 补齐 `error` 监听。
+  - `InboxManager` 改为按变更项增量更新 `meta.json`（$O(1)$）；过滤高频轮询日志并为 `omsd.log` / `connections.jsonl` 增加 2 MB 自动轮转；修复 Swift 蓝牙桥 `fd` 锁保护、`SIGPIPE` 忽略及 `txQueue` 误清空问题。
+- **Android 端安全护栏与系统入口加固**：
+  - 坐标点击强制要求 `observationId`，并通过 `SemanticTreeExtractor.findSmallestNodeAt` 对坐标命中节点及子树聚合文本执行敏感词拦截；将 `com.oms.client` 本包、支付/安装器/权限控制器与非蓝牙设置页纳入黑名单，检查分屏/小窗多根节点并拦截 `isPassword` 节点。
+  - 解锁、拨号、挂断、实时同屏全路径补齐急停胶囊展示；手势被用户触摸取消（`onCancelled`）时锁存急停，并在 `MainActivity` 顶部新增本地「▶️ 恢复 AI 操作」按钮。
+  - 收紧系统分享与语音闪念标签白名单（禁止伪造 `sms_otp`），拦截外部 `file://` 与敏感 ContentProvider URI；修正 `AndroidManifest.xml` 中 `android.provider.Telephony.SMS_RECEIVED`，设置 `android:allowBackup="false"`。
+- **传输可靠性、Keystore 密钥保护与 Release 构建**：
+  - 修复 `isConnectingLan` 在 generation 过期退出路径未复位的死锁 Bug；增加 WebSocket 发送背压流控与断连自动停止屏幕镜像。
+  - 使用 Android Keystore (`AES/GCM/NoPadding`) 加密存储配对密钥（支持旧版明文自动无感迁移）。
+  - 切换为非调试版 `assembleRelease`（`debuggable=false`，保持签名兼容以支持平滑覆盖升级），缓存 APK SHA-256 并将耗时 I/O 移出主线程。
+
+### 安装与兼容性
+
+- APK：`OneMoreStep-v1.6.1.apk`，Android 11+，包名 `com.oms.client`，versionName **1.6.1** / versionCode **37**；可直接覆盖安装。
+- APK SHA-256：`073e1db4f3dbb76ed4202459a69c19167dd633c8d7a65a7d0f9d596c822f78f2`。
+
 ## 1.6.0 - 2026-10-30
 
 新增自动电话拨打 + 接通检测 + 多模式智能语音传话（`--mac-say` / `--ai-call` / `--say`）与常用联系人速查表（`oms contacts`），并修复小米 HyperOS 通话界面免提/挂断嵌套控件点击、免 `READ_PHONE_STATE` 权限通话状态判定、小米画报锁屏自动退出以及蓝牙桥重连恢复。
