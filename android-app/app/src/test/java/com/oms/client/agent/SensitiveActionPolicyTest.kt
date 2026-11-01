@@ -24,6 +24,7 @@ class SensitiveActionPolicyTest {
         assertTrue(SensitiveActionPolicy.requiresObservationId("click", targetNodeId = "#1", hasCoordinates = false))
         assertTrue(SensitiveActionPolicy.requiresObservationId("click", targetNodeId = "", hasCoordinates = true))
         assertTrue(SensitiveActionPolicy.requiresObservationId("long_click", targetNodeId = "", hasCoordinates = true))
+        assertTrue(SensitiveActionPolicy.requiresObservationId("swipe", targetNodeId = "", hasCoordinates = true))
         assertTrue(SensitiveActionPolicy.requiresObservationId("set_text", targetNodeId = "#3", hasCoordinates = false))
         assertFalse(SensitiveActionPolicy.requiresObservationId("back", targetNodeId = "", hasCoordinates = false))
         assertFalse(SensitiveActionPolicy.requiresObservationId("home", targetNodeId = "", hasCoordinates = false))
@@ -44,7 +45,9 @@ class SensitiveActionPolicyTest {
     @Test
     fun blockedPackageAndWindowPolicyPreventsSelfControlAndPrivilegeEscalation() {
         assertTrue(SensitiveActionPolicy.isBlockedPackage("com.oms.client"))
+        assertFalse(SensitiveActionPolicy.isBlockedPackage("com.oms.client", allowSelfPackage = true))
         assertTrue(SensitiveActionPolicy.isBlockedPackage("com.eg.android.AlipayGphone"))
+        assertTrue(SensitiveActionPolicy.isBlockedPackage("com.eg.android.AlipayGphone", allowSelfPackage = true))
         assertTrue(SensitiveActionPolicy.isBlockedPackage("com.google.android.permissioncontroller"))
         assertTrue(SensitiveActionPolicy.isBlockedPackage("com.miui.securitycenter"))
         assertFalse(SensitiveActionPolicy.isBlockedPackage("com.tencent.mm"))

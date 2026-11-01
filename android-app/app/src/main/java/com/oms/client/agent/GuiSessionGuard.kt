@@ -8,6 +8,8 @@ internal class GuiSessionGuard(initiallyStopped: Boolean = false) {
         private set
     var revision: Long = 0
         private set
+    var stopEpoch: Long = 0
+        private set
     private var observationId: String? = null
     private var observedWindow: String? = null
 
@@ -30,8 +32,20 @@ internal class GuiSessionGuard(initiallyStopped: Boolean = false) {
         return UUID.randomUUID().toString().also { observationId = it }
     }
 
-    fun stop() { stopped = true; invalidate() }
-    fun resumeOnPhone() { stopped = false; invalidate() }
+    fun stop() { stopped = true; stopEpoch++; invalidate() }
+    fun resumeOnPhone() { stopped = false; stopEpoch++; invalidate() }
+
+    fun checkMirrorQueued(
+        now: Long,
+        deadline: Long,
+        expectedStopEpoch: Long,
+        sessionAuthorized: Boolean = true
+    ) {
+        checkAuthorization(now, deadline, sessionAuthorized)
+        check(stopEpoch == expectedStopEpoch) {
+            "ERR_USER_INTERRUPTED: Emergency stop state changed while queued"
+        }
+    }
 
     fun check(
         now: Long,

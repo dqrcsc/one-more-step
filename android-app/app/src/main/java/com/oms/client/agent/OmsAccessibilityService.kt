@@ -190,30 +190,37 @@ class OmsAccessibilityService : AccessibilityService() {
         val roots = mutableListOf<AccessibilityNodeInfo>()
         var hasWindowInventory = false
         var applicationWindowIds: Set<Int> = emptySet()
+        val keyguardLocked = try {
+            (getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.isKeyguardLocked == true
+        } catch (_: Throwable) {
+            false
+        }
         try {
             val allWindows = windows
             if (!allWindows.isNullOrEmpty()) {
                 hasWindowInventory = true
                 applicationWindowIds = allWindows.filter { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }.map { it.id }.toSet()
-                val appWindows = allWindows
-                    .filter { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }
-                    .sortedByDescending { w ->
-                        val r = Rect()
-                        w.getBoundsInScreen(r)
-                        r.width() * r.height()
-                    }
-                for (w in appWindows) {
-                    val rNode = w.root ?: continue
-                    val pkg = rNode.packageName?.toString() ?: ""
-                    if (pkg != "com.miui.personalassistant" || appWindows.size == 1) {
-                        roots.add(rNode)
+                if (!keyguardLocked) {
+                    val appWindows = allWindows
+                        .filter { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }
+                        .sortedByDescending { w ->
+                            val r = Rect()
+                            w.getBoundsInScreen(r)
+                            r.width() * r.height()
+                        }
+                    for (w in appWindows) {
+                        val rNode = w.root ?: continue
+                        val pkg = rNode.packageName?.toString() ?: ""
+                        if (pkg != "com.miui.personalassistant" || appWindows.size == 1) {
+                            roots.add(rNode)
+                        }
                     }
                 }
             }
         } catch (_: Throwable) {
         }
         val activeRoot = rootInActiveWindow
-        if (activeRoot != null && (!hasWindowInventory || activeRoot.windowId in applicationWindowIds)
+        if (activeRoot != null && (!hasWindowInventory || (!keyguardLocked && activeRoot.windowId in applicationWindowIds))
             && roots.none { it.windowId == activeRoot.windowId }) {
             roots.add(activeRoot)
         }
@@ -364,7 +371,7 @@ class OmsAccessibilityService : AccessibilityService() {
             throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Password field interaction is blocked")
         }
 
-        val hitNodeForCoords = if (targetNode == null && hasCoordinates && action in setOf("click", "long_click")) {
+        val hitNodeForCoords = if (targetNode == null && hasCoordinates && action in setOf("click", "long_click", "swipe")) {
             SemanticTreeExtractor.findSmallestNodeAt(params.optInt("x"), params.optInt("y"))
         } else {
             null
@@ -1638,23 +1645,20 @@ class OmsAccessibilityService : AccessibilityService() {
     ): JSONObject = withContext(Dispatchers.Main.immediate) {
         val now = System.currentTimeMillis()
         val deadline = minOf(now + 5000L, params.optLong("deadlineMs", now + 5000L))
-        val queuedRevision = guard.revision
+        val queuedStopEpoch = guard.stopEpoch
         guard.checkAuthorization(now, deadline, sessionStillValid())
         withTimeout((deadline - now).coerceAtLeast(1L)) {
             guiMutex.withLock {
-                guard.check(System.currentTimeMillis(), deadline, windowIdentity(), queuedRevision,
-                    null, false, sessionStillValid())
-                activeAction = currentCoroutineContext()[Job]
-                safetyOverlay?.showActivePill()
-                try {
-                    val result = executeMirrorInputLocked(params)
-                    currentCoroutineContext().ensureActive()
-                    guard.checkAuthorization(System.currentTimeMillis(), deadline, sessionStillValid())
-                    result
-                } finally {
-                    activeAction = null
-                    if (!guard.stopped) safetyOverlay?.hideActivePill()
-                }
+                guard.checkMirrorQueued(
+                    System.currentTimeMillis(),
+                    deadline,
+                    queuedStopEpoch,
+                    sessionStillValid()
+                )
+                val result = executeMirrorInputLocked(params)
+                currentCoroutineContext().ensureActive()
+                guard.checkAuthorization(System.currentTimeMillis(), deadline, sessionStillValid())
+                result
             }
         }
     }
@@ -1679,8 +1683,15 @@ class OmsAccessibilityService : AccessibilityService() {
         var ok = false
         val typeLower = type.lowercase()
         val isSafeMirrorNav = typeLower in setOf("key", "nav") &&
-            params.optString("key", params.optString("target", "home")).lowercase() in setOf("home", "back", "lock", "lock_screen")
-        if (!isSafeMirrorNav && isBlockedFinancialOrPasswordWindow(rootInActiveWindow, collectApplicationRoots())) {
+            params.optString("key", params.optString("target", "home")).lowercase() in setOf(
+                "home", "back", "recents", "notifications", "quick_settings", "lock", "lock_screen", "wake"
+            )
+        val activePkg = currentPackageName.ifBlank { rootInActiveWindow?.packageName?.toString().orEmpty() }
+        if (!isSafeMirrorNav && (
+                SensitiveActionPolicy.isBlockedPackage(activePkg, allowSelfPackage = true) ||
+                    SensitiveActionPolicy.isBlockedActivity(currentActivityName)
+            )
+        ) {
             throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password safety policy")
         }
         when (type) {
@@ -1835,9 +1846,6 @@ class OmsAccessibilityService : AccessibilityService() {
                     if (continuation.isActive) continuation.resume(true)
                 }
                 override fun onCancelled(gestureDescription: GestureDescription?) {
-                    if (activeAction != null) {
-                        setStopped("gesture_cancelled_by_touch")
-                    }
                     if (continuation.isActive) continuation.resume(false)
                 }
             }, null)

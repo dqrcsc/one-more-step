@@ -79,11 +79,18 @@ class GuiSessionGuardTest {
     @Test fun queuedMirrorInputCannotSurviveEmergencyStopAndResume() {
         val guard = GuiSessionGuard()
         val queuedRevision = guard.revision
+        val queuedStopEpoch = guard.stopEpoch
+        // Normal content invalidations during mirror scrolling do not invalidate queuedMirrorInput
+        guard.invalidate("scroll animation frame")
+        guard.checkMirrorQueued(100, 200, queuedStopEpoch, true)
         guard.stop()
         rejected { guard.checkAuthorization(100, 200, true) }
+        rejected { guard.checkMirrorQueued(100, 200, queuedStopEpoch, true) }
         guard.resumeOnPhone()
         rejected { guard.check(100, 200, "app", queuedRevision, null, false, true) }
+        rejected { guard.checkMirrorQueued(100, 200, queuedStopEpoch, true) }
         guard.check(100, 200, "app", guard.revision, null, false, true)
+        guard.checkMirrorQueued(100, 200, guard.stopEpoch, true)
     }
 
     @Test fun mirrorGestureRecheckAllowsItsOwnWindowChangeButNotRevocationOrExpiry() {

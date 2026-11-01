@@ -287,7 +287,7 @@ export class PhoneSessionManager extends EventEmitter {
       return {
         available: false,
         apkPath,
-        versionCode: 37,
+        versionCode: 38,
         versionName: defaultVer,
         sha256: "",
         sizeBytes: 0,
@@ -299,7 +299,7 @@ export class PhoneSessionManager extends EventEmitter {
     }
 
     const stat = fs.statSync(apkPath);
-    let versionCode = 37;
+    let versionCode = 38;
     let versionName = pkgVersion;
     const fileMatch = path.basename(apkPath).match(/^OneMoreStep-v([\d.]+)\.apk$/);
     if (fileMatch) {

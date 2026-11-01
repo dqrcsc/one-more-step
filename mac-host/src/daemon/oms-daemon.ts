@@ -1296,8 +1296,9 @@ export class OmsDaemon {
       isSecureWindow: Boolean(this.mirrorFlags & ScreenFrameFlags.IS_SECURE_WINDOW),
       isScreenOff: Boolean(this.mirrorFlags & ScreenFrameFlags.IS_SCREEN_OFF),
       isScreenLocked:
-        Boolean(this.mirrorFlags & ScreenFrameFlags.IS_SCREEN_LOCKED) ||
-        Boolean(ps?.screenLocked),
+        this.mirrorLastFrameAtMs > 0
+          ? Boolean(this.mirrorFlags & ScreenFrameFlags.IS_SCREEN_LOCKED)
+          : Boolean(ps?.screenLocked),
       foregroundPackage: ps?.foregroundPackage,
       foregroundAppLabel: ps?.foregroundAppLabel,
       lastFrameAtMs: this.mirrorLastFrameAtMs,

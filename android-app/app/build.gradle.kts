@@ -11,7 +11,7 @@ android {
         applicationId = "com.oms.client"
         minSdk = 30
         targetSdk = 34
-        versionCode = 37
+        versionCode = 38
         versionName = "1.6.1"
     }
 

@@ -10,6 +10,7 @@ import android.os.Build
 import android.view.Display
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.Executors
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -17,6 +18,10 @@ import kotlin.coroutines.resumeWithException
  * Module 05: Silent Screenshot Capturer (Android 11+ API 30+) & Set-of-Mark (SoM) Visual Annotator
  */
 object ScreenCapturer {
+
+    private val screenshotExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "oms-screen-capturer").apply { isDaemon = true }
+    }
 
     data class MirrorFrameResult(
         val bytes: ByteArray,
@@ -64,7 +69,7 @@ object ScreenCapturer {
 
         service.takeScreenshot(
             Display.DEFAULT_DISPLAY,
-            service.mainExecutor,
+            screenshotExecutor,
             object : AccessibilityService.TakeScreenshotCallback {
                 override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
                     try {
@@ -175,7 +180,7 @@ object ScreenCapturer {
     ): ByteArray? = suspendCancellableCoroutine { cont ->
         service.takeScreenshot(
             Display.DEFAULT_DISPLAY,
-            service.mainExecutor,
+            screenshotExecutor,
             object : AccessibilityService.TakeScreenshotCallback {
                 override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
                     try {
