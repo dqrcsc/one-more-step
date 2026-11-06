@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "one-more-step-monorepo",
+      "name": "one-more-step",
       "devDependencies": {
         "@types/bun": "latest",
         "typescript": "^5.8.2",
@@ -11,7 +11,7 @@
     },
     "mac-host": {
       "name": "@oms/mac-host",
-      "version": "1.5.9",
+      "version": "1.6.2",
       "bin": {
         "oms": "./src/cli/index.ts",
         "omsd": "./src/daemon/main.ts",
@@ -22,7 +22,7 @@
     },
     "shared-protocol": {
       "name": "@oms/shared-protocol",
-      "version": "1.5.9",
+      "version": "1.6.2",
     },
   },
   "packages": {
