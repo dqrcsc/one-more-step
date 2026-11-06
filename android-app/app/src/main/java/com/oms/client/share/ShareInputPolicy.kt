@@ -43,7 +43,10 @@ object ShareInputPolicy {
     ): Boolean {
         val normScheme = scheme?.lowercase() ?: return false
         if (normScheme != "content") return false
-        val normAuthority = authority?.lowercase()?.substringBefore('@')?.trim().orEmpty()
+        // Android interprets 0@sms as user 0's sms provider, not provider "0".
+        // External attachments never need a user-qualified authority.
+        val normAuthority = authority?.lowercase()?.trim().orEmpty()
+        if ('@' in normAuthority) return false
         if (normAuthority.isEmpty() || normAuthority in BLOCKED_AUTHORITIES) return false
         if (normAuthority.contains("telephony") || normAuthority.contains("sms") || normAuthority.contains("contacts")) {
             return false

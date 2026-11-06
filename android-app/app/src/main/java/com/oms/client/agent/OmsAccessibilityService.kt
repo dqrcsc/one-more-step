@@ -169,7 +169,8 @@ class OmsAccessibilityService : AccessibilityService() {
 
     private fun isBlockedFinancialOrPasswordWindow(
         root: AccessibilityNodeInfo?,
-        allRoots: List<AccessibilityNodeInfo> = emptyList()
+        allRoots: List<AccessibilityNodeInfo> = emptyList(),
+        allowSelfPackage: Boolean = false
     ): Boolean {
         val candidateRoots = if (allRoots.isNotEmpty()) allRoots else listOfNotNull(root)
         val hasFocusedPassword = candidateRoots.any { r ->
@@ -179,7 +180,8 @@ class OmsAccessibilityService : AccessibilityService() {
             currentPackageName = currentPackageName,
             currentActivityName = currentActivityName,
             rootPackages = candidateRoots.map { it.packageName?.toString() },
-            hasFocusedPasswordInput = hasFocusedPassword
+            hasFocusedPasswordInput = hasFocusedPassword,
+            allowSelfPackage = allowSelfPackage
         )
     }
 
@@ -1465,6 +1467,13 @@ class OmsAccessibilityService : AccessibilityService() {
             "com.xiaomi.aiasst.vision",
             "com.miui.voiceassist"
         )
+        fun aiWindows(roots: List<AccessibilityNodeInfo>): Map<Int, String> = roots
+            .filter { it.packageName?.toString() in aiAllowedPkgs }
+            .associate { it.windowId to it.packageName.toString() }
+        fun inputState(node: AccessibilityNodeInfo) = AiCallInputPolicy.NodeState(
+            node.packageName?.toString(), node.windowId, node.isVisibleToUser,
+            node.isEnabled, node.isEditable, node.isPassword
+        )
         val aiButton = findClickableCallControl(
             roots = collectAllWindowRoots(),
             allowedPackages = aiAllowedPkgs,
@@ -1485,16 +1494,20 @@ class OmsAccessibilityService : AccessibilityService() {
         }
 
         var editableNode: AccessibilityNodeInfo? = null
+        var editableScope: AiCallInputPolicy.Target? = null
         var clickedKeyboardToggle = false
         for (attempt in 0 until 14) {
             if (isInCall() != true) return false
             val roots = collectAllWindowRoots()
+            val allowedWindows = aiWindows(roots)
             val queue = ArrayDeque<AccessibilityNodeInfo>()
-            roots.forEach { queue.addLast(it) }
+            roots.filter { it.windowId in allowedWindows }.forEach { queue.addLast(it) }
             while (queue.isNotEmpty()) {
                 val n = queue.removeFirst()
-                if (n.isVisibleToUser && n.isEditable && n.isEnabled) {
+                val target = AiCallInputPolicy.select(inputState(n), aiAllowedPkgs, allowedWindows)
+                if (target != null) {
                     editableNode = n
+                    editableScope = target
                     break
                 }
                 for (i in 0 until n.childCount) {
@@ -1526,23 +1539,31 @@ class OmsAccessibilityService : AccessibilityService() {
         }
 
         val targetEdit = editableNode ?: return false
+        val targetScope = editableScope ?: return false
         val textFilled = steps.effect {
-            if (isInCall() != true || !targetEdit.refresh() || !targetEdit.isEditable) {
-                false
-            } else {
-                targetEdit.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                val args = Bundle().apply {
-                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, textToSend)
+            AiCallInputPolicy.write(
+                target = targetScope,
+                refresh = {
+                    if (isInCall() == true && targetEdit.refresh()) inputState(targetEdit) else null
+                },
+                windows = { aiWindows(collectAllWindowRoots()) },
+                focus = { targetEdit.isFocused || targetEdit.performAction(AccessibilityNodeInfo.ACTION_FOCUS) },
+                setText = {
+                    val args = Bundle().apply {
+                        putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, textToSend)
+                    }
+                    targetEdit.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
                 }
-                targetEdit.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-            }
+            )
         }
         if (!textFilled) return false
         steps.pause(250L)
 
         val sendBtn = findClickableCallControl(
-            roots = collectAllWindowRoots(),
-            allowedPackages = aiAllowedPkgs,
+            roots = collectAllWindowRoots().filter {
+                it.windowId == targetScope.windowId && it.packageName?.toString() == targetScope.packageName
+            },
+            allowedPackages = setOf(targetScope.packageName),
             predicate = { lbl, vid ->
                 val t = lbl.trim()
                 t in setOf("发送", "播报", "朗读", "确定", "Send") ||
@@ -1552,6 +1573,9 @@ class OmsAccessibilityService : AccessibilityService() {
 
         return steps.effect {
             isInCall() == true && sendBtn.refresh() && sendBtn.isVisibleToUser &&
+                sendBtn.packageName?.toString() == targetScope.packageName &&
+                sendBtn.windowId == targetScope.windowId &&
+                aiWindows(collectAllWindowRoots())[targetScope.windowId] == targetScope.packageName &&
                 sendBtn.isEnabled && sendBtn.isClickable &&
                 sendBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         }
@@ -1643,24 +1667,25 @@ class OmsAccessibilityService : AccessibilityService() {
         params: JSONObject,
         sessionStillValid: () -> Boolean
     ): JSONObject = withContext(Dispatchers.Main.immediate) {
-        val now = System.currentTimeMillis()
-        val deadline = minOf(now + 5000L, params.optLong("deadlineMs", now + 5000L))
-        val queuedStopEpoch = guard.stopEpoch
-        guard.checkAuthorization(now, deadline, sessionStillValid())
-        withTimeout((deadline - now).coerceAtLeast(1L)) {
-            guiMutex.withLock {
-                guard.checkMirrorQueued(
-                    System.currentTimeMillis(),
-                    deadline,
-                    queuedStopEpoch,
-                    sessionStillValid()
-                )
-                val result = executeMirrorInputLocked(params)
-                currentCoroutineContext().ensureActive()
-                guard.checkAuthorization(System.currentTimeMillis(), deadline, sessionStillValid())
-                result
+        val type = params.optString("type", params.optString("action", "tap")).lowercase()
+        val isSafeNavigation = type in setOf("key", "nav") &&
+            params.optString("key", params.optString("target", "home")).lowercase() in setOf(
+                "home", "back", "recents", "notifications", "quick_settings", "lock", "lock_screen", "wake"
+            )
+        GuardedMirrorAction(guard, guiMutex).run(
+            requestedDeadline = if (params.has("deadlineMs")) params.optLong("deadlineMs") else null,
+            sessionValid = sessionStillValid,
+            activeJob = { activeAction = it },
+            showStopControl = { safetyOverlay?.showActivePill() == true },
+            hideStopControl = { safetyOverlay?.hideActivePill(); Unit },
+            checkWindow = {
+                if (!isSafeNavigation && isBlockedFinancialOrPasswordWindow(
+                        rootInActiveWindow, collectApplicationRoots(), allowSelfPackage = true
+                    )) {
+                    throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password safety policy")
+                }
             }
-        }
+        ) { executeMirrorInputLocked(params) }
     }
 
     private suspend fun executeMirrorInputLocked(params: JSONObject): JSONObject {
@@ -1681,19 +1706,6 @@ class OmsAccessibilityService : AccessibilityService() {
         }
 
         var ok = false
-        val typeLower = type.lowercase()
-        val isSafeMirrorNav = typeLower in setOf("key", "nav") &&
-            params.optString("key", params.optString("target", "home")).lowercase() in setOf(
-                "home", "back", "recents", "notifications", "quick_settings", "lock", "lock_screen", "wake"
-            )
-        val activePkg = currentPackageName.ifBlank { rootInActiveWindow?.packageName?.toString().orEmpty() }
-        if (!isSafeMirrorNav && (
-                SensitiveActionPolicy.isBlockedPackage(activePkg, allowSelfPackage = true) ||
-                    SensitiveActionPolicy.isBlockedActivity(currentActivityName)
-            )
-        ) {
-            throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password safety policy")
-        }
         when (type) {
             "tap", "click" -> {
                 val tx = resolveCoord("normX", "x", screenW, screenW / 2)
@@ -1841,12 +1853,15 @@ class OmsAccessibilityService : AccessibilityService() {
     private suspend fun dispatchAndAwait(gesture: GestureDescription): Boolean =
         suspendCancellableCoroutine { continuation ->
             if (!continuation.isActive) return@suspendCancellableCoroutine
+            val originatingAction = activeAction
+            val originatingStopEpoch = guard.stopEpoch
             val accepted = dispatchGesture(gesture, object : GestureResultCallback() {
                 override fun onCompleted(gestureDescription: GestureDescription?) {
                     if (continuation.isActive) continuation.resume(true)
                 }
                 override fun onCancelled(gestureDescription: GestureDescription?) {
-                    if (continuation.isActive) continuation.resume(false)
+                    GestureCancellation.complete(continuation, originatingAction, activeAction,
+                        originatingStopEpoch, guard.stopEpoch) { setStopped("gesture_cancelled") }
                 }
             }, null)
             if (!accepted && continuation.isActive) continuation.resume(false)

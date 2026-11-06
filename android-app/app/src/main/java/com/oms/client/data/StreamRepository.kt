@@ -148,24 +148,15 @@ class StreamRepository(context: Context) :
         }
     }
 
-    private fun readStoredPairSecretHex(): String {
-        val enc = prefs.getString("pair_secret_enc", null)
-        if (!enc.isNullOrBlank()) {
-            val decrypted = decryptPairSecret(enc)
-            if (!decrypted.isNullOrBlank()) return decrypted
+    private fun readStoredPairSecretHex(migrateLegacy: Boolean = true): String =
+        PairingSecretPersistence.read(
+            prefs.getString("pair_secret_enc", null),
+            prefs.getString("pair_secret_hex", "") ?: "",
+            ::decryptPairSecret,
+            { if (migrateLegacy) encryptPairSecret(it) else null }
+        ) { wrapped ->
+            prefs.edit().putString("pair_secret_enc", wrapped).remove("pair_secret_hex").apply()
         }
-        val legacyPlain = prefs.getString("pair_secret_hex", "") ?: ""
-        if (legacyPlain.isNotBlank()) {
-            val wrapped = encryptPairSecret(legacyPlain)
-            if (!wrapped.isNullOrBlank()) {
-                prefs.edit()
-                    .putString("pair_secret_enc", wrapped)
-                    .remove("pair_secret_hex")
-                    .apply()
-            }
-        }
-        return legacyPlain
-    }
 
     @Synchronized
     fun savePairedMac(config: PairedMacConfig) {
@@ -178,28 +169,25 @@ class StreamRepository(context: Context) :
             if (sameMac) prefs.getString("wan_room_id", "") ?: "" else ""
         }
         val effectivePairSecret = config.pairSecretHex.ifBlank {
-            if (sameMac) readStoredPairSecretHex() else ""
+            if (sameMac) readStoredPairSecretHex(migrateLegacy = false) else ""
         }
         val effectiveRelay = config.wanRelayWssUrl ?: if (sameMac) prefs.getString("wan_relay_url", null) else null
 
         val ipsArr = JSONArray(config.lanIps)
-        val editor = prefs.edit()
-            .putString("mac_id", config.macId)
-            .putString("mac_name", config.macName)
-            .putString("lan_ips", ipsArr.toString())
-            .putInt("lan_port", config.lanPort)
-            .putString("mac_pub_key", effectivePubKey)
-            .putString("wan_room_id", effectiveWanRoom)
-            .putString("wan_relay_url", effectiveRelay)
-            .putInt("pairing_version", config.pairingVersion)
+        PairingSecretPersistence.save(effectivePairSecret, ::encryptPairSecret) { encryptedSecret ->
+            val editor = prefs.edit()
+                .putString("mac_id", config.macId)
+                .putString("mac_name", config.macName)
+                .putString("lan_ips", ipsArr.toString())
+                .putInt("lan_port", config.lanPort)
+                .putString("mac_pub_key", effectivePubKey)
+                .putString("wan_room_id", effectiveWanRoom)
+                .putString("wan_relay_url", effectiveRelay)
+                .putInt("pairing_version", config.pairingVersion)
 
-        val encryptedSecret = encryptPairSecret(effectivePairSecret)
-        if (encryptedSecret != null) {
             editor.putString("pair_secret_enc", encryptedSecret).remove("pair_secret_hex")
-        } else {
-            editor.putString("pair_secret_hex", effectivePairSecret)
+            editor.commit().also { check(it) { "Unable to persist pairing configuration" } }
         }
-        editor.commit().also { check(it) { "Unable to persist pairing configuration" } }
     }
 
     /** Discovery may refresh routing, never restore a stale pairing credential or security version. */
@@ -212,7 +200,11 @@ class StreamRepository(context: Context) :
             .filter { it.isNotBlank() && !it.startsWith("198.18.") && !it.startsWith("127.") }
             .distinct()
             .take(6)
-        savePairedMac(current.copy(lanIps = mergedIps.ifEmpty { discovered.lanIps }, lanPort = discovered.lanPort))
+        // Discovery only owns routing; it must not re-encrypt or replace credentials.
+        prefs.edit()
+            .putString("lan_ips", JSONArray(mergedIps.ifEmpty { discovered.lanIps }).toString())
+            .putInt("lan_port", discovered.lanPort)
+            .commit().also { check(it) { "Unable to persist discovery routing" } }
     }
 
     @Synchronized
