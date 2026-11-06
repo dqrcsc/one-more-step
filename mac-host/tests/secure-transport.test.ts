@@ -36,6 +36,7 @@ test("bound RPC callers never migrate after replacement, re-pair or active route
     const f = fixture();
     const old = f.connect({ tier: change === "promotion" ? "WAN_WEBRTC" : "LAN_WS" });
     const call = f.manager.bindPhoneSession();
+    expect(() => call.assertCurrent()).not.toThrow();
     let current: ReturnType<typeof secureMemoryPhone>;
     if (change === "re-pair") {
       const token = crypto.randomBytes(32).toString("hex");
@@ -46,6 +47,7 @@ test("bound RPC callers never migrate after replacement, re-pair or active route
     }
     // Promotion leaves the original physical pipe alive, but it is no longer the active route.
     if (change === "promotion") expect(old.pipe.closed).not.toBe(true);
+    expect(() => call.assertCurrent()).toThrow("ERR_SESSION_REVOKED");
     await expect(call("sys.control", { action: "call_phone", number: "test-only" }, 100)).rejects.toThrow("ERR_SESSION_REVOKED");
     expect(old.messages).toHaveLength(0);
     expect(current.messages).toHaveLength(0);
@@ -55,6 +57,18 @@ test("bound RPC callers never migrate after replacement, re-pair or active route
     expect(await fresh).toEqual({ ok: true });
     await f.manager.stop();
   }
+});
+
+test("a bound local continuation rejects a closed phone without sending a probe RPC", async () => {
+  const f = fixture();
+  const phone = f.connect();
+  const call = f.manager.bindPhoneSession();
+  call.assertCurrent();
+  expect(phone.messages).toHaveLength(0);
+  f.raw.onPipeClosed(phone.pipe);
+  expect(() => call.assertCurrent()).toThrow("ERR_SESSION_REVOKED");
+  expect(phone.messages).toHaveLength(0);
+  await f.manager.stop();
 });
 
 test("timed-out and duplicate RPC replies cannot settle another request or emit phone actions", async () => {

@@ -247,6 +247,40 @@ final class MacAirPodsController {
         return status == noErr && running != 0
     }
 
+    // Fail closed: names and "not AirPods" cannot identify the physical speaker.
+    func isBuiltInSpeaker(_ id: AudioDeviceID) -> Bool {
+        guard id != 0 else { return false }
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &transport) == noErr,
+              transport == kAudioDeviceTransportTypeBuiltIn else { return false }
+        addr.mSelector = kAudioDevicePropertyStreams
+        addr.mScope = kAudioObjectPropertyScopeOutput
+        guard AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size) == noErr,
+              size > 0 else { return false }
+        var streams = [AudioStreamID](repeating: 0, count: Int(size) / MemoryLayout<AudioStreamID>.size)
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &streams) == noErr else { return false }
+        return !streams.isEmpty && streams.allSatisfy { stream in
+            var terminal: UInt32 = 0
+            var terminalSize = UInt32(MemoryLayout<UInt32>.size)
+            var terminalAddr = AudioObjectPropertyAddress(mSelector: kAudioStreamPropertyTerminalType,
+                mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+            return AudioObjectGetPropertyData(stream, &terminalAddr, 0, nil, &terminalSize, &terminal) == noErr
+                && terminal == kAudioStreamTerminalTypeSpeaker
+        }
+    }
+
+    func reportAudioOutput(reqId: String) {
+        let id = getDefaultOutputDevice()
+        let uid = getDeviceUID(id)
+        let builtInSpeaker = isBuiltInSpeaker(id)
+        ipc.sendJson(["type": "audio_output_result", "reqId": reqId,
+            "ok": id != 0 && !uid.isEmpty && id == getDefaultOutputDevice(),
+            "uid": uid, "name": getDeviceName(id), "builtInSpeaker": builtInSpeaker])
+    }
+
     func hasOutputStreams(_ id: AudioDeviceID) -> Bool {
         guard id != 0 else { return false }
         var outSize: UInt32 = 0
@@ -845,6 +879,8 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
                     self.airpodsController.suppressAutoGrab(durationMs: durationMs)
                 case "airpods_get_status":
                     self.airpodsController.reportStatusIfNeeded(force: true)
+                case "audio_output_query":
+                    if let reqId = msg["reqId"] as? String { self.airpodsController.reportAudioOutput(reqId: reqId) }
                 default:
                     break
                 }

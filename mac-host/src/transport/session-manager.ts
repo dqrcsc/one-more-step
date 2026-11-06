@@ -240,7 +240,7 @@ export class PhoneSessionManager extends EventEmitter {
     );
     const releaseApkDir = path.join(repoRoot, "android-app/app/build/outputs/apk/release");
     const debugApkDir = path.join(repoRoot, "android-app/app/build/outputs/apk/debug");
-    let pkgVersion = "1.6.1";
+    let pkgVersion = "1.6.2";
     try {
       const pkgRaw = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
       if (typeof pkgRaw?.version === "string" && pkgRaw.version.trim()) {
@@ -287,7 +287,7 @@ export class PhoneSessionManager extends EventEmitter {
       return {
         available: false,
         apkPath,
-        versionCode: 38,
+        versionCode: 39,
         versionName: defaultVer,
         sha256: "",
         sizeBytes: 0,
@@ -299,7 +299,7 @@ export class PhoneSessionManager extends EventEmitter {
     }
 
     const stat = fs.statSync(apkPath);
-    let versionCode = 38;
+    let versionCode = 39;
     let versionName = pkgVersion;
     const fileMatch = path.basename(apkPath).match(/^OneMoreStep-v([\d.]+)\.apk$/);
     if (fileMatch) {
@@ -1449,7 +1449,10 @@ export class PhoneSessionManager extends EventEmitter {
    * A later route change or reconnect invalidates this caller; it never silently
    * transfers an already authorized operation to another connection or phone.
    */
-  public bindPhoneSession(): <TResult = any>(method: string, params: Record<string, unknown>, timeoutMs?: number) => Promise<TResult> {
+  public bindPhoneSession(): {
+    <TResult = any>(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<TResult>;
+    assertCurrent(): void;
+  } {
     const pipe = this.pipes.get(this.activeTier);
     if (!pipe || !this.isLivePipe(pipe)) {
       throw Object.assign(new Error("Xiaomi phone is currently disconnected across all tiers (LAN / Bluetooth / WAN)."), {
@@ -1457,8 +1460,13 @@ export class PhoneSessionManager extends EventEmitter {
       });
     }
     const routeGeneration = this.activeRouteGeneration;
-    return <TResult = any>(method: string, params: Record<string, unknown>, timeoutMs?: number) =>
+    const call = <TResult = any>(method: string, params: Record<string, unknown>, timeoutMs?: number) =>
       this.callPhoneOnPipe<TResult>(pipe, routeGeneration, method, params, timeoutMs);
+    return Object.assign(call, { assertCurrent: () => {
+      if (routeGeneration !== this.activeRouteGeneration || !this.isLivePipe(pipe) || this.pipes.get(this.activeTier) !== pipe) {
+        throw new Error("ERR_SESSION_REVOKED: Phone connection changed; request a new operation");
+      }
+    } });
   }
 
   /**

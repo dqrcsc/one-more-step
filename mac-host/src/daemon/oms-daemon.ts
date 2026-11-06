@@ -1,4 +1,5 @@
 import { approvalTimeoutSec, boundedControlDeadline } from "./request-timeouts.js";
+import { CallContinuation, runCallAudioProcess } from "./call-continuation.js";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -122,6 +123,7 @@ export class OmsDaemon {
   private lastAirpodsSwitchEvent?: AirPodsStatusSnapshot["lastSwitchEvent"];
   private suppressPhoneAirpodsClaimUntilMs = 0;
   private airpodsHandoffInFlight = false;
+  private phoneEmergencyStopEpoch = 0;
   private airpodsDiagnostics: { mac?: Record<string, any>; phone?: Record<string, any> } = {};
   private phoneAirpodsState: AirPodsStatusSnapshot["phone"] = {
     connected: false,
@@ -457,28 +459,59 @@ export class OmsDaemon {
     return { cleanNumber, simSlot };
   }
 
-  public async playNeuralAudioOnMacSpeaker(audioBase64: string, repeatCount = 1): Promise<boolean> {
+  protected playMacAudioFile(mp3Path: string, continuation: CallContinuation): Promise<void> {
+    return runCallAudioProcess("afplay", [mp3Path], continuation);
+  }
+
+  private async requireMacSpeakerOutput(continuation: CallContinuation, expectedUid?: string): Promise<string> {
+    continuation.check();
+    const output = await this.session.getBluetoothBridge()?.queryAudioOutput(
+      Math.max(1, Math.min(1000, continuation.deadlineMs - Date.now())));
+    continuation.check();
+    if (output?.ok !== true || output.builtInSpeaker !== true || typeof output.uid !== "string" || !output.uid
+        || (expectedUid !== undefined && output.uid !== expectedUid)) {
+      throw new Error("ERR_MAC_SPEAKER_ROUTE: 无法确认 Mac 内置扬声器输出，请在系统声音设置中选择内置扬声器后重试");
+    }
+    return output.uid;
+  }
+
+  public async playNeuralAudioOnMacSpeaker(audioBase64: string, repeatCount: number, continuation: CallContinuation): Promise<boolean> {
+    continuation.check();
     if (!audioBase64 || process.env.OMS_DISABLE_OSASCRIPT === "1") return false;
+    let monitoring = false;
+    let routeTimer: ReturnType<typeof setInterval> | undefined;
     try {
+      const outputUid = await this.requireMacSpeakerOutput(continuation);
+      monitoring = true;
+      let checking = false;
+      routeTimer = setInterval(async () => {
+        if (!monitoring || checking) return;
+        checking = true;
+        try { await this.requireMacSpeakerOutput(continuation, outputUid); }
+        catch (error) { if (monitoring) continuation.cancel(error instanceof Error ? error : new Error(String(error))); }
+        finally { checking = false; }
+      }, 250);
       const cacheDir = path.join(this.homeDir || os.tmpdir(), "cache", "tts");
       fs.mkdirSync(cacheDir, { recursive: true });
       const mp3Path = path.join(cacheDir, "mac_speaker_active.mp3");
       fs.writeFileSync(mp3Path, Buffer.from(audioBase64, "base64"));
       const count = Math.max(1, Math.min(10, Math.round(repeatCount)));
       for (let i = 0; i < count; i++) {
-        await new Promise<void>((resolve, reject) => {
-          execFile("afplay", [mp3Path], { timeout: 45000 }, (err) => {
-            if (err) reject(err);
-            else resolve();
-          });
-        });
+        await this.requireMacSpeakerOutput(continuation, outputUid);
+        await this.playMacAudioFile(mp3Path, continuation);
+        await this.requireMacSpeakerOutput(continuation, outputUid);
         if (i < count - 1) {
-          await new Promise((r) => setTimeout(r, 420));
+          await continuation.pause(420);
         }
       }
       return true;
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("ERR_MAC_SPEAKER_ROUTE")) continuation.cancel(error);
+      continuation.check();
       return false;
+    } finally {
+      monitoring = false;
+      if (routeTimer) clearInterval(routeTimer);
     }
   }
 
@@ -774,6 +807,7 @@ export class OmsDaemon {
             waiter.resolve(params);
             reply({ result: { ack: true } });
           } else if (req.method === "gui.emergencyStop") {
+            this.phoneEmergencyStopEpoch++;
             this.showMacDesktopNotification(
               "🛑 手机端已触发 AI 急停",
               "你在小米手机上点击了急停胶囊，GUI 自动化已立即中止。"
@@ -2286,7 +2320,7 @@ export class OmsDaemon {
           const hasAnyPostAnswerTask = Boolean(sayText || macSayText || aiCallText || params.waitForAnswer);
           const maxBudgetMs = hasAnyPostAnswerTask ? 90000 : 25000;
           // Validate caller deadline upfront before any synthesis or session work
-          boundedControlDeadline(params.deadlineMs, maxBudgetMs);
+          const deadlineMs = boundedControlDeadline(params.deadlineMs, maxBudgetMs);
           const rawNum = String(params.number || params.phoneNumber || params.text || "").trim();
           const { cleanNumber, simSlot, matchedContact } = this.resolveContactTarget(
             rawNum,
@@ -2298,6 +2332,7 @@ export class OmsDaemon {
             );
           }
           const callPhone = this.session.bindPhoneSession();
+          const stopEpoch = this.phoneEmergencyStopEpoch ?? 0;
 
           let callTtsMeta: Awaited<ReturnType<typeof this.synthesizeNeuralTts>> = null;
           let callTtsFallbackReason: TtsFallbackReason | undefined;
@@ -2321,7 +2356,11 @@ export class OmsDaemon {
             });
           }
 
-          const deadlineMs = boundedControlDeadline(params.deadlineMs, maxBudgetMs);
+          boundedControlDeadline(deadlineMs, maxBudgetMs);
+          if (macSayText) {
+            callPhone.assertCurrent();
+            if ((this.phoneEmergencyStopEpoch ?? 0) !== stopEpoch) throw new Error("ERR_USER_INTERRUPTED: Phone emergency stop");
+          }
           const speakerEnabled =
             params.speaker !== undefined
               ? Boolean(params.speaker)
@@ -2370,33 +2409,41 @@ export class OmsDaemon {
                 typeof params.postAnswerDelayMs === "number" && Number.isFinite(params.postAnswerDelayMs)
                   ? Math.max(150, Math.min(4000, Math.round(params.postAnswerDelayMs)))
                   : 650;
-              await new Promise((r) => setTimeout(r, postDelay));
-              const playedOnMac = callTtsMeta
-                ? await this.playNeuralAudioOnMacSpeaker(callTtsMeta.audioBase64, repeatCount)
-                : false;
-              let hungUpAfter = false;
-              if (Boolean(params.hangupAfter ?? params.autoHangup) && playedOnMac) {
-                try {
-                  const hRes = await this.session.callPhone<any>("sys.control", { action: "hangup_call" }, 10000);
-                  hungUpAfter = Boolean(hRes?.hungUp);
-                } catch {}
-              }
-              return {
-                ...res,
-                ...(matchedContact ? { matchedContact } : {}),
-                spoken: playedOnMac,
-                spokenText: macSayText,
-                ttsEngine: playedOnMac ? "mac_speaker_edge_neural" : "mac_speaker_failed",
-                ...(callTtsMeta
-                  ? {
-                      voiceId: callTtsMeta.voiceId,
-                      voiceLabel: callTtsMeta.voiceLabel,
-                      cached: callTtsMeta.cached,
-                      audioBytes: callTtsMeta.bytes,
-                    }
-                  : {}),
-                ...(Boolean(params.hangupAfter ?? params.autoHangup) ? { hungUpAfter } : {}),
-              };
+              const continuation = new CallContinuation(deadlineMs, () => {
+                callPhone.assertCurrent();
+                if ((this.phoneEmergencyStopEpoch ?? 0) !== stopEpoch) throw new Error("ERR_USER_INTERRUPTED: Phone emergency stop");
+              });
+              try {
+                await continuation.pause(postDelay);
+                const playedOnMac = callTtsMeta
+                  ? await this.playNeuralAudioOnMacSpeaker(callTtsMeta.audioBase64, repeatCount, continuation)
+                  : false;
+                continuation.check();
+                let hungUpAfter = false;
+                if (Boolean(params.hangupAfter ?? params.autoHangup) && playedOnMac) {
+                  try {
+                    const hRes = await callPhone<any>("sys.control", { action: "hangup_call", deadlineMs }, Math.max(1, Math.min(10000, deadlineMs - Date.now())));
+                    continuation.check();
+                    hungUpAfter = Boolean(hRes?.hungUp);
+                  } catch { continuation.check(); }
+                }
+                return {
+                  ...res,
+                  ...(matchedContact ? { matchedContact } : {}),
+                  spoken: playedOnMac,
+                  spokenText: macSayText,
+                  ttsEngine: playedOnMac ? "mac_speaker_edge_neural" : "mac_speaker_failed",
+                  ...(callTtsMeta
+                    ? {
+                        voiceId: callTtsMeta.voiceId,
+                        voiceLabel: callTtsMeta.voiceLabel,
+                        cached: callTtsMeta.cached,
+                        audioBytes: callTtsMeta.bytes,
+                      }
+                    : {}),
+                  ...(Boolean(params.hangupAfter ?? params.autoHangup) ? { hungUpAfter } : {}),
+                };
+              } finally { continuation.dispose(); }
             }
             if (sayText && res && typeof res === "object") {
               if (callTtsMeta) {

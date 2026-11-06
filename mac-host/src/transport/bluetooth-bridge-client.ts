@@ -162,6 +162,19 @@ export class BluetoothBridgeServer extends EventEmitter {
     return this.latestAirpodsStatus;
   }
 
+  public async queryAudioOutput(timeoutMs = 1000): Promise<Record<string, any>> {
+    if (!this.activeClient) return { ok: false, message: "oms-bt-bridge 未连接" };
+    const reqId = `output_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingCmdWaiters.delete(reqId);
+        resolve({ ok: false, message: "音频输出核验超时" });
+      }, timeoutMs);
+      this.pendingCmdWaiters.set(reqId, { resolve, timer });
+      this.sendToBridge({ type: "audio_output_query", reqId });
+    });
+  }
+
   public updateAirpodsConfig(partial: Partial<MacBridgeAirPodsConfig>): void {
     this.latestAirpodsConfig = {
       ...this.latestAirpodsConfig,
@@ -340,6 +353,7 @@ export class BluetoothBridgeServer extends EventEmitter {
           this.emit("airpodsDiagnostics", msg.diagnostics);
         }
         break;
+      case "audio_output_result":
       case "airpods_cmd_result": {
         const reqId = String(msg.reqId || "");
         const waiter = this.pendingCmdWaiters.get(reqId);
