@@ -30,3 +30,6 @@ mac-host/bin/
 *.log
 *.tsbuildinfo
 __pycache__/
+
+# Local promotional assets
+docs/assets/share/

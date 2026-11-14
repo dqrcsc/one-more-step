@@ -43,17 +43,29 @@ describe("packaged Neural TTS provider", () => {
     const empty = fixture(`process.exit(0);`);
     expect(await synthesizeNeuralAudio(empty)).toEqual({ ok: false, reason: "invalid_audio" });
   });
-  test("notification and phone-speech callers expose their own fallback reasons", async () => {
+  test("notification and phone-speech callers expose their own fallback reasons and default to alarm stream", async () => {
     const d: any = Object.create(OmsDaemon.prototype);
     d.config = {};
+    const calls: Array<{ method: string; params: any }> = [];
     d.session = { presence: { getSnapshot: () => ({ state: "AWAY" }) },
-      callPhone: async () => ({ ok: true }), getActiveTier: () => "DISCONNECTED" };
+      callPhone: async (method: string, params: any) => { calls.push({ method, params }); return { ok: true }; },
+      getActiveTier: () => "DISCONNECTED" };
     d.synthesizeNeuralTts = async (_: string, opts: any) => { opts.onFallback("dependency_missing"); return null; };
     const notification = await d.handleIpcAction("phone_notify", { title: "test", ttsSpeak: true, level: "silent" });
+    const urgentNotification = await d.handleIpcAction("phone_notify", { title: "urgent", ttsSpeak: true, level: "urgent" });
     const speech = await d.handleIpcAction("phone_device_control", { action: "tts_speak", text: "test" });
     expect(notification.ttsFallbackReason).toBe("dependency_missing");
     expect(speech.ttsFallbackReason).toBe("dependency_missing");
     expect(speech.ttsEngine).toBe("android_local");
+    expect(calls[0].params.audioPolicy).toBe("alarm_respect_headset");
+    expect(calls[0].params.useAlarmStream).toBe(true);
+    expect(calls[0].params.forceSpeakerAlarmStream).toBe(false);
+    expect(calls[1].params.audioPolicy).toBe("force_speaker_alarm");
+    expect(calls[1].params.useAlarmStream).toBe(true);
+    expect(calls[1].params.forceSpeakerAlarmStream).toBe(true);
+    expect(calls[2].params.audioPolicy).toBe("alarm_respect_headset");
+    expect(calls[2].params.useAlarmStream).toBe(true);
+    expect(calls[2].params.forceSpeakerAlarmStream).toBe(false);
   });
   test("old phones never receive blind hangup GUI fallback", async () => {
     const d: any = Object.create(OmsDaemon.prototype);

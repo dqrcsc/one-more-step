@@ -1,6 +1,6 @@
 ---
 name: one-more-step
-description: 青简·咫尺 (OneMoreStep / oms) —— macOS 本地 AI Agent 与小米 Android 手机（HyperOS / MIUI）的全场景双向互操作与跨端协同工具。当用户提到“oms”、“OneMoreStep”、“青简”、“看看手机发来的图/文件/想法”、“拉取手机刚截的图/拍的照片”、“把这个发到我手机上/推送到手机时间流/通勤朗读”、“同步/读取/写入手机剪贴板或验证码”、“在手机上定闹钟”、“查手机日历/加日程”、“给手机发通知/强提醒/语音播报”、“寻找手机/让手机说话”、“解锁手机/图案密码解锁”、“用手机打电话/拨号/挂断电话”、“远程截屏/调节手机音量/打开手机应用或链接”、“发远程审批卡片到手机”、或“观察/点击/自动化操作手机屏幕 App”时使用。
+description: 青简·咫尺 (OneMoreStep / oms) —— macOS 本地 AI Agent 与小米 Android 手机（HyperOS / MIUI）的全场景双向互操作与跨端协同工具。当用户提到“设置闹钟”、“在手机上设置闹钟”、“定闹钟/设个闹钟/叫我起床”、“让手机提醒我”、“手机提醒我/发提醒到手机/任务完成后手机提醒我”、“让手机说话”、“让手机说/让手机喊一声/手机语音播报”、“找手机/手机在哪”、“oms”、“OneMoreStep”、“青简”、“看看手机发来的图/文件/想法”、“拉取手机刚截的图/拍的照片”、“把这个发到我手机上/推送到手机时间流/通勤朗读”、“同步/读取/写入手机剪贴板或验证码”、“查手机日历/加日程”、“给手机发通知/强提醒”、“解锁手机/图案密码解锁”、“用手机打电话/拨号/挂断电话”、“远程截屏/调节手机音量/打开手机应用或链接”、“发远程审批卡片到手机”、或“观察/点击/自动化操作手机屏幕 App”时，必须触发本技能并通过 oms 服务操作手机。
 ---
 
 # 青简·咫尺 · OneMoreStep (`oms`) 跨端双向互操作技能
@@ -16,9 +16,29 @@ description: 青简·咫尺 (OneMoreStep / oms) —— macOS 本地 AI Agent 与
 
 > 开发分支升级注意：v1.4.0 主机和手机同时升级，旧配对需使用 Mac 本地完整链接重新配对；禁止通过旧 OMS 明文通道或 HTTP 页面传递新凭据。GUI 节点动作必须携带最新 observationId；文件推送等待对端落盘 ACK。v2 使用认证加密业务帧且拒绝明文回退；HTTP 安装页、BLE/WAN 与完整断点恢复的边界见 [implementation-status](../../docs/implementation-status.md)。
 
-## 0. ⚡ 极速执行铁律（Fast Execution Rules）
+## 0. ⚡ 极速执行铁律与高频意图直达路由（Fast Execution & Intent Routing）
 
-- **直接执行全局 CLI，严禁翻阅源码**：当用户要求打电话、解锁、找手机、语音播报、同步剪贴板、拉取截图或操控手机时，**直接调用一条 `oms <subcommand>` 命令立即执行**，严禁在执行前去 `grep` 或阅读 `mac-host/`、`android-app/` 的代码文件。
+- **直接执行全局 CLI，严禁翻阅源码**：当用户要求设置闹钟、让手机提醒、让手机说话、打电话、解锁、找手机、同步剪贴板、拉取截图或操控手机时，**直接调用一条 `oms <subcommand>` 命令（或对应 `phone_*` MCP 工具）立即执行**，严禁在执行前去 `grep` 或阅读 `mac-host/`、`android-app/` 的代码文件。
+- **凡涉及“闹钟 / 手机提醒 / 手机说话”一律走 `oms` 手机端执行，禁止用 Mac 本地定时器替代**：
+  1. **「设置闹钟 / 在手机上设置闹钟 / 定个 X 点的闹钟 / 叫我起床」** ➔ 直接调用手机原生系统闹钟：
+     ```bash
+     oms alarm <HH:MM> --label "<闹钟备注>" [--days 1,2,3,4,5]
+     ```
+  2. **「让手机说话 / 让手机说句话 / 让手机语音播报……」** ➔ 直接调用手机真人语音开口说话（**默认三级智能路由 `alarm_respect_headset`：连接 AirPods/耳机时私密走耳机且锁屏/调音量不断流；未连耳机时走闹钟声道 `USAGE_ALARM` ≥75% 穿透静音/勿扰，播完自动恢复原系统闹钟音量；加 `--force-speaker` 可强制扬声器外放，加 `--no-alarm` 走纯媒体流**）：
+     ```bash
+     oms phone say "<要说的话>" [--force-speaker|--no-alarm] [--voice xiaoyi] [--repeat 1]
+     ```
+  3. **「让手机提醒我…… / 任务跑完让手机提醒我」** ➔ 按提醒性质自动选择最佳方式：
+     - **即时提醒 / 任务完成强提醒**（需要手机立即弹窗 + 震动 + 强制扬声器开口说话提醒用户，播完自动恢复原闹钟音量）：
+       ```bash
+       oms notify "<提醒正文>" --title "<提醒标题>" --level urgent --tts
+       ```
+     - **定点时刻提醒**（如“让手机 8:30 提醒我出门”）：同时或优先调用 `oms alarm 08:30 --label "<提醒内容>"`；
+     - **跨天/指定日期日程提醒**（如“让手机明天下午 3 点提醒我开评审会”）：先 `oms calendar list` 查重，再 `oms calendar add --title "<标题>" --start "<ISO时间>" --remind 15`。
+  4. **「找手机 / 手机放哪了 / 让手机响一下」** ➔ 强制手机内置扬声器 + 闹钟声道突破静音呼唤 + 强震动（播完自动恢复原闹钟音量）：
+     ```bash
+     oms phone find "正在寻找手机，我在这里！" --voice xiaoyi --repeat 2
+     ```
 - **联系人速查优先**：打电话给某人（如“老婆”）时，直接运行 `oms call 老婆 ...`（已内置常用联系人速查表 `oms contacts`），无需手动解锁再去点开手机通讯录 App 搜索号码；若遇到新联系人首次查到号码后，立即用 `oms contacts set <姓名> <号码> --sim <1|2>` 存入本地速查表。
 
 ## 1. 调用方式与架构约定
@@ -59,6 +79,9 @@ oms inbox --q "白板"
 # 查看单条投递记录详情
 oms inbox show <itemId>
 
+# 在 Mac 原生悬浮详情窗中直接打开查看（支持图片/PDF/Word/Excel内联预览，无需启动任何外部App）
+oms inbox peek [itemId]
+
 # 对包含语音附件 (.m4a/.mp3/.wav/.ogg) 的投递记录手动触发 SenseVoice 离线语音转写
 oms inbox transcribe <itemId>
 
@@ -67,10 +90,10 @@ oms inbox ack <itemId>
 ```
 
 **执行准则**：
-- 返回 JSON 中的 `items[].files[].absPath` 是文件在 Mac 本地的绝对路径，拿到后直接用 `read_file` 查看图片、截图或文档；
-- 手机端底部输入栏支持点击 **`🎙️语音`** 直接录制 `.m4a` 语音消息，Mac `omsd` 收到音频附件后会自动调用本地 `local-asr`（SenseVoiceSmall 离线模型）完成转写并回填到 `items[].voiceTranscript`；
+- 返回 JSON 中的 `items[].files[].absPath` 是文件在 Mac 本地的绝对路径（支持相册多图、PDF、Word `.doc/.docx`、Excel、PPT、Markdown、压缩包等多附件原文件名保留），拿到后可直接处理或用 `read_file` 查看；
+- 手机端底部输入栏与控制中心「青简·发Mac」半屏速发面板支持 **`🖼️相册`**、**`📎文件`**、**`📋剪贴板`** 与 **`🎙️语音`**，Mac `omsd` 收到音频附件后会自动调用本地 `local-asr`（SenseVoiceSmall 离线模型）完成转写并回填到 `items[].voiceTranscript`；
 - 务必同时关注 `items[].textContent` 与 `items[].voiceTranscript`；
-- Mac 宿主端默认开启「收到文字/语音转写自动进 Mac 剪贴板（可直接 `⌘V`）」与「收到图片自动弹窗预览」，可通过 `oms prefs` 查看或切换。
+- Mac 宿主端通过原生无 Dock 图标组件 `oms-mac-hud` 提供顶部菜单栏入口、右上角无打扰轻通知卡与点击即开的内联悬浮详情窗（内嵌 `PDFKit` 与 `QuickLookUI`，无需打开脚本编辑器或外部预览 App）。
 
 ### 2.2 主动检索并拉取手机相册最新截图或照片 (`oms media` & `oms pull`)
 
@@ -156,14 +179,15 @@ oms clip push
 oms status --live
 oms phone status
 
-# 2. 远程寻找手机（闹钟声道突破静音满音量 + Microsoft Edge Neural TTS 真人自然语音 + 强震动）
-#    - 默认循环播报 3 遍（可通过 --repeat <1..20> 指定重复遍数）
+# 2. 远程寻找手机（强制扬声器 + 闹钟声道突破静音 + Microsoft Edge Neural TTS 真人自然语音 + 强震动，播完自动恢复原闹钟音量）
+#    - 默认循环播报 2 遍（可通过 --repeat <1..20> 指定重复遍数）
 #    - 支持 --voice <音色别名> 选择 9 款真人神经网络音色，加 --save 可设为默认音色
 oms phone find "皮卡丘，快回家吃饭" --voice yunxia --repeat 8
 oms phone find "出来吧，皮卡丘" --voice hsiaochen --repeat 10
 
-# 3. 让手机直接用 Neural TTS 真人语音开口说话（--alarm 走闹钟声道突破静音）或查看音色列表 / 停止朗读
-oms phone say "任务已经执行完毕，请查看结果" --voice xiaoyi --repeat 2 --alarm
+# 3. 让手机直接用 Neural TTS 真人语音开口说话（默认尊重耳机私密播报、无耳机走闹钟声道突破静音并自动恢复音量；--force-speaker 强制外放；--no-alarm 纯媒体流）或查看音色列表 / 停止朗读
+oms phone say "任务已经执行完毕，请查看结果" --voice xiaoyi --repeat 2
+oms phone say "紧急广播，请立即查看" --force-speaker --voice xiaoyi
 oms phone voices
 oms phone stop-tts
 ```
@@ -289,10 +313,10 @@ oms calendar delete <eventId>
 # L1 静默记录（仅记入手机时间流，不响铃不震动）
 oms notify "后台索引已完成" --title "进度记录" --level silent
 
-# L2 常规通知（若用户在电脑旁 AT_DESK，自动转为 Mac 桌面弹窗 + 手机静默入流，避免桌上手机震动吵人）
+# L2 常规通知（若用户在电脑旁 AT_DESK，自动转为 Mac 桌面弹窗 + 手机静默入流，避免桌上手机震动吵人；加 --tts 默认戴耳机走耳机私密播报、无耳机走闹钟声道突破静音并恢复原音量）
 oms notify "单元测试已全部通过" --title "测试完成" --level normal
 
-# L3 紧急强触达（突破勿扰模式 + 锁屏全屏亮屏 + 强震动；加 --tts 走闹钟声道直接用 Neural TTS 真人语音播报，支持 --voice 与 --repeat）
+# L3 紧急强触达 / 让手机提醒我（突破勿扰模式 + 锁屏全屏亮屏 + 强震动；加 --tts 默认强制扬声器+闹钟声道用 Neural TTS 真人语音播报，播完自动恢复原闹钟音量）
 oms notify "注意：长耗时任务遇到异常，请及时查看" --title "紧急告警" --level urgent --tts --voice xiaoyi --repeat 2
 ```
 

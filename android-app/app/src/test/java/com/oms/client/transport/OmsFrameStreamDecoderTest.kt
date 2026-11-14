@@ -26,4 +26,19 @@ class OmsFrameStreamDecoderTest {
         assertTrue(decoder.push(frame.copyOfRange(0, 4)).isEmpty())
         assertEquals(2, decoder.push(frame.copyOfRange(4, frame.size) + frame).size)
     }
+
+    @Test fun tinyBleFragmentsDecodeLargeStreamWithLinearCompaction() {
+        val decoder = OmsFrameStreamDecoder()
+        val payload = ByteArray(128 * 1024) { (it and 0xFF).toByte() }
+        val encoded = OmsFrameProtocol.encodeFrame(OmsFrameProtocol.TYPE_STREAM_CHUNK, payload)
+        val decodedFrames = mutableListOf<OmsFrameProtocol.DecodedFrame>()
+        var offset = 0
+        while (offset < encoded.size) {
+            val end = minOf(offset + 180, encoded.size)
+            decodedFrames.addAll(decoder.push(encoded.copyOfRange(offset, end)))
+            offset = end
+        }
+        assertEquals(1, decodedFrames.size)
+        assertArrayEquals(payload, decodedFrames[0].payload)
+    }
 }

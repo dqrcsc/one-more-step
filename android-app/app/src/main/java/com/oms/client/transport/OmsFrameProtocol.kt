@@ -192,49 +192,88 @@ object OmsFrameProtocol {
 }
 
 /**
- * Stateful streaming frame decoder supporting fragmented Bluetooth RFCOMM streams & WebSocket frames
+ * Stateful O(N) streaming frame decoder supporting fragmented Bluetooth GATT/RFCOMM streams & WebSocket frames
  */
 class OmsFrameStreamDecoder {
-    private val buffer = ByteArrayOutputStream()
+    private var buf = ByteArray(8192)
+    private var readPos = 0
+    private var writePos = 0
     private val maxPayloadBytes = 16 * 1024 * 1024
 
     private fun validateFrame(condition: Boolean, message: String) {
-        if (!condition) { buffer.reset(); throw IllegalArgumentException(message) }
+        if (!condition) {
+            reset()
+            throw IllegalArgumentException(message)
+        }
+    }
+
+    private fun ensureCapacity(extraBytes: Int) {
+        val unread = writePos - readPos
+        val needed = unread + extraBytes
+        if (writePos + extraBytes <= buf.size) return
+        if (needed <= buf.size) {
+            if (unread > 0) {
+                System.arraycopy(buf, readPos, buf, 0, unread)
+            }
+            readPos = 0
+            writePos = unread
+            return
+        }
+        var newCap = buf.size.coerceAtLeast(8192)
+        while (newCap < needed) {
+            newCap = (newCap.toLong() * 2L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            if (newCap < needed && newCap == Int.MAX_VALUE) break
+        }
+        val next = ByteArray(maxOf(newCap, needed))
+        if (unread > 0) {
+            System.arraycopy(buf, readPos, next, 0, unread)
+        }
+        buf = next
+        readPos = 0
+        writePos = unread
     }
 
     @Synchronized
     fun push(chunk: ByteArray): List<OmsFrameProtocol.DecodedFrame> {
         if (chunk.isEmpty()) return emptyList()
-        validateFrame(buffer.size().toLong() + chunk.size <= 2L * (maxPayloadBytes + OmsFrameProtocol.HEADER_BYTES), "OMS decoder buffer exceeds limit")
-        buffer.write(chunk)
-        var current = buffer.toByteArray()
-        val frames = mutableListOf<OmsFrameProtocol.DecodedFrame>()
-        var offset = 0
+        val unreadBefore = (writePos - readPos).toLong()
+        validateFrame(
+            unreadBefore + chunk.size <= 2L * (maxPayloadBytes + OmsFrameProtocol.HEADER_BYTES),
+            "OMS decoder buffer exceeds limit"
+        )
+        ensureCapacity(chunk.size)
+        System.arraycopy(chunk, 0, buf, writePos, chunk.size)
+        writePos += chunk.size
 
-        while (current.size - offset >= OmsFrameProtocol.HEADER_BYTES) {
-            val magic = current[offset]
+        val frames = mutableListOf<OmsFrameProtocol.DecodedFrame>()
+        while (writePos - readPos >= OmsFrameProtocol.HEADER_BYTES) {
+            val magic = buf[readPos]
             validateFrame(magic == OmsFrameProtocol.MAGIC_BYTE, "Invalid OMS frame magic")
-            val version = current[offset + 1].toInt() and 0xFF
+            val version = buf[readPos + 1].toInt() and 0xFF
             validateFrame(version == OmsFrameProtocol.PROTOCOL_VERSION.toInt(), "Unsupported OMS protocol version")
-            val frameType = current[offset + 2].toInt() and 0xFF
-            val flags = current[offset + 3].toInt() and 0xFF
-            val payloadLen = ByteBuffer.wrap(current, offset + 4, 4).order(ByteOrder.BIG_ENDIAN).int
+            val frameType = buf[readPos + 2].toInt() and 0xFF
+            val flags = buf[readPos + 3].toInt() and 0xFF
+            val payloadLen = ((buf[readPos + 4].toInt() and 0xFF) shl 24) or
+                ((buf[readPos + 5].toInt() and 0xFF) shl 16) or
+                ((buf[readPos + 6].toInt() and 0xFF) shl 8) or
+                (buf[readPos + 7].toInt() and 0xFF)
 
             validateFrame(payloadLen in 0..maxPayloadBytes, "OMS frame payload exceeds limit")
             val totalLen = OmsFrameProtocol.HEADER_BYTES + payloadLen
-            if (current.size - offset < totalLen) {
+            if (writePos - readPos < totalLen) {
                 break
             }
 
-            val payload = current.copyOfRange(offset + OmsFrameProtocol.HEADER_BYTES, offset + totalLen)
+            val payload = buf.copyOfRange(readPos + OmsFrameProtocol.HEADER_BYTES, readPos + totalLen)
             frames.add(OmsFrameProtocol.DecodedFrame(version, frameType, flags, payload))
-            offset += totalLen
+            readPos += totalLen
         }
 
-        if (offset > 0) {
-            buffer.reset()
-            if (offset < current.size) {
-                buffer.write(current, offset, current.size - offset)
+        if (readPos == writePos) {
+            readPos = 0
+            writePos = 0
+            if (buf.size > 262_144) {
+                buf = ByteArray(8192)
             }
         }
         return frames
@@ -242,6 +281,10 @@ class OmsFrameStreamDecoder {
 
     @Synchronized
     fun reset() {
-        buffer.reset()
+        readPos = 0
+        writePos = 0
+        if (buf.size > 262_144) {
+            buf = ByteArray(8192)
+        }
     }
 }

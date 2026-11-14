@@ -55,4 +55,24 @@ class DeliveryPolicyTest {
         assertFalse(DeliveryPolicy.approvalCanDispatch(200, 100, "APPROVED"))
         assertTrue(DeliveryPolicy.approvalCanDispatch(200, 100, "PENDING_APPROVAL"))
     }
+
+    @Test fun diskBackedPartFileWritesOutOfOrderHandlesDuplicatesAndVerifiesSha256() {
+        val payload = byteArrayOf(10, 20, 30, 40, 50)
+        val hdr = header(payload, chunkSize = 2)
+        hdr.validate()
+        val tempFile = java.io.File.createTempFile("oms_stream_test_", ".part")
+        try {
+            val received = java.util.BitSet(hdr.totalChunks)
+            assertFalse(hdr.writeChunkToPartFile(tempFile, received, 2, byteArrayOf(50)))
+            assertFalse(hdr.writeChunkToPartFile(tempFile, received, 0, byteArrayOf(10, 20)))
+            // Idempotent duplicate chunk succeeds; conflicting duplicate chunk is rejected
+            assertFalse(hdr.writeChunkToPartFile(tempFile, received, 0, byteArrayOf(10, 20)))
+            rejects { hdr.writeChunkToPartFile(tempFile, received, 0, byteArrayOf(10, 99)) }
+            assertTrue(hdr.writeChunkToPartFile(tempFile, received, 1, byteArrayOf(30, 40)))
+            hdr.verifyAndSyncPartFile(tempFile)
+            assertArrayEquals(payload, tempFile.readBytes())
+        } finally {
+            tempFile.delete()
+        }
+    }
 }

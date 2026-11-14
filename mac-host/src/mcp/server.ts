@@ -1,5 +1,19 @@
 #!/usr/bin/env bun
+import fs from "node:fs";
+import path from "node:path";
 import { OmsIpcClient } from "../daemon/ipc-client.js";
+
+function loadPackageVersion(): string {
+  try {
+    const pkgPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../../package.json");
+    const parsed = JSON.parse(fs.readFileSync(pkgPath, "utf8")) as { version?: string };
+    return parsed.version || "1.6.2";
+  } catch {
+    return "1.6.2";
+  }
+}
+
+const OMS_MCP_VERSION = loadPackageVersion();
 
 /**
  * Module 07: Standard MCP Server (`one-more-step-mcp`) over stdio
@@ -212,7 +226,23 @@ export const OMS_MCP_TOOLS = [
         ttsSpeak: {
           type: "boolean",
           default: false,
-          description: "是否让手机直接用真人语音播报通知内容（urgent 级别下静音也能发声）",
+          description:
+            "是否让手机直接用真人语音播报通知内容（level=urgent 默认强制扬声器+闹钟声道并在播完自动恢复原音量；常规提醒默认 alarm_respect_headset：戴耳机时走耳机私密播报，未戴耳机时走闹钟声道穿透静音并自动恢复音量）",
+        },
+        audioPolicy: {
+          type: "string",
+          enum: ["force_speaker_alarm", "alarm_respect_headset", "media_commute"],
+          description:
+            "可选：三级语音路由策略（force_speaker_alarm=强制扬声器+闹钟声道；alarm_respect_headset=尊重耳机私密播报、无耳机走闹钟声道穿透静音；media_commute=纯媒体流）",
+        },
+        forceSpeakerAlarmStream: {
+          type: "boolean",
+          description: "可选：true 时即使佩戴耳机也强制通过手机内置扬声器+闹钟声道外放",
+        },
+        useAlarmStream: {
+          type: "boolean",
+          default: true,
+          description: "ttsSpeak 时是否允许在无耳机时走闹钟声道穿透静音（设为 false 则强制走 media_commute 媒体流）",
         },
         voice: {
           type: "string",
@@ -312,17 +342,27 @@ export const OMS_MCP_TOOLS = [
           minimum: 1,
           maximum: 20,
           description:
-            "find_phone 或 tts_speak 时的语音循环播报次数（1~20 次；find_phone 默认 3 次，tts_speak 默认 1 次）",
+            "find_phone 或 tts_speak 时的语音循环播报次数（1~20 次；find_phone 默认 2 次，tts_speak 默认 1 次）",
         },
         saveVoice: {
           type: "boolean",
           default: false,
           description: "是否将本次指定的 voice 设为默认语音音色",
         },
+        audioPolicy: {
+          type: "string",
+          enum: ["force_speaker_alarm", "alarm_respect_headset", "media_commute"],
+          description:
+            "可选：三级语音路由策略（find_phone 默认 force_speaker_alarm 强制扬声器外放；tts_speak 默认 alarm_respect_headset 戴耳机走耳机、未戴耳机走闹钟声道穿透静音并自动恢复原音量）",
+        },
+        forceSpeakerAlarmStream: {
+          type: "boolean",
+          description: "可选：tts_speak 时设为 true 可强制使用手机内置扬声器+闹钟声道外放",
+        },
         useAlarmStream: {
           type: "boolean",
           default: true,
-          description: "tts_speak 时是否走闹钟声道（静音模式下也能发声）",
+          description: "tts_speak 时设为 false 可切换为 media_commute 纯媒体流（不触碰闹钟声道）",
         },
         stream: {
           type: "string",
@@ -530,7 +570,7 @@ export class OmsMcpServer {
               },
               serverInfo: {
                 name: "one-more-step-mcp",
-                version: "1.5.8",
+                version: OMS_MCP_VERSION,
               },
             },
           };
@@ -577,11 +617,26 @@ export class OmsMcpServer {
           if (uri === "oms://inbox/latest") {
             data = await this.ipc.call("phone_inbox_latest", { limit: 1 });
           } else if (uri === "oms://inbox/pkb_pending") {
-            data = await this.ipc.call("phone_inbox_latest", {
-              tag: "pkb_vault",
-              onlyUnprocessed: true,
-              limit: 20,
-            });
+            const [pkbRes, voiceRes] = await Promise.all([
+              this.ipc.call("phone_inbox_latest", {
+                tag: "pkb_vault",
+                onlyUnprocessed: true,
+                limit: 20,
+              }),
+              this.ipc.call("phone_inbox_latest", {
+                tag: "voice_idea",
+                onlyUnprocessed: true,
+                limit: 20,
+              }),
+            ]);
+            const mergedMap = new Map<string, any>();
+            for (const item of [...(pkbRes?.items ?? []), ...(voiceRes?.items ?? [])]) {
+              if (item?.itemId) mergedMap.set(item.itemId, item);
+            }
+            const items = Array.from(mergedMap.values())
+              .sort((a, b) => (b.createdAtMs ?? 0) - (a.createdAtMs ?? 0))
+              .slice(0, 20);
+            data = { count: items.length, items };
           } else if (uri === "oms://phone/status") {
             data = await this.ipc.call("phone_presence_status", {});
           } else {

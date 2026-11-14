@@ -15,17 +15,25 @@ try {
   console.warn("⚠️ Neural TTS unavailable; using Android local speech. Retry: bun run setup:tts");
 }
 
-// 1. Compile macOS CoreBluetooth bridge if on macOS
+// 1. Compile macOS CoreBluetooth bridge & Native Mac HUD if on macOS
 if (process.platform === "darwin") {
   const btSrc = path.join(repoRoot, "mac-host/bluetooth-bridge/main.swift");
+  const hudSrc = path.join(repoRoot, "mac-host/mac-hud/main.swift");
   const btBinDir = path.join(repoRoot, "mac-host/bin");
   const btBin = path.join(btBinDir, "oms-bt-bridge");
+  const hudBin = path.join(btBinDir, "oms-mac-hud");
   try {
     fs.mkdirSync(btBinDir, { recursive: true });
     execFileSync("swiftc", [path.join(path.dirname(btSrc), "AirPodsOperation.swift"), path.join(path.dirname(btSrc), "AirPodsNativeRequest.swift"), btSrc, "-o", btBin], { stdio: "inherit" });
     console.log(`✅ Compiled macOS CoreBluetooth bridge: ${btBin}`);
   } catch (err: any) {
     console.warn(`⚠️ Skipping Bluetooth binary compilation (${err?.message || err})`);
+  }
+  try {
+    execFileSync("swiftc", [hudSrc, "-framework", "Cocoa", "-framework", "PDFKit", "-framework", "Quartz", "-framework", "AVFoundation", "-o", hudBin], { stdio: "inherit" });
+    console.log(`✅ Compiled macOS Native HUD helper: ${hudBin}`);
+  } catch (err: any) {
+    console.warn(`⚠️ Skipping Mac HUD binary compilation (${err?.message || err})`);
   }
 }
 

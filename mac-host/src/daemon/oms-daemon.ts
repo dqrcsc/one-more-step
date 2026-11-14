@@ -28,11 +28,13 @@ import {
   PairedAirPodsDevice,
   ScreenFrameCodec,
   ScreenFrameFlags,
+  SpeechAudioPolicyName,
 } from "@oms/shared-protocol";
 import { PhoneSessionManager, TrustedPhoneDevice } from "../transport/session-manager.js";
-import { InboxManager } from "../inbox/inbox-manager.js";
+import { InboxManager, StoredInboxItem } from "../inbox/inbox-manager.js";
 import { handleDashboardHttpRequest } from "../inbox/inbox-web-dashboard.js";
 import { DingTalkConfig, DingTalkPlugin } from "../plugins/dingtalk.js";
+import { HudStatusPayload, MacHudServer } from "../hud/mac-hud-server.js";
 
 export interface OmsHostConfig {
   lanPort: number;
@@ -65,6 +67,29 @@ export const NEURAL_TTS_VOICE_CATALOG: Record<string, { id: string; label: strin
   hiugaai: { id: "zh-HK-HiuGaaiNeural", label: "晓佳 · 自然粤语女声" },
 };
 
+const SAFE_MAC_PREVIEW_EXTENSIONS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".gif",
+  ".heic",
+  ".bmp",
+  ".tiff",
+  ".pdf",
+  ".mp3",
+  ".m4a",
+  ".wav",
+  ".aac",
+  ".ogg",
+  ".mp4",
+  ".mov",
+  ".txt",
+  ".md",
+  ".csv",
+  ".json",
+]);
+
 /**
  * Module 06: Mac Host Singleton Daemon (`omsd`)
  * Manages ~/.one_more_step/, Multi-Agent Local Unix Socket IPC, Inbox, Presence Routing & Approvals
@@ -73,6 +98,7 @@ export class OmsDaemon {
   public readonly homeDir: string;
   public readonly ipcSocketPath: string;
   public readonly btSocketPath: string;
+  public readonly hudSocketPath: string;
   public readonly inbox: InboxManager;
   public readonly session: PhoneSessionManager;
   public readonly dingtalk: DingTalkPlugin;
@@ -83,6 +109,7 @@ export class OmsDaemon {
   private readonly config: OmsHostConfig;
   private readonly identity: Ed25519Identity;
   private ipcServer: net.Server | null = null;
+  private hudServer: MacHudServer | null = null;
   private lastStatusRefreshMs = 0;
 
   private readonly pendingApprovals = new Map<
@@ -146,6 +173,7 @@ export class OmsDaemon {
     this.trustedDevicesPath = path.join(this.homeDir, "keystore", "trusted_devices.json");
     this.ipcSocketPath = path.join(this.homeDir, "run", "omsd.sock");
     this.btSocketPath = path.join(this.homeDir, "run", "bt.sock");
+    this.hudSocketPath = path.join(this.homeDir, "run", "hud.sock");
 
     this.rotateLogFileIfNeeded(path.join(this.homeDir, "logs", "omsd.log"));
     this.rotateLogFileIfNeeded(path.join(this.homeDir, "logs", "connections.jsonl"));
@@ -463,6 +491,94 @@ export class OmsDaemon {
     return runCallAudioProcess("afplay", [mp3Path], continuation);
   }
 
+  protected playMacSystemSay(text: string, continuation: CallContinuation): Promise<void> {
+    return runCallAudioProcess("say", [text], continuation);
+  }
+
+  public static isSafeForDirectMacPreview(absPath: string): boolean {
+    if (!absPath) return false;
+    const normalized = absPath.toLowerCase();
+    if (normalized.endsWith(".app") || normalized.includes(".app/")) return false;
+    const ext = path.extname(normalized);
+    return Boolean(ext && SAFE_MAC_PREVIEW_EXTENSIONS.has(ext));
+  }
+
+  public static resolveSpeechAudioPolicy(
+    params: Record<string, any> = {},
+    defaultPolicy: SpeechAudioPolicyName = "alarm_respect_headset"
+  ): SpeechAudioPolicyName {
+    if (typeof params.audioPolicy === "string") {
+      const normalized = params.audioPolicy.trim().toLowerCase();
+      if (normalized === "force_speaker_alarm" || normalized === "force_speaker") {
+        return "force_speaker_alarm";
+      }
+      if (normalized === "alarm_respect_headset" || normalized === "respect_headset") {
+        return "alarm_respect_headset";
+      }
+      if (normalized === "media_commute" || normalized === "media") {
+        return "media_commute";
+      }
+    }
+    if (params.forceSpeakerAlarmStream === true || params.forceSpeaker === true) {
+      return "force_speaker_alarm";
+    }
+    if (params.useAlarmStream === false) {
+      return "media_commute";
+    }
+    if (params.forceSpeakerAlarmStream === false && defaultPolicy === "force_speaker_alarm") {
+      return "alarm_respect_headset";
+    }
+    return defaultPolicy;
+  }
+
+  private async runMonitoredMacSpeakerLoop(
+    repeatCount: number,
+    continuation: CallContinuation,
+    playOnce: () => Promise<void>
+  ): Promise<boolean> {
+    continuation.check();
+    if (process.env.OMS_DISABLE_OSASCRIPT === "1") return false;
+    let monitoring = false;
+    let routeTimer: ReturnType<typeof setInterval> | undefined;
+    try {
+      const outputUid = await this.requireMacSpeakerOutput(continuation);
+      monitoring = true;
+      let checking = false;
+      routeTimer = setInterval(async () => {
+        if (!monitoring || checking) return;
+        checking = true;
+        try {
+          await this.requireMacSpeakerOutput(continuation, outputUid);
+        } catch (error) {
+          if (monitoring) {
+            continuation.cancel(error instanceof Error ? error : new Error(String(error)));
+          }
+        } finally {
+          checking = false;
+        }
+      }, 250);
+      const count = Math.max(1, Math.min(10, Math.round(repeatCount)));
+      for (let i = 0; i < count; i++) {
+        await this.requireMacSpeakerOutput(continuation, outputUid);
+        await playOnce();
+        await this.requireMacSpeakerOutput(continuation, outputUid);
+        if (i < count - 1) {
+          await continuation.pause(420);
+        }
+      }
+      return true;
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("ERR_MAC_SPEAKER_ROUTE")) {
+        continuation.cancel(error);
+      }
+      continuation.check();
+      return false;
+    } finally {
+      monitoring = false;
+      if (routeTimer) clearInterval(routeTimer);
+    }
+  }
+
   private async requireMacSpeakerOutput(continuation: CallContinuation, expectedUid?: string): Promise<string> {
     continuation.check();
     const output = await this.session.getBluetoothBridge()?.queryAudioOutput(
@@ -478,47 +594,30 @@ export class OmsDaemon {
   public async playNeuralAudioOnMacSpeaker(audioBase64: string, repeatCount: number, continuation: CallContinuation): Promise<boolean> {
     continuation.check();
     if (!audioBase64 || process.env.OMS_DISABLE_OSASCRIPT === "1") return false;
-    let monitoring = false;
-    let routeTimer: ReturnType<typeof setInterval> | undefined;
-    try {
-      const outputUid = await this.requireMacSpeakerOutput(continuation);
-      monitoring = true;
-      let checking = false;
-      routeTimer = setInterval(async () => {
-        if (!monitoring || checking) return;
-        checking = true;
-        try { await this.requireMacSpeakerOutput(continuation, outputUid); }
-        catch (error) { if (monitoring) continuation.cancel(error instanceof Error ? error : new Error(String(error))); }
-        finally { checking = false; }
-      }, 250);
-      const cacheDir = path.join(this.homeDir || os.tmpdir(), "cache", "tts");
-      fs.mkdirSync(cacheDir, { recursive: true });
-      const mp3Path = path.join(cacheDir, "mac_speaker_active.mp3");
-      fs.writeFileSync(mp3Path, Buffer.from(audioBase64, "base64"));
-      const count = Math.max(1, Math.min(10, Math.round(repeatCount)));
-      for (let i = 0; i < count; i++) {
-        await this.requireMacSpeakerOutput(continuation, outputUid);
-        await this.playMacAudioFile(mp3Path, continuation);
-        await this.requireMacSpeakerOutput(continuation, outputUid);
-        if (i < count - 1) {
-          await continuation.pause(420);
-        }
-      }
-      return true;
-    } catch (error) {
-      if (error instanceof Error && error.message.startsWith("ERR_MAC_SPEAKER_ROUTE")) continuation.cancel(error);
-      continuation.check();
-      return false;
-    } finally {
-      monitoring = false;
-      if (routeTimer) clearInterval(routeTimer);
-    }
+    const cacheDir = path.join(this.homeDir || os.tmpdir(), "cache", "tts");
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const mp3Path = path.join(cacheDir, "mac_speaker_active.mp3");
+    fs.writeFileSync(mp3Path, Buffer.from(audioBase64, "base64"));
+    return await this.runMonitoredMacSpeakerLoop(repeatCount, continuation, () =>
+      this.playMacAudioFile(mp3Path, continuation)
+    );
+  }
+
+  public async playFallbackSayOnMacSpeaker(text: string, repeatCount: number, continuation: CallContinuation): Promise<boolean> {
+    const clean = text.trim();
+    continuation.check();
+    if (!clean || process.env.OMS_DISABLE_OSASCRIPT === "1") return false;
+    return await this.runMonitoredMacSpeakerLoop(repeatCount, continuation, () =>
+      this.playMacSystemSay(clean, continuation)
+    );
   }
 
   public copyTextToMacClipboard(text: string): void {
     if (!text || process.env.OMS_DISABLE_OSASCRIPT === "1") return;
     try {
       const proc = spawn("pbcopy");
+      proc.on("error", () => {});
+      proc.stdin.on("error", () => {});
       proc.stdin.write(text, "utf8");
       proc.stdin.end();
     } catch {
@@ -526,14 +625,21 @@ export class OmsDaemon {
     }
   }
 
-  public openFileOnMac(absPath: string, revealInFinder = false): void {
-    if (!absPath || process.env.OMS_DISABLE_OSASCRIPT === "1") return;
+  public openFileOnMac(absPath: string, revealInFinder = false): { args: string[]; downgradedToReveal: boolean } {
+    const safeDirect = !revealInFinder && OmsDaemon.isSafeForDirectMacPreview(absPath);
+    const effectiveReveal = revealInFinder || !safeDirect;
+    const args = effectiveReveal ? ["-R", absPath] : [absPath];
+    const downgradedToReveal = !revealInFinder && effectiveReveal;
+    if (!absPath || process.env.OMS_DISABLE_OSASCRIPT === "1") {
+      return { args, downgradedToReveal };
+    }
     try {
-      const args = revealInFinder ? ["-R", absPath] : [absPath];
-      execFile("open", args);
+      const child = execFile("open", args, () => {});
+      child.on("error", () => {});
     } catch {
       // ignore
     }
+    return { args, downgradedToReveal };
   }
 
   private loadOrInitIdentity(): Ed25519Identity {
@@ -578,6 +684,7 @@ export class OmsDaemon {
         this.ingestPhoneAirpodsSnapshot(evt.status);
       }
       this.syncAirpodsConfigToBridgeAndPhone();
+      this.syncMacHudState();
     });
 
     this.session.on("airpodsDiagnostics", (diagnostics) => {
@@ -723,6 +830,11 @@ export class OmsDaemon {
             const stored = this.inbox.storeSubmittedItem(params, (streamId) =>
               this.session.getCompletedStream(streamId)
             );
+            try {
+              this.inbox.pruneStagingCache();
+            } catch {
+              // best-effort staging cleanup
+            }
 
             if (alreadyCommitted) {
               reply({ result: { ack: true, savedId: stored.itemId, macPath: stored.files[0]?.absPath ?? this.inbox.inboxRootDir } });
@@ -741,6 +853,7 @@ export class OmsDaemon {
             );
 
             let actionHint = "";
+            const nativeHudActive = Boolean(this.hudServer?.isConnected());
             if (stored.intentTag === "sms_otp" || stored.otpCode) {
               const otpCode = stored.otpCode || textBody.trim();
               const isFreshOtp =
@@ -759,7 +872,8 @@ export class OmsDaemon {
                   `🔑 ${senderBadge}验证码: ${otpCode}`,
                   textBody || stored.title || `验证码: ${otpCode}`,
                   subtitle,
-                  "Glass"
+                  "Glass",
+                  stored
                 );
               }
             } else {
@@ -768,17 +882,35 @@ export class OmsDaemon {
                 actionHint = " · 已复制可 ⌘V";
               }
               if (imageFile && this.config.autoPreviewImageOnMac !== false) {
-                this.openFileOnMac(imageFile.absPath, false);
-                actionHint = actionHint ? `${actionHint} & 已打开预览` : " · 已打开图片预览";
+                if (nativeHudActive) {
+                  actionHint = actionHint
+                    ? `${actionHint} · 点卡片内联查看`
+                    : " · 点卡片内联查看";
+                } else {
+                  const opened = this.openFileOnMac(imageFile.absPath, false);
+                  const label = opened.downgradedToReveal ? "已在 Finder 中定位" : "已打开预览";
+                  actionHint = actionHint ? `${actionHint} & ${label}` : ` · ${label}`;
+                }
+              } else if (!imageFile && stored.files.length > 0 && nativeHudActive) {
+                actionHint = actionHint
+                  ? `${actionHint} · 点卡片直接预览`
+                  : " · 点卡片直接预览";
               }
               if (audioFile && !stored.voiceTranscript) {
                 actionHint = actionHint ? `${actionHint} · 正在离线转写语音` : " · 正在离线转写语音";
                 void this.transcribeInboxItem(stored.itemId).catch(() => {});
               }
 
+              const attachmentDesc =
+                stored.files.length > 1
+                  ? `${stored.files[0].fileName} 等 ${stored.files.length} 个文件`
+                  : stored.files[0]?.fileName || "附件";
               this.showMacDesktopNotification(
                 `📱 收到小米手机投递 (#${stored.intentTag})${actionHint}`,
-                textBody || stored.title || `新文件 (${stored.files[0]?.fileName || "附件"}) 已存入 Inbox`
+                textBody || stored.title || `新文件 (${attachmentDesc}) 已存入 Inbox`,
+                nativeHudActive ? `#${stored.intentTag} · 点击查看详情(无需打开外部App)` : undefined,
+                undefined,
+                stored
               );
             }
             reply({
@@ -1168,16 +1300,66 @@ export class OmsDaemon {
     };
   }
 
+  private getHudStatusPayload(): HudStatusPayload {
+    return {
+      activeTier: this.session.getActiveTier(),
+      phoneName: this.session.getPhoneStatus()?.deviceModel,
+      inboxDir: this.inbox.inboxRootDir,
+    };
+  }
+
+  public syncMacHudState(): void {
+    if (!this.hudServer?.isConnected()) return;
+    this.hudServer.syncState(
+      this.inbox.queryLatest({ limit: 25 }),
+      this.getHudStatusPayload()
+    );
+  }
+
+  public peekInboxInHud(itemId?: string): { ok: boolean; hudActive: boolean; itemId?: string } {
+    const targetItem = itemId
+      ? this.inbox.getItem(itemId)
+      : this.inbox.queryLatest({ limit: 1 })[0];
+    if (this.hudServer?.isConnected()) {
+      const delivered = this.hudServer.peek(targetItem?.itemId ?? itemId, {
+        item: targetItem,
+        status: this.getHudStatusPayload(),
+      });
+      return { ok: delivered, hudActive: true, itemId: targetItem?.itemId ?? itemId };
+    }
+    return { ok: false, hudActive: false, itemId: targetItem?.itemId ?? itemId };
+  }
+
   private showMacDesktopNotification(
     title: string,
     message: string,
     subtitle?: string,
-    soundName?: string
+    soundName?: string,
+    item?: StoredInboxItem
   ): void {
-    if (process.env.OMS_DISABLE_OSASCRIPT === "1") return;
     if (soundName) {
       this.session.getBluetoothBridge()?.suppressAirpodsAutoGrab(2600);
     }
+    if (
+      this.hudServer?.isConnected() &&
+      this.hudServer.notify(
+        {
+          title,
+          message,
+          subtitle,
+          soundName,
+          itemId: item?.itemId,
+        },
+        {
+          item,
+          items: this.inbox.queryLatest({ limit: 25 }),
+          status: this.getHudStatusPayload(),
+        }
+      )
+    ) {
+      return;
+    }
+    if (process.env.OMS_DISABLE_OSASCRIPT === "1") return;
     const safeTitle = title.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
     const safeMsg = message.replace(/\\/g, "\\\\").replace(/"/g, '\\"').slice(0, 180);
     const safeSub = subtitle
@@ -1193,7 +1375,38 @@ export class OmsDaemon {
         script += ` sound name "${safeSound}"`;
       }
     }
-    execFile("osascript", ["-e", script]);
+    const child = execFile("osascript", ["-e", script], () => {});
+    child.on("error", () => {});
+  }
+
+  private pruneFlatCacheDir(dirPath: string, maxFiles = 200, maxAgeMs = 7 * 24 * 3600 * 1000): void {
+    try {
+      if (!fs.existsSync(dirPath)) return;
+      const now = Date.now();
+      const entries = fs
+        .readdirSync(dirPath)
+        .map((name) => {
+          const full = path.join(dirPath, name);
+          try {
+            const st = fs.statSync(full);
+            if (!st.isFile()) return null;
+            return { full, mtimeMs: st.mtimeMs };
+          } catch {
+            return null;
+          }
+        })
+        .filter((e): e is { full: string; mtimeMs: number } => e !== null)
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+      for (let i = 0; i < entries.length; i++) {
+        if (i >= maxFiles || now - entries[i].mtimeMs > maxAgeMs) {
+          try {
+            fs.unlinkSync(entries[i].full);
+          } catch {}
+        }
+      }
+    } catch {
+      // best-effort cache prune
+    }
   }
 
   public async transcribeAudioFileWithLocalAsr(audioAbsPath: string): Promise<string | null> {
@@ -1208,41 +1421,46 @@ export class OmsDaemon {
     const outDir = path.join(this.homeDir, "inbox", "asr_cache");
     fs.mkdirSync(outDir, { recursive: true });
 
-    return await new Promise<string | null>((resolve) => {
-      execFile(
-        asrBin,
-        [audioAbsPath, "--out-dir", outDir, "--format", "json,txt", "--print-json", "--quiet"],
-        { timeout: 60000, maxBuffer: 4 * 1024 * 1024 },
-        (err, stdout) => {
-          if (!err && stdout) {
-            try {
-              const trimmed = stdout.trim();
-              const jsonStart = trimmed.indexOf("{");
-              if (jsonStart !== -1) {
-                const parsed = JSON.parse(trimmed.slice(jsonStart));
-                const txt = String(parsed.text || parsed.raw_text || "").trim();
-                if (txt) {
-                  resolve(txt);
-                  return;
+    try {
+      return await new Promise<string | null>((resolve) => {
+        const child = execFile(
+          asrBin,
+          [audioAbsPath, "--out-dir", outDir, "--format", "json,txt", "--print-json", "--quiet"],
+          { timeout: 60000, maxBuffer: 4 * 1024 * 1024 },
+          (err, stdout) => {
+            if (!err && stdout) {
+              try {
+                const trimmed = stdout.trim();
+                const jsonStart = trimmed.indexOf("{");
+                if (jsonStart !== -1) {
+                  const parsed = JSON.parse(trimmed.slice(jsonStart));
+                  const txt = String(parsed.text || parsed.raw_text || "").trim();
+                  if (txt) {
+                    resolve(txt);
+                    return;
+                  }
                 }
+              } catch {
+                // fallback to txt file
               }
-            } catch {
-              // fallback to txt file
             }
-          }
-          const stem = path.basename(audioAbsPath, path.extname(audioAbsPath));
-          const txtPath = path.join(outDir, `${stem}.txt`);
-          if (fs.existsSync(txtPath)) {
-            const txt = fs.readFileSync(txtPath, "utf8").trim();
-            if (txt) {
-              resolve(txt);
-              return;
+            const stem = path.basename(audioAbsPath, path.extname(audioAbsPath));
+            const txtPath = path.join(outDir, `${stem}.txt`);
+            if (fs.existsSync(txtPath)) {
+              const txt = fs.readFileSync(txtPath, "utf8").trim();
+              if (txt) {
+                resolve(txt);
+                return;
+              }
             }
+            resolve(null);
           }
-          resolve(null);
-        }
-      );
-    });
+        );
+        child.on("error", () => {});
+      });
+    } finally {
+      this.pruneFlatCacheDir(outDir);
+    }
   }
 
   public async transcribeInboxItem(itemId: string): Promise<{
@@ -1264,13 +1482,16 @@ export class OmsDaemon {
     }
     const transcript = await this.transcribeAudioFileWithLocalAsr(audioFile.absPath);
     if (transcript) {
-      this.inbox.updateItemTranscript(itemId, transcript);
+      const updated = this.inbox.updateItemTranscript(itemId, transcript);
       if (this.config.autoCopyTextToClipboard !== false) {
         this.copyTextToMacClipboard(transcript);
       }
       this.showMacDesktopNotification(
         `🎙️ 手机语音已转写 (#${item.intentTag} · 可 ⌘V)`,
-        transcript
+        transcript,
+        "点击卡片查看完整转写与播放原声",
+        undefined,
+        updated
       );
       return { ok: true, itemId, transcript };
     }
@@ -1463,7 +1684,10 @@ export class OmsDaemon {
     if (typeof params.maxFps === "number" && Number.isFinite(params.maxFps)) {
       this.mirrorMaxFps = Math.max(2, Math.min(12, Math.round(params.maxFps)));
     }
-    const autoWake = params.autoWake !== false;
+    const autoWake =
+      params.autoWake !== undefined
+        ? Boolean(params.autoWake)
+        : params.wakeScreen !== false;
     const request = {
       maxWidth: this.mirrorMaxWidth,
       quality: this.mirrorQuality,
@@ -1610,6 +1834,49 @@ export class OmsDaemon {
         wanRelayWssUrl: this.config.wanRelayWssUrl,
       });
       this.syncAirpodsConfigToBridgeAndPhone();
+
+      if (process.platform === "darwin" && process.env.OMS_DISABLE_OSASCRIPT !== "1") {
+        const hudBin = path.join(macHostRoot, "bin", "oms-mac-hud");
+        const hudSrc = path.join(macHostRoot, "mac-hud", "main.swift");
+        const hudBinStat = fs.existsSync(hudBin) ? fs.statSync(hudBin) : null;
+        const hudSrcStat = fs.existsSync(hudSrc) ? fs.statSync(hudSrc) : null;
+        if (hudSrcStat && (!hudBinStat || hudSrcStat.mtimeMs > hudBinStat.mtimeMs)) {
+          try {
+            fs.mkdirSync(path.dirname(hudBin), { recursive: true });
+            execFileSync(
+              "swiftc",
+              [
+                hudSrc,
+                "-framework",
+                "Cocoa",
+                "-framework",
+                "PDFKit",
+                "-framework",
+                "Quartz",
+                "-framework",
+                "AVFoundation",
+                "-o",
+                hudBin,
+              ],
+              { timeout: 35000, stdio: "ignore" }
+            );
+          } catch {
+            // ignore if swiftc / Xcode CLT is unavailable
+          }
+        }
+        this.hudServer = new MacHudServer({
+          socketPath: this.hudSocketPath,
+          binaryPath: fs.existsSync(hudBin) ? hudBin : undefined,
+          autoSpawnBinary: true,
+        });
+        this.hudServer.on("clientConnected", () => this.syncMacHudState());
+        this.hudServer.on("requestSync", () => this.syncMacHudState());
+        this.hudServer.on("markProcessed", (id: string) => {
+          this.inbox.markProcessed(id, true);
+          this.syncMacHudState();
+        });
+        await this.hudServer.start().catch(() => {});
+      }
     }
 
     if (fs.existsSync(this.ipcSocketPath)) {
@@ -1814,12 +2081,19 @@ export class OmsDaemon {
         const itemId = String(params.itemId || "");
         const processed = params.processed !== false;
         const ok = this.inbox.markProcessed(itemId, processed);
+        this.syncMacHudState();
         return { ok, itemId, processed };
       }
 
       case "inbox.clear_processed": {
         const removedCount = this.inbox.clearProcessed();
+        this.syncMacHudState();
         return { ok: true, removedCount };
+      }
+
+      case "inbox.peek": {
+        const itemId = params.itemId ? String(params.itemId) : undefined;
+        return this.peekInboxInHud(itemId);
       }
 
       case "inbox.transcribe_item": {
@@ -1949,7 +2223,11 @@ export class OmsDaemon {
           });
           if (params.includeRecentOtp && !clipRes?.recentOtp) {
             const latestOtp = this.inbox.queryLatest({ tag: "sms_otp", limit: 1 })[0];
-            if (latestOtp && latestOtp.otpCode) {
+            if (
+              latestOtp &&
+              latestOtp.otpCode &&
+              Math.abs(Date.now() - (latestOtp.createdAtMs || 0)) <= 5 * 60 * 1000
+            ) {
               return {
                 ...clipRes,
                 recentOtp: {
@@ -2026,6 +2304,12 @@ export class OmsDaemon {
           presenceState === "AT_DESK" && level === "normal" ? "silent" : level;
 
         const ttsSpeak = Boolean(params.ttsSpeak);
+        const audioPolicy = OmsDaemon.resolveSpeechAudioPolicy(
+          params,
+          effectivePhoneLevel === "urgent" ? "force_speaker_alarm" : "alarm_respect_headset"
+        );
+        const useAlarmStream = audioPolicy !== "media_commute";
+        const forceSpeakerAlarmStream = audioPolicy === "force_speaker_alarm";
         const repeatCount =
           typeof params.repeat === "number" && Number.isFinite(params.repeat)
             ? Math.max(1, Math.min(20, Math.round(params.repeat)))
@@ -2033,6 +2317,7 @@ export class OmsDaemon {
         let neuralTts: Awaited<ReturnType<typeof this.synthesizeNeuralTts>> = null;
         let ttsFallbackReason: TtsFallbackReason | undefined;
         if (ttsSpeak) {
+          this.suppressPhoneAirpodsClaimUntilMs = Date.now() + Math.max(12000, repeatCount * 4500);
           const speakContent = [title, body].filter(Boolean).join("。");
           neuralTts = await this.synthesizeNeuralTts(speakContent, {
             voice: params.voice ? String(params.voice) : undefined,
@@ -2045,6 +2330,9 @@ export class OmsDaemon {
           body,
           level: effectivePhoneLevel,
           ttsSpeak,
+          audioPolicy,
+          useAlarmStream,
+          forceSpeakerAlarmStream,
           audioBase64: neuralTts?.audioBase64,
           voiceId: neuralTts?.voiceId,
           repeatCount,
@@ -2235,6 +2523,7 @@ export class OmsDaemon {
             if (stored.files[0]?.absPath) {
               savedAbsPath = stored.files[0].absPath;
             }
+            this.syncMacHudState();
           }
 
           return {
@@ -2359,7 +2648,32 @@ export class OmsDaemon {
           boundedControlDeadline(deadlineMs, maxBudgetMs);
           if (macSayText) {
             callPhone.assertCurrent();
-            if ((this.phoneEmergencyStopEpoch ?? 0) !== stopEpoch) throw new Error("ERR_USER_INTERRUPTED: Phone emergency stop");
+            if ((this.phoneEmergencyStopEpoch ?? 0) !== stopEpoch) {
+              throw new Error("ERR_USER_INTERRUPTED: Phone emergency stop");
+            }
+            const btBridge =
+              typeof this.session.getBluetoothBridge === "function"
+                ? this.session.getBluetoothBridge()
+                : null;
+            if (btBridge) {
+              const preflightOutput = await btBridge.queryAudioOutput(
+                Math.max(1, Math.min(1000, deadlineMs - Date.now()))
+              );
+              callPhone.assertCurrent();
+              if ((this.phoneEmergencyStopEpoch ?? 0) !== stopEpoch) {
+                throw new Error("ERR_USER_INTERRUPTED: Phone emergency stop");
+              }
+              if (
+                preflightOutput?.ok !== true ||
+                preflightOutput.builtInSpeaker !== true ||
+                typeof preflightOutput.uid !== "string" ||
+                !preflightOutput.uid
+              ) {
+                throw new Error(
+                  "ERR_MAC_SPEAKER_ROUTE: 拨号前检测到 Mac 当前输出不是内置扬声器（如连接了耳机），已中止外放拨号；请在系统声音设置中选择内置扬声器或改用 --say"
+                );
+              }
+            }
           }
           const speakerEnabled =
             params.speaker !== undefined
@@ -2417,7 +2731,7 @@ export class OmsDaemon {
                 await continuation.pause(postDelay);
                 const playedOnMac = callTtsMeta
                   ? await this.playNeuralAudioOnMacSpeaker(callTtsMeta.audioBase64, repeatCount, continuation)
-                  : false;
+                  : await this.playFallbackSayOnMacSpeaker(macSayText, repeatCount, continuation);
                 continuation.check();
                 let hungUpAfter = false;
                 if (Boolean(params.hangupAfter ?? params.autoHangup) && playedOnMac) {
@@ -2432,7 +2746,12 @@ export class OmsDaemon {
                   ...(matchedContact ? { matchedContact } : {}),
                   spoken: playedOnMac,
                   spokenText: macSayText,
-                  ttsEngine: playedOnMac ? "mac_speaker_edge_neural" : "mac_speaker_failed",
+                  ttsEngine: playedOnMac
+                    ? callTtsMeta
+                      ? "mac_speaker_edge_neural"
+                      : "mac_speaker_system_say"
+                    : "mac_speaker_failed",
+                  ...(callTtsFallbackReason ? { ttsFallbackReason: callTtsFallbackReason } : {}),
                   ...(callTtsMeta
                     ? {
                         voiceId: callTtsMeta.voiceId,
@@ -2545,9 +2864,18 @@ export class OmsDaemon {
               onFallback: (reason) => { ttsFallbackReason = reason; },
             });
           }
+          const audioPolicy = OmsDaemon.resolveSpeechAudioPolicy(
+            params,
+            subAction === "find_phone" ? "force_speaker_alarm" : "alarm_respect_headset"
+          );
+          const useAlarmStream = audioPolicy !== "media_commute";
+          const forceSpeakerAlarmStream = audioPolicy === "force_speaker_alarm";
           enrichedParams = {
             ...params,
             text: speakText,
+            audioPolicy,
+            useAlarmStream,
+            forceSpeakerAlarmStream,
             repeatCount,
             ...(neuralTtsMeta
               ? {
@@ -2600,6 +2928,8 @@ export class OmsDaemon {
               body: text,
               level: "urgent",
               ttsSpeak: true,
+              audioPolicy: "force_speaker_alarm",
+              useAlarmStream: true,
               forceSpeakerAlarmStream: true,
               audioBase64: neuralTtsMeta?.audioBase64,
               repeatCount: enrichedParams.repeatCount,
@@ -2608,12 +2938,16 @@ export class OmsDaemon {
           }
           if (subAction === "tts_speak") {
             const text = String(enrichedParams.text || "");
+            const useAlarm = enrichedParams.useAlarmStream !== false;
+            const forceSpeaker = Boolean(enrichedParams.forceSpeakerAlarmStream);
             const fallback = await this.session.callPhone<any>("notify.send", {
               title: "🗣️ 语音播报",
               body: text,
               level: "silent",
               ttsSpeak: true,
-              forceSpeakerAlarmStream: Boolean(params.useAlarmStream),
+              audioPolicy: enrichedParams.audioPolicy,
+              useAlarmStream: useAlarm,
+              forceSpeakerAlarmStream: forceSpeaker,
               audioBase64: neuralTtsMeta?.audioBase64,
               repeatCount: enrichedParams.repeatCount,
             });
@@ -2719,6 +3053,10 @@ export class OmsDaemon {
       } catch {
         // ignore
       }
+    }
+    if (this.hudServer) {
+      await this.hudServer.stop();
+      this.hudServer = null;
     }
     await this.session.stop();
   }

@@ -10,13 +10,16 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.util.LruCache
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -55,13 +58,16 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -74,11 +80,13 @@ import com.oms.client.OmsApplication
 import com.oms.client.R
 import com.oms.client.agent.OmsAccessibilityService
 import com.oms.client.capability.NotificationExecutor
+import com.oms.client.capability.SpeechAudioPolicy
 import com.oms.client.capability.VoiceRecorderHelper
 import com.oms.client.data.StreamItemModel
 import com.oms.client.otp.OtpExtractor
 import com.oms.client.otp.OtpMatch
 import com.oms.client.service.OmsCoreForegroundService
+import com.oms.client.share.AttachmentResolver
 import com.oms.client.transport.OtaCheckResult
 import com.oms.client.xiaomi.XiaomiAdaptationHelper
 import kotlinx.coroutines.Dispatchers
@@ -102,8 +110,17 @@ class MainActivity : ComponentActivity() {
         OmsApplication.instance?.transportClient?.startAutoConnect()
     }
 
+    private fun applyLockscreenDisplayPolicy(incoming: Intent?) {
+        val isUrgentDisplay = incoming?.action == "com.oms.client.ACTION_DISPLAY_URGENT_NOTIFICATION"
+        runCatching {
+            setShowWhenLocked(isUrgentDisplay)
+            setTurnScreenOn(isUrgentDisplay)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applyLockscreenDisplayPolicy(intent)
         if (intent?.getBooleanExtra(NotificationExecutor.EXTRA_STOP_TTS, false) == true) {
             NotificationExecutor.stopSpeaking(this)
         }
@@ -129,6 +146,7 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        applyLockscreenDisplayPolicy(intent)
         if (intent.getBooleanExtra(NotificationExecutor.EXTRA_STOP_TTS, false)) {
             NotificationExecutor.stopSpeaking(this)
         }
@@ -150,7 +168,8 @@ class MainActivity : ComponentActivity() {
     override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
         if ((keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN ||
                 keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP) &&
-            NotificationExecutor.isSpeakingFlow.value
+            NotificationExecutor.isSpeakingFlow.value &&
+            NotificationExecutor.isHardwareStopActive
         ) {
             NotificationExecutor.stopSpeaking(this)
             return true
@@ -163,13 +182,13 @@ class MainActivity : ComponentActivity() {
             Manifest.permission.READ_CALENDAR,
             Manifest.permission.WRITE_CALENDAR,
             Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.READ_PHONE_STATE,
             Manifest.permission.RECEIVE_SMS,
             Manifest.permission.READ_SMS
         )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             perms.add(Manifest.permission.BLUETOOTH_SCAN)
             perms.add(Manifest.permission.BLUETOOTH_CONNECT)
-            perms.add(Manifest.permission.BLUETOOTH_ADVERTISE)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             perms.add(Manifest.permission.POST_NOTIFICATIONS)
@@ -225,6 +244,23 @@ fun OneMoreStepMainScreen() {
     var pairUriInput by remember { mutableStateOf("") }
     var composerText by remember { mutableStateOf("") }
     var selectedTag by remember { mutableStateOf("default_inbox") }
+    val stagedAttachmentUris = remember { mutableStateListOf<Uri>() }
+
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(12)
+    ) { uris ->
+        uris.forEach { u ->
+            if (u !in stagedAttachmentUris) stagedAttachmentUris.add(u)
+        }
+    }
+
+    val documentPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        uris.forEach { u ->
+            if (u !in stagedAttachmentUris) stagedAttachmentUris.add(u)
+        }
+    }
 
     // Filter, Search, Voice Recording & OTA states
     var filterTab by remember { mutableStateOf("ALL") } // "ALL" | "MAC_TO_PHONE" | "PHONE_TO_MAC" | "PENDING_APPROVAL"
@@ -865,7 +901,7 @@ fun OneMoreStepMainScreen() {
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // 6. Bottom Quick Send & Tag Selector Bar
+        // 6. Bottom Quick Send & Tag Selector Bar (Text + Album Photos + PDF/Word Files + Voice)
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
@@ -874,8 +910,29 @@ fun OneMoreStepMainScreen() {
             Column(modifier = Modifier.padding(10.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
+                    OutlinedButton(
+                        onClick = {
+                            photoPickerLauncher.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                        },
+                        modifier = Modifier.height(28.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(containerColor = Color(0xFF0F2942))
+                    ) {
+                        Text("🖼️ 相册图", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, softWrap = false)
+                    }
+                    OutlinedButton(
+                        onClick = { documentPickerLauncher.launch(arrayOf("*/*")) },
+                        modifier = Modifier.height(28.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(containerColor = Color(0xFF0F2942))
+                    ) {
+                        Text("📎 选文件", color = Color(0xFF4ADE80), fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, softWrap = false)
+                    }
                     listOf(
                         "default_inbox" to "📥 默认Inbox",
                         "pkb_vault" to "📚 存知识库",
@@ -892,6 +949,52 @@ fun OneMoreStepMainScreen() {
                             )
                         ) {
                             Text(label, color = Color.White, fontSize = 11.sp, maxLines = 1, softWrap = false)
+                        }
+                    }
+                }
+                if (stagedAttachmentUris.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        stagedAttachmentUris.forEach { uri ->
+                            val meta = remember(uri) { AttachmentResolver.describeUri(context, uri) }
+                            val badge = AttachmentResolver.badgeForFile(meta.safeFileName, meta.mimeType)
+                            val sizeStr = AttachmentResolver.formatSizeShort(meta.sizeBytes)
+                            Row(
+                                modifier = Modifier
+                                    .background(Color(0xFF0F172A), RoundedCornerShape(8.dp))
+                                    .border(1.dp, Color(0xFF38BDF8).copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text(
+                                    text = "$badge ${meta.safeFileName}${if (sizeStr.isNotEmpty()) " ($sizeStr)" else ""}",
+                                    color = Color(0xFFE2E8F0),
+                                    fontSize = 11.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = "✕",
+                                    color = Color(0xFFF87171),
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier
+                                        .clickable { stagedAttachmentUris.remove(uri) }
+                                        .padding(start = 2.dp)
+                                )
+                            }
+                        }
+                        TextButton(
+                            onClick = { stagedAttachmentUris.clear() },
+                            modifier = Modifier.height(26.dp),
+                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)
+                        ) {
+                            Text("清空", color = Color(0xFF94A3B8), fontSize = 11.sp)
                         }
                     }
                 }
@@ -938,16 +1041,31 @@ fun OneMoreStepMainScreen() {
                                         val (audioFile, durMs) = stopped
                                         val sec = ((durMs + 500L) / 1000L).toInt().coerceAtLeast(1)
                                         val noteTxt = composerText.trim()
-                                        val effectiveTag = if (selectedTag == "default_inbox") "voice_idea" else selectedTag
+                                        val attached = stagedAttachmentUris.toList()
+                                        val effectiveTag = if (selectedTag == "default_inbox" && attached.isEmpty()) "voice_idea" else selectedTag
+                                        val metas = attached.map { AttachmentResolver.describeUri(context, it) }
+                                        val itemType = AttachmentResolver.inferItemType(
+                                            metas.map { it.mimeType },
+                                            hasVoiceNote = true
+                                        )
+                                        val title = if (metas.isNotEmpty()) {
+                                            val first = metas.first()
+                                            "${AttachmentResolver.badgeForFile(first.safeFileName, first.mimeType)} ${first.safeFileName}${if (metas.size > 1) " 等 ${metas.size} 个附件" else ""} + 语音(${sec}s)"
+                                        } else {
+                                            "🎙️ 手机语音消息 (${sec}秒 · #$effectiveTag)"
+                                        }
                                         app.transportClient.submitItemToMacOrQueue(
                                             intentTag = effectiveTag,
-                                            itemType = "VOICE_IDEA",
-                                            title = "🎙️ 手机语音消息 (${sec}秒 · #$effectiveTag)",
+                                            itemType = itemType,
+                                            title = title,
                                             textContent = noteTxt.ifEmpty { null },
                                             voiceTranscript = null,
-                                            fileUri = Uri.fromFile(audioFile)
+                                            fileUri = attached.firstOrNull() ?: Uri.fromFile(audioFile),
+                                            extraAudioUri = if (attached.isNotEmpty()) Uri.fromFile(audioFile) else null,
+                                            additionalFileUris = if (attached.size > 1) attached.drop(1) else emptyList()
                                         )
                                         composerText = ""
+                                        stagedAttachmentUris.clear()
                                         Toast.makeText(context, "🚀 语音 (${sec}秒) 已发送至 Mac！", Toast.LENGTH_SHORT).show()
                                     }
                                 },
@@ -963,7 +1081,14 @@ fun OneMoreStepMainScreen() {
                         OutlinedTextField(
                             value = composerText,
                             onValueChange = { composerText = it },
-                            placeholder = { Text("发消息、链接，或点右侧🎙️录语音...", color = Color.Gray, fontSize = 12.sp) },
+                            placeholder = {
+                                Text(
+                                    if (stagedAttachmentUris.isNotEmpty()) "可选：补充附言说明，直接点右侧发送..."
+                                    else "发消息、选上方🖼️相册/📎文件(PDF/Word)，或🎙️语音...",
+                                    color = Color.Gray,
+                                    fontSize = 12.sp
+                                )
+                            },
                             maxLines = 3,
                             colors = OutlinedTextFieldDefaults.colors(
                                 focusedTextColor = Color.White,
@@ -1003,22 +1128,55 @@ fun OneMoreStepMainScreen() {
                         Button(
                             onClick = {
                                 val txt = composerText.trim()
-                                if (txt.isNotEmpty()) {
+                                val attached = stagedAttachmentUris.toList()
+                                if (txt.isNotEmpty() || attached.isNotEmpty()) {
+                                    val metas = attached.map { AttachmentResolver.describeUri(context, it) }
+                                    val computedType = if (attached.isNotEmpty()) {
+                                        AttachmentResolver.inferItemType(metas.map { it.mimeType })
+                                    } else if (selectedTag == "voice_idea") {
+                                        "VOICE_IDEA"
+                                    } else {
+                                        "TEXT"
+                                    }
+                                    val computedTitle = when {
+                                        metas.size == 1 -> {
+                                            val m = metas.first()
+                                            "${AttachmentResolver.badgeForFile(m.safeFileName, m.mimeType)} ${m.safeFileName}"
+                                        }
+                                        metas.size > 1 -> {
+                                            val first = metas.first()
+                                            "${AttachmentResolver.badgeForFile(first.safeFileName, first.mimeType)} ${first.safeFileName} 等 ${metas.size} 个附件"
+                                        }
+                                        else -> "手机直接投递 (#$selectedTag)"
+                                    }
                                     app.transportClient.submitItemToMacOrQueue(
                                         intentTag = selectedTag,
-                                        itemType = if (selectedTag == "voice_idea") "VOICE_IDEA" else "TEXT",
-                                        title = "手机直接投递 (#$selectedTag)",
-                                        textContent = txt,
+                                        itemType = computedType,
+                                        title = computedTitle,
+                                        textContent = txt.ifEmpty { null },
                                         voiceTranscript = null,
-                                        fileUri = null
+                                        fileUri = attached.firstOrNull(),
+                                        additionalFileUris = if (attached.size > 1) attached.drop(1) else emptyList()
                                     )
                                     composerText = ""
+                                    stagedAttachmentUris.clear()
+                                    if (attached.isNotEmpty()) {
+                                        Toast.makeText(context, "🚀 已发送 ${attached.size} 个附件至 Mac", Toast.LENGTH_SHORT).show()
+                                    }
                                 }
                             },
                             modifier = Modifier.height(44.dp),
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (stagedAttachmentUris.isNotEmpty()) Color(0xFF0284C7) else MaterialTheme.colorScheme.primary
+                            )
                         ) {
-                            Text("发送", fontSize = 12.sp, maxLines = 1, softWrap = false)
+                            Text(
+                                if (stagedAttachmentUris.isNotEmpty()) "发送(${stagedAttachmentUris.size})" else "发送",
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                softWrap = false
+                            )
                         }
                     }
                 }
@@ -1033,6 +1191,9 @@ fun XiaomiPermissionWizardCard(context: Context, onDismiss: (() -> Unit)? = null
     var refreshTick by remember { mutableStateOf(0) }
     var autoOtpEnabled by remember {
         mutableStateOf(app?.repository?.isAutoSyncOtpEnabled() ?: true)
+    }
+    var cameraPillEnabled by remember {
+        mutableStateOf(app?.repository?.isCameraPillEnabled() ?: true)
     }
     val health = remember(refreshTick) { XiaomiAdaptationHelper.inspectAll(context) }
     Card(
@@ -1182,6 +1343,30 @@ fun XiaomiPermissionWizardCard(context: Context, onDismiss: (() -> Unit)? = null
                     }
                 }
             }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (cameraPillEnabled) "📷 拍照后弹出「发Mac」胶囊：已开启" else "📷 拍照后弹出「发Mac」胶囊：已关闭",
+                    color = if (cameraPillEnabled) Color(0xFF38BDF8) else Color(0xFF94A3B8),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedButton(
+                    onClick = {
+                        val next = !cameraPillEnabled
+                        cameraPillEnabled = next
+                        app?.repository?.setCameraPillEnabled(next)
+                    },
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                    modifier = Modifier.height(26.dp)
+                ) {
+                    Text(if (cameraPillEnabled) "关闭拍照胶囊" else "开启拍照胶囊", color = Color.White, fontSize = 11.sp, maxLines = 1, softWrap = false)
+                }
+            }
         }
     }
 }
@@ -1221,6 +1406,24 @@ fun XiaomiCheckRow(label: String, ok: Boolean, actionLabel: String? = null, onCl
     }
 }
 
+private object ThumbnailMemoryCache {
+    private val cache = LruCache<String, ImageBitmap>(36)
+    fun get(key: String): ImageBitmap? = synchronized(cache) { cache.get(key) }
+    fun put(key: String, bmp: ImageBitmap) = synchronized(cache) { cache.put(key, bmp) }
+
+    fun calculateSampleSize(width: Int, height: Int, maxDim: Int = 512): Int {
+        var sample = 1
+        var w = width
+        var h = height
+        while (w > maxDim || h > maxDim) {
+            w /= 2
+            h /= 2
+            sample *= 2
+        }
+        return sample.coerceAtLeast(1)
+    }
+}
+
 @Composable
 fun StreamTimelineCard(item: StreamItemModel) {
     val context = LocalContext.current
@@ -1237,21 +1440,61 @@ fun StreamTimelineCard(item: StreamItemModel) {
         u.endsWith(".m4a") || u.endsWith(".mp3") || u.endsWith(".wav") || u.endsWith(".ogg") || u.endsWith(".aac")
     }
 
+    val isLikelyImageAttachment = remember(item.localFileUri, item.itemType, isAudioAttachment) {
+        if (isAudioAttachment || item.localFileUri.isNullOrBlank()) {
+            false
+        } else {
+            val u = item.localFileUri.lowercase()
+            val nonImageExts = listOf(".pdf", ".zip", ".rar", ".7z", ".txt", ".md", ".json", ".csv", ".apk", ".mp4", ".mov", ".mkv", ".doc", ".docx", ".xls", ".xlsx")
+            nonImageExts.none { u.endsWith(it) }
+        }
+    }
+
     var isPlayingAudio by remember(item.itemId) {
         mutableStateOf(VoiceRecorderHelper.playingItemId == item.itemId)
     }
 
-    val thumbnailBitmap = remember(item.localFileUri, isAudioAttachment) {
-        if (isAudioAttachment) return@remember null
-        val uriStr = item.localFileUri ?: return@remember null
-        try {
-            val uri = Uri.parse(uriStr)
-            val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
-            context.contentResolver.openInputStream(uri)?.use { input ->
-                BitmapFactory.decodeStream(input, null, opts)?.asImageBitmap()
+    val uriKey = item.localFileUri
+    val thumbnailBitmap by produceState<ImageBitmap?>(
+        initialValue = uriKey?.let { ThumbnailMemoryCache.get(it) },
+        key1 = uriKey,
+        key2 = isLikelyImageAttachment
+    ) {
+        if (!isLikelyImageAttachment || uriKey.isNullOrBlank()) {
+            value = null
+            return@produceState
+        }
+        ThumbnailMemoryCache.get(uriKey)?.let {
+            value = it
+            return@produceState
+        }
+        value = withContext(Dispatchers.IO) {
+            try {
+                val uri = Uri.parse(uriKey)
+                val mime = context.contentResolver.getType(uri)?.lowercase()
+                if (mime != null && !mime.startsWith("image/")) {
+                    return@withContext null
+                }
+                val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    BitmapFactory.decodeStream(input, null, boundsOpts)
+                }
+                if (boundsOpts.outWidth <= 0 || boundsOpts.outHeight <= 0) {
+                    return@withContext null
+                }
+                val decodeOpts = BitmapFactory.Options().apply {
+                    inSampleSize = ThumbnailMemoryCache.calculateSampleSize(boundsOpts.outWidth, boundsOpts.outHeight, 512)
+                }
+                val decoded = context.contentResolver.openInputStream(uri)?.use { input ->
+                    BitmapFactory.decodeStream(input, null, decodeOpts)?.asImageBitmap()
+                }
+                if (decoded != null) {
+                    ThumbnailMemoryCache.put(uriKey, decoded)
+                }
+                decoded
+            } catch (_: Throwable) {
+                null
             }
-        } catch (_: Throwable) {
-            null
         }
     }
 
@@ -1324,14 +1567,35 @@ fun StreamTimelineCard(item: StreamItemModel) {
 
             Spacer(modifier = Modifier.height(4.dp))
 
+            val thumb = thumbnailBitmap
+            val attachmentSummary = remember(item.metadataJson, item.localFileUri) {
+                val names = mutableListOf<String>()
+                runCatching {
+                    val arr = item.metadataJson?.let { JSONObject(it).optJSONArray("attachmentNames") }
+                    if (arr != null) {
+                        for (i in 0 until arr.length()) {
+                            val n = arr.optString(i, "").trim()
+                            if (n.isNotEmpty()) names.add("${AttachmentResolver.badgeForFile(n)} $n")
+                        }
+                    }
+                }
+                if (names.isEmpty() && !item.localFileUri.isNullOrBlank()) {
+                    val leaf = Uri.parse(item.localFileUri).lastPathSegment?.substringAfterLast('/')
+                    if (!leaf.isNullOrBlank()) {
+                        names.add("${AttachmentResolver.badgeForFile(leaf)} $leaf")
+                    }
+                }
+                names.joinToString(" · ")
+            }
+
             // 2. Body Row (Compact 2-line preview with optional image thumbnail vs Full Expanded View)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                if (thumbnailBitmap != null && !expanded) {
+                if (thumb != null && !expanded) {
                     Image(
-                        bitmap = thumbnailBitmap,
+                        bitmap = thumb,
                         contentDescription = "缩略图",
                         contentScale = ContentScale.Crop,
                         modifier = Modifier
@@ -1355,7 +1619,9 @@ fun StreamTimelineCard(item: StreamItemModel) {
                     }
                     val summaryText = item.textContent?.takeIf { it.isNotBlank() }
                         ?: item.voiceTranscript?.let { "🎙️ \"$it\"" }
-                        ?: (if (isAudioAttachment) "🎙️ 语音录音附件 (展开可回放)" else if (item.localFileUri != null) "📎 包含图片/文件附件" else "")
+                        ?: (if (isAudioAttachment) "🎙️ 语音录音附件 (展开可回放)"
+                            else if (attachmentSummary.isNotBlank()) attachmentSummary
+                            else if (item.localFileUri != null) "📎 包含图片/文件附件" else "")
 
                     if (summaryText.isNotBlank()) {
                         Spacer(modifier = Modifier.height(2.dp))
@@ -1367,15 +1633,23 @@ fun StreamTimelineCard(item: StreamItemModel) {
                             overflow = TextOverflow.Ellipsis
                         )
                     }
+                    if (expanded && attachmentSummary.isNotBlank() && (!item.textContent.isNullOrBlank() || !item.voiceTranscript.isNullOrBlank())) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "📎 附件：$attachmentSummary",
+                            color = Color(0xFF93C5FD),
+                            fontSize = 11.sp
+                        )
+                    }
                 }
             }
 
             // 3. Expanded Details & Interactive Buttons
             if (expanded) {
-                if (thumbnailBitmap != null) {
+                if (thumb != null) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Image(
-                        bitmap = thumbnailBitmap,
+                        bitmap = thumb,
                         contentDescription = "图片预览",
                         contentScale = ContentScale.Fit,
                         modifier = Modifier
@@ -1480,13 +1754,18 @@ fun StreamTimelineCard(item: StreamItemModel) {
                                     val speakStr = "${item.title ?: ""}。${item.textContent}"
                                     val tc = OmsApplication.instance?.transportClient
                                     if (tc != null) {
-                                        tc.speakTextSmart(speakStr, useAlarmStream = false)
+                                        tc.speakTextSmart(
+                                            speakStr,
+                                            useAlarmStream = false,
+                                            audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE
+                                        )
                                     } else {
                                         NotificationExecutor.speakText(
                                             context,
                                             speakStr,
                                             useAlarmStream = false,
-                                            speechRate = 1.0f
+                                            speechRate = 1.0f,
+                                            audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE
                                         )
                                     }
                                 }

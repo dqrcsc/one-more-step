@@ -50,6 +50,97 @@ function parseBoolFlag(val: string | boolean | undefined): boolean | undefined {
   return undefined;
 }
 
+function resolveCliSpeechFlags(flags: Record<string, string | boolean>): {
+  audioPolicy?: string;
+  useAlarmStream?: boolean;
+  forceSpeakerAlarmStream?: boolean;
+} {
+  const explicitPolicy =
+    typeof flags["audio-policy"] === "string" ? flags["audio-policy"] : undefined;
+  const forceSpeaker =
+    flags["force-speaker"] === true
+      ? true
+      : parseBoolFlag(flags["force-speaker"]);
+  const noAlarm = Boolean(flags["no-alarm"] || flags.media);
+  const alarmFlag = parseBoolFlag(flags.alarm);
+  const useAlarmStream = noAlarm ? false : alarmFlag;
+  const audioPolicy =
+    explicitPolicy ||
+    (forceSpeaker === true
+      ? "force_speaker_alarm"
+      : useAlarmStream === false
+        ? "media_commute"
+        : undefined);
+  return {
+    ...(audioPolicy ? { audioPolicy } : {}),
+    ...(useAlarmStream !== undefined ? { useAlarmStream } : {}),
+    ...(forceSpeaker !== undefined ? { forceSpeakerAlarmStream: forceSpeaker } : {}),
+  };
+}
+
+async function executeCliPhoneCall(
+  ipc: OmsIpcClient,
+  flags: Record<string, string | boolean>,
+  positional: string[],
+  posOffset: number,
+  isDialOnlyCmd: boolean,
+  usagePrefix: string
+): Promise<void> {
+  const number = (flags.number as string) || positional[posOffset];
+  if (!number) {
+    throw new Error(
+      `Usage: ${usagePrefix} <name-or-number> [--sim 1|2] [--say <text> | --mac-say <text> | --ai-call <text>] [--voice <v>] [--repeat <N>] [--hangup-after] [--wait-answer <sec>] [--dial-only] [--speaker|--no-speaker]`
+    );
+  }
+  const trailingTextPos = posOffset + 1;
+  const sayText =
+    typeof flags.say === "string"
+      ? flags.say
+      : typeof flags.tts === "string"
+        ? flags.tts
+        : typeof flags.speak === "string"
+          ? flags.speak
+          : positional.length > trailingTextPos
+            ? positional.slice(trailingTextPos).join(" ")
+            : undefined;
+  const macSayText =
+    typeof flags["mac-say"] === "string"
+      ? flags["mac-say"]
+      : typeof flags["mac-tts"] === "string"
+        ? flags["mac-tts"]
+        : undefined;
+  const aiCallText =
+    typeof flags["ai-call"] === "string"
+      ? flags["ai-call"]
+      : typeof flags.ai === "string"
+        ? flags.ai
+        : undefined;
+  const speakerFlag =
+    flags["no-speaker"] ? false : flags.speaker !== undefined ? Boolean(flags.speaker) : undefined;
+  const hasSpeechTask = Boolean(sayText || macSayText || aiCallText);
+  const res = await ipc.call(
+    "phone_device_control",
+    {
+      action: "call_phone",
+      number,
+      simSlot: flags.sim !== undefined ? String(flags.sim) : undefined,
+      dialOnly: isDialOnlyCmd || Boolean(flags["dial-only"]),
+      speaker: speakerFlag,
+      say: sayText,
+      macSay: macSayText,
+      aiCall: aiCallText,
+      voice: typeof flags.voice === "string" ? flags.voice : undefined,
+      repeat: flags.repeat !== undefined ? Number(flags.repeat) : undefined,
+      hangupAfter: Boolean(flags["hangup-after"] || flags["auto-hangup"] || flags.hangup),
+      waitAnswerSec: flags["wait-answer"] !== undefined ? Number(flags["wait-answer"]) : undefined,
+      postAnswerDelayMs: flags["speak-delay"] !== undefined ? Number(flags["speak-delay"]) : undefined,
+      saveVoice: Boolean(flags.save),
+    },
+    hasSpeechTask ? 95000 : 35000
+  );
+  console.log(JSON.stringify(res, null, 2));
+}
+
 async function readStdinText(): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) {
@@ -107,6 +198,20 @@ async function main() {
         if (pid > 0) {
           try {
             process.kill(pid, "SIGTERM");
+            for (let i = 0; i < 15; i++) {
+              await new Promise((r) => setTimeout(r, 100));
+              try {
+                process.kill(pid, 0);
+              } catch {
+                break;
+              }
+            }
+            try {
+              process.kill(pid, 0);
+              process.kill(pid, "SIGKILL");
+            } catch {
+              // already exited cleanly
+            }
           } catch {
             // already exited
           }
@@ -124,7 +229,7 @@ async function main() {
         console.log(JSON.stringify({ ok: true, status: "stopped" }, null, 2));
         return;
       }
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 250));
     }
 
     // start / restart / status
@@ -185,6 +290,7 @@ async function main() {
           maxWidth: flags.width ? Number(flags.width) : 720,
           quality: flags.quality ? Number(flags.quality) : 72,
           maxFps: flags.fps ? Number(flags.fps) : 12,
+          autoWake: flags["no-wake"] ? false : true,
           wakeScreen: flags["no-wake"] ? false : true,
         });
       } catch (err: any) {
@@ -212,7 +318,7 @@ async function main() {
         console.log(`🪞 Opening Live Phone Mirror Studio: ${mirrorUrl}`);
         if (mirrorRes?.mode) {
           console.log(
-            `   Mode: ${mirrorRes.mode} (${mirrorRes.targetMaxWidth || 720}px @ ${mirrorRes.targetMaxFps || 12}fps)`
+            `   Mode: ${mirrorRes.mode} (${mirrorRes.maxWidth || 720}px @ ${mirrorRes.maxFps || 12}fps)`
           );
         } else if (mirrorRes?.error) {
           console.log(`   Note: ${mirrorRes.error}`);
@@ -288,6 +394,14 @@ async function main() {
         if (process.env.OMS_DISABLE_OSASCRIPT !== "1") {
           execFile("open", [url]);
         }
+        break;
+      }
+
+      if (sub === "peek") {
+        const res = await ipc.call("inbox.peek", {
+          ...(positional[1] ? { itemId: positional[1] } : {}),
+        });
+        console.log(JSON.stringify(res, null, 2));
         break;
       }
 
@@ -505,11 +619,13 @@ async function main() {
 
     case "notify": {
       const body = (flags.body as string) || positional.join(" ") || "";
+      const speechFlags = resolveCliSpeechFlags(flags);
       const res = await ipc.call("phone_notify", {
         title: (flags.title as string) || "Mac AI 提醒",
         body,
         level: (flags.level as string) || "normal",
         ttsSpeak: Boolean(flags.tts),
+        ...speechFlags,
         voice: typeof flags.voice === "string" ? flags.voice : undefined,
         repeat: flags.repeat !== undefined ? Number(flags.repeat) : undefined,
         syncDingtalk: Boolean(flags.dingtalk),
@@ -623,58 +739,7 @@ async function main() {
 
     case "call":
     case "dial": {
-      const number = (flags.number as string) || positional[0];
-      if (!number) {
-        throw new Error(
-          "Usage: oms call <name-or-number> [--sim 1|2] [--say <text> | --mac-say <text> | --ai-call <text>] [--voice <v>] [--repeat <N>] [--hangup-after] [--wait-answer <sec>] [--dial-only] [--speaker|--no-speaker]"
-        );
-      }
-      const sayText =
-        typeof flags.say === "string"
-          ? flags.say
-          : typeof flags.tts === "string"
-            ? flags.tts
-            : typeof flags.speak === "string"
-              ? flags.speak
-              : positional.length > 1
-                ? positional.slice(1).join(" ")
-                : undefined;
-      const macSayText =
-        typeof flags["mac-say"] === "string"
-          ? flags["mac-say"]
-          : typeof flags["mac-tts"] === "string"
-            ? flags["mac-tts"]
-            : undefined;
-      const aiCallText =
-        typeof flags["ai-call"] === "string"
-          ? flags["ai-call"]
-          : typeof flags.ai === "string"
-            ? flags.ai
-            : undefined;
-      const speakerFlag =
-        flags["no-speaker"] ? false : flags.speaker !== undefined ? Boolean(flags.speaker) : undefined;
-      const hasSpeechTask = Boolean(sayText || macSayText || aiCallText);
-      const res = await ipc.call(
-        "phone_device_control",
-        {
-          action: "call_phone",
-          number,
-          simSlot: flags.sim !== undefined ? String(flags.sim) : undefined,
-          dialOnly: cmd === "dial" || Boolean(flags["dial-only"]),
-          speaker: speakerFlag,
-          say: sayText,
-          macSay: macSayText,
-          aiCall: aiCallText,
-          voice: typeof flags.voice === "string" ? flags.voice : undefined,
-          repeat: flags.repeat !== undefined ? Number(flags.repeat) : undefined,
-          hangupAfter: Boolean(flags["hangup-after"] || flags["auto-hangup"] || flags.hangup),
-          waitAnswerSec: flags["wait-answer"] !== undefined ? Number(flags["wait-answer"]) : undefined,
-          postAnswerDelayMs: flags["speak-delay"] !== undefined ? Number(flags["speak-delay"]) : undefined,
-          saveVoice: Boolean(flags.save),
-        },
-        hasSpeechTask ? 95000 : 35000
-      );
-      console.log(JSON.stringify(res, null, 2));
+      await executeCliPhoneCall(ipc, flags, positional, 0, cmd === "dial", "oms call");
       break;
     }
 
@@ -707,13 +772,14 @@ async function main() {
         const text = (flags.text as string) || positional.slice(1).join(" ");
         if (!text) {
           throw new Error(
-            "Usage: oms phone say <text> [--alarm] [--voice xiaoyi|xiaoxiao|yunxia|yunxi|xiaobei|hsiaochen] [--repeat N] [--save]"
+            "Usage: oms phone say <text> [--force-speaker | --no-alarm] [--voice xiaoyi|xiaoxiao|yunxia|yunxi|yunjian|xiaobei|xiaoni|hsiaochen|hiugaai] [--repeat N] [--save]"
           );
         }
+        const speechFlags = resolveCliSpeechFlags(flags);
         const res = await ipc.call("phone_device_control", {
           action: "tts_speak",
           text,
-          useAlarmStream: Boolean(flags.alarm),
+          ...speechFlags,
           voice: typeof flags.voice === "string" ? flags.voice : undefined,
           repeat: flags.repeat !== undefined ? Number(flags.repeat) : undefined,
           saveVoice: Boolean(flags.save),
@@ -791,58 +857,7 @@ async function main() {
         );
         console.log(JSON.stringify(res, null, 2));
       } else if (actionSub === "call" || actionSub === "dial" || actionSub === "call_phone") {
-        const number = (flags.number as string) || positional[1];
-        if (!number) {
-          throw new Error(
-            "Usage: oms phone call <name-or-number> [--sim 1|2] [--say <text> | --mac-say <text> | --ai-call <text>] [--voice <v>] [--repeat <N>] [--hangup-after] [--wait-answer <sec>] [--dial-only] [--speaker|--no-speaker]"
-          );
-        }
-        const sayText =
-          typeof flags.say === "string"
-            ? flags.say
-            : typeof flags.tts === "string"
-              ? flags.tts
-              : typeof flags.speak === "string"
-                ? flags.speak
-                : positional.length > 2
-                  ? positional.slice(2).join(" ")
-                  : undefined;
-        const macSayText =
-          typeof flags["mac-say"] === "string"
-            ? flags["mac-say"]
-            : typeof flags["mac-tts"] === "string"
-              ? flags["mac-tts"]
-              : undefined;
-        const aiCallText =
-          typeof flags["ai-call"] === "string"
-            ? flags["ai-call"]
-            : typeof flags.ai === "string"
-              ? flags.ai
-              : undefined;
-        const speakerFlag =
-          flags["no-speaker"] ? false : flags.speaker !== undefined ? Boolean(flags.speaker) : undefined;
-        const hasSpeechTask = Boolean(sayText || macSayText || aiCallText);
-        const res = await ipc.call(
-          "phone_device_control",
-          {
-            action: "call_phone",
-            number,
-            simSlot: flags.sim !== undefined ? String(flags.sim) : undefined,
-            dialOnly: actionSub === "dial" || Boolean(flags["dial-only"]),
-            speaker: speakerFlag,
-            say: sayText,
-            macSay: macSayText,
-            aiCall: aiCallText,
-            voice: typeof flags.voice === "string" ? flags.voice : undefined,
-            repeat: flags.repeat !== undefined ? Number(flags.repeat) : undefined,
-            hangupAfter: Boolean(flags["hangup-after"] || flags["auto-hangup"] || flags.hangup),
-            waitAnswerSec: flags["wait-answer"] !== undefined ? Number(flags["wait-answer"]) : undefined,
-            postAnswerDelayMs: flags["speak-delay"] !== undefined ? Number(flags["speak-delay"]) : undefined,
-            saveVoice: Boolean(flags.save),
-          },
-          hasSpeechTask ? 95000 : 35000
-        );
-        console.log(JSON.stringify(res, null, 2));
+        await executeCliPhoneCall(ipc, flags, positional, 1, actionSub === "dial", "oms phone call");
       } else if (actionSub === "hangup" || actionSub === "end-call" || actionSub === "hangup_call") {
         const res = await ipc.call("phone_device_control", { action: "hangup_call" }, 20000);
         console.log(JSON.stringify(res, null, 2));
@@ -910,8 +925,8 @@ Commands:
                                                        Inspect rich phone telemetry or remotely control phone from Mac
   oms phone find [text] [--voice <v>] [--repeat <N>] [--save]
                                                        Ring/speak at max alarm volume with 9 Neural TTS human voices (e.g. xiaoyi, yunxia, hsiaochen)
-  oms phone say <text> [--voice <v>] [--repeat <N>] [--save]
-                                                       Speak text on phone via Neural TTS (--voice xiaoyi|xiaoxiao|yunxia|yunxi|yunjian|xiaobei|xiaoni|hsiaochen|hiugaai)
+  oms phone say <text> [--force-speaker|--no-alarm] [--voice <v>] [--repeat <N>] [--save]
+                                                       Speak text on phone (respects AirPods/headset privately by default; --force-speaker forces built-in speaker)
   oms phone voices                                     List all 9 Neural TTS human voices & current default voice
   oms phone stop-tts                                   Stop active Find-My-Phone or TTS voice playback on phone
   oms phone unlock [pattern] [--save] [--bounds l,t,r,b] Wake screen, swipe up bouncer & draw 3x3 pattern (1~9) to unlock phone

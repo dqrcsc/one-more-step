@@ -1,5 +1,30 @@
 # Changelog · 更新日志
 
+## 1.6.4 - 2026-11-14
+
+新增手机端相册多图与通用文档（PDF / Word / Excel / PPT / Markdown / ZIP）一键快传、macOS 原生无 Dock 菜单栏与内嵌速览浮窗（`oms-mac-hud`），并完成全栈安全边界、传输可靠性、三级语音播报路由及后台功耗/磁盘配额治理。
+
+### 新增能力与交互升级
+
+- **手机端相册多选与通用办公文件快传**：
+  - **控制中心快捷磁贴半屏快传面板（`QuickSendSheetActivity`）**：下拉控制中心点击磁贴弹出轻量半屏面板，一键直达「发相册图片（多选）」「发文件（PDF/Word 等）」「发剪贴板」「按住发语音」。
+  - **系统分享多附件与文档支持（`ShareReceiverActivity` + `AttachmentResolver`）**：支持 `ACTION_SEND` 与 `ACTION_SEND_MULTIPLE`（单次最多 9 个附件、单文件最大 30 MB），保留原始中文文件名与扩展名，新增 `file` 媒体类型投递。
+  - **可选相机新拍照片悬浮胶囊（`ScreenshotPillController`）**：支持在 App 主界面开启相机新拍照片「发送到 Mac」悬浮胶囊（默认关闭防打扰）。
+- **macOS 原生菜单栏与内嵌速览 HUD（`oms-mac-hud` + `MacHudServer`）**：
+  - 新增无 Dock 原生 Swift AppKit 助手 `oms-mac-hud`，彻底替代 `osascript`（点击误开 `Script Editor.app`）与自动弹出 `Preview.app` 的打断式通知。
+  - 提供右上角不抢焦点的毛玻璃通知卡片、顶部菜单栏最近 20 条收件历史，以及内嵌 `NSImageView` / `PDFKit` / `QuickLookUI` (`QLPreviewView`) / `AVAudioPlayer` 的原生速览浮窗（免打开外部软件直接阅读 PDF/Word/图片/语音，并支持一键复制文件以便 `⌘V` 粘贴）。
+
+### 全栈安全、可靠性与功耗治理
+
+- **安全与权限边界**：Web Dashboard 非回环访问强制 `oms_token` Cookie 鉴权、跨源 `POST` 拦截与镜像 WebSocket 鉴权；统一离线/在线配对码过期校验；收紧无障碍窗口事件采样并移除测试 MAC 硬编码；明文 HTTP OTA 强制 SHA-256 校验并防降级（`OtaVersionPolicy`）。
+- **传输与语音路由**：`oms-bt-bridge` 监听 `STDIN` EOF 防孤儿驻留，`DeliveryPolicy` 队列落盘防丢；手机语音播报重构为三级声道策略（默认走媒体声道尊重耳机/静音，仅 `--urgent` 寻机强制闹钟外放）。
+- **功耗与存储治理**：蓝牙已连桌面时暂停手机后台 mDNS 持续扫描，息屏挂起传感器与前台应用轮询，`ScreenCapturer` 复用 `VirtualDisplay`；Mac 收件箱增加 500 条 / 2 GB 自动配额清理。
+
+### 自动化验证与兼容性
+
+- Android JVM：**132 项通过**（25 个测试类，0 failure / error / skipped）；Mac/共享协议：**123 项通过**（16 个测试文件，0 fail，800 assertions）。
+- APK：`OneMoreStep-v1.6.4.apk`（versionName **1.6.4** / versionCode **41**，Release 构建），与 v1.4.x–v1.6.2 签名一致可直接覆盖升级，SHA-256：`15f5d8493f7ba212d5688cc2c59a259cdf37fc7bfdac3950dc93cc670824f411`。
+
 ## 1.6.2 - 2026-11-06
 
 修复 v1.6.1 审查发现的 3 个 P1、6 个 P2 问题，新增 38 项自动化回归。**本版已通过本地自动化测试与构建，以下真机验收尚未完成，不代表相关硬件场景已验证通过。**

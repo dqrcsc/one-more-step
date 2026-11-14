@@ -79,6 +79,56 @@ export class InboxManager {
     }
   }
 
+  private sha256FileSync(filePath: string): { sha256: string; sizeBytes: number } {
+    const hash = crypto.createHash("sha256");
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const buf = Buffer.allocUnsafe(65536);
+      let total = 0;
+      while (true) {
+        const read = fs.readSync(fd, buf, 0, buf.length, null);
+        if (read <= 0) break;
+        total += read;
+        hash.update(read === buf.length ? buf : buf.subarray(0, read));
+      }
+      return { sha256: hash.digest("hex"), sizeBytes: total };
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  public pruneStagingCache(maxAgeMs = 7 * 24 * 3600 * 1000, maxFiles = 200): number {
+    const cacheDir = path.join(this.inboxRootDir, "pulled_cache");
+    if (!fs.existsSync(cacheDir)) return 0;
+    let removed = 0;
+    try {
+      const now = Date.now();
+      const entries = fs
+        .readdirSync(cacheDir)
+        .map((name) => {
+          const full = path.join(cacheDir, name);
+          try {
+            const st = fs.statSync(full);
+            return st.isFile() ? { full, mtimeMs: st.mtimeMs } : null;
+          } catch {
+            return null;
+          }
+        })
+        .filter((e): e is { full: string; mtimeMs: number } => e !== null)
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+      entries.forEach((entry, idx) => {
+        if (idx >= maxFiles || now - entry.mtimeMs > maxAgeMs) {
+          try {
+            fs.unlinkSync(entry.full);
+            removed++;
+          } catch {}
+        }
+      });
+    } catch {}
+    return removed;
+  }
+
   /**
    * Idempotently store a submitted item from the Xiaomi phone
    */
@@ -102,13 +152,12 @@ export class InboxManager {
       if (!completed || !fs.existsSync(completed.savedAbsPath)) {
         throw new Error(`Attachment stream is not complete: ${att.streamId}`);
       }
-      const bytes = fs.readFileSync(completed.savedAbsPath);
-      const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+      const { sha256, sizeBytes } = this.sha256FileSync(completed.savedAbsPath);
       const declaredSha = String(att.sha256 || "").toLowerCase();
       if (
         completed.header.streamId !== att.streamId ||
-        bytes.byteLength !== att.totalBytes ||
-        bytes.byteLength !== completed.header.totalBytes ||
+        sizeBytes !== att.totalBytes ||
+        sizeBytes !== completed.header.totalBytes ||
         !/^[0-9a-f]{64}$/.test(declaredSha) ||
         sha256 !== declaredSha ||
         sha256 !== completed.sha256Actual.toLowerCase() ||
@@ -116,7 +165,7 @@ export class InboxManager {
       ) {
         throw new Error(`Attachment size or SHA-256 mismatch: ${att.streamId}`);
       }
-      return { att, bytes, sha256 };
+      return { att, srcAbsPath: completed.savedAbsPath, sha256 };
     });
 
     const now = new Date();
@@ -128,9 +177,16 @@ export class InboxManager {
       fs.chmodSync(itemDir, 0o700);
     } catch {}
 
+    const pulledCacheDir = path.resolve(path.join(this.inboxRootDir, "pulled_cache"));
+    const remainingRefs = new Map<string, number>();
+    for (const { srcAbsPath } of attachments) {
+      const resolvedSrc = path.resolve(srcAbsPath);
+      remainingRefs.set(resolvedSrc, (remainingRefs.get(resolvedSrc) ?? 0) + 1);
+    }
+
     const storedFiles: StoredInboxFile[] = [];
     const usedNames = new Set(["meta.json"]);
-    for (const { att, bytes, sha256 } of attachments) {
+    for (const { att, srcAbsPath, sha256 } of attachments) {
       const basename = path.basename(att.fileName || "attachment.bin");
       const safeBase = !basename || basename === "." || basename === ".." ? "attachment.bin" : basename;
       const extension = path.extname(safeBase);
@@ -142,7 +198,26 @@ export class InboxManager {
       }
       usedNames.add(safeName.toLowerCase());
       const destAbsPath = path.join(itemDir, safeName);
-      fs.writeFileSync(destAbsPath, bytes, { mode: 0o600 });
+      const resolvedSrc = path.resolve(srcAbsPath);
+      const refsLeft = (remainingRefs.get(resolvedSrc) ?? 1) - 1;
+      remainingRefs.set(resolvedSrc, refsLeft);
+
+      const isInsidePulledCache =
+        path.dirname(resolvedSrc) === pulledCacheDir &&
+        !resolvedSrc.endsWith(".partial");
+
+      if (isInsidePulledCache && refsLeft === 0) {
+        try {
+          fs.renameSync(resolvedSrc, destAbsPath);
+        } catch {
+          fs.copyFileSync(resolvedSrc, destAbsPath);
+          try {
+            fs.unlinkSync(resolvedSrc);
+          } catch {}
+        }
+      } else {
+        fs.copyFileSync(resolvedSrc, destAbsPath);
+      }
       try {
         fs.chmodSync(destAbsPath, 0o600);
       } catch {}

@@ -329,7 +329,13 @@ export interface SemanticNode {
   center: [number, number]; // [cx, cy]
 }
 
+export type SpeechAudioPolicyName =
+  | "force_speaker_alarm"
+  | "alarm_respect_headset"
+  | "media_commute";
+
 export interface GuiObserveResult {
+  observationId?: string;
   packageName: string;
   activityName: string;
   isSecureWindow: boolean;

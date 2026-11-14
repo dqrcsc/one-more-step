@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import android.net.Uri
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -12,6 +13,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -21,14 +23,14 @@ import javax.crypto.spec.GCMParameterSpec
 data class StreamItemModel(
     val itemId: String,
     val direction: String, // "PHONE_TO_MAC" | "MAC_TO_PHONE" | "SYSTEM_LOG"
-    val itemType: String,  // "MEDIA" | "FILE" | "TEXT" | "VOICE_IDEA" | "APPROVAL" | "CAPABILITY_LOG"
-    val intentTag: String, // "default_inbox" | "pkb_vault" | "voice_idea" | "ui_bug"
+    val itemType: String,  // "MEDIA" | "FILE" | "TEXT" | "VOICE_IDEA" | "APPROVAL" | "CAPABILITY_LOG" | "OTP"
+    val intentTag: String, // "default_inbox" | "pkb_vault" | "voice_idea" | "ui_bug" | "sms_otp"
     val title: String?,
     val textContent: String?,
     val voiceTranscript: String?,
     val localFileUri: String?,
     val macSavedPath: String?,
-    val syncStatus: String, // "QUEUED" | "SENDING" | "DELIVERED" | "APPROVED" | "REJECTED"
+    val syncStatus: String, // "QUEUED" | "SENDING" | "DELIVERED" | "APPROVED" | "REJECTED" | "EXPIRED"
     val metadataJson: String?,
     val createdAtMs: Long
 )
@@ -49,11 +51,17 @@ data class PairedMacConfig(
  * Module 03: Local SQLite Store for Bidirectional Timeline Stream & Offline Idempotent Outbox Queue
  */
 class StreamRepository(context: Context) :
-    SQLiteOpenHelper(context.applicationContext, "oms_client.db", null, 1) {
+    SQLiteOpenHelper(context.applicationContext, "oms_client.db", null, DATABASE_VERSION) {
 
-    private val prefs = context.applicationContext.getSharedPreferences("oms_prefs", Context.MODE_PRIVATE)
+    private val appContext = context.applicationContext
+    private val prefs = appContext.getSharedPreferences("oms_prefs", Context.MODE_PRIVATE)
     private val _itemsFlow = MutableStateFlow<List<StreamItemModel>>(emptyList())
     val itemsFlow: StateFlow<List<StreamItemModel>> = _itemsFlow
+
+    @Volatile
+    private var cachedPairedMac: PairedMacConfig? = null
+    @Volatile
+    private var pairedMacLoaded = false
 
     init {
         refreshFlow()
@@ -78,9 +86,19 @@ class StreamRepository(context: Context) :
             )
             """.trimIndent()
         )
+        ensureIndexes(db)
     }
 
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) {
+            ensureIndexes(db)
+        }
+    }
+
+    private fun ensureIndexes(db: SQLiteDatabase) {
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_stream_items_created ON stream_items(created_at_ms DESC)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_stream_items_dir_status ON stream_items(direction, sync_status, created_at_ms ASC)")
+    }
 
     fun getOrCreatePhoneId(): String {
         var id = prefs.getString("phone_id", null)
@@ -92,6 +110,7 @@ class StreamRepository(context: Context) :
     }
 
     private companion object {
+        private const val DATABASE_VERSION = 2
         private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
         private const val PAIR_SECRET_KEY_ALIAS = "oms_pair_secret_aes_key_v1"
     }
@@ -188,6 +207,18 @@ class StreamRepository(context: Context) :
             editor.putString("pair_secret_enc", encryptedSecret).remove("pair_secret_hex")
             editor.commit().also { check(it) { "Unable to persist pairing configuration" } }
         }
+        cachedPairedMac = PairedMacConfig(
+            macId = config.macId,
+            macName = config.macName,
+            lanIps = config.lanIps,
+            lanPort = config.lanPort,
+            macPubKeyBase64Url = effectivePubKey,
+            wanRoomId = effectiveWanRoom,
+            wanRelayWssUrl = effectiveRelay,
+            pairSecretHex = effectivePairSecret,
+            pairingVersion = config.pairingVersion
+        )
+        pairedMacLoaded = true
     }
 
     /** Discovery may refresh routing, never restore a stale pairing credential or security version. */
@@ -200,15 +231,19 @@ class StreamRepository(context: Context) :
             .filter { it.isNotBlank() && !it.startsWith("198.18.") && !it.startsWith("127.") }
             .distinct()
             .take(6)
-        // Discovery only owns routing; it must not re-encrypt or replace credentials.
+        val finalIps = mergedIps.ifEmpty { discovered.lanIps }
         prefs.edit()
-            .putString("lan_ips", JSONArray(mergedIps.ifEmpty { discovered.lanIps }).toString())
+            .putString("lan_ips", JSONArray(finalIps).toString())
             .putInt("lan_port", discovered.lanPort)
             .commit().also { check(it) { "Unable to persist discovery routing" } }
+        cachedPairedMac = current.copy(lanIps = finalIps, lanPort = discovered.lanPort)
+        pairedMacLoaded = true
     }
 
     @Synchronized
     fun clearPairedMac() {
+        cachedPairedMac = null
+        pairedMacLoaded = true
         prefs.edit()
             .remove("mac_id")
             .remove("mac_name")
@@ -223,26 +258,37 @@ class StreamRepository(context: Context) :
             .apply()
     }
 
-    @Synchronized
     fun getPairedMac(): PairedMacConfig? {
-        val macId = prefs.getString("mac_id", null)?.takeIf { it.isNotBlank() } ?: return null
-        val ipsJson = prefs.getString("lan_ips", "[]") ?: "[]"
-        val arr = JSONArray(ipsJson)
-        val ips = mutableListOf<String>()
-        for (i in 0 until arr.length()) {
-            ips.add(arr.getString(i))
+        if (pairedMacLoaded) return cachedPairedMac
+        synchronized(this) {
+            if (pairedMacLoaded) return cachedPairedMac
+            val macId = prefs.getString("mac_id", null)?.takeIf { it.isNotBlank() }
+            if (macId == null) {
+                cachedPairedMac = null
+                pairedMacLoaded = true
+                return null
+            }
+            val ipsJson = prefs.getString("lan_ips", "[]") ?: "[]"
+            val arr = JSONArray(ipsJson)
+            val ips = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                ips.add(arr.getString(i))
+            }
+            val loaded = PairedMacConfig(
+                macId = macId,
+                macName = prefs.getString("mac_name", "MacBook Pro") ?: "MacBook Pro",
+                lanIps = ips,
+                lanPort = prefs.getInt("lan_port", 19527),
+                macPubKeyBase64Url = prefs.getString("mac_pub_key", "") ?: "",
+                wanRoomId = prefs.getString("wan_room_id", "") ?: "",
+                wanRelayWssUrl = prefs.getString("wan_relay_url", null),
+                pairSecretHex = readStoredPairSecretHex(),
+                pairingVersion = prefs.getInt("pairing_version", 0)
+            )
+            cachedPairedMac = loaded
+            pairedMacLoaded = true
+            return loaded
         }
-        return PairedMacConfig(
-            macId = macId,
-            macName = prefs.getString("mac_name", "MacBook Pro") ?: "MacBook Pro",
-            lanIps = ips,
-            lanPort = prefs.getInt("lan_port", 19527),
-            macPubKeyBase64Url = prefs.getString("mac_pub_key", "") ?: "",
-            wanRoomId = prefs.getString("wan_room_id", "") ?: "",
-            wanRelayWssUrl = prefs.getString("wan_relay_url", null),
-            pairSecretHex = readStoredPairSecretHex(),
-            pairingVersion = prefs.getInt("pairing_version", 0)
-        )
     }
 
     fun getAuthorizedDirs(): Set<String> {
@@ -262,6 +308,14 @@ class StreamRepository(context: Context) :
 
     fun setAutoSyncOtpEnabled(enabled: Boolean) {
         prefs.edit().putBoolean("auto_sync_otp", enabled).apply()
+    }
+
+    fun isCameraPillEnabled(): Boolean {
+        return prefs.getBoolean("camera_pill_enabled", true)
+    }
+
+    fun setCameraPillEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("camera_pill_enabled", enabled).apply()
     }
 
     fun upsertStreamItem(item: StreamItemModel) {
@@ -305,17 +359,65 @@ class StreamRepository(context: Context) :
         return queryItems("direction = 'PHONE_TO_MAC' AND sync_status = 'QUEUED'", "created_at_ms ASC")
     }
 
+    private fun deleteOwnedAttachmentIfPresent(uriString: String?) {
+        if (uriString.isNullOrBlank()) return
+        try {
+            val uri = Uri.parse(uriString)
+            if (uri.scheme != "file") return
+            val path = uri.path ?: return
+            val file = File(path).canonicalFile
+            val filesRoot = appContext.filesDir.canonicalPath
+            val cacheRoot = appContext.cacheDir.canonicalPath
+            val outboxRoot = File(appContext.filesDir, "outbox_attachments").canonicalPath
+            if (file.path.startsWith(filesRoot + File.separator) || file.path.startsWith(cacheRoot + File.separator)) {
+                val parent = file.parentFile
+                file.delete()
+                if (parent != null &&
+                    parent.canonicalPath.startsWith(outboxRoot + File.separator) &&
+                    parent.list()?.isEmpty() == true
+                ) {
+                    parent.delete()
+                }
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun cleanupItemAttachments(item: StreamItemModel) {
+        deleteOwnedAttachmentIfPresent(item.localFileUri)
+        if (!item.metadataJson.isNullOrBlank()) {
+            runCatching {
+                val meta = JSONObject(item.metadataJson)
+                deleteOwnedAttachmentIfPresent(meta.optString("extraAudioUri", ""))
+                val extraArr = meta.optJSONArray("extraFileUris")
+                if (extraArr != null) {
+                    for (i in 0 until extraArr.length()) {
+                        deleteOwnedAttachmentIfPresent(extraArr.optString(i, ""))
+                    }
+                }
+            }
+        }
+    }
+
     fun deleteStreamItem(itemId: String) {
+        val existing = getStreamItem(itemId)
         writableDatabase.delete("stream_items", "item_id = ?", arrayOf(itemId))
+        if (existing != null) {
+            cleanupItemAttachments(existing)
+        }
         refreshFlow()
     }
 
     fun clearDeliveredHistory(): Int {
+        val doomed = queryItems("sync_status IN ('DELIVERED', 'APPROVED', 'REJECTED', 'EXPIRED')", "created_at_ms ASC")
         val deleted = writableDatabase.delete(
             "stream_items",
-            "sync_status IN ('DELIVERED', 'APPROVED', 'REJECTED')",
+            "sync_status IN ('DELIVERED', 'APPROVED', 'REJECTED', 'EXPIRED')",
             null
         )
+        for (item in doomed) {
+            cleanupItemAttachments(item)
+        }
         refreshFlow()
         return deleted
     }

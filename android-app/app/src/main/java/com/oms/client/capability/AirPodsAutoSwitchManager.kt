@@ -323,7 +323,6 @@ class AirPodsAutoSwitchManager(
             if (prefNorm.isNotEmpty() && item.mac == prefNorm) score += 300
             if (lastNorm.isNotEmpty() && item.mac == lastNorm) score += 200
             if (item.name.trim().equals("AirPods", ignoreCase = true)) score += 100
-            if (item.mac == "B4:59:76:DB:BF:81") score += 50
             score
         }
         return entries

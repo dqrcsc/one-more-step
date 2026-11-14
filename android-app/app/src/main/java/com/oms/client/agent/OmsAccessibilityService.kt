@@ -128,24 +128,34 @@ class OmsAccessibilityService : AccessibilityService() {
         }
         if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
             onMirrorUiEvent?.invoke()
-            if (windowTracker.windowsChanged(applicationWindows(collectApplicationRoots()))) {
+            if (guard.hasActiveObservation && windowTracker.windowsChanged(applicationWindows(collectApplicationRoots()))) {
                 guard.invalidate("application windows changed")
             }
         } else if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
             event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
             event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
             onMirrorUiEvent?.invoke()
-            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
-                event.windowId in applicationWindows(collectApplicationRoots())) {
-                event.packageName?.toString()?.let { currentPackageName = it }
-                event.className?.toString()?.takeUnless {
-                    it.startsWith("android.widget.") || it.startsWith("android.view.") || it.startsWith("android.inputmethodservice.")
-                }?.let { currentActivityName = it }
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                val pkg = event.packageName?.toString()
+                if (!guard.hasActiveObservation) {
+                    if (!pkg.isNullOrBlank() && pkg != "com.android.systemui" && !pkg.contains("inputmethod")) {
+                        currentPackageName = pkg
+                        event.className?.toString()?.takeUnless {
+                            it.startsWith("android.widget.") || it.startsWith("android.view.") || it.startsWith("android.inputmethodservice.")
+                        }?.let { currentActivityName = it }
+                    }
+                    return
+                }
+                if (event.windowId in applicationWindows(collectApplicationRoots())) {
+                    pkg?.let { currentPackageName = it }
+                    event.className?.toString()?.takeUnless {
+                        it.startsWith("android.widget.") || it.startsWith("android.view.") || it.startsWith("android.inputmethodservice.")
+                    }?.let { currentActivityName = it }
+                }
             }
+            if (!guard.hasActiveObservation) return
             if (!windowTracker.belongsToApplication(event.windowId, event.packageName?.toString())) return
-            if (event.eventType != AccessibilityEvent.TYPE_VIEW_SCROLLED) {
-                guard.invalidate("event=${event.eventType}, window=${event.windowId}, package=${event.packageName}, class=${event.className}")
-            }
+            guard.invalidate("event=${event.eventType}, window=${event.windowId}, package=${event.packageName}, class=${event.className}")
         }
     }
 
@@ -481,7 +491,7 @@ class OmsAccessibilityService : AccessibilityService() {
         windowTracker.track(applicationWindows(postRoots))
         val postObservationId = guard.observe(windowIdentity(postRoots))
         val postTree = SemanticTreeExtractor.extractCompactTreeFromRoots(
-            if (isBlockedFinancialOrPasswordWindow(postRoots.firstOrNull())) emptyList() else postRoots,
+            if (isBlockedFinancialOrPasswordWindow(postRoots.firstOrNull(), postRoots)) emptyList() else postRoots,
             dm.widthPixels,
             dm.heightPixels
         )
@@ -712,7 +722,7 @@ class OmsAccessibilityService : AccessibilityService() {
         return dispatchAndAwait(gesture)
     }
 
-    private fun findPinDigitNodeCenter(digit: Char, screenW: Int, screenH: Int): PointF? {
+    private fun findPinDigitNodeCenter(digit: Char, screenH: Int): PointF? {
         val targetStr = digit.toString()
         val roots = collectAllWindowRoots()
         val queue = ArrayDeque<AccessibilityNodeInfo>()
@@ -897,7 +907,7 @@ class OmsAccessibilityService : AccessibilityService() {
                 for (ch in rawPin) {
                     steps.check()
                     requireKeyguardInputSurface()
-                    val pt = findPinDigitNodeCenter(ch, screenW, screenH)
+                    val pt = findPinDigitNodeCenter(ch, screenH)
                         ?: throw IllegalStateException("ERR_PIN_TARGET_UNAVAILABLE: No verified keyguard digit target")
                     check(steps.effect { injectTapGesture(pt.x.toInt(), pt.y.toInt(), 65L) }) {
                         "ERR_PIN_INPUT_FAILED: Keyguard input was not accepted"
@@ -1658,10 +1668,49 @@ class OmsAccessibilityService : AccessibilityService() {
         return firstEditable
     }
 
+    private fun hitTestLiveNodeAt(
+        roots: List<AccessibilityNodeInfo>,
+        x: Int,
+        y: Int
+    ): Pair<String, Boolean> {
+        var bestLabel = ""
+        var bestArea = Long.MAX_VALUE
+        var hitPassword = false
+        val rect = Rect()
+
+        fun visit(node: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 30 || !node.isVisibleToUser) return
+            node.getBoundsInScreen(rect)
+            if (rect.left < rect.right && rect.top < rect.bottom &&
+                x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+            ) {
+                if (node.isPassword) {
+                    hitPassword = true
+                }
+                val area = (rect.right - rect.left).toLong() * (rect.bottom - rect.top).toLong()
+                val label = SemanticTreeExtractor.extractNodeLabel(node)
+                if (label.isNotEmpty() && (node.isClickable || node.isLongClickable || node.isCheckable || area <= bestArea)) {
+                    if (area <= bestArea || bestLabel.isEmpty()) {
+                        bestArea = area
+                        bestLabel = label
+                    }
+                }
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { visit(it, depth + 1) }
+                }
+            }
+        }
+
+        for (r in roots) {
+            visit(r, 0)
+        }
+        return bestLabel to hitPassword
+    }
+
     /**
      * Direct, low-latency human input injection for Mac Live Screen Mirroring (L1/L2).
-     * Skips the semantic settle delay, but shares GUI serialization, session revocation
-     * and the phone's durable emergency-stop latch with automated input.
+     * Skips the semantic settle delay, but shares GUI serialization, session revocation,
+     * self-package block, sensitive-action confirmation, and the phone's durable emergency-stop latch.
      */
     suspend fun executeMirrorInput(
         params: JSONObject,
@@ -1677,18 +1726,25 @@ class OmsAccessibilityService : AccessibilityService() {
             sessionValid = sessionStillValid,
             activeJob = { activeAction = it },
             showStopControl = { safetyOverlay?.showActivePill() == true },
-            hideStopControl = { safetyOverlay?.hideActivePill(); Unit },
+            hideStopControl = {
+                safetyOverlay?.cancelConfirmation()
+                if (!guard.stopped) safetyOverlay?.scheduleHideActivePill(2_200L)
+                Unit
+            },
             checkWindow = {
                 if (!isSafeNavigation && isBlockedFinancialOrPasswordWindow(
-                        rootInActiveWindow, collectApplicationRoots(), allowSelfPackage = true
+                        rootInActiveWindow, collectApplicationRoots(), allowSelfPackage = false
                     )) {
-                    throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password safety policy")
+                    throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password/self-package safety policy")
                 }
             }
-        ) { executeMirrorInputLocked(params) }
+        ) { executeMirrorInputLocked(params, sessionStillValid) }
     }
 
-    private suspend fun executeMirrorInputLocked(params: JSONObject): JSONObject {
+    private suspend fun executeMirrorInputLocked(
+        params: JSONObject,
+        sessionStillValid: () -> Boolean
+    ): JSONObject {
         val dm = resources.displayMetrics
         val screenW = dm.widthPixels.coerceAtLeast(1)
         val screenH = dm.heightPixels.coerceAtLeast(1)
@@ -1705,17 +1761,38 @@ class OmsAccessibilityService : AccessibilityService() {
             return defaultPx.coerceIn(1, maxDim - 1)
         }
 
+        suspend fun enforceMirrorPointSafety(tx: Int, ty: Int, normAction: String) {
+            val roots = collectApplicationRoots()
+            if (isBlockedFinancialOrPasswordWindow(rootInActiveWindow, roots, allowSelfPackage = false)) {
+                throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password/self-package safety policy")
+            }
+            val (hitLabel, hitPassword) = hitTestLiveNodeAt(roots, tx, ty)
+            if (hitPassword) {
+                throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Password field interaction is blocked")
+            }
+            if (SensitiveActionPolicy.requiresUserConfirmation(normAction, false, hitLabel)) {
+                val confirmed = safetyOverlay?.awaitUserConfirmForSensitiveAction(
+                    if (hitLabel.isNotEmpty()) "点击「$hitLabel」" else "执行 $normAction"
+                ) ?: false
+                if (!confirmed || guard.stopped || !sessionStillValid()) {
+                    throw IllegalStateException("ERR_USER_INTERRUPTED: User declined sensitive mirror action")
+                }
+            }
+        }
+
         var ok = false
         when (type) {
             "tap", "click" -> {
                 val tx = resolveCoord("normX", "x", screenW, screenW / 2)
                 val ty = resolveCoord("normY", "y", screenH, screenH / 2)
+                enforceMirrorPointSafety(tx, ty, "click")
                 val dur = params.optLong("durationMs", 55L).coerceIn(30L, 250L)
                 ok = injectTapGesture(tx, ty, dur)
             }
             "long_press", "long_click" -> {
                 val tx = resolveCoord("normX", "x", screenW, screenW / 2)
                 val ty = resolveCoord("normY", "y", screenH, screenH / 2)
+                enforceMirrorPointSafety(tx, ty, "long_click")
                 val dur = params.optLong("durationMs", 620L).coerceIn(400L, 2500L)
                 ok = injectTapGesture(tx, ty, dur)
             }

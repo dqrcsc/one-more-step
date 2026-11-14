@@ -20,7 +20,16 @@ export function ipcTimeoutForAction(action: string, params: Record<string, any>)
   if (
     action === "phone_device_control" &&
     (params.action === "call_phone" || params.action === "call") &&
-    Boolean(params.say || params.sayText || params.ttsText)
+    Boolean(
+      params.say ||
+        params.sayText ||
+        params.ttsText ||
+        params.macSay ||
+        params.macSayText ||
+        params.aiCall ||
+        params.aiCallText ||
+        params.waitForAnswer
+    )
   ) {
     return 95000;
   }

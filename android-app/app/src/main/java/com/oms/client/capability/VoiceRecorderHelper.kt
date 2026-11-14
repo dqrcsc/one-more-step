@@ -1,6 +1,9 @@
 package com.oms.client.capability
 
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.net.Uri
@@ -28,11 +31,56 @@ object VoiceRecorderHelper {
     var playingItemId: String? = null
         private set
 
+    private val focusLock = Any()
+    private var appContextRef: Context? = null
+    private var activeFocusRequest: AudioFocusRequest? = null
+
     fun isRecording(): Boolean = recorder != null
+
+    private fun requestExclusiveAudioFocus(context: Context, usage: Int, gainType: Int) {
+        val appCtx = context.applicationContext
+        appContextRef = appCtx
+        val am = appCtx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        synchronized(focusLock) {
+            activeFocusRequest?.let { prev ->
+                runCatching { am.abandonAudioFocusRequest(prev) }
+                activeFocusRequest = null
+            }
+            runCatching {
+                val attrs = AudioAttributes.Builder()
+                    .setUsage(usage)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+                val req = AudioFocusRequest.Builder(gainType)
+                    .setAudioAttributes(attrs)
+                    .setOnAudioFocusChangeListener { }
+                    .build()
+                am.requestAudioFocus(req)
+                activeFocusRequest = req
+            }
+        }
+    }
+
+    private fun abandonAudioFocus() {
+        val ctx = appContextRef ?: return
+        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        synchronized(focusLock) {
+            activeFocusRequest?.let { req ->
+                activeFocusRequest = null
+                runCatching { am.abandonAudioFocusRequest(req) }
+            }
+        }
+    }
 
     fun startRecording(context: Context): File? {
         stopRecordingInternal(deleteFile = true)
         stopPlayback()
+        NotificationExecutor.stopSpeaking(context)
+        requestExclusiveAudioFocus(
+            context = context,
+            usage = AudioAttributes.USAGE_MEDIA,
+            gainType = AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE
+        )
 
         return try {
             val dir = File(context.filesDir, "voice_notes").apply { mkdirs() }
@@ -116,6 +164,7 @@ object VoiceRecorderHelper {
                 }
             }
         }
+        abandonAudioFocus()
         if (deleteFile && f != null) {
             try {
                 f.delete()
@@ -132,9 +181,20 @@ object VoiceRecorderHelper {
         onFinish: () -> Unit
     ): Boolean {
         stopPlayback()
+        requestExclusiveAudioFocus(
+            context = context,
+            usage = AudioAttributes.USAGE_MEDIA,
+            gainType = AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+        )
         return try {
             val uri = Uri.parse(uriString)
             val mp = MediaPlayer()
+            mp.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
             if (uri.scheme == "file" && uri.path != null) {
                 mp.setDataSource(uri.path!!)
             } else {
@@ -149,10 +209,14 @@ object VoiceRecorderHelper {
                 onFinish()
                 true
             }
-            mp.prepare()
-            mp.start()
+            mp.setOnPreparedListener { prepared ->
+                if (mediaPlayer === prepared) {
+                    runCatching { prepared.start() }
+                }
+            }
             mediaPlayer = mp
             playingItemId = itemId
+            mp.prepareAsync()
             true
         } catch (_: Throwable) {
             stopPlayback()
@@ -174,6 +238,9 @@ object VoiceRecorderHelper {
                 mp.release()
             } catch (_: Throwable) {
             }
+        }
+        if (recorder == null) {
+            abandonAudioFocus()
         }
     }
 }

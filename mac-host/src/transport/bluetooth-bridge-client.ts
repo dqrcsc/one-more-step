@@ -41,6 +41,9 @@ export class BluetoothBridgeServer extends EventEmitter {
   private server: net.Server | null = null;
   private activeClient: net.Socket | null = null;
   private childProc: ChildProcess | null = null;
+  private respawnTimer: ReturnType<typeof setTimeout> | null = null;
+  private respawnAttempt = 0;
+  private stopped = false;
   private connectedCentralId: string | null = null;
   private readonly opts: BluetoothBridgeOptions;
   private latestAirpodsStatus: MacBridgeAirPodsStatus = {
@@ -69,6 +72,7 @@ export class BluetoothBridgeServer extends EventEmitter {
   }
 
   public async start(): Promise<void> {
+    this.stopped = false;
     const dir = path.dirname(this.opts.socketPath);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     try {
@@ -140,18 +144,45 @@ export class BluetoothBridgeServer extends EventEmitter {
     });
 
     if (this.opts.autoSpawnBinary && this.opts.binaryPath && fs.existsSync(this.opts.binaryPath)) {
-      const infoJson = JSON.stringify({
-        macId: this.opts.macId,
-        lanIps: this.opts.lanIps,
-        lanPort: this.opts.lanPort,
-      });
-      this.childProc = spawn(
-        this.opts.binaryPath,
-        ["--socket", this.opts.socketPath, "--info", infoJson],
-        { stdio: "ignore" }
-      );
-      this.childProc.unref();
+      this.spawnBridgeProcess();
     }
+  }
+
+  private spawnBridgeProcess(): void {
+    if (this.stopped || !this.opts.binaryPath || !fs.existsSync(this.opts.binaryPath)) return;
+    if (this.respawnTimer) {
+      clearTimeout(this.respawnTimer);
+      this.respawnTimer = null;
+    }
+    const infoJson = JSON.stringify({
+      macId: this.opts.macId,
+      lanIps: this.opts.lanIps,
+      lanPort: this.opts.lanPort,
+    });
+    const spawnedAt = Date.now();
+    const child = spawn(
+      this.opts.binaryPath,
+      ["--socket", this.opts.socketPath, "--info", infoJson],
+      { stdio: "ignore" }
+    );
+    this.childProc = child;
+    child.on("error", () => {});
+    child.on("exit", () => {
+      if (this.childProc === child) {
+        this.childProc = null;
+      }
+      if (this.stopped) return;
+      if (Date.now() - spawnedAt > 10_000) {
+        this.respawnAttempt = 0;
+      }
+      const delayMs = Math.min(15_000, 1_500 * Math.pow(2, this.respawnAttempt++));
+      this.respawnTimer = setTimeout(() => {
+        this.respawnTimer = null;
+        this.spawnBridgeProcess();
+      }, delayMs);
+      (this.respawnTimer as any).unref?.();
+    });
+    child.unref();
   }
 
   public get isPhoneConnectedOverBt(): boolean {
@@ -288,6 +319,9 @@ export class BluetoothBridgeServer extends EventEmitter {
 
   private handleBridgeMessage(msg: Record<string, any>): void {
     switch (msg.type) {
+      case "bridge_ready":
+        this.respawnAttempt = 0;
+        break;
       case "ble_state":
         this.emit("bleState", msg.state);
         break;
@@ -368,6 +402,11 @@ export class BluetoothBridgeServer extends EventEmitter {
   }
 
   public async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.respawnTimer) {
+      clearTimeout(this.respawnTimer);
+      this.respawnTimer = null;
+    }
     for (const [reqId, w] of this.pendingCmdWaiters) {
       this.sendToBridge({ type: "airpods_cancel", reqId });
       clearTimeout(w.timer);

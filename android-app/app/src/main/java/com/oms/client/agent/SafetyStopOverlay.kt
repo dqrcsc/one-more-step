@@ -25,8 +25,11 @@ class SafetyStopOverlay(
     private val mainHandler = Handler(Looper.getMainLooper())
     private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private var pillView: TextView? = null
+    private var pillStoppedState: Boolean? = null
     private var confirmBar: LinearLayout? = null
     private var pendingConfirmation: CancellableContinuation<Boolean>? = null
+    private val deferredHidePillRunnable: Runnable = Runnable { hideActivePill() }
+
     val isAwaitingConfirmation: Boolean get() = pendingConfirmation?.isActive == true
 
     private fun onMain(block: () -> Unit) {
@@ -42,13 +45,27 @@ class SafetyStopOverlay(
 
     private fun showPill(stopped: Boolean): Boolean {
         check(Looper.myLooper() == Looper.getMainLooper())
-        hideActivePill()
-        if (!Settings.canDrawOverlays(context)) return false
+        mainHandler.removeCallbacks(deferredHidePillRunnable)
+        if (!Settings.canDrawOverlays(context)) {
+            remove(pillView)
+            pillView = null
+            pillStoppedState = null
+            return false
+        }
+        val existing = pillView
+        if (existing != null && pillStoppedState == stopped && existing.isAttachedToWindow) {
+            return true
+        }
+        remove(existing)
+        pillView = null
+        pillStoppedState = null
+
         val tv = TextView(context).apply {
             text = if (stopped) "⏸ AI 已急停 · 点击恢复后请重新观察" else "🤖 Mac AI 操作中 · 点击立即停止"
             setTextColor(Color.WHITE)
             textSize = 13f
             setPadding(36, 16, 36, 16)
+            filterTouchesWhenObscured = true
             background = GradientDrawable().apply {
                 setColor(Color.parseColor(if (stopped) "#E6334155" else "#E6FF5722"))
                 cornerRadius = 48f
@@ -61,10 +78,28 @@ class SafetyStopOverlay(
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL; y = 24 }
-        return try { windowManager.addView(tv, params); pillView = tv; true } catch (_: Exception) { false }
+        return try {
+            windowManager.addView(tv, params)
+            pillView = tv
+            pillStoppedState = stopped
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
-    fun hideActivePill() = onMain { remove(pillView); pillView = null }
+    fun scheduleHideActivePill(delayMs: Long = 2_200L): Unit = onMain {
+        if (pillStoppedState == true) return@onMain
+        mainHandler.removeCallbacks(deferredHidePillRunnable)
+        mainHandler.postDelayed(deferredHidePillRunnable, delayMs.coerceAtLeast(100L))
+    }
+
+    fun hideActivePill(): Unit = onMain {
+        mainHandler.removeCallbacks(deferredHidePillRunnable)
+        remove(pillView)
+        pillView = null
+        pillStoppedState = null
+    }
 
     fun cancelConfirmation() = onMain {
         val continuation = pendingConfirmation
@@ -76,7 +111,6 @@ class SafetyStopOverlay(
 
     suspend fun awaitUserConfirmForSensitiveAction(actionDesc: String): Boolean =
         suspendCancellableCoroutine { cont ->
-            // The caller's deadline cancels this continuation and removes the UI.
             cont.invokeOnCancellation {
                 onMain {
                     if (pendingConfirmation === cont) {
@@ -97,6 +131,7 @@ class SafetyStopOverlay(
                 val container = LinearLayout(context).apply {
                     orientation = LinearLayout.HORIZONTAL
                     setPadding(36, 24, 36, 24)
+                    filterTouchesWhenObscured = true
                     background = GradientDrawable().apply {
                         setColor(Color.parseColor("#F21E293B")); cornerRadius = 36f
                     }
@@ -114,10 +149,12 @@ class SafetyStopOverlay(
                 })
                 container.addView(TextView(context).apply {
                     text = " [✅ 放行] "; setTextColor(Color.parseColor("#4ADE80")); textSize = 14f
+                    filterTouchesWhenObscured = true
                     setOnClickListener { finish(true) }
                 })
                 container.addView(TextView(context).apply {
                     text = " [❌ 拦截] "; setTextColor(Color.parseColor("#F87171")); textSize = 14f
+                    filterTouchesWhenObscured = true
                     setOnClickListener { finish(false) }
                 })
                 val params = WindowManager.LayoutParams(

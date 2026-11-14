@@ -48,11 +48,14 @@ import com.oms.client.capability.AppLauncherHelper
 import com.oms.client.capability.CalendarExecutor
 import com.oms.client.capability.NotificationExecutor
 import com.oms.client.capability.ScopedStorageExecutor
+import com.oms.client.capability.SpeechAudioPolicy
 import com.oms.client.data.PairedMacConfig
 import com.oms.client.data.StreamItemModel
 import com.oms.client.data.StreamRepository
 import com.oms.client.otp.OtpExtractor
 import com.oms.client.otp.OtpMatch
+import com.oms.client.service.OmsCoreForegroundService
+import com.oms.client.share.AttachmentResolver
 import com.oms.client.share.ClipboardCatcherActivity
 import com.oms.client.share.ShareInputPolicy
 import com.oms.client.xiaomi.XiaomiAdaptationHelper
@@ -86,6 +89,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.InputStream
+import java.io.RandomAccessFile
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
@@ -95,6 +100,8 @@ import java.net.NetworkInterface
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
+import java.util.BitSet
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -176,6 +183,8 @@ class OmsTransportClient(
     private val isBleScanning = AtomicBoolean(false)
     private val isFlushingOutbox = AtomicBoolean(false)
 
+    private val baseHttpClient: OkHttpClient = OkHttpClient.Builder().build()
+
     @Volatile
     private var cachedWifiNetwork: Network? = null
     @Volatile
@@ -205,9 +214,14 @@ class OmsTransportClient(
         val header: JSONObject,
         val source: FrameSource,
         val validated: DeliveryPolicy.Header,
+        val partFile: File,
         val createdAtMs: Long = System.currentTimeMillis(),
-        val chunks: MutableMap<Int, ByteArray> = ConcurrentHashMap()
-    )
+        val receivedChunks: BitSet = BitSet(validated.totalChunks)
+    ) {
+        fun cleanup() {
+            runCatching { if (partFile.exists()) partFile.delete() }
+        }
+    }
 
     private data class FrameSource(val tier: String, val socket: WebSocket?, val gatt: BluetoothGatt?)
     private data class PendingReply(val source: FrameSource, val result: CompletableDeferred<JSONObject>)
@@ -301,18 +315,25 @@ class OmsTransportClient(
                         }
                     }
                     val expiredTransfers = synchronized(incomingTransferLock) {
-                        incomingTransfers.entries.filter { it.value.createdAtMs + 180_000 <= now }
+                        val exp = incomingTransfers.entries.filter { it.value.createdAtMs + 180_000 <= now }
                             .mapNotNull { (id, transfer) -> if (incomingTransfers.remove(id, transfer)) id to transfer else null }
+                        OmsCoreForegroundService.setLowLatencyWifiNeeded("incoming_stream", incomingTransfers.isNotEmpty())
+                        exp
                     }
-                    for ((id, transfer) in expiredTransfers) streamAck(id, "ERROR", transfer.source, error = "Stream timed out")
+                    for ((id, transfer) in expiredTransfers) {
+                        transfer.cleanup()
+                        streamAck(id, "ERROR", transfer.source, error = "Stream timed out")
+                    }
                     val paired = repo.getPairedMac()?.takeIf { isV2Pairing(it) } ?: continue
                     val lanSource = captureSource("LAN_WS", lanWebSocket)
                     val btSource = captureSource("BT_RFCOMM", null)
+                    val wanSource = captureSource("WAN_WEBRTC", wanWebSocket)
                     watchdogTickCount++
                     if (watchdogTickCount % 2L == 0L) {
                         val heartbeatTarget = when {
                             _activeTierFlow.value == "LAN_WS" && lanWebSocket != null && sourceAuthenticated(lanSource) -> lanSource
                             sourceAuthenticated(btSource) -> btSource
+                            sourceAuthenticated(wanSource) -> wanSource
                             else -> null
                         }
                         if (heartbeatTarget != null) {
@@ -327,6 +348,9 @@ class OmsTransportClient(
                             startBleNearFieldScanner()
                         }
                         connectLanIfPossible(paired.lanIps, paired.lanPort)
+                        if (watchdogTickCount % 3L == 0L && wanWebSocket == null && !sourceAuthenticated(btSource)) {
+                            paired.wanRelayWssUrl?.takeIf { it.isNotBlank() }?.let { connectWanRelay(it) }
+                        }
                     }
                 } catch (_: Throwable) {
                 }
@@ -494,7 +518,7 @@ class OmsTransportClient(
         if (existing != null && physicalWifi == cachedWifiNetwork) {
             return existing
         }
-        val builder = OkHttpClient.Builder()
+        val builder = baseHttpClient.newBuilder()
             .connectTimeout(5000, TimeUnit.MILLISECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .pingInterval(10, TimeUnit.SECONDS)
@@ -608,7 +632,7 @@ class OmsTransportClient(
 
         try {
             val wifiNet = findNonVpnWifiNetwork()
-            val clientBuilder = OkHttpClient.Builder()
+            val clientBuilder = baseHttpClient.newBuilder()
                 .connectTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
                 .readTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
             if (wifiNet != null) {
@@ -628,7 +652,7 @@ class OmsTransportClient(
         // Fallback to default system network socket if custom Wi-Fi binding failed on priority IP
         if (!checkTcpFirst) {
             try {
-                val fallbackClient = OkHttpClient.Builder()
+                val fallbackClient = baseHttpClient.newBuilder()
                     .connectTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
                     .readTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
                     .build()
@@ -1008,10 +1032,14 @@ class OmsTransportClient(
     }
 
     fun connectWanRelay(wssUrl: String) {
+        if (wanWebSocket != null && isSourceAuthenticated("WAN_WEBRTC", wanWebSocket)) return
         if (hasPendingSecureHandshake(captureSource("WAN_WEBRTC", wanWebSocket))) return
         if (!isV2Pairing(repo.getPairedMac())) return
-        val client = OkHttpClient.Builder().connectTimeout(5, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.MILLISECONDS).build()
+        val client = baseHttpClient.newBuilder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .pingInterval(15, TimeUnit.SECONDS)
+            .build()
         val generation = synchronized(connectionLock) { wanGeneration.incrementAndGet() }
         client.newWebSocket(Request.Builder().url(wssUrl).build(), secureSocketListener("WAN_WEBRTC", generation))
     }
@@ -1539,7 +1567,15 @@ class OmsTransportClient(
         for ((id, pending) in pendingReplies) {
             if (pending.source == source && pendingReplies.remove(id, pending)) pending.result.completeExceptionally(IllegalStateException(reason))
         }
-        incomingTransfers.entries.removeIf { it.value.source == source }
+        val iter = incomingTransfers.entries.iterator()
+        while (iter.hasNext()) {
+            val entry = iter.next()
+            if (entry.value.source == source) {
+                entry.value.cleanup()
+                iter.remove()
+            }
+        }
+        OmsCoreForegroundService.setLowLatencyWifiNeeded("incoming_stream", incomingTransfers.isNotEmpty())
         if (source.gatt != null) runCatching { source.gatt.disconnect(); source.gatt.close() }
         runCatching { source.socket?.close(4003, reason.take(100)) }
         recomputeFallbackTier()
@@ -1573,9 +1609,108 @@ class OmsTransportClient(
         }
     }
 
+    private data class OpenedShareAttachment(
+        val originalUri: Uri,
+        val stream: InputStream?,
+        val itemId: String,
+        val fileName: String,
+        val mimeType: String
+    )
+
+    private fun uniqueFileNameInSet(baseName: String, usedLower: MutableSet<String>): String {
+        val dot = baseName.lastIndexOf('.')
+        val stem = if (dot > 0) baseName.substring(0, dot) else baseName
+        val ext = if (dot > 0) baseName.substring(dot) else ""
+        var candidate = baseName
+        var idx = 2
+        while (!usedLower.add(candidate.lowercase())) {
+            candidate = "${stem}_${idx++}${ext}"
+        }
+        return candidate
+    }
+
+    private fun openShareAttachmentForPersistence(
+        uri: Uri?,
+        itemId: String,
+        suffix: String,
+        usedNames: MutableSet<String>
+    ): OpenedShareAttachment? {
+        if (uri == null) return null
+        if (!ShareInputPolicy.isSafeInternalOrContentUri(uri, listOf(context.filesDir, context.cacheDir))) {
+            return OpenedShareAttachment(uri, null, itemId, "", "application/octet-stream")
+        }
+        return try {
+            val stream = if (uri.scheme == "file" && uri.path != null) {
+                File(uri.path!!).takeIf { it.exists() }?.inputStream()
+            } else {
+                context.contentResolver.openInputStream(uri)
+            }
+            val meta = AttachmentResolver.describeUri(
+                context,
+                uri,
+                fallbackPrefix = if (suffix.startsWith("audio")) "voice_${itemId.takeLast(6)}" else "file_${suffix}"
+            )
+            val uniqueName = uniqueFileNameInSet(meta.safeFileName, usedNames)
+            OpenedShareAttachment(uri, stream, itemId, uniqueName, meta.mimeType)
+        } catch (_: Throwable) {
+            OpenedShareAttachment(uri, null, itemId, "", "application/octet-stream")
+        }
+    }
+
+    private fun persistOpenedShareAttachment(
+        opened: OpenedShareAttachment?,
+        budgetTracker: LongArray
+    ): Uri? {
+        if (opened == null) return null
+        val input = opened.stream
+        if (input == null || opened.fileName.isBlank()) {
+            mainHandler.post {
+                android.widget.Toast.makeText(
+                    context,
+                    "附件无法读取，条目将保留待发送；请检查权限或重新选择文件",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+            }
+            return opened.originalUri
+        }
+        val itemDir = File(context.filesDir, "outbox_attachments/${opened.itemId}").apply { mkdirs() }
+        val target = File(itemDir, opened.fileName)
+        return try {
+            input.use { src ->
+                java.io.FileOutputStream(target).use { out ->
+                    val buf = ByteArray(65536)
+                    while (true) {
+                        val n = src.read(buf)
+                        if (n < 0) break
+                        budgetTracker[0] = budgetTracker[0] + n.toLong()
+                        require(budgetTracker[0] <= DeliveryPolicy.MAX_BYTES.toLong()) { "File exceeds 64 MiB" }
+                        out.write(buf, 0, n)
+                    }
+                    out.fd.sync()
+                }
+            }
+            Uri.fromFile(target)
+        } catch (e: Throwable) {
+            runCatching { if (target.exists()) target.delete() }
+            val msg = if (e.message?.contains("64 MiB") == true) {
+                "⚠️ 单个投递附件总大小超过 64MB 上限"
+            } else {
+                "附件无法保存，条目将保留待发送；请检查权限或重新分享"
+            }
+            mainHandler.post {
+                android.widget.Toast.makeText(
+                    context,
+                    msg,
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+            }
+            opened.originalUri // Retain the reference and queue the whole item; never silently drop an attachment.
+        }
+    }
+
     /**
-     * Submit an item (screenshot, shared article, voice idea, clipboard) to Mac Inbox,
-     * or queue offline in SQLite if currently disconnected.
+     * Submit an item (screenshot, album photos, PDF/Word/Office documents, shared article, voice idea, clipboard)
+     * to Mac Inbox, or queue offline in SQLite if currently disconnected.
      */
     fun submitItemToMacOrQueue(
         intentTag: String,
@@ -1585,44 +1720,98 @@ class OmsTransportClient(
         voiceTranscript: String?,
         fileUri: Uri?,
         sourceApp: String? = null,
-        extraAudioUri: Uri? = null
+        extraAudioUri: Uri? = null,
+        additionalFileUris: List<Uri> = emptyList()
     ): String {
         val itemId = OmsFrameProtocol.generateUuidV7()
-        fun persistAttachment(uri: Uri?, suffix: String): Uri? {
-            if (uri == null) return null
-            return try {
-                val loaded = readUriBytesAndMime(uri.toString(), "${itemId}_$suffix")
-                    ?: throw IllegalArgumentException("无法读取共享附件")
-                val target = File(context.filesDir, loaded.third)
-                java.io.FileOutputStream(target).use { it.write(loaded.first); it.fd.sync() }
-                Uri.fromFile(target)
-            } catch (_: Exception) {
-                mainHandler.post { android.widget.Toast.makeText(context, "附件无法保存，条目将保留待发送；请检查权限或重新分享", android.widget.Toast.LENGTH_LONG).show() }
-                uri // Retain the reference and queue the whole item; never silently drop an attachment.
+        val createdAtMs = System.currentTimeMillis()
+        val allPrimaryUris = buildList {
+            if (fileUri != null) add(fileUri)
+            for (u in additionalFileUris) {
+                if (u != fileUri) add(u)
             }
         }
-        val durableFile = persistAttachment(fileUri, "file")
-        val durableAudio = persistAttachment(extraAudioUri, "audio")
-        val metaObj = JSONObject()
-        if (durableAudio != null) metaObj.put("extraAudioUri", durableAudio.toString())
-        if (!sourceApp.isNullOrBlank()) metaObj.put("sourceApp", sourceApp)
-        val metaJson = if (metaObj.length() > 0) metaObj.toString() else null
-        val item = StreamItemModel(
-            itemId = itemId,
-            direction = "PHONE_TO_MAC",
-            itemType = itemType,
-            intentTag = intentTag,
-            title = title,
-            textContent = textContent,
-            voiceTranscript = voiceTranscript,
-            localFileUri = durableFile?.toString(),
-            macSavedPath = null,
-            syncStatus = "QUEUED",
-            metadataJson = metaJson,
-            createdAtMs = System.currentTimeMillis()
-        )
-        repo.upsertStreamItem(item)
-        flushOutboxQueue()
+        if (allPrimaryUris.isEmpty() && extraAudioUri == null) {
+            val metaObj = JSONObject()
+            if (!sourceApp.isNullOrBlank()) metaObj.put("sourceApp", sourceApp)
+            val metaJson = if (metaObj.length() > 0) metaObj.toString() else null
+            repo.upsertStreamItem(
+                StreamItemModel(
+                    itemId = itemId,
+                    direction = "PHONE_TO_MAC",
+                    itemType = itemType,
+                    intentTag = intentTag,
+                    title = title,
+                    textContent = textContent,
+                    voiceTranscript = voiceTranscript,
+                    localFileUri = null,
+                    macSavedPath = null,
+                    syncStatus = "QUEUED",
+                    metadataJson = metaJson,
+                    createdAtMs = createdAtMs
+                )
+            )
+            flushOutboxQueue()
+            return itemId
+        }
+
+        // Open transient ContentResolver streams synchronously so ShareReceiverActivity.finish()
+        // cannot revoke FLAG_GRANT_READ_URI_PERMISSION before background I/O completes.
+        val usedNames = mutableSetOf<String>()
+        val openedFiles = allPrimaryUris.mapIndexedNotNull { idx, u ->
+            openShareAttachmentForPersistence(u, itemId, "att${idx + 1}", usedNames)
+        }
+        val openedAudio = openShareAttachmentForPersistence(extraAudioUri, itemId, "audio", usedNames)
+        scope.launch(Dispatchers.IO) {
+            try {
+                val budgetTracker = longArrayOf(0L)
+                val durableFiles = openedFiles.mapNotNull { persistOpenedShareAttachment(it, budgetTracker) }
+                val durableAudio = persistOpenedShareAttachment(openedAudio, budgetTracker)
+                val metaObj = JSONObject()
+                if (durableFiles.size > 1) {
+                    val extraArr = JSONArray()
+                    for (i in 1 until durableFiles.size) {
+                        extraArr.put(durableFiles[i].toString())
+                    }
+                    metaObj.put("extraFileUris", extraArr)
+                }
+                if (openedFiles.isNotEmpty()) {
+                    val namesArr = JSONArray()
+                    openedFiles.forEach { if (it.fileName.isNotBlank()) namesArr.put(it.fileName) }
+                    if (namesArr.length() > 0) metaObj.put("attachmentNames", namesArr)
+                }
+                if (durableAudio != null) metaObj.put("extraAudioUri", durableAudio.toString())
+                if (!sourceApp.isNullOrBlank()) metaObj.put("sourceApp", sourceApp)
+                val metaJson = if (metaObj.length() > 0) metaObj.toString() else null
+                val effectiveType = if (itemType == "MEDIA" || itemType == "FILE") {
+                    AttachmentResolver.inferItemType(
+                        openedFiles.map { it.mimeType },
+                        hasVoiceNote = durableAudio != null
+                    )
+                } else {
+                    itemType
+                }
+                val item = StreamItemModel(
+                    itemId = itemId,
+                    direction = "PHONE_TO_MAC",
+                    itemType = effectiveType,
+                    intentTag = intentTag,
+                    title = title,
+                    textContent = textContent,
+                    voiceTranscript = voiceTranscript,
+                    localFileUri = durableFiles.firstOrNull()?.toString(),
+                    macSavedPath = null,
+                    syncStatus = "QUEUED",
+                    metadataJson = metaJson,
+                    createdAtMs = createdAtMs
+                )
+                repo.upsertStreamItem(item)
+                flushOutboxQueue()
+            } finally {
+                openedFiles.forEach { opened -> runCatching { opened.stream?.close() } }
+                runCatching { openedAudio?.stream?.close() }
+            }
+        }
         return itemId
     }
 
@@ -1668,28 +1857,12 @@ class OmsTransportClient(
                 context.contentResolver.openInputStream(uri)?.use { DeliveryPolicy.readBounded(it) }
             } ?: return null
 
-            val pathLower = (uri.path ?: uriStr).lowercase()
-            val resolverMime = try {
-                context.contentResolver.getType(uri)
-            } catch (_: Throwable) {
-                null
-            }
-            val (mime, ext) = when {
-                pathLower.endsWith(".m4a") -> "audio/mp4" to "m4a"
-                pathLower.endsWith(".mp3") -> "audio/mpeg" to "mp3"
-                pathLower.endsWith(".wav") -> "audio/wav" to "wav"
-                pathLower.endsWith(".ogg") -> "audio/ogg" to "ogg"
-                pathLower.endsWith(".aac") -> "audio/aac" to "aac"
-                pathLower.endsWith(".webp") -> "image/webp" to "webp"
-                pathLower.endsWith(".jpg") || pathLower.endsWith(".jpeg") -> "image/jpeg" to "jpg"
-                pathLower.endsWith(".png") -> "image/png" to "png"
-                pathLower.endsWith(".pdf") -> "application/pdf" to "pdf"
-                !resolverMime.isNullOrBlank() -> resolverMime to resolverMime.substringAfterLast('/', "bin")
-                else -> "image/png" to "png"
-            }
-            val filePrefix = if (mime.startsWith("audio/")) "voice" else prefix
-            val fileName = "${filePrefix}_${itemIdSuffix}.$ext"
-            Triple(bytes, mime, fileName)
+            val meta = AttachmentResolver.describeUri(
+                context,
+                uri,
+                fallbackPrefix = "${prefix}_${itemIdSuffix}"
+            )
+            Triple(bytes, meta.mimeType, meta.safeFileName)
         } catch (_: Throwable) {
             null
         }
@@ -1701,6 +1874,10 @@ class OmsTransportClient(
         scope.launch {
             try {
                 for (item in repo.listQueuedOutboxItems()) {
+                    if (item.itemType == "OTP" && System.currentTimeMillis() - item.createdAtMs > OtpExtractor.OTP_MAX_AGE_MS) {
+                        repo.updateSyncStatus(item.itemId, "EXPIRED")
+                        continue
+                    }
                     try {
                         val source = activeSource()
                         val attachments = JSONArray()
@@ -1731,7 +1908,13 @@ class OmsTransportClient(
                         }
                         val metadata = item.metadataJson?.takeIf { it.isNotBlank() }?.let { JSONObject(it) }
                         attach(item.localFileUri)
-                        attach(item.metadataJson?.let { JSONObject(it).optString("extraAudioUri", "") })
+                        val extraFileArr = metadata?.optJSONArray("extraFileUris")
+                        if (extraFileArr != null) {
+                            for (i in 0 until extraFileArr.length()) {
+                                attach(extraFileArr.optString(i, ""))
+                            }
+                        }
+                        attach(metadata?.optString("extraAudioUri", ""))
                         val request = JSONObject().put("jsonrpc", "2.0")
                             .put("id", "inbox_${UUID.randomUUID()}").put("method", "inbox.submitItem")
                             .put("params", JSONObject().put("clientItemId", item.itemId).put("intentTag", item.intentTag)
@@ -1826,7 +2009,16 @@ class OmsTransportClient(
                 return existing
             }
             val sha = if (srcFile.exists()) {
-                OmsFrameProtocol.sha256Hex(srcFile.readBytes())
+                val digest = MessageDigest.getInstance("SHA-256")
+                val buf = ByteArray(65536)
+                srcFile.inputStream().use { input ->
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        digest.update(buf, 0, n)
+                    }
+                }
+                digest.digest().joinToString("") { "%02x".format(it) }
             } else {
                 ""
             }
@@ -1837,17 +2029,6 @@ class OmsTransportClient(
         } catch (_: Throwable) {
             Triple("1.1.0", 2, "")
         }
-    }
-
-    private fun parseSemVerCode(verName: String, fallbackCode: Int): Int {
-        val parts = verName.removePrefix("v").trim().split('.').mapNotNull { it.toIntOrNull() }
-        if (parts.size == 3 && parts[0] == 1 && parts[1] == 4) {
-            return 14 + parts[2]
-        }
-        if (parts.size == 3 && parts[0] == 1 && parts[1] == 5) {
-            return 24 + parts[2]
-        }
-        return fallbackCode
     }
 
     fun checkOtaUpdate(onResult: (OtaCheckResult) -> Unit) {
@@ -1906,9 +2087,14 @@ class OmsTransportClient(
                             } else {
                                 ghUrl
                             }
-                            val isSameBinary = localSha.isNotBlank() && localSha.equals(remoteSha, ignoreCase = true)
-                            val isOlderOnMac = remoteVerCode in 1 until localVerCode && remoteVerName == localVerName
-                            val hasUpdate = !isSameBinary && (remoteVerCode > localVerCode || remoteVerName != localVerName || !isOlderOnMac)
+                            val hasUpdate = OtaVersionPolicy.hasMacHostUpdate(
+                                localVersionName = localVerName,
+                                localVersionCode = localVerCode,
+                                localSha256 = localSha,
+                                remoteVersionName = remoteVerName,
+                                remoteVersionCode = remoteVerCode,
+                                remoteSha256 = remoteSha
+                            )
 
                             mainHandler.post {
                                 onResult(
@@ -1970,9 +2156,14 @@ class OmsTransportClient(
                             val remoteUpdatedIso = json.optString("updatedAtIso", "")
 
                             if (available && remoteSha.isNotBlank()) {
-                                val isSameBinary = localSha.isNotBlank() && localSha.equals(remoteSha, ignoreCase = true)
-                                val isOlderOnMac = remoteVerCode < localVerCode
-                                val hasUpdate = !isSameBinary && !isOlderOnMac
+                                val hasUpdate = OtaVersionPolicy.hasMacHostUpdate(
+                                    localVersionName = localVerName,
+                                    localVersionCode = localVerCode,
+                                    localSha256 = localSha,
+                                    remoteVersionName = remoteVerName,
+                                    remoteVersionCode = remoteVerCode,
+                                    remoteSha256 = remoteSha
+                                )
 
                                 mainHandler.post {
                                     onResult(
@@ -2006,7 +2197,7 @@ class OmsTransportClient(
 
             // 3. Priority 3: Fallback to GitHub Releases API when LAN HTTP is isolated/unreachable
             try {
-                val ghClient = OkHttpClient.Builder()
+                val ghClient = baseHttpClient.newBuilder()
                     .connectTimeout(5, TimeUnit.SECONDS)
                     .readTimeout(6, TimeUnit.SECONDS)
                     .build()
@@ -2024,14 +2215,26 @@ class OmsTransportClient(
                             var assetUrl = "https://github.com/dqrcsc/one-more-step/releases/download/v$tagName/OneMoreStep-v$tagName.apk"
                             var assetSize = 0L
                             var assetUpdatedIso = json.optString("published_at", "")
+                            var assetSha256 = ""
                             if (assets != null && assets.length() > 0) {
-                                val firstAsset = assets.getJSONObject(0)
-                                assetUrl = firstAsset.optString("browser_download_url", assetUrl)
-                                assetSize = firstAsset.optLong("size", 0L)
-                                assetUpdatedIso = firstAsset.optString("updated_at", assetUpdatedIso)
+                                val apkAsset = (0 until assets.length())
+                                    .map { assets.getJSONObject(it) }
+                                    .firstOrNull { it.optString("name", "").endsWith(".apk", ignoreCase = true) }
+                                    ?: assets.getJSONObject(0)
+                                assetUrl = apkAsset.optString("browser_download_url", assetUrl)
+                                assetSize = apkAsset.optLong("size", 0L)
+                                assetUpdatedIso = apkAsset.optString("updated_at", assetUpdatedIso)
+                                val digest = apkAsset.optString("digest", "")
+                                if (digest.startsWith("sha256:", ignoreCase = true)) {
+                                    assetSha256 = digest.substringAfter(':').trim()
+                                }
                             }
-                            val remoteVerCode = parseSemVerCode(tagName, localVerCode)
-                            val hasUpdate = tagName != localVerName && remoteVerCode >= localVerCode
+                            val hasUpdate = OtaVersionPolicy.hasGithubReleaseUpdate(
+                                localVersionName = localVerName,
+                                releaseTagName = tagName,
+                                localSha256 = localSha,
+                                assetSha256 = assetSha256
+                            )
                             mainHandler.post {
                                 onResult(
                                     OtaCheckResult(
@@ -2041,8 +2244,8 @@ class OmsTransportClient(
                                         localVersionCode = localVerCode,
                                         localSha256 = localSha,
                                         remoteVersionName = tagName,
-                                        remoteVersionCode = remoteVerCode,
-                                        remoteSha256 = "github_release",
+                                        remoteVersionCode = if (hasUpdate) localVerCode + 1 else localVerCode,
+                                        remoteSha256 = assetSha256.ifBlank { "github_release" },
                                         remoteSizeBytes = assetSize,
                                         remoteUpdatedAtIso = assetUpdatedIso,
                                         downloadUrl = assetUrl,
@@ -2099,23 +2302,33 @@ class OmsTransportClient(
             put("sha256", sha256)
             if (intentTag != null) put("intentTag", intentTag)
         }
-        check(sendOnSource(OmsFrameProtocol.encodeStreamStart(startHeader), source)) { "Stream start send failed" }
-
-        for (i in 0 until totalChunks) {
-            val ws = source.socket
-            if (ws != null) {
-                var waitedMs = 0L
-                while (isSourceCurrent(source) && ws.queueSize() > 4L * 1024L * 1024L && waitedMs < 15_000L) {
-                    Thread.sleep(25L)
-                    waitedMs += 25L
-                }
-            }
-            val start = i * chunkSize
-            val end = (start + chunkSize).coerceAtMost(bytes.size)
-            val slice = bytes.copyOfRange(start, end)
-            check(sendOnSource(OmsFrameProtocol.encodeStreamChunk(streamId, i, slice), source)) { "Stream chunk send failed" }
+        val needWifiLowLatency = source.tier == "LAN_WS" || source.tier == "WAN_WEBRTC"
+        if (needWifiLowLatency) {
+            OmsCoreForegroundService.setLowLatencyWifiNeeded("outgoing_stream", true)
         }
-        return streamId
+        try {
+            check(sendOnSource(OmsFrameProtocol.encodeStreamStart(startHeader), source)) { "Stream start send failed" }
+
+            for (i in 0 until totalChunks) {
+                val ws = source.socket
+                if (ws != null) {
+                    var waitedMs = 0L
+                    while (isSourceCurrent(source) && ws.queueSize() > 4L * 1024L * 1024L && waitedMs < 15_000L) {
+                        Thread.sleep(25L)
+                        waitedMs += 25L
+                    }
+                }
+                val start = i * chunkSize
+                val end = (start + chunkSize).coerceAtMost(bytes.size)
+                val slice = bytes.copyOfRange(start, end)
+                check(sendOnSource(OmsFrameProtocol.encodeStreamChunk(streamId, i, slice), source)) { "Stream chunk send failed" }
+            }
+            return streamId
+        } finally {
+            if (needWifiLowLatency) {
+                OmsCoreForegroundService.setLowLatencyWifiNeeded("outgoing_stream", false)
+            }
+        }
     }
 
     private val incomingTransferLock = Any()
@@ -2127,6 +2340,14 @@ class OmsTransportClient(
         if (error != null) ack.put("errorMessage", error)
         sendOnSource(OmsFrameProtocol.encodeFrame(OmsFrameProtocol.TYPE_STREAM_ACK_RESUME,
             ack.toString().toByteArray(Charsets.UTF_8)), source)
+    }
+
+    private fun readPreviewFromFile(file: File, maxBytes: Int = 256 * 1024): String {
+        val len = minOf(file.length(), maxBytes.toLong()).toInt()
+        if (len <= 0) return ""
+        val buf = ByteArray(len)
+        RandomAccessFile(file, "r").use { it.readFully(buf) }
+        return String(buf, Charsets.UTF_8)
     }
 
     private fun receiveStreamStart(payload: ByteArray, source: FrameSource) = synchronized(incomingTransferLock) {
@@ -2152,7 +2373,7 @@ class OmsTransportClient(
                     metadata.optString("sha256").equals(validated.sha256, true) && metadata.optLong("totalBytes", -1) == validated.totalBytes) { "Stream ID conflicts with committed item" }
                 val file = File(Uri.parse(existingItem.localFileUri ?: "").path ?: "")
                 require(file.isFile && file.length() == validated.totalBytes &&
-                    OmsFrameProtocol.sha256Hex(file.inputStream().use { DeliveryPolicy.readBounded(it) }).equals(validated.sha256, true)) { "Committed file unavailable" }
+                    DeliveryPolicy.sha256FileHex(file).equals(validated.sha256, true)) { "Committed file unavailable" }
                 streamAck(streamId, "COMPLETED", source, validated.totalChunks)
                 return@synchronized
             }
@@ -2160,9 +2381,17 @@ class OmsTransportClient(
             require(existing == null || existing.source == source) { "Stream belongs to another connection" }
             require(existing == null || existing.validated == validated) { "Stream header changed" }
             require(existing != null || incomingTransfers.size < DeliveryPolicy.MAX_TRANSFERS) { "Too many concurrent streams" }
-            if (existing == null) incomingTransfers[streamId] = IncomingPushTransfer(header, source, validated)
+            if (existing == null) {
+                val partFile = File(context.filesDir, "$streamId.part")
+                if (partFile.exists()) partFile.delete()
+                incomingTransfers[streamId] = IncomingPushTransfer(header, source, validated, partFile)
+                OmsCoreForegroundService.setLowLatencyWifiNeeded("incoming_stream", incomingTransfers.isNotEmpty())
+            }
         } catch (e: Exception) {
-            if (incomingTransfers[streamId]?.source == source) incomingTransfers.remove(streamId)
+            if (incomingTransfers[streamId]?.source == source) {
+                incomingTransfers.remove(streamId)?.cleanup()
+                OmsCoreForegroundService.setLowLatencyWifiNeeded("incoming_stream", incomingTransfers.isNotEmpty())
+            }
             streamAck(streamId, "ERROR", source, error = e.message ?: "Invalid stream")
         }
     }
@@ -2184,35 +2413,34 @@ class OmsTransportClient(
         try {
             val index = ByteBuffer.wrap(payload, 16, 4).order(ByteOrder.BIG_ENDIAN).int
             val bytes = payload.copyOfRange(OmsFrameProtocol.STREAM_CHUNK_PREFIX_BYTES, payload.size)
-            transfer.validated.validateChunk(index, bytes)
-            transfer.chunks[index]?.let { require(it.contentEquals(bytes)) { "Conflicting duplicate chunk" } }
-            transfer.chunks[index] = bytes
-            if (transfer.chunks.size != transfer.validated.totalChunks) return@synchronized
-            val fullBytes = transfer.validated.assemble(transfer.chunks)
+            val completed = transfer.validated.writeChunkToPartFile(transfer.partFile, transfer.receivedChunks, index, bytes)
+            if (!completed) return@synchronized
+            transfer.validated.verifyAndSyncPartFile(transfer.partFile)
             check(sourceAuthenticated(source)) { "Connection revoked" }
             val fileName = transfer.header.optString("fileName", "pushed_doc.md")
                 .substringAfterLast('/').substringAfterLast('\\').replace(Regex("[^\\p{L}\\p{N}._ -]"), "_").take(120).ifBlank { "file.bin" }
             val savedFile = File(context.filesDir, "${streamId}_$fileName")
-            val temporary = File(context.filesDir, "$streamId.part")
+            if (savedFile.exists()) savedFile.delete()
             try {
-                java.io.FileOutputStream(temporary).use { it.write(fullBytes); it.fd.sync() }
-                check(temporary.renameTo(savedFile)) { "Unable to commit stream file" }
+                check(transfer.partFile.renameTo(savedFile)) { "Unable to commit stream file" }
                 val enableTts = transfer.header.optBoolean("enableCommuteTts", false)
                 val preview = if (fileName.endsWith(".md") || fileName.endsWith(".txt")) {
-                    String(fullBytes.copyOfRange(0, minOf(fullBytes.size, 256 * 1024)), Charsets.UTF_8)
-                } else "收到 Mac 推送文件：$fileName (${fullBytes.size / 1024} KB)"
+                    readPreviewFromFile(savedFile, 256 * 1024)
+                } else "收到 Mac 推送文件：$fileName (${transfer.validated.totalBytes / 1024} KB)"
                 repo.upsertStreamItem(StreamItemModel(streamId, "MAC_TO_PHONE", if (enableTts) "COMMUTE_READER" else "FILE",
                     "default_inbox", transfer.header.optString("title", fileName), preview, null,
                     Uri.fromFile(savedFile).toString(), null, "DELIVERED",
                     JSONObject().put("enableCommuteTts", enableTts).put("sha256", transfer.validated.sha256)
-                        .put("totalBytes", fullBytes.size).toString(), System.currentTimeMillis()))
+                        .put("totalBytes", transfer.validated.totalBytes).toString(), System.currentTimeMillis()))
             } finally {
-                if (temporary.exists()) temporary.delete()
+                transfer.cleanup()
             }
             incomingTransfers.remove(streamId)
+            OmsCoreForegroundService.setLowLatencyWifiNeeded("incoming_stream", incomingTransfers.isNotEmpty())
             streamAck(streamId, "COMPLETED", source, transfer.validated.totalChunks)
         } catch (e: Exception) {
-            incomingTransfers.remove(streamId)
+            incomingTransfers.remove(streamId)?.cleanup()
+            OmsCoreForegroundService.setLowLatencyWifiNeeded("incoming_stream", incomingTransfers.isNotEmpty())
             streamAck(streamId, "ERROR", source, error = e.message ?: "Stream commit failed")
         }
     }
@@ -2381,7 +2609,7 @@ class OmsTransportClient(
                 val result: JSONObject = when (method) {
                     "sys.getStatus" -> collectDeviceSnapshot()
                     "storage.listRecentMedia" -> ScopedStorageExecutor.listRecentMedia(context, repo, params)
-                    "storage.listDir" -> ScopedStorageExecutor.listDir(repo, params)
+                    "storage.listDir" -> ScopedStorageExecutor.listDir(context, repo, params)
                     "storage.pullFile" -> {
                         val src = params.getString("sourceUriOrPath")
                         val isBle = source.tier == "BT_RFCOMM"
@@ -2431,7 +2659,7 @@ class OmsTransportClient(
                             text = withTimeoutOrNull(2500L) { focusDef.await() } ?: ""
                         }
                         val includeOtp = params.optBoolean("includeRecentOtp", false)
-                        val latestOtp = OtpExtractor.latestCapturedOtp
+                        val latestOtp = OtpExtractor.getFreshLatestOtp()
                         JSONObject().apply {
                             put("text", text)
                             if (includeOtp && latestOtp != null) {
@@ -2647,9 +2875,10 @@ class OmsTransportClient(
 
     fun speakTextSmart(
         rawText: String,
-        useAlarmStream: Boolean = false,
+        useAlarmStream: Boolean = true,
         repeatCount: Int = 1,
-        voice: String = "xiaoyi"
+        voice: String = "xiaoyi",
+        audioPolicy: SpeechAudioPolicy? = null
     ) {
         scope.launch {
             val activeSrc = runCatching { activeSource() }.getOrNull()
@@ -2672,7 +2901,8 @@ class OmsTransportClient(
                             useAlarmStream = useAlarmStream,
                             speechRate = 1.0f,
                             audioBase64 = audioB64,
-                            repeatCount = repeatCount
+                            repeatCount = repeatCount,
+                            audioPolicy = audioPolicy
                         )
                         return@launch
                     }
@@ -2684,7 +2914,8 @@ class OmsTransportClient(
                 rawText,
                 useAlarmStream = useAlarmStream,
                 speechRate = 1.0f,
-                repeatCount = repeatCount
+                repeatCount = repeatCount,
+                audioPolicy = audioPolicy
             )
         }
     }
@@ -2706,6 +2937,7 @@ class OmsTransportClient(
                         put("body", text)
                         put("level", "urgent")
                         put("ttsSpeak", true)
+                        put("audioPolicy", SpeechAudioPolicy.FORCE_SPEAKER_ALARM.wireName)
                         put("forceSpeakerAlarmStream", true)
                         if (audioBase64 != null) put("audioBase64", audioBase64)
                         put("repeatCount", repeatCount)
@@ -2714,6 +2946,7 @@ class OmsTransportClient(
                 JSONObject().apply {
                     put("ok", true)
                     put("action", "find_phone")
+                    put("audioPolicy", SpeechAudioPolicy.FORCE_SPEAKER_ALARM.wireName)
                     put("spokenText", text)
                     put("ttsEngine", if (audioBase64 != null) "edge_neural" else "android_local")
                     put("repeatCount", repeatCount)
@@ -2721,7 +2954,11 @@ class OmsTransportClient(
             }
             "tts_speak" -> {
                 val text = params.optString("text", "").trim()
-                val useAlarm = params.optBoolean("useAlarmStream", false)
+                val useAlarm = params.optBoolean("useAlarmStream", true)
+                val policy = SpeechAudioPolicy.fromParams(
+                    params,
+                    defaultPolicy = SpeechAudioPolicy.ALARM_RESPECT_HEADSET
+                )
                 val rate = params.optDouble("speechRate", 1.0).toFloat()
                 val audioBase64 = params.optString("audioBase64", "").takeIf { it.isNotBlank() }
                 val repeatCount = params.optInt("repeatCount", 1).coerceIn(1, 20)
@@ -2733,12 +2970,15 @@ class OmsTransportClient(
                         useAlarmStream = useAlarm,
                         speechRate = rate,
                         audioBase64 = audioBase64,
-                        repeatCount = repeatCount
+                        repeatCount = repeatCount,
+                        audioPolicy = policy
                     )
                 }
                 JSONObject().apply {
                     put("ok", hasContent)
                     put("action", "tts_speak")
+                    put("useAlarmStream", useAlarm)
+                    put("audioPolicy", policy.wireName)
                     put("ttsEngine", if (audioBase64 != null) "edge_neural" else "android_local")
                     put("repeatCount", repeatCount)
                 }
@@ -3178,6 +3418,7 @@ class OmsTransportClient(
         boostMirrorPacing(3500L)
 
         if (mirrorActive.compareAndSet(false, true)) {
+            OmsCoreForegroundService.setLowLatencyWifiNeeded("mirror", true)
             latestMirrorFrameSlot.set(null)
 
             // Non-blocking Latest-Frame-Wins sender coroutine
@@ -3351,6 +3592,7 @@ class OmsTransportClient(
 
     private fun stopScreenMirror(): JSONObject {
         mirrorActive.set(false)
+        OmsCoreForegroundService.setLowLatencyWifiNeeded("mirror", false)
         OmsAccessibilityService.instance?.onMirrorUiEvent = null
         latestMirrorFrameSlot.set(null)
         mirrorCaptureJob?.cancel()

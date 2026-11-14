@@ -20,6 +20,76 @@ function containedFile(root: string, filePath: string): string | null {
   }
 }
 
+const SAFE_INLINE_MIME_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+  "audio/mp4",
+  "audio/mpeg",
+  "audio/wav",
+  "audio/ogg",
+  "audio/aac",
+  "audio/x-m4a",
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
+  "application/pdf",
+]);
+
+function encodeContentDispositionFilename(rawName: string): string {
+  const base = path.basename(rawName || "attachment.bin").replace(/[\r\n"]/g, "_");
+  const asciiFallback = base.replace(/[^\x20-\x7E]/g, "_") || "attachment.bin";
+  return `filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(base)}`;
+}
+
+function resolveAttachmentResponseHeaders(fileName: string, rawMime?: string): Record<string, string> {
+  const normalizedMime = (rawMime || "").split(";")[0].trim().toLowerCase();
+  const ext = path.extname(fileName || "").toLowerCase();
+  const inferredMime =
+    normalizedMime ||
+    (ext === ".png"
+      ? "image/png"
+      : ext === ".jpg" || ext === ".jpeg"
+      ? "image/jpeg"
+      : ext === ".webp"
+      ? "image/webp"
+      : ext === ".gif"
+      ? "image/gif"
+      : ext === ".m4a"
+      ? "audio/mp4"
+      : ext === ".mp3"
+      ? "audio/mpeg"
+      : ext === ".wav"
+      ? "audio/wav"
+      : ext === ".ogg"
+      ? "audio/ogg"
+      : ext === ".aac"
+      ? "audio/aac"
+      : ext === ".mp4"
+      ? "video/mp4"
+      : ext === ".webm"
+      ? "video/webm"
+      : ext === ".pdf"
+      ? "application/pdf"
+      : "application/octet-stream");
+
+  // Never render HTML, SVG, XML, or scriptable documents inline under the dashboard origin.
+  const allowInline = SAFE_INLINE_MIME_TYPES.has(inferredMime) && ext !== ".svg" && ext !== ".html" && ext !== ".htm" && ext !== ".xhtml" && ext !== ".xml";
+  const safeMime = allowInline ? inferredMime : "application/octet-stream";
+  const dispositionType = allowInline ? "inline" : "attachment";
+
+  return {
+    "Content-Type": safeMime,
+    "Content-Disposition": `${dispositionType}; ${encodeContentDispositionFilename(fileName)}`,
+    "Content-Security-Policy":
+      "sandbox; default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'self'",
+    "X-Content-Type-Options": "nosniff",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Cache-Control": "private, max-age=3600",
+  };
+}
+
 /**
  * Module 06+: Mac Real-Time Web Inbox & Bidirectional Collaboration Dashboard
  * Served strictly on localhost: http://127.0.0.1:19527/inbox (and /dashboard)
@@ -62,7 +132,26 @@ export async function handleDashboardHttpRequest(
     );
   }
 
-  const dashboardCsp =
+  if (isDashboardRoute) {
+    const fetchSite = req.headers.get("sec-fetch-site");
+    if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "Forbidden cross-site request to localhost dashboard.",
+        }),
+        {
+          status: 403,
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+          },
+        }
+      );
+    }
+  }
+
+  const dashboardCspBase =
     "default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; frame-src 'self'; object-src 'none'; base-uri 'none'";
 
   if (url.pathname === "/inbox" || url.pathname === "/dashboard") {
@@ -70,8 +159,10 @@ export async function handleDashboardHttpRequest(
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store, no-cache, must-revalidate",
-        "Content-Security-Policy": dashboardCsp,
+        "Content-Security-Policy": `${dashboardCspBase}; frame-ancestors 'none'`,
+        "X-Frame-Options": "DENY",
         "X-Content-Type-Options": "nosniff",
+        "Cross-Origin-Resource-Policy": "same-origin",
       },
     });
   }
@@ -81,8 +172,10 @@ export async function handleDashboardHttpRequest(
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store, no-cache, must-revalidate",
-        "Content-Security-Policy": dashboardCsp,
+        "Content-Security-Policy": `${dashboardCspBase}; frame-ancestors 'self'`,
+        "X-Frame-Options": "SAMEORIGIN",
         "X-Content-Type-Options": "nosniff",
+        "Cross-Origin-Resource-Policy": "same-origin",
       },
     });
   }
@@ -94,6 +187,8 @@ export async function handleDashboardHttpRequest(
         status: 204,
         headers: {
           "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+          "Cross-Origin-Resource-Policy": "same-origin",
           "X-Oms-Flags": String(latest?.decoded.flags ?? 0),
           "X-Oms-Seq": String(latest?.decoded.seq ?? 0),
         },
@@ -104,6 +199,8 @@ export async function handleDashboardHttpRequest(
       headers: {
         "Content-Type": mime,
         "Cache-Control": "no-store, no-cache, must-revalidate",
+        "X-Content-Type-Options": "nosniff",
+        "Cross-Origin-Resource-Policy": "same-origin",
         "X-Oms-Seq": String(latest.decoded.seq),
         "X-Oms-Width": String(latest.decoded.width),
         "X-Oms-Height": String(latest.decoded.height),
@@ -141,6 +238,8 @@ export async function handleDashboardHttpRequest(
         headers: {
           "Content-Type": "application/json; charset=utf-8",
           "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+          "Cross-Origin-Resource-Policy": "same-origin",
         },
       }
     );
@@ -167,10 +266,7 @@ export async function handleDashboardHttpRequest(
     }
 
     return new Response(Bun.file(resolved), {
-      headers: {
-        "Content-Type": fileEntry.mimeType || "application/octet-stream",
-        "Cache-Control": "private, max-age=3600",
-      },
+      headers: resolveAttachmentResponseHeaders(fileEntry.fileName, fileEntry.mimeType),
     });
   }
 
@@ -1329,7 +1425,12 @@ document.getElementById('itemsContainer').addEventListener('click', (e) => {
 });
 
 fetchInbox();
-setInterval(fetchInbox, 2000);
+setInterval(() => {
+  if (!document.hidden) fetchInbox();
+}, 2000);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) fetchInbox();
+});
 
 function openStandaloneMirror() {
   window.open('/mirror', 'oms_live_mirror', 'width=440,height=880,menubar=no,toolbar=no,location=no,status=no');

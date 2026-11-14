@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import dgram from "node:dgram";
-import { spawn, execFile, ChildProcess } from "node:child_process";
+import { spawn, ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
   DecodedScreenFrame,
@@ -57,7 +57,8 @@ export interface TrustedPhoneDevice {
 
 export interface IncomingFileTransfer {
   header: StreamStartHeader;
-  receivedChunks: Map<number, Uint8Array>;
+  partFilePath: string;
+  receivedChunks: Set<number>;
   receivedBytes: number;
   startedAtMs: number;
   pipe: ActiveTransportPipe;
@@ -93,6 +94,7 @@ interface ActiveTransportPipe {
   };
   decoder: FrameStreamDecoder;
   sendRaw: (bytes: Uint8Array) => boolean | number;
+  getBufferedAmount?: () => number;
   close: () => void;
 }
 
@@ -126,9 +128,14 @@ export class PhoneSessionManager extends EventEmitter {
   private wsServer: ReturnType<typeof Bun.serve> | null = null;
   private btBridge: BluetoothBridgeServer | null = null;
   private wanRelayWs: WebSocket | null = null;
+  private wanRelayWssUrl: string | null = null;
+  private wanReconnectTimer: Timer | null = null;
+  private wanReconnectAttempts = 0;
+  private stopped = false;
   private udpDiscoveryServer: dgram.Socket | null = null;
   private mdnsAdvertiseProc: ChildProcess | null = null;
   private housekeepingTimer: Timer | null = null;
+  private housekeepingTick = 0;
   private lastKnownLanIpsKey = "";
 
   private pipes: Map<TransportTier, ActiveTransportPipe> = new Map();
@@ -240,7 +247,7 @@ export class PhoneSessionManager extends EventEmitter {
     );
     const releaseApkDir = path.join(repoRoot, "android-app/app/build/outputs/apk/release");
     const debugApkDir = path.join(repoRoot, "android-app/app/build/outputs/apk/debug");
-    let pkgVersion = "1.6.2";
+    let pkgVersion = "1.6.3";
     try {
       const pkgRaw = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
       if (typeof pkgRaw?.version === "string" && pkgRaw.version.trim()) {
@@ -299,7 +306,7 @@ export class PhoneSessionManager extends EventEmitter {
     }
 
     const stat = fs.statSync(apkPath);
-    let versionCode = 39;
+    let versionCode = 40;
     let versionName = pkgVersion;
     const fileMatch = path.basename(apkPath).match(/^OneMoreStep-v([\d.]+)\.apk$/);
     if (fileMatch) {
@@ -474,7 +481,9 @@ export class PhoneSessionManager extends EventEmitter {
           }
           const origin = req.headers.get("origin");
           const validOrigin = !origin || origin === url.origin;
-          if (!PhoneSessionManager.isLoopbackAddress(clientIp) || !validHost || !validOrigin) {
+          const fetchSite = req.headers.get("sec-fetch-site");
+          const validFetchSite = !fetchSite || fetchSite === "same-origin" || fetchSite === "none";
+          if (!PhoneSessionManager.isLoopbackAddress(clientIp) || !validHost || !validOrigin || !validFetchSite) {
             return new Response(
               JSON.stringify({ ok: false, error: "Forbidden: Mirror WebSocket is strictly restricted to localhost (127.0.0.1 / ::1)." }),
               { status: 403, headers: { "Content-Type": "application/json; charset=utf-8" } }
@@ -637,6 +646,8 @@ export class PhoneSessionManager extends EventEmitter {
             remoteIp,
             decoder: new FrameStreamDecoder(),
             sendRaw: (bytes) => ws.send(bytes),
+            getBufferedAmount: () =>
+              typeof (ws as any).getBufferedAmount === "function" ? (ws as any).getBufferedAmount() : 0,
             close: () => ws.close(),
           };
           ws.data.pipe = pipe;
@@ -808,6 +819,7 @@ export class PhoneSessionManager extends EventEmitter {
           ],
           { stdio: "ignore" }
         );
+        this.mdnsAdvertiseProc.on("error", () => {});
         this.mdnsAdvertiseProc.unref();
       } catch {
         // ignore if dns-sd unavailable
@@ -819,16 +831,22 @@ export class PhoneSessionManager extends EventEmitter {
       this.broadcastLanBeacon();
     }
     this.housekeepingTimer = setInterval(() => {
+      this.housekeepingTick++;
       const currentIps = PhoneSessionManager.getLocalLanIps();
       const key = currentIps.join(",");
       if (key !== this.lastKnownLanIpsKey) {
         this.lastKnownLanIpsKey = key;
         this.btBridge?.updateMacLanInfo(currentIps, this.lanPort);
       }
+      const pairingActive = Boolean(
+        this.activePairingCreds && Date.now() < this.activePairingCreds.expiresAtMs
+      );
       if (this.activeTier !== "DISCONNECTED") {
         this.sendPing();
         if (this.pipes.get("BT_RFCOMM")?.authenticated) {
           this.presence.onBleRssiSample(this.presence.getSnapshot().rssiRaw ?? -58);
+        } else {
+          this.presence.evaluateTimeouts();
         }
         if (this.activeTier !== "LAN_WS" && enableMdns) {
           this.broadcastLanBeacon();
@@ -836,7 +854,14 @@ export class PhoneSessionManager extends EventEmitter {
       } else {
         this.presence.evaluateTimeouts();
         if (enableMdns) {
-          this.broadcastLanBeacon();
+          // Back off idle UDP beacons to once every 20s when phone is AWAY and not pairing
+          const shouldBeaconNow =
+            pairingActive ||
+            this.presence.getSnapshot().state === "AT_DESK" ||
+            this.housekeepingTick % 5 === 0;
+          if (shouldBeaconNow) {
+            this.broadcastLanBeacon();
+          }
         }
       }
     }, 4000);
@@ -848,6 +873,12 @@ export class PhoneSessionManager extends EventEmitter {
   private broadcastLanBeacon(): void {
     const sock = this.udpDiscoveryServer;
     if (!sock) return;
+    const pairingActive = Boolean(
+      this.activePairingCreds && Date.now() < this.activePairingCreds.expiresAtMs
+    );
+    // Avoid advertising beacons on public networks when neither paired nor actively pairing
+    if (this.trustedDevices.size === 0 && !pairingActive) return;
+
     const lanIps = PhoneSessionManager.getLocalLanIps();
     const payload = Buffer.from(
       JSON.stringify({
@@ -881,7 +912,7 @@ export class PhoneSessionManager extends EventEmitter {
       } catch {}
     }
 
-    // 2. Direct unicast to known trusted phone LAN IPs (wakes up phone even after ARP cache expiration)
+    // 2. Direct UDP unicast to known trusted phone LAN IPs (zero child subprocesses)
     const trustedPhoneIps = new Set<string>();
     for (const dev of this.trustedDevices.values()) {
       for (const pip of dev.lastKnownLanIps || []) {
@@ -899,34 +930,25 @@ export class PhoneSessionManager extends EventEmitter {
       try {
         sock.send(payload, beaconPort, pip);
       } catch {}
-      if (process.platform === "darwin") {
-        execFile("ping", ["-c", "1", "-W", "300", pip], { timeout: 600 }, () => {
-          try {
-            sock.send(payload, beaconPort, pip);
-          } catch {}
-        });
-      }
-    }
-
-    // 3. Unicast to active ARP neighbors (bypasses enterprise Wi-Fi broadcast filtering & refreshes phone ARP cache!)
-    if (process.platform === "darwin") {
-      execFile("arp", ["-an"], { timeout: 1500 }, (err, stdout) => {
-        if (err || !stdout) return;
-        const lines = stdout.split("\n");
-        for (const line of lines) {
-          if (line.includes("(incomplete)")) continue;
-          const m = line.match(/\((\d+\.\d+\.\d+\.\d+)\)/);
-          if (m && m[1] && !lanIps.includes(m[1]) && !m[1].startsWith("224.") && !m[1].endsWith(".255")) {
-            try {
-              sock.send(payload, beaconPort, m[1]);
-            } catch {}
-          }
-        }
-      });
     }
   }
 
+  private scheduleWanRelayReconnect(): void {
+    if (this.stopped || !this.wanRelayWssUrl || this.wanReconnectTimer) return;
+    const delayMs = Math.min(60_000, 2_000 * Math.pow(2, Math.min(this.wanReconnectAttempts, 5)));
+    this.wanReconnectAttempts++;
+    this.wanReconnectTimer = setTimeout(() => {
+      this.wanReconnectTimer = null;
+      if (!this.stopped && this.wanRelayWssUrl) {
+        this.connectWanRelay(this.wanRelayWssUrl);
+      }
+    }, delayMs);
+    (this.wanReconnectTimer as any)?.unref?.();
+  }
+
   private connectWanRelay(wssUrl: string): void {
+    this.wanRelayWssUrl = wssUrl;
+    if (this.stopped) return;
     try {
       const ws = new WebSocket(wssUrl);
       ws.binaryType = "arraybuffer";
@@ -939,9 +961,14 @@ export class PhoneSessionManager extends EventEmitter {
           ws.send(bytes);
           return true;
         },
+        getBufferedAmount: () =>
+          typeof (ws as any).bufferedAmount === "number" ? ws.bufferedAmount : 0,
         close: () => ws.close(),
       };
-      ws.onopen = () => this.onPipeOpened(pipe);
+      ws.onopen = () => {
+        this.wanReconnectAttempts = 0;
+        this.onPipeOpened(pipe);
+      };
       ws.onmessage = (ev) => {
         const bytes =
           typeof ev.data === "string"
@@ -949,10 +976,17 @@ export class PhoneSessionManager extends EventEmitter {
             : new Uint8Array(ev.data as ArrayBuffer);
         this.onRawBytesReceived(pipe, bytes);
       };
-      ws.onclose = () => this.onPipeClosed(pipe);
+      ws.onerror = () => {};
+      ws.onclose = () => {
+        if (this.wanRelayWs === ws) {
+          this.wanRelayWs = null;
+        }
+        this.onPipeClosed(pipe);
+        this.scheduleWanRelayReconnect();
+      };
       this.wanRelayWs = ws;
     } catch {
-      // ignore initial WAN connection errors
+      this.scheduleWanRelayReconnect();
     }
   }
 
@@ -1036,7 +1070,10 @@ export class PhoneSessionManager extends EventEmitter {
       pending.reject(new Error("Transport closed before delivery acknowledgement"));
     }
     for (const [id, transfer] of this.incomingStreams) {
-      if (transfer.pipe === pipe) this.incomingStreams.delete(id);
+      if (transfer.pipe === pipe) {
+        this.cleanupIncomingTransfer(transfer);
+        this.incomingStreams.delete(id);
+      }
     }
     this.recomputeActiveTier();
   }
@@ -1230,6 +1267,9 @@ export class PhoneSessionManager extends EventEmitter {
         this.onPipeClosed(old);
         try { old.close(); } catch {}
       }
+      for (const [, transfer] of this.incomingStreams) {
+        this.cleanupIncomingTransfer(transfer);
+      }
       this.incomingStreams.clear();
       this.completedStreams.clear();
       while (this.outQueue.size) this.outQueue.dequeue();
@@ -1321,9 +1361,39 @@ export class PhoneSessionManager extends EventEmitter {
       && crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(actual, "hex"));
   }
 
+  private cleanupIncomingTransfer(transfer?: IncomingFileTransfer): void {
+    if (!transfer) return;
+    try {
+      if (fs.existsSync(transfer.partFilePath)) {
+        fs.unlinkSync(transfer.partFilePath);
+      }
+    } catch {}
+  }
+
+  private sha256FileSync(filePath: string): { sha256: string; sizeBytes: number } {
+    const hash = crypto.createHash("sha256");
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const buf = Buffer.allocUnsafe(65536);
+      let total = 0;
+      while (true) {
+        const n = fs.readSync(fd, buf, 0, buf.length, null);
+        if (n <= 0) break;
+        total += n;
+        hash.update(n === buf.length ? buf : buf.subarray(0, n));
+      }
+      return { sha256: hash.digest("hex"), sizeBytes: total };
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
   private streamError(pipe: ActiveTransportPipe, streamId: string, message: string): void {
     const transfer = this.incomingStreams.get(streamId);
-    if (transfer?.pipe === pipe) this.incomingStreams.delete(streamId);
+    if (transfer?.pipe === pipe) {
+      this.cleanupIncomingTransfer(transfer);
+      this.incomingStreams.delete(streamId);
+    }
     this.sendSecure(pipe, encodeStreamAckResumeFrame({ streamId, status: "ERROR", nextExpectedChunkIndex: 0, errorMessage: message }));
   }
 
@@ -1360,13 +1430,31 @@ export class PhoneSessionManager extends EventEmitter {
     }
     // Bound abandoned partial transfers as well as their individual sizes.
     for (const [id, transfer] of this.incomingStreams) {
-      if (Date.now() - transfer.startedAtMs > 180000) this.incomingStreams.delete(id);
+      if (Date.now() - transfer.startedAtMs > 180000) {
+        this.cleanupIncomingTransfer(transfer);
+        this.incomingStreams.delete(id);
+      }
     }
     if (this.incomingStreams.size >= 16) {
       this.streamError(pipe, header.streamId, "Too many active streams");
       return;
     }
-    this.incomingStreams.set(header.streamId, { header, pipe, receivedChunks: new Map(), receivedBytes: 0, startedAtMs: Date.now() });
+    const partFilePath = path.join(this.streamDownloadDir, `${header.streamId}.partial`);
+    try {
+      const fd = fs.openSync(partFilePath, "w", 0o600);
+      fs.closeSync(fd);
+    } catch (err) {
+      this.streamError(pipe, header.streamId, `Could not create staging file: ${String(err)}`);
+      return;
+    }
+    this.incomingStreams.set(header.streamId, {
+      header,
+      partFilePath,
+      pipe,
+      receivedChunks: new Set(),
+      receivedBytes: 0,
+      startedAtMs: Date.now(),
+    });
   }
 
   private handleStreamChunk(pipe: ActiveTransportPipe, streamId: string, chunkIndex: number, data: Uint8Array): void {
@@ -1378,27 +1466,44 @@ export class PhoneSessionManager extends EventEmitter {
       this.streamError(pipe, streamId, "Invalid chunk index or length");
       return;
     }
-    const previous = transfer.receivedChunks.get(chunkIndex);
-    if (previous && !Buffer.from(previous).equals(Buffer.from(data))) {
-      this.streamError(pipe, streamId, "Conflicting duplicate chunk");
-      return;
-    }
-    if (!previous) {
-      transfer.receivedChunks.set(chunkIndex, data.slice());
-      transfer.receivedBytes += data.byteLength;
-    }
-    if (transfer.receivedChunks.size !== h.totalChunks) return;
-    const totalBuf = Buffer.concat(Array.from({ length: h.totalChunks }, (_, i) => Buffer.from(transfer.receivedChunks.get(i)!)));
-    const actualSha256 = crypto.createHash("sha256").update(totalBuf).digest("hex");
-    if (totalBuf.byteLength !== h.totalBytes || !this.equalDigest(actualSha256, h.sha256)) {
-      this.streamError(pipe, streamId, "Stream length or SHA-256 mismatch");
-      return;
-    }
-    const safeName = path.basename(h.fileName || `${streamId}.bin`);
-    const savedAbsPath = path.join(this.streamDownloadDir, `${streamId}_${safeName}`);
+    const offset = chunkIndex * h.chunkSize;
     try {
-      fs.writeFileSync(savedAbsPath + ".partial", totalBuf, { mode: 0o600 });
-      fs.renameSync(savedAbsPath + ".partial", savedAbsPath);
+      const fd = fs.openSync(transfer.partFilePath, "r+");
+      try {
+        if (transfer.receivedChunks.has(chunkIndex)) {
+          if (data.byteLength > 0) {
+            const existingBuf = Buffer.allocUnsafe(data.byteLength);
+            const bytesRead = fs.readSync(fd, existingBuf, 0, data.byteLength, offset);
+            if (bytesRead !== data.byteLength || !existingBuf.equals(Buffer.from(data.buffer, data.byteOffset, data.byteLength))) {
+              this.streamError(pipe, streamId, "Conflicting duplicate chunk");
+              return;
+            }
+          }
+        } else {
+          if (data.byteLength > 0) {
+            fs.writeSync(fd, data, 0, data.byteLength, offset);
+          }
+          transfer.receivedChunks.add(chunkIndex);
+          transfer.receivedBytes += data.byteLength;
+        }
+        if (transfer.receivedChunks.size === h.totalChunks) {
+          fs.fsyncSync(fd);
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+
+      if (transfer.receivedChunks.size !== h.totalChunks) return;
+
+      const { sha256: actualSha256, sizeBytes } = this.sha256FileSync(transfer.partFilePath);
+      if (sizeBytes !== h.totalBytes || !this.equalDigest(actualSha256, h.sha256)) {
+        this.streamError(pipe, streamId, "Stream length or SHA-256 mismatch");
+        return;
+      }
+
+      const safeName = path.basename(h.fileName || `${streamId}.bin`);
+      const savedAbsPath = path.join(this.streamDownloadDir, `${streamId}_${safeName}`);
+      fs.renameSync(transfer.partFilePath, savedAbsPath);
       try {
         fs.chmodSync(savedAbsPath, 0o600);
       } catch {}
@@ -1556,23 +1661,57 @@ export class PhoneSessionManager extends EventEmitter {
         ? Math.max(90000, 30000 + totalChunks * 800)
         : 60000);
 
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
+    let ackTimer: Timer | null = null;
+    const ackPromise = new Promise<void>((resolve, reject) => {
+      ackTimer = setTimeout(() => {
         this.outgoingStreams.delete(streamId);
         reject(new Error("Phone delivery acknowledgement timed out; delivery is unconfirmed"));
       }, effectiveTimeoutMs);
-      this.outgoingStreams.set(streamId, { pipe, resolve, reject, timer });
-      try {
-        this.sendSecure(pipe, encodeStreamStartFrame(startHeader));
-        for (let i = 0; i < totalChunks; i++) {
-          if (!this.outgoingStreams.has(streamId)) break;
-          if (!this.isLivePipe(pipe)) throw new Error("Transport changed during stream transfer");
-          this.sendSecure(pipe, encodeStreamChunkFrame(streamId, i, opts.data.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, opts.data.byteLength))));
-        }
-      } catch (err) {
-        clearTimeout(timer); this.outgoingStreams.delete(streamId); reject(err);
-      }
+      this.outgoingStreams.set(streamId, { pipe, resolve, reject, timer: ackTimer });
     });
+
+    try {
+      this.sendSecure(pipe, encodeStreamStartFrame(startHeader));
+      const maxBufferedBytes = 2 * 1024 * 1024;
+      for (let i = 0; i < totalChunks; i++) {
+        if (!this.outgoingStreams.has(streamId)) break;
+        if (!this.isLivePipe(pipe)) throw new Error("Transport changed during stream transfer");
+        // Interleave any pending P0 control frames ahead of P2 bulk chunks
+        if (this.outQueue.size > 0) {
+          this.flushOutQueue();
+        }
+        if (i > 0) {
+          let waitedMs = 0;
+          while (
+            this.outgoingStreams.has(streamId) &&
+            this.isLivePipe(pipe) &&
+            (pipe.getBufferedAmount?.() ?? 0) > maxBufferedBytes &&
+            waitedMs < 15000
+          ) {
+            await new Promise((r) => setTimeout(r, 15));
+            waitedMs += 15;
+          }
+          if (i % 16 === 0 && totalChunks > 16) {
+            await new Promise((r) => setTimeout(r, 0));
+          }
+        }
+        if (!this.outgoingStreams.has(streamId)) break;
+        if (!this.isLivePipe(pipe)) throw new Error("Transport changed during stream transfer");
+        this.sendSecure(
+          pipe,
+          encodeStreamChunkFrame(
+            streamId,
+            i,
+            opts.data.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, opts.data.byteLength))
+          )
+        );
+      }
+      await ackPromise;
+    } catch (err) {
+      if (ackTimer) clearTimeout(ackTimer);
+      this.outgoingStreams.delete(streamId);
+      throw err;
+    }
 
     return { streamId, sha256 };
   }
@@ -1604,6 +1743,12 @@ export class PhoneSessionManager extends EventEmitter {
   }
 
   public async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.wanReconnectTimer) {
+      clearTimeout(this.wanReconnectTimer);
+      this.wanReconnectTimer = null;
+    }
+    this.wanRelayWssUrl = null;
     for (const pipe of [...this.openPipes]) this.onPipeClosed(pipe);
     this.emit("sessionRevoked");
     if (this.housekeepingTimer) {

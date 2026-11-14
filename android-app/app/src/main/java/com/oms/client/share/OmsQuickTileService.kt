@@ -9,7 +9,7 @@ import com.oms.client.OmsApplication
 
 /**
  * Module 03: Xiaomi HyperOS / MIUI Control Center Quick Settings Tile
- * Single tap -> Launches 1x1 transparent ClipboardCatcherActivity to sync clipboard to Mac AI.
+ * Single tap -> Opens translucent QuickSendSheetActivity (recent album strip + pick photos/PDF/Word + clipboard + voice).
  * Long press -> Opens VoiceIdeaActivity ("我有一个想法").
  */
 class OmsQuickTileService : TileService() {
@@ -21,9 +21,9 @@ class OmsQuickTileService : TileService() {
         tile.state = Tile.STATE_ACTIVE
         tile.label = "青简·发Mac"
         tile.subtitle = when (tier) {
-            "LAN_WS" -> "局域网已连"
-            "BT_RFCOMM" -> "蓝牙近场已连"
-            "WAN_WEBRTC" -> "远程在线"
+            "LAN_WS" -> "速发图/文件"
+            "BT_RFCOMM" -> "蓝牙速发"
+            "WAN_WEBRTC" -> "远程速发"
             else -> "离线暂存"
         }
         tile.updateTile()
@@ -31,7 +31,7 @@ class OmsQuickTileService : TileService() {
 
     override fun onClick() {
         super.onClick()
-        val intent = Intent(this, ClipboardCatcherActivity::class.java).apply {
+        val intent = Intent(this, QuickSendSheetActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {

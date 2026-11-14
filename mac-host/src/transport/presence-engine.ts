@@ -34,6 +34,8 @@ export class PresenceEngine extends EventEmitter {
   private candidateAboveSinceMs: number | null = null;
   private candidateBelowSinceMs: number | null = null;
   private disconnectedSinceMs: number | null = null;
+  private lastLanActiveMs: number | null = null;
+  private lanElevatedRttSinceMs: number | null = null;
 
   private readonly emaAlpha: number;
   private readonly arriveThresholdDbm: number;
@@ -119,12 +121,29 @@ export class PresenceEngine extends EventEmitter {
   }
 
   /**
-   * Force AT_DESK when user actively interacts on same LAN with low RTT (< 5ms)
+   * Update presence when user interacts on same LAN:
+   * - Low RTT (<= 8ms) promotes AWAY -> AT_DESK when BLE is unavailable.
+   * - Sustained high RTT (>= 65ms) or stale LAN heartbeat transitions AT_DESK -> AWAY.
    */
   public onLanDirectActive(rttMs: number, nowMs = Date.now()): void {
     this.disconnectedSinceMs = null;
-    if (rttMs <= 8 && this.state === "AWAY" && !this.bleConnected) {
-      this.transitionTo("AT_DESK", nowMs, "lan_low_latency");
+    this.lastLanActiveMs = nowMs;
+    if (!this.bleConnected) {
+      if (rttMs <= 8) {
+        this.lanElevatedRttSinceMs = null;
+        if (this.state === "AWAY") {
+          this.transitionTo("AT_DESK", nowMs, "lan_low_latency");
+        }
+      } else if (rttMs >= 65 && this.state === "AT_DESK") {
+        if (this.lanElevatedRttSinceMs === null) {
+          this.lanElevatedRttSinceMs = nowMs;
+        }
+        if (nowMs - this.lanElevatedRttSinceMs >= this.leaveHoldMs) {
+          this.transitionTo("AWAY", nowMs, "lan_high_latency");
+        }
+      } else {
+        this.lanElevatedRttSinceMs = null;
+      }
     }
   }
 
@@ -132,6 +151,8 @@ export class PresenceEngine extends EventEmitter {
    * Notify when all transport tiers drop to DISCONNECTED
    */
   public onAllTransportsDisconnected(nowMs = Date.now()): PresenceState {
+    this.lastLanActiveMs = null;
+    this.lanElevatedRttSinceMs = null;
     if (!this.bleConnected && this.state === "AT_DESK") {
       this.transitionTo("AWAY", nowMs, "all_transports_disconnected");
     }
@@ -139,13 +160,18 @@ export class PresenceEngine extends EventEmitter {
   }
 
   public evaluateTimeouts(nowMs = Date.now()): PresenceState {
-    if (
-      !this.bleConnected &&
-      this.state === "AT_DESK" &&
-      this.disconnectedSinceMs !== null &&
-      nowMs - this.disconnectedSinceMs >= this.disconnectGraceMs
-    ) {
-      this.transitionTo("AWAY", nowMs, "ble_disconnect_timeout");
+    if (!this.bleConnected && this.state === "AT_DESK") {
+      if (
+        this.disconnectedSinceMs !== null &&
+        nowMs - this.disconnectedSinceMs >= this.disconnectGraceMs
+      ) {
+        this.transitionTo("AWAY", nowMs, "ble_disconnect_timeout");
+      } else if (
+        this.lastLanActiveMs !== null &&
+        nowMs - this.lastLanActiveMs >= Math.max(this.leaveHoldMs, 25000)
+      ) {
+        this.transitionTo("AWAY", nowMs, "lan_heartbeat_stale");
+      }
     }
     return this.state;
   }
@@ -157,6 +183,7 @@ export class PresenceEngine extends EventEmitter {
     this.lastTransitionMs = nowMs;
     this.candidateAboveSinceMs = null;
     this.candidateBelowSinceMs = null;
+    this.lanElevatedRttSinceMs = null;
 
     const payload = {
       previous: prev,

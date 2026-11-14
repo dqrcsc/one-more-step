@@ -15,11 +15,13 @@ const GENERIC_SENDER_TITLES = new Set([
   "新消息",
   "消息",
   "通知",
+  "验证码",
   "messages",
   "message",
   "sms",
   "mms",
   "com.android.mms",
+  "com.miui.notification",
   "com.google.android.apps.messaging",
 ]);
 

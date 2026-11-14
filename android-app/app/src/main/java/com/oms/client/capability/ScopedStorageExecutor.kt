@@ -124,12 +124,13 @@ object ScopedStorageExecutor {
         }
     }
 
-    fun listDir(repo: StreamRepository, params: JSONObject): JSONObject {
+    fun listDir(context: Context, repo: StreamRepository, params: JSONObject): JSONObject {
         val dirAlias = StoragePathPolicy.normalizeAlias(params.optString("dirAlias", "download"))
-        val subPath = params.optString("subPath", "")
+        val subPath = params.optString("subPath", "").trim().trim('/')
         val limit = params.optInt("limit", 50).coerceIn(1, 200)
 
-        if (!repo.getAuthorizedDirs().map { StoragePathPolicy.normalizeAlias(it) }.contains(dirAlias)) {
+        val authorized = repo.getAuthorizedDirs().map { StoragePathPolicy.normalizeAlias(it) }.toSet()
+        if (!authorized.contains(dirAlias)) {
             throw SecurityException("ERR_SCOPED_PATH_DENIED: Alias '$dirAlias' is not enabled in allowlist")
         }
 
@@ -142,21 +143,81 @@ object ScopedStorageExecutor {
             throw SecurityException("ERR_SCOPED_PATH_DENIED: Path traversal outside '$dirAlias' blocked")
         }
 
-        val files = targetDir.listFiles()
+        data class DirItem(
+            val name: String,
+            val isDir: Boolean,
+            val size: Long,
+            val updatedAtMs: Long,
+            val uriOrPath: String
+        )
+
+        val mergedByName = LinkedHashMap<String, DirItem>()
+
+        // 1. Direct filesystem listing (works for media files and app-accessible entries)
+        targetDir.listFiles()
             ?.filter { StoragePathPolicy.isWithin(baseDir, it) }
             ?.sortedByDescending { it.lastModified() }
-            ?.take(limit)
-            ?: emptyList()
+            ?.forEach { f ->
+                mergedByName[f.name] = DirItem(
+                    name = f.name,
+                    isDir = f.isDirectory,
+                    size = if (f.isFile) f.length() else 0L,
+                    updatedAtMs = f.lastModified(),
+                    uriOrPath = "$dirAlias/${f.relativeTo(baseDir).path}"
+                )
+            }
+
+        // 2. Android 11+ MediaStore.Downloads supplement for non-media documents in Download/
+        if (dirAlias == "download" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val expectedRelPrefix = if (subPath.isEmpty()) "Download/" else "Download/$subPath/"
+            runCatching {
+                context.contentResolver.query(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    arrayOf(
+                        MediaStore.MediaColumns._ID,
+                        MediaStore.MediaColumns.DISPLAY_NAME,
+                        MediaStore.MediaColumns.RELATIVE_PATH,
+                        MediaStore.MediaColumns.SIZE,
+                        MediaStore.MediaColumns.DATE_MODIFIED
+                    ),
+                    "${MediaStore.MediaColumns.RELATIVE_PATH} = ?",
+                    arrayOf(expectedRelPrefix),
+                    "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
+                )?.use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val id = cursor.getLong(0)
+                        val name = cursor.getString(1) ?: continue
+                        val relPath = cursor.getString(2) ?: ""
+                        if (!StoragePathPolicy.mediaPathAllowed(relPath, authorized)) continue
+                        if (mergedByName.containsKey(name)) continue
+                        val size = cursor.getLong(3)
+                        val modifiedSec = cursor.getLong(4)
+                        val contentUri = ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id)
+                        mergedByName[name] = DirItem(
+                            name = name,
+                            isDir = false,
+                            size = size,
+                            updatedAtMs = modifiedSec * 1000L,
+                            uriOrPath = contentUri.toString()
+                        )
+                    }
+                }
+            }
+        }
+
+        val sorted = mergedByName.values
+            .sortedByDescending { it.updatedAtMs }
+            .take(limit)
 
         val entriesArr = JSONArray()
-        for (f in files) {
+        for (item in sorted) {
             entriesArr.put(
                 JSONObject().apply {
-                    put("name", f.name)
-                    put("isDir", f.isDirectory)
-                    put("size", if (f.isFile) f.length() else 0L)
-                    put("updatedAtMs", f.lastModified())
-                    put("uriOrPath", "$dirAlias/${f.relativeTo(baseDir).path}")
+                    put("name", item.name)
+                    put("isDir", item.isDir)
+                    put("size", item.size)
+                    put("updatedAtMs", item.updatedAtMs)
+                    put("uriOrPath", item.uriOrPath)
                 }
             )
         }
@@ -173,6 +234,36 @@ object ScopedStorageExecutor {
         val bytes: ByteArray
     )
 
+    private fun resolveMediaStoreDownloadUri(
+        context: Context,
+        authorized: Set<String>,
+        relativeUnderDownload: String
+    ): Uri? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+        val normalized = relativeUnderDownload.replace('\\', '/').trim('/')
+        if (normalized.isEmpty()) return null
+        val fileName = normalized.substringAfterLast('/')
+        val subDir = normalized.substringBeforeLast('/', "")
+        val expectedRelPath = if (subDir.isEmpty()) "Download/" else "Download/$subDir/"
+        if (!StoragePathPolicy.mediaPathAllowed(expectedRelPath, authorized)) return null
+
+        return runCatching {
+            context.contentResolver.query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.RELATIVE_PATH),
+                "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.RELATIVE_PATH} = ?",
+                arrayOf(fileName, expectedRelPath),
+                "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cursor.getLong(0))
+                } else {
+                    null
+                }
+            }
+        }.getOrNull()
+    }
+
     fun readAuthorizedFileBytes(
         context: Context,
         repo: StreamRepository,
@@ -182,13 +273,21 @@ object ScopedStorageExecutor {
     ): PulledFilePayload {
         if (sourceUriOrPath.startsWith("content://")) {
             val uri = Uri.parse(sourceUriOrPath)
-            // Only MediaStore can attest a public-media directory; arbitrary providers cannot bypass the allowlist.
             if (uri.authority != MediaStore.AUTHORITY) {
                 throw SecurityException("ERR_SCOPED_PATH_DENIED: Only authorized MediaStore content URIs are supported")
             }
-            val metadata = context.contentResolver.query(uri,
-                arrayOf(MediaStore.MediaColumns.RELATIVE_PATH, MediaStore.MediaColumns.DISPLAY_NAME,
-                    MediaStore.MediaColumns.MIME_TYPE, MediaStore.MediaColumns.SIZE), null, null, null)?.use { cursor ->
+            val metadata = context.contentResolver.query(
+                uri,
+                arrayOf(
+                    MediaStore.MediaColumns.RELATIVE_PATH,
+                    MediaStore.MediaColumns.DISPLAY_NAME,
+                    MediaStore.MediaColumns.MIME_TYPE,
+                    MediaStore.MediaColumns.SIZE
+                ),
+                null,
+                null,
+                null
+            )?.use { cursor ->
                 if (!cursor.moveToFirst()) null else {
                     val relativePath = cursor.getString(0) ?: ""
                     if (!StoragePathPolicy.mediaPathAllowed(relativePath, repo.getAuthorizedDirs())) {
@@ -220,15 +319,26 @@ object ScopedStorageExecutor {
         val alias = StoragePathPolicy.normalizeAlias(sourceUriOrPath.substring(0, slashIdx))
         val rel = sourceUriOrPath.substring(slashIdx + 1)
 
-        if (!repo.getAuthorizedDirs().map { StoragePathPolicy.normalizeAlias(it) }.contains(alias)) {
+        val authorized = repo.getAuthorizedDirs().map { StoragePathPolicy.normalizeAlias(it) }.toSet()
+        if (!authorized.contains(alias)) {
             throw SecurityException("ERR_SCOPED_PATH_DENIED: Alias '$alias' is not authorized")
         }
 
         val baseDir = resolveAliasBaseDir(alias)
             ?: throw SecurityException("ERR_SCOPED_PATH_DENIED: Invalid alias '$alias'")
         val file = File(baseDir, rel)
-        if (!StoragePathPolicy.isWithin(baseDir, file) || !file.isFile) {
+        if (!StoragePathPolicy.isWithin(baseDir, file)) {
             throw SecurityException("ERR_SCOPED_PATH_DENIED: Invalid or unauthorized file path")
+        }
+
+        if (!file.isFile || !file.canRead()) {
+            if (alias == "download") {
+                val dlUri = resolveMediaStoreDownloadUri(context, authorized, rel)
+                if (dlUri != null) {
+                    return readAuthorizedFileBytes(context, repo, dlUri.toString(), compressImage, compactForBle)
+                }
+            }
+            throw SecurityException("ERR_SCOPED_PATH_DENIED: File unavailable under Android Scoped Storage (share file directly from Files app if created by another app)")
         }
 
         val rawBytes = file.inputStream().use { DeliveryPolicy.readBounded(it) }
@@ -249,13 +359,32 @@ object ScopedStorageExecutor {
         )
     }
 
+    internal fun computePowerOfTwoSampleSize(width: Int, height: Int, maxDim: Int): Int {
+        if (maxDim <= 0 || width <= 0 || height <= 0) return 1
+        var sample = 1
+        var halfW = width / 2
+        var halfH = height / 2
+        while (maxOf(halfW / sample, halfH / sample) >= maxDim) {
+            sample *= 2
+        }
+        return sample.coerceAtLeast(1)
+    }
+
     fun compressToWebpIfPossible(
         rawBytes: ByteArray,
         maxDimensionPx: Int = 0,
         quality: Int = 82
     ): ByteArray? {
         return try {
-            val bmp = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size) ?: return null
+            val decodeMaxDim = if (maxDimensionPx > 0) maxDimensionPx else 4096
+            val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, boundsOpts)
+            if (boundsOpts.outWidth <= 0 || boundsOpts.outHeight <= 0) return null
+
+            val decodeOpts = BitmapFactory.Options().apply {
+                inSampleSize = computePowerOfTwoSampleSize(boundsOpts.outWidth, boundsOpts.outHeight, decodeMaxDim)
+            }
+            val bmp = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, decodeOpts) ?: return null
             val targetBmp = if (maxDimensionPx > 0 && maxOf(bmp.width, bmp.height) > maxDimensionPx) {
                 val ratio = maxDimensionPx.toFloat() / maxOf(bmp.width, bmp.height).toFloat()
                 val targetW = (bmp.width * ratio).toInt().coerceAtLeast(1)

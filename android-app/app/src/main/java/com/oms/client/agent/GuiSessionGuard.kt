@@ -13,6 +13,9 @@ internal class GuiSessionGuard(initiallyStopped: Boolean = false) {
     private var observationId: String? = null
     private var observedWindow: String? = null
 
+    val hasActiveObservation: Boolean
+        get() = observationId != null
+
     private var invalidationReason: String = "observation replaced"
 
     fun invalidate(reason: String = "observation replaced") {

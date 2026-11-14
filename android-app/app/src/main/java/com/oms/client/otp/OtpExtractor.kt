@@ -21,12 +21,18 @@ data class OtpMatch(
  */
 object OtpExtractor {
 
+    const val OTP_MAX_AGE_MS = 5 * 60 * 1000L
     private const val DEDUP_WINDOW_MS = 25_000L
     private val recentCodes = ConcurrentHashMap<String, Long>()
 
     @Volatile
     var latestCapturedOtp: OtpMatch? = null
         private set
+
+    fun getFreshLatestOtp(nowMs: Long = System.currentTimeMillis()): OtpMatch? {
+        val current = latestCapturedOtp ?: return null
+        return if (nowMs - current.capturedAtMs in 0..OTP_MAX_AGE_MS) current else null
+    }
 
     private val GENERIC_SENDER_TITLES = setOf(
         "短信", "信息", "新消息", "消息", "通知", "验证码",
@@ -65,6 +71,27 @@ object OtpExtractor {
         RegexOption.IGNORE_CASE
     )
 
+    private val URL_MASK_REGEX = Regex("""https?://\S+""", RegexOption.IGNORE_CASE)
+    private val ACCOUNT_TAIL_MASK_REGEX = Regex(
+        """(?:尾号|末四位|后四位|尾数|卡号|账号|账户|订单号|流水号|工单号|序列号|编号|手机尾号|银行卡)(?:为|是|:|：|\s)*[0-9A-Za-z]{3,20}""",
+        RegexOption.IGNORE_CASE
+    )
+    private val MOBILE_PHONE_MASK_REGEX = Regex("""(?<!\d)1[3-9]\d{9}(?!\d)""")
+    private val HOTLINE_400_MASK_REGEX = Regex("""(?<!\d)(?:400|800)[-\s]?\d{3}[-\s]?\d{4}(?!\d)""")
+    private val LANDLINE_MASK_REGEX = Regex("""(?<!\d)\d{3,4}-\d{7,8}(?!\d)""")
+    private val CN_DATE_MASK_REGEX = Regex("""20[2-3]\d\s*年(?:\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*日)?)?""")
+    private val ISO_DATE_MASK_REGEX = Regex("""20[2-3]\d[-/.]\d{1,2}[-/.]\d{1,2}""")
+    private val TIME_MASK_REGEX = Regex("""\b\d{1,2}:\d{2}(?::\d{2})?\b""")
+    private val DURATION_MASK_REGEX = Regex(
+        """\d+\s*(?:分钟|秒钟?|小时|天|个?工作日|min|mins|minutes|sec|secs|seconds|hr|hrs|hours)\b""",
+        RegexOption.IGNORE_CASE
+    )
+    private val CURRENCY_PREFIX_MASK_REGEX = Regex(
+        """(?:人民币|金额|消费|支出|转出|存入|余额|合计|总计|RMB|USD|CNY|\$|¥|￥)\s*\d+(?:\.\d+)?""",
+        RegexOption.IGNORE_CASE
+    )
+    private val CURRENCY_SUFFIX_MASK_REGEX = Regex("""\d+(?:\.\d+)?\s*(?:元|块|万元|美元|港币)""")
+
     private fun isValidOtpCandidate(raw: String): Boolean {
         if (raw.length < 4 || raw.length > 8) return false
         if (EXCLUDED_ALPHA_WORDS.contains(raw.lowercase())) return false
@@ -97,45 +124,19 @@ object OtpExtractor {
 
     private fun maskInterferingNumbers(text: String): String {
         return text
-            // Mask anti-fraud disclaimer phrases so they don't act as proximity anchors
             .replace(ANTI_FRAUD_WARNING_REGEX, " ")
-            // Mask URLs
-            .replace(Regex("""https?://\S+""", RegexOption.IGNORE_CASE), " ")
-            // Mask bracketed brand names that might contain digits like 【12306】 or 【58同城】
+            .replace(URL_MASK_REGEX, " ")
             .replace(CN_BRACKET_REGEX, " ")
-            // Mask tail / account / order numbers
-            .replace(
-                Regex(
-                    """(?:尾号|末四位|后四位|尾数|卡号|账号|账户|订单号|流水号|工单号|序列号|编号|手机尾号|银行卡)(?:为|是|:|：|\s)*[0-9A-Za-z]{3,20}""",
-                    RegexOption.IGNORE_CASE
-                ),
-                " "
-            )
-            // Mask phone numbers & service hotlines
-            .replace(Regex("""(?<!\d)1[3-9]\d{9}(?!\d)"""), " ")
-            .replace(Regex("""(?<!\d)(?:400|800)[-\s]?\d{3}[-\s]?\d{4}(?!\d)"""), " ")
-            .replace(Regex("""(?<!\d)\d{3,4}-\d{7,8}(?!\d)"""), " ")
-            // Mask dates and times
-            .replace(Regex("""20[2-3]\d\s*年(?:\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*日)?)?"""), " ")
-            .replace(Regex("""20[2-3]\d[-/.]\d{1,2}[-/.]\d{1,2}"""), " ")
-            .replace(Regex("""\b\d{1,2}:\d{2}(?::\d{2})?\b"""), " ")
-            // Mask durations
-            .replace(
-                Regex(
-                    """\d+\s*(?:分钟|秒钟?|小时|天|个?工作日|min|mins|minutes|sec|secs|seconds|hr|hrs|hours)\b""",
-                    RegexOption.IGNORE_CASE
-                ),
-                " "
-            )
-            // Mask currency / money amounts
-            .replace(
-                Regex(
-                    """(?:人民币|金额|消费|支出|转出|存入|余额|合计|总计|RMB|USD|CNY|\$|¥|￥)\s*\d+(?:\.\d+)?""",
-                    RegexOption.IGNORE_CASE
-                ),
-                " "
-            )
-            .replace(Regex("""\d+(?:\.\d+)?\s*(?:元|块|万元|美元|港币)"""), " ")
+            .replace(ACCOUNT_TAIL_MASK_REGEX, " ")
+            .replace(MOBILE_PHONE_MASK_REGEX, " ")
+            .replace(HOTLINE_400_MASK_REGEX, " ")
+            .replace(LANDLINE_MASK_REGEX, " ")
+            .replace(CN_DATE_MASK_REGEX, " ")
+            .replace(ISO_DATE_MASK_REGEX, " ")
+            .replace(TIME_MASK_REGEX, " ")
+            .replace(DURATION_MASK_REGEX, " ")
+            .replace(CURRENCY_PREFIX_MASK_REGEX, " ")
+            .replace(CURRENCY_SUFFIX_MASK_REGEX, " ")
     }
 
     fun extractOtp(rawText: String?, senderHint: String? = null, sourceApp: String? = null): OtpMatch? {
@@ -194,7 +195,6 @@ object OtpExtractor {
         val match = extractOtp(rawText, senderHint, sourcePackage) ?: return null
         val now = System.currentTimeMillis()
 
-        // Prune expired deduplication entries
         val iter = recentCodes.entries.iterator()
         while (iter.hasNext()) {
             val entry = iter.next()

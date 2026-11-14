@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
+import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.os.Build
@@ -35,6 +36,7 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
 class OmsTtsStopReceiver : BroadcastReceiver() {
@@ -44,7 +46,118 @@ class OmsTtsStopReceiver : BroadcastReceiver() {
 }
 
 /**
- * Module 04: L1~L3 Graded Notification Dispatcher & Neural + Local Alarm-Stream TTS Speaker
+ * Three-tier audio routing policy for TTS & Neural speech:
+ * 1. [FORCE_SPEAKER_ALARM]: Urgent L3 alert / Find My Phone / In-Call speech ->
+ *    forces built-in speaker + STREAM_ALARM (restoring baseline alarm volume afterwards).
+ * 2. [ALARM_RESPECT_HEADSET]: Default `oms phone say` & normal `oms notify --tts` ->
+ *    uses connected headset privately via USAGE_MEDIA when headphones/AirPods are connected;
+ *    otherwise uses STREAM_ALARM to pierce silent/DND mode and restores baseline alarm volume afterwards.
+ * 3. [MEDIA_COMMUTE]: Timeline card `🎧 TTS朗读` or `--no-alarm` / `--media` ->
+ *    uses USAGE_MEDIA without modifying alarm volume and without stopping on screen-off / volume keys.
+ */
+enum class SpeechAudioPolicy(val wireName: String) {
+    FORCE_SPEAKER_ALARM("force_speaker_alarm"),
+    ALARM_RESPECT_HEADSET("alarm_respect_headset"),
+    MEDIA_COMMUTE("media_commute");
+
+    companion object {
+        fun fromWireName(
+            rawPolicy: String?,
+            forceSpeakerAlarmStream: Boolean = false,
+            useAlarmStream: Boolean? = null,
+            defaultPolicy: SpeechAudioPolicy = ALARM_RESPECT_HEADSET
+        ): SpeechAudioPolicy {
+            when (rawPolicy?.trim()?.lowercase(Locale.ROOT)) {
+                "force_speaker_alarm" -> return FORCE_SPEAKER_ALARM
+                "alarm_respect_headset" -> return ALARM_RESPECT_HEADSET
+                "media_commute" -> return MEDIA_COMMUTE
+            }
+            if (forceSpeakerAlarmStream) {
+                return FORCE_SPEAKER_ALARM
+            }
+            if (useAlarmStream != null) {
+                return if (useAlarmStream) defaultPolicy else MEDIA_COMMUTE
+            }
+            return defaultPolicy
+        }
+
+        fun fromParams(
+            params: JSONObject,
+            defaultPolicy: SpeechAudioPolicy = ALARM_RESPECT_HEADSET
+        ): SpeechAudioPolicy {
+            val rawPolicy = params.optString("audioPolicy", "").takeIf { it.isNotBlank() }
+            val forceSpeaker = params.optBoolean("forceSpeakerAlarmStream", false)
+            val useAlarm = if (params.has("useAlarmStream")) {
+                params.optBoolean("useAlarmStream", true)
+            } else {
+                null
+            }
+            return fromWireName(
+                rawPolicy = rawPolicy,
+                forceSpeakerAlarmStream = forceSpeaker,
+                useAlarmStream = useAlarm,
+                defaultPolicy = defaultPolicy
+            )
+        }
+
+        fun resolveRouting(
+            policy: SpeechAudioPolicy,
+            externalHeadsetConnected: Boolean
+        ): ResolvedSpeechRouting {
+            return when (policy) {
+                FORCE_SPEAKER_ALARM -> ResolvedSpeechRouting(
+                    policy = policy,
+                    useAlarmStream = true,
+                    forceBuiltInSpeaker = true,
+                    enableHardwareStop = true
+                )
+                ALARM_RESPECT_HEADSET -> {
+                    if (externalHeadsetConnected) {
+                        ResolvedSpeechRouting(
+                            policy = policy,
+                            useAlarmStream = false,
+                            forceBuiltInSpeaker = false,
+                            enableHardwareStop = false
+                        )
+                    } else {
+                        ResolvedSpeechRouting(
+                            policy = policy,
+                            useAlarmStream = true,
+                            forceBuiltInSpeaker = false,
+                            enableHardwareStop = true
+                        )
+                    }
+                }
+                MEDIA_COMMUTE -> ResolvedSpeechRouting(
+                    policy = policy,
+                    useAlarmStream = false,
+                    forceBuiltInSpeaker = false,
+                    enableHardwareStop = false
+                )
+            }
+        }
+
+        fun extractGenFromUtteranceId(utteranceId: String?): Int? {
+            if (utteranceId.isNullOrBlank()) return null
+            val prefix = "oms_tts_g"
+            if (!utteranceId.startsWith(prefix)) return null
+            val rest = utteranceId.substring(prefix.length)
+            val endIdx = rest.indexOf('_')
+            if (endIdx <= 0) return null
+            return rest.substring(0, endIdx).toIntOrNull()
+        }
+    }
+}
+
+data class ResolvedSpeechRouting(
+    val policy: SpeechAudioPolicy,
+    val useAlarmStream: Boolean,
+    val forceBuiltInSpeaker: Boolean,
+    val enableHardwareStop: Boolean
+)
+
+/**
+ * Module 04: L1~L3 Graded Notification Dispatcher & Neural + Local Multi-Policy TTS Speaker
  */
 object NotificationExecutor {
     const val CHANNEL_SILENT = "oms_silent_stream"
@@ -54,6 +167,7 @@ object NotificationExecutor {
     const val EXTRA_STOP_TTS = "stop_tts_on_open"
 
     private data class PendingSpeech(
+        val gen: Int,
         val text: String,
         val useAlarmStream: Boolean,
         val speechRate: Float,
@@ -61,6 +175,9 @@ object NotificationExecutor {
     )
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val ioExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "oms-tts-io").apply { isDaemon = true }
+    }
     private val pendingSpeechQueue = ConcurrentLinkedQueue<PendingSpeech>()
     private val playbackGeneration = AtomicInteger(0)
 
@@ -70,6 +187,13 @@ object NotificationExecutor {
     private val _speakingTextFlow = MutableStateFlow("")
     val speakingTextFlow: StateFlow<String> = _speakingTextFlow.asStateFlow()
 
+    private val alarmVolumeLock = Any()
+    private var savedBaselineAlarmVolume: Int? = null
+    private var alarmVolumeOwnerGen: Int = 0
+
+    private val audioFocusLock = Any()
+    private var activeAudioFocusRequest: AudioFocusRequest? = null
+
     @Volatile
     private var activeMediaPlayer: MediaPlayer? = null
     @Volatile
@@ -78,6 +202,11 @@ object NotificationExecutor {
     private var playbackStartedElapsedMs: Long = 0L
     @Volatile
     private var hardwareStopReceiverRegistered = false
+    @Volatile
+    private var activeHardwareStopEnabled = false
+
+    val isHardwareStopActive: Boolean
+        get() = activeHardwareStopEnabled && !ignoreHardwareStopForInCallSpeech
     @Volatile
     private var appContextRef: Context? = null
 
@@ -90,26 +219,58 @@ object NotificationExecutor {
     @Volatile
     private var ignoreHardwareStopForInCallSpeech = false
 
+    internal fun resolvePlaybackRouting(
+        policy: SpeechAudioPolicy,
+        externalHeadsetConnected: Boolean
+    ): ResolvedSpeechRouting = SpeechAudioPolicy.resolveRouting(policy, externalHeadsetConnected)
+
+    internal fun extractGenFromUtteranceId(utteranceId: String?): Int? =
+        SpeechAudioPolicy.extractGenFromUtteranceId(utteranceId)
+
+    fun isExternalHeadsetConnected(context: Context): Boolean {
+        return try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return false
+            am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any { dev ->
+                when (dev.type) {
+                    AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+                    AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+                    AudioDeviceInfo.TYPE_WIRED_HEADSET,
+                    AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+                    AudioDeviceInfo.TYPE_USB_HEADSET,
+                    AudioDeviceInfo.TYPE_USB_DEVICE -> true
+                    else -> {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                                dev.type == AudioDeviceInfo.TYPE_BLE_SPEAKER ||
+                                dev.type == AudioDeviceInfo.TYPE_BLE_BROADCAST
+                        } else {
+                            false
+                        }
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     private val hardwareStopReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent?) {
             val action = intent?.action ?: return
-            if (!_isSpeakingFlow.value || ignoreHardwareStopForInCallSpeech) return
+            if (!_isSpeakingFlow.value || !activeHardwareStopEnabled || ignoreHardwareStopForInCallSpeech) return
             val elapsedSinceStart = SystemClock.elapsedRealtime() - playbackStartedElapsedMs
             when (action) {
                 Intent.ACTION_USER_PRESENT -> {
-                    // User unlocked the phone after finding it -> automatically stop ringing
                     if (elapsedSinceStart > 500L) {
                         stopSpeaking(context)
                     }
                 }
                 Intent.ACTION_SCREEN_OFF -> {
-                    // User pressed the physical Power button -> automatically stop ringing
                     if (elapsedSinceStart > 700L) {
                         stopSpeaking(context)
                     }
                 }
                 "android.media.VOLUME_CHANGED_ACTION" -> {
-                    // User pressed physical Volume Up / Volume Down key -> stop ringing immediately
                     if (elapsedSinceStart > 750L) {
                         stopSpeaking(context)
                     }
@@ -139,6 +300,7 @@ object NotificationExecutor {
     }
 
     fun ensureChannelsAndTts(context: Context) {
+        appContextRef = context.applicationContext
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
         val silentCh = NotificationChannel(
@@ -197,20 +359,23 @@ object NotificationExecutor {
                             engine?.setPitch(1.0f)
                             engine?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                                 override fun onStart(utteranceId: String?) {
-                                    _isSpeakingFlow.value = true
+                                    val uttGen = extractGenFromUtteranceId(utteranceId)
+                                    if (uttGen != null && uttGen == playbackGeneration.get()) {
+                                        _isSpeakingFlow.value = true
+                                    }
                                 }
 
                                 override fun onDone(utteranceId: String?) {
+                                    val uttGen = extractGenFromUtteranceId(utteranceId) ?: return
                                     if (utteranceId?.endsWith("_last") == true) {
-                                        _isSpeakingFlow.value = false
-                                        _speakingTextFlow.value = ""
+                                        onPlaybackFinished(uttGen)
                                     }
                                 }
 
                                 @Deprecated("Deprecated in Java")
                                 override fun onError(utteranceId: String?) {
-                                    _isSpeakingFlow.value = false
-                                    _speakingTextFlow.value = ""
+                                    val uttGen = extractGenFromUtteranceId(utteranceId) ?: return
+                                    onPlaybackFinished(uttGen)
                                 }
                             })
                         } catch (_: Throwable) {
@@ -223,17 +388,121 @@ object NotificationExecutor {
         }
     }
 
-    private fun ensureAlarmStreamAudible(context: Context) {
-        try {
-            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            val maxVol = am.getStreamMaxVolume(AudioManager.STREAM_ALARM)
-            val curVol = am.getStreamVolume(AudioManager.STREAM_ALARM)
-            val minTarget = (maxVol * 0.75f).toInt().coerceAtLeast(1)
-            if (curVol < minTarget) {
-                am.setStreamVolume(AudioManager.STREAM_ALARM, minTarget, 0)
+    private fun applyOrTransferAlarmVolume(
+        context: Context,
+        gen: Int,
+        useAlarmStream: Boolean,
+        minVolumeRatio: Float
+    ) {
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        synchronized(alarmVolumeLock) {
+            if (!useAlarmStream) {
+                val baseline = savedBaselineAlarmVolume
+                if (baseline != null) {
+                    savedBaselineAlarmVolume = null
+                    alarmVolumeOwnerGen = 0
+                    try {
+                        am.setStreamVolume(AudioManager.STREAM_ALARM, baseline, 0)
+                    } catch (_: Throwable) {
+                    }
+                }
+                return
             }
-        } catch (_: Throwable) {
+
+            try {
+                val maxVol = am.getStreamMaxVolume(AudioManager.STREAM_ALARM).coerceAtLeast(1)
+                val curVol = am.getStreamVolume(AudioManager.STREAM_ALARM)
+                val minTarget = (maxVol * minVolumeRatio).toInt().coerceIn(1, maxVol)
+                if (savedBaselineAlarmVolume == null) {
+                    if (curVol < minTarget) {
+                        savedBaselineAlarmVolume = curVol
+                        alarmVolumeOwnerGen = gen
+                        am.setStreamVolume(AudioManager.STREAM_ALARM, minTarget, 0)
+                    }
+                } else {
+                    // Preempted an ongoing alarm-stream playback: transfer ownership without overwriting baseline!
+                    alarmVolumeOwnerGen = gen
+                    if (curVol < minTarget) {
+                        am.setStreamVolume(AudioManager.STREAM_ALARM, minTarget, 0)
+                    }
+                }
+            } catch (_: Throwable) {
+            }
         }
+    }
+
+    private fun restoreAlarmVolumeIfOwned(context: Context?, gen: Int) {
+        val ctx = context ?: appContextRef ?: return
+        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        synchronized(alarmVolumeLock) {
+            val baseline = savedBaselineAlarmVolume
+            if (baseline != null && alarmVolumeOwnerGen == gen) {
+                savedBaselineAlarmVolume = null
+                alarmVolumeOwnerGen = 0
+                try {
+                    am.setStreamVolume(AudioManager.STREAM_ALARM, baseline, 0)
+                } catch (_: Throwable) {
+                }
+            }
+        }
+    }
+
+    private fun restoreAlarmVolumeForce(context: Context?) {
+        val ctx = context ?: appContextRef ?: return
+        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        synchronized(alarmVolumeLock) {
+            val baseline = savedBaselineAlarmVolume
+            if (baseline != null) {
+                savedBaselineAlarmVolume = null
+                alarmVolumeOwnerGen = 0
+                try {
+                    am.setStreamVolume(AudioManager.STREAM_ALARM, baseline, 0)
+                } catch (_: Throwable) {
+                }
+            }
+        }
+    }
+
+    private fun requestSpeechAudioFocus(context: Context, useAlarmStream: Boolean) {
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        val attrs = AudioAttributes.Builder()
+            .setUsage(if (useAlarmStream) AudioAttributes.USAGE_ALARM else AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+        synchronized(audioFocusLock) {
+            activeAudioFocusRequest?.let { prev ->
+                runCatching { am.abandonAudioFocusRequest(prev) }
+                activeAudioFocusRequest = null
+            }
+            runCatching {
+                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                    .setAudioAttributes(attrs)
+                    .setOnAudioFocusChangeListener { }
+                    .build()
+                am.requestAudioFocus(req)
+                activeAudioFocusRequest = req
+            }
+        }
+    }
+
+    private fun abandonSpeechAudioFocus(context: Context?) {
+        val ctx = context ?: appContextRef ?: return
+        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        synchronized(audioFocusLock) {
+            activeAudioFocusRequest?.let { req ->
+                activeAudioFocusRequest = null
+                runCatching { am.abandonAudioFocusRequest(req) }
+            }
+        }
+    }
+
+    private fun onPlaybackFinished(gen: Int) {
+        if (playbackGeneration.get() != gen) return
+        _isSpeakingFlow.value = false
+        _speakingTextFlow.value = ""
+        activeHardwareStopEnabled = false
+        restoreAlarmVolumeIfOwned(appContextRef, gen)
+        abandonSpeechAudioFocus(appContextRef)
     }
 
     private fun releaseActiveMediaPlayer() {
@@ -258,6 +527,7 @@ object NotificationExecutor {
         if (!ttsReady) return
         while (true) {
             val item = pendingSpeechQueue.poll() ?: break
+            if (playbackGeneration.get() != item.gen) continue
             val audioAttrs = AudioAttributes.Builder()
                 .setUsage(if (item.useAlarmStream) AudioAttributes.USAGE_ALARM else AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
@@ -273,15 +543,21 @@ object NotificationExecutor {
                     engine.playSilentUtterance(
                         420L,
                         TextToSpeech.QUEUE_ADD,
-                        "oms_tts_pause_${ts}_$i"
+                        "oms_tts_g${item.gen}_pause_${ts}_$i"
                     )
                 }
                 val suffix = if (i == count - 1) "_last" else "_$i"
+                val utteranceParams = Bundle().apply {
+                    putInt(
+                        TextToSpeech.Engine.KEY_PARAM_STREAM,
+                        if (item.useAlarmStream) AudioManager.STREAM_ALARM else AudioManager.STREAM_MUSIC
+                    )
+                }
                 engine.speak(
                     item.text,
                     queueMode,
-                    Bundle.EMPTY,
-                    "oms_tts_${ts}$suffix"
+                    utteranceParams,
+                    "oms_tts_g${item.gen}_${ts}$suffix"
                 )
             }
         }
@@ -291,7 +567,7 @@ object NotificationExecutor {
         ensureChannelsAndTts(context)
         val title = params.optString("title", "Mac AI 提醒")
         val body = params.optString("body", "")
-        val level = params.optString("level", "normal").lowercase()
+        val level = params.optString("level", "normal").lowercase(Locale.ROOT)
         val ttsSpeak = params.optBoolean("ttsSpeak", false)
         val audioBase64 = params.optString("audioBase64", "").takeIf { it.isNotBlank() }
         val repeatCount = params.optInt("repeatCount", 1).coerceIn(1, 20)
@@ -347,9 +623,6 @@ object NotificationExecutor {
             if (level == "urgent") {
                 builder.setPriority(NotificationCompat.PRIORITY_MAX)
                 builder.setCategory(NotificationCompat.CATEGORY_ALARM)
-                // Full-screen display may be launched by Android without a user tap.
-                // Give it a distinct PendingIntent identity (extras alone are ignored)
-                // and never attach the content-click stop command to this path.
                 val displayIntent = Intent(context, MainActivity::class.java).apply {
                     action = "com.oms.client.ACTION_DISPLAY_URGENT_NOTIFICATION"
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
@@ -365,13 +638,20 @@ object NotificationExecutor {
             nm.notify(notificationId, builder.build())
         }
 
+        var resolvedPolicyWire = SpeechAudioPolicy.ALARM_RESPECT_HEADSET.wireName
         if (ttsSpeak) {
-            val forceAlarmSpeaker = params.optBoolean("forceSpeakerAlarmStream", false)
+            val defaultPolicy = if (level == "urgent") {
+                SpeechAudioPolicy.FORCE_SPEAKER_ALARM
+            } else {
+                SpeechAudioPolicy.ALARM_RESPECT_HEADSET
+            }
+            val policy = SpeechAudioPolicy.fromParams(params, defaultPolicy = defaultPolicy)
+            resolvedPolicyWire = policy.wireName
             val fallbackText = if (audioBase64 != null && body.isNotBlank()) body else "$title。$body"
             speakText(
-                context,
-                fallbackText,
-                useAlarmStream = forceAlarmSpeaker,
+                context = context,
+                rawText = fallbackText,
+                audioPolicy = policy,
                 speechRate = 1.0f,
                 audioBase64 = audioBase64,
                 repeatCount = repeatCount
@@ -382,72 +662,113 @@ object NotificationExecutor {
             put("notificationId", notificationId.toString())
             put("deliveredAtMs", System.currentTimeMillis())
             put("ttsEngine", if (audioBase64 != null) "edge_neural" else "android_local")
+            if (ttsSpeak) {
+                put("audioPolicy", resolvedPolicyWire)
+            }
         }
     }
 
     /**
-     * Speak text via Neural TTS MP3 (when [audioBase64] is provided by Mac) or local Android TTS fallback.
-     * When [useAlarmStream] is true, binds to USAGE_ALARM so L3 urgent alerts and Find My Phone are
-     * audible even when the phone is in silent/DND mode or media volume is muted.
+     * Speak text via Neural TTS MP3 (when [audioBase64] is provided by Mac) or local Android TTS fallback,
+     * applying the 3-tier [SpeechAudioPolicy] and automatically saving/restoring STREAM_ALARM volume.
      */
     fun speakText(
         context: Context,
         rawText: String,
-        useAlarmStream: Boolean = false,
+        useAlarmStream: Boolean = true,
         speechRate: Float = 1.0f,
         audioBase64: String? = null,
-        repeatCount: Int = 1
+        repeatCount: Int = 1,
+        audioPolicy: SpeechAudioPolicy? = null,
+        minAlarmVolumeRatio: Float = 0.75f
     ): Int {
+        val appCtx = context.applicationContext
+        appContextRef = appCtx
         val cleanText = rawText
             .replace(Regex("```[\\s\\S]*?```"), "，代码片段已略过，")
             .replace(Regex("[#*`>|\\[\\]]"), " ")
             .trim()
+
+        val effectivePolicy = audioPolicy
+            ?: if (useAlarmStream) SpeechAudioPolicy.ALARM_RESPECT_HEADSET else SpeechAudioPolicy.MEDIA_COMMUTE
+        val routing = resolvePlaybackRouting(
+            policy = effectivePolicy,
+            externalHeadsetConnected = isExternalHeadsetConnected(appCtx)
+        )
 
         val gen = playbackGeneration.incrementAndGet()
         pendingSpeechQueue.clear()
         ttsEngine?.stop()
         releaseActiveMediaPlayer()
 
-        registerHardwareStopReceiverIfNeeded(context)
-        if (useAlarmStream) {
-            ensureAlarmStreamAudible(context)
+        if (cleanText.isEmpty() && audioBase64.isNullOrBlank()) {
+            _isSpeakingFlow.value = false
+            _speakingTextFlow.value = ""
+            activeHardwareStopEnabled = false
+            restoreAlarmVolumeForce(appCtx)
+            abandonSpeechAudioFocus(appCtx)
+            return 0
         }
+
+        activeHardwareStopEnabled = routing.enableHardwareStop
+        if (routing.enableHardwareStop) {
+            registerHardwareStopReceiverIfNeeded(appCtx)
+        }
+        applyOrTransferAlarmVolume(
+            context = appCtx,
+            gen = gen,
+            useAlarmStream = routing.useAlarmStream,
+            minVolumeRatio = minAlarmVolumeRatio
+        )
+        requestSpeechAudioFocus(appCtx, routing.useAlarmStream)
+
         playbackStartedElapsedMs = SystemClock.elapsedRealtime()
         _isSpeakingFlow.value = true
         _speakingTextFlow.value = cleanText.ifBlank { "语音播报中" }
 
         if (!audioBase64.isNullOrBlank()) {
-            val appCtx = context.applicationContext
-            mainHandler.post {
-                if (playbackGeneration.get() != gen) return@post
-                val played = playNeuralAudioInternal(
+            ioExecutor.execute {
+                if (playbackGeneration.get() != gen) return@execute
+                val preparedPlayer = prepareNeuralAudioPlayerOffMain(
                     context = appCtx,
                     audioBase64 = audioBase64,
-                    useAlarmStream = useAlarmStream,
+                    routing = routing,
                     repeatCount = repeatCount.coerceIn(1, 20),
                     gen = gen
                 )
-                if (!played && cleanText.isNotEmpty() && playbackGeneration.get() == gen) {
-                    enqueueLocalSpeech(appCtx, cleanText, useAlarmStream, speechRate, repeatCount)
-                } else if (!played && playbackGeneration.get() == gen) {
-                    _isSpeakingFlow.value = false
-                    _speakingTextFlow.value = ""
+                mainHandler.post {
+                    if (playbackGeneration.get() != gen) {
+                        preparedPlayer?.let { mp -> runCatching { mp.release() } }
+                        return@post
+                    }
+                    if (preparedPlayer != null) {
+                        try {
+                            activeMediaPlayer = preparedPlayer
+                            preparedPlayer.start()
+                        } catch (_: Throwable) {
+                            releaseActiveMediaPlayer()
+                            if (cleanText.isNotEmpty()) {
+                                enqueueLocalSpeech(appCtx, gen, cleanText, routing.useAlarmStream, speechRate, repeatCount)
+                            } else {
+                                onPlaybackFinished(gen)
+                            }
+                        }
+                    } else if (cleanText.isNotEmpty()) {
+                        enqueueLocalSpeech(appCtx, gen, cleanText, routing.useAlarmStream, speechRate, repeatCount)
+                    } else {
+                        onPlaybackFinished(gen)
+                    }
                 }
             }
             return gen
         }
 
-        if (cleanText.isEmpty()) {
-            _isSpeakingFlow.value = false
-            _speakingTextFlow.value = ""
-            return 0
-        }
-        enqueueLocalSpeech(context, cleanText, useAlarmStream, speechRate, repeatCount)
+        enqueueLocalSpeech(appCtx, gen, cleanText, routing.useAlarmStream, speechRate, repeatCount)
         return gen
     }
 
     /**
-     * Speak text on the phone (typically over USAGE_ALARM + built-in speaker for in-call speech)
+     * Speak text on the phone (over FORCE_SPEAKER_ALARM when [useAlarmStream] is true, for in-call speech)
      * and suspend until playback finishes or [shouldContinue] returns false.
      */
     suspend fun speakTextAndAwait(
@@ -461,31 +782,22 @@ object NotificationExecutor {
         ignoreHardwareStop: Boolean = true,
         shouldContinue: () -> Boolean = { true }
     ): Boolean {
-        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        val savedAlarmVolume = try {
-            if (useAlarmStream && am != null) am.getStreamVolume(AudioManager.STREAM_ALARM) else null
-        } catch (_: Throwable) {
-            null
-        }
         try {
-            if (useAlarmStream && am != null) {
-                try {
-                    val maxVol = am.getStreamMaxVolume(AudioManager.STREAM_ALARM)
-                    val targetVol = (maxVol * 0.85f).toInt().coerceAtLeast(1)
-                    if (am.getStreamVolume(AudioManager.STREAM_ALARM) < targetVol) {
-                        am.setStreamVolume(AudioManager.STREAM_ALARM, targetVol, 0)
-                    }
-                } catch (_: Throwable) {
-                }
-            }
             ignoreHardwareStopForInCallSpeech = ignoreHardwareStop
+            val policy = if (useAlarmStream) {
+                SpeechAudioPolicy.FORCE_SPEAKER_ALARM
+            } else {
+                SpeechAudioPolicy.MEDIA_COMMUTE
+            }
             val gen = speakText(
                 context = context,
                 rawText = rawText,
                 useAlarmStream = useAlarmStream,
                 speechRate = speechRate,
                 audioBase64 = audioBase64,
-                repeatCount = repeatCount
+                repeatCount = repeatCount,
+                audioPolicy = policy,
+                minAlarmVolumeRatio = 0.85f
             )
             if (gen == 0) return false
             val startedAt = SystemClock.elapsedRealtime()
@@ -509,111 +821,108 @@ object NotificationExecutor {
             throw e
         } finally {
             ignoreHardwareStopForInCallSpeech = false
-            if (savedAlarmVolume != null && am != null) {
-                try {
-                    am.setStreamVolume(AudioManager.STREAM_ALARM, savedAlarmVolume, 0)
-                } catch (_: Throwable) {
-                }
-            }
         }
     }
 
-    private fun playNeuralAudioInternal(
+    private fun prepareNeuralAudioPlayerOffMain(
         context: Context,
         audioBase64: String,
-        useAlarmStream: Boolean,
+        routing: ResolvedSpeechRouting,
         repeatCount: Int,
         gen: Int
-    ): Boolean {
+    ): MediaPlayer? {
+        var player: MediaPlayer? = null
         return try {
             val mp3Bytes = Base64.decode(audioBase64, Base64.DEFAULT)
-            if (mp3Bytes.size < 128) return false
-            val cacheFile = File(context.cacheDir, "oms_neural_tts_active.mp3")
+            if (mp3Bytes.size < 128) return null
+            val ttsCacheDir = File(context.cacheDir, "tts").apply { mkdirs() }
+            runCatching { File(context.cacheDir, "oms_neural_tts_active.mp3").delete() }
+            pruneStaleTtsCacheFiles(ttsCacheDir)
+
+            val cacheFile = File(ttsCacheDir, "oms_neural_${gen and 3}.mp3")
             FileOutputStream(cacheFile).use { fos ->
                 fos.write(mp3Bytes)
-                fos.fd.sync()
             }
 
-            val player = MediaPlayer()
+            val mp = MediaPlayer()
+            player = mp
             val audioAttrs = AudioAttributes.Builder()
-                .setUsage(if (useAlarmStream) AudioAttributes.USAGE_ALARM else AudioAttributes.USAGE_MEDIA)
+                .setUsage(if (routing.useAlarmStream) AudioAttributes.USAGE_ALARM else AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build()
-            player.setAudioAttributes(audioAttrs)
-            if (useAlarmStream) {
+            mp.setAudioAttributes(audioAttrs)
+            if (routing.forceBuiltInSpeaker) {
                 try {
                     val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
                     val speakerDev = am
                         ?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
                         ?.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
                     if (speakerDev != null) {
-                        player.setPreferredDevice(speakerDev)
+                        mp.setPreferredDevice(speakerDev)
                     }
                 } catch (_: Throwable) {
                 }
             }
             FileInputStream(cacheFile).use { fis ->
-                player.setDataSource(fis.fd)
+                mp.setDataSource(fis.fd)
             }
-            player.prepare()
+            mp.prepare()
 
             var remainingRepeats = (repeatCount - 1).coerceAtLeast(0)
-            player.setOnCompletionListener { mp ->
+            mp.setOnCompletionListener { completedMp ->
                 if (playbackGeneration.get() == gen && remainingRepeats > 0) {
                     remainingRepeats -= 1
                     mainHandler.postDelayed({
-                        if (playbackGeneration.get() == gen && activeMediaPlayer === mp) {
+                        if (playbackGeneration.get() == gen && activeMediaPlayer === completedMp) {
                             try {
-                                mp.seekTo(0)
-                                mp.start()
+                                completedMp.seekTo(0)
+                                completedMp.start()
                             } catch (_: Throwable) {
                                 releaseActiveMediaPlayer()
-                                _isSpeakingFlow.value = false
-                                _speakingTextFlow.value = ""
+                                onPlaybackFinished(gen)
                             }
                         }
                     }, 420L)
                 } else {
-                    if (activeMediaPlayer === mp) {
+                    if (activeMediaPlayer === completedMp) {
                         releaseActiveMediaPlayer()
                     } else {
-                        try {
-                            mp.release()
-                        } catch (_: Throwable) {
-                        }
+                        runCatching { completedMp.release() }
                     }
-                    if (playbackGeneration.get() == gen) {
-                        _isSpeakingFlow.value = false
-                        _speakingTextFlow.value = ""
-                    }
+                    onPlaybackFinished(gen)
                 }
             }
-            player.setOnErrorListener { mp, _, _ ->
-                if (activeMediaPlayer === mp) {
+            mp.setOnErrorListener { errMp, _, _ ->
+                if (activeMediaPlayer === errMp) {
                     releaseActiveMediaPlayer()
                 } else {
-                    try {
-                        mp.release()
-                    } catch (_: Throwable) {
-                    }
+                    runCatching { errMp.release() }
                 }
-                if (playbackGeneration.get() == gen) {
-                    _isSpeakingFlow.value = false
-                    _speakingTextFlow.value = ""
-                }
+                onPlaybackFinished(gen)
                 true
             }
-            activeMediaPlayer = player
-            player.start()
-            true
+            mp
         } catch (_: Throwable) {
-            releaseActiveMediaPlayer()
-            false
+            player?.let { runCatching { it.release() } }
+            null
+        }
+    }
+
+    fun pruneStaleTtsCacheFiles(ttsCacheDir: File, maxAgeMs: Long = 24L * 3600_000L) {
+        try {
+            val cutoff = System.currentTimeMillis() - maxAgeMs
+            ttsCacheDir.listFiles()?.forEach { f ->
+                if (f.isFile && f.lastModified() < cutoff) {
+                    runCatching { f.delete() }
+                }
+            }
+        } catch (_: Throwable) {
         }
     }
 
     private fun enqueueLocalSpeech(
         context: Context,
+        gen: Int,
         cleanText: String,
         useAlarmStream: Boolean,
         speechRate: Float,
@@ -621,6 +930,7 @@ object NotificationExecutor {
     ) {
         pendingSpeechQueue.offer(
             PendingSpeech(
+                gen = gen,
                 text = cleanText,
                 useAlarmStream = useAlarmStream,
                 speechRate = speechRate,
@@ -638,7 +948,10 @@ object NotificationExecutor {
         pendingSpeechQueue.clear()
         _isSpeakingFlow.value = false
         _speakingTextFlow.value = ""
+        activeHardwareStopEnabled = false
         val ctx = context ?: appContextRef
+        restoreAlarmVolumeForce(ctx)
+        abandonSpeechAudioFocus(ctx)
         val notifId = activeTtsNotificationId
         activeTtsNotificationId = 0
         if (ctx != null) {

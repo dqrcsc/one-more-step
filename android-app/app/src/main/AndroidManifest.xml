@@ -14,7 +14,6 @@
         android:name="android.permission.BLUETOOTH_SCAN"
         android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
 
     <!-- Scoped Media & Storage -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
@@ -23,15 +22,12 @@
 
     <!-- Native System Alarm & Calendar -->
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
-    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.READ_CALENDAR" />
     <uses-permission android:name="android.permission.WRITE_CALENDAR" />
 
-    <!-- Overlays, Notifications, Voice Note, Telephony Call, SMS OTP & Keep-Alive -->
+    <!-- Overlays, Notifications, Voice Note, Telephony Call State, SMS OTP & Keep-Alive -->
     <uses-feature android:name="android.hardware.telephony" android:required="false" />
-    <uses-permission android:name="android.permission.CALL_PHONE" />
-    <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.READ_SMS" />
@@ -109,7 +105,14 @@
             </intent-filter>
         </activity>
 
-        <!-- 3. Transparent 1x1 Window Focus Catcher for Android 10+ Clipboard Read -->
+        <!-- 3. Translucent Half-Screen Quick-Send Sheet (Album / PDF / Word / Clipboard / Voice) -->
+        <activity
+            android:name=".share.QuickSendSheetActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- 3b. Transparent 1x1 Window Focus Catcher for Android 10+ Clipboard Read -->
         <activity
             android:name=".share.ClipboardCatcherActivity"
             android:exported="false"

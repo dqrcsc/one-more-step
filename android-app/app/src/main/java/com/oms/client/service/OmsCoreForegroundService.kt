@@ -23,6 +23,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import java.util.Collections
 
 /**
  * Module 04: Persistent Foreground Keep-Alive Service for Xiaomi HyperOS / MIUI
@@ -32,39 +33,68 @@ import kotlinx.coroutines.launch
 class OmsCoreForegroundService : Service() {
     companion object {
         private const val FG_NOTIFICATION_ID = 19527
+
+        @Volatile
+        private var instance: OmsCoreForegroundService? = null
+
+        private val lowLatencyReasons = Collections.synchronizedSet(HashSet<String>())
+
+        /**
+         * Dynamically acquire WIFI_MODE_FULL_LOW_LATENCY only during active screen mirroring
+         * or bulk binary file transfers, allowing Wi-Fi DTIM power saving during normal standby.
+         */
+        fun setLowLatencyWifiNeeded(reason: String, needed: Boolean) {
+            if (needed) {
+                lowLatencyReasons.add(reason)
+            } else {
+                lowLatencyReasons.remove(reason)
+            }
+            instance?.syncWifiLockState()
+        }
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var screenshotWatcher: ScreenshotPillController? = null
     private var smsObserver: SmsContentObserver? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private val wifiLockMutex = Any()
 
-    private fun ensureWifiLockAcquired() {
-        try {
-            if (wifiLock == null) {
-                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
-                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+    private fun syncWifiLockState() {
+        val shouldHold = lowLatencyReasons.isNotEmpty()
+        synchronized(wifiLockMutex) {
+            try {
+                if (shouldHold) {
+                    if (wifiLock == null) {
+                        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
+                        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                        } else {
+                            @Suppress("DEPRECATION")
+                            WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                        }
+                        wifiLock = wm.createWifiLock(mode, "OneMoreStep::ActiveTransferLock").apply {
+                            setReferenceCounted(false)
+                        }
+                    }
+                    if (wifiLock?.isHeld == false) {
+                        wifiLock?.acquire()
+                    }
                 } else {
-                    @Suppress("DEPRECATION")
-                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                    if (wifiLock?.isHeld == true) {
+                        wifiLock?.release()
+                    }
                 }
-                wifiLock = wm.createWifiLock(mode, "OneMoreStep::LanKeepAliveLock").apply {
-                    setReferenceCounted(false)
-                }
+            } catch (_: Throwable) {
             }
-            if (wifiLock?.isHeld == false) {
-                wifiLock?.acquire()
-            }
-        } catch (_: Throwable) {
         }
     }
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         NotificationExecutor.ensureChannelsAndTts(this)
         safeStartForeground("正在连接 Mac...")
-        ensureWifiLockAcquired()
+        syncWifiLockState()
 
         screenshotWatcher = ScreenshotPillController(this).also {
             it.startWatching()
@@ -86,11 +116,12 @@ class OmsCoreForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        ensureWifiLockAcquired()
         val client = OmsApplication.instance?.transportClient
-        client?.startAutoConnect()
         val tier = client?.activeTierFlow?.value ?: "DISCONNECTED"
-        updateNotificationForTier(tier)
+        // Re-promote to pure CONNECTED_DEVICE foreground type once runtime permissions are granted
+        safeStartForeground(statusTextForTier(tier))
+        syncWifiLockState()
+        client?.startAutoConnect()
         return START_STICKY
     }
 
@@ -106,10 +137,11 @@ class OmsCoreForegroundService : Service() {
             val notif = buildStatusNotification(statusText)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 try {
+                    // Request CONNECTED_DEVICE alone so Android 15+ does not apply the 6h dataSync quota
                     startForeground(
                         FG_NOTIFICATION_ID,
                         notif,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
                     )
                 } catch (_: SecurityException) {
                     startForeground(
@@ -171,13 +203,18 @@ class OmsCoreForegroundService : Service() {
             .build()
 
     override fun onDestroy() {
-        try {
-            if (wifiLock?.isHeld == true) {
-                wifiLock?.release()
-            }
-        } catch (_: Throwable) {
+        if (instance === this) {
+            instance = null
         }
-        wifiLock = null
+        synchronized(wifiLockMutex) {
+            try {
+                if (wifiLock?.isHeld == true) {
+                    wifiLock?.release()
+                }
+            } catch (_: Throwable) {
+            }
+            wifiLock = null
+        }
         serviceScope.cancel()
         screenshotWatcher?.stopWatching()
         smsObserver?.stopWatching()

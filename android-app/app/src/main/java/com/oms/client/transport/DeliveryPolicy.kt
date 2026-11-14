@@ -1,8 +1,11 @@
 package com.oms.client.transport
 
-import java.security.MessageDigest
-import java.io.InputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.InputStream
+import java.io.RandomAccessFile
+import java.security.MessageDigest
+import java.util.BitSet
 
 /** Pure validation shared by transport and JVM regression tests. */
 object DeliveryPolicy {
@@ -39,6 +42,53 @@ object DeliveryPolicy {
             require(actual.equals(sha256, true)) { "SHA-256 mismatch" }
             return result
         }
+        fun writeChunkToPartFile(partFile: File, receivedChunks: BitSet, index: Int, bytes: ByteArray): Boolean {
+            validateChunk(index, bytes)
+            val offset = index.toLong() * chunkSize.toLong()
+            RandomAccessFile(partFile, "rw").use { raf ->
+                if (receivedChunks.get(index)) {
+                    require(raf.length() >= offset + bytes.size) { "Corrupted part file on duplicate chunk" }
+                    val existing = ByteArray(bytes.size)
+                    raf.seek(offset)
+                    raf.readFully(existing)
+                    require(existing.contentEquals(bytes)) { "Conflicting duplicate chunk" }
+                } else {
+                    if (bytes.isNotEmpty()) {
+                        raf.seek(offset)
+                        raf.write(bytes)
+                    } else if (raf.length() == 0L) {
+                        raf.setLength(0L)
+                    }
+                    receivedChunks.set(index)
+                }
+            }
+            return receivedChunks.cardinality() == totalChunks
+        }
+        fun verifyAndSyncPartFile(partFile: File) {
+            require(partFile.isFile) { "Part file missing" }
+            RandomAccessFile(partFile, "rw").use { raf ->
+                require(raf.length() == totalBytes) { "Part file size mismatch" }
+                raf.fd.sync()
+            }
+            val actual = sha256FileHex(partFile)
+            require(actual.equals(sha256, ignoreCase = true)) { "SHA-256 mismatch" }
+        }
+    }
+
+    fun sha256FileHex(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(65536)
+        file.inputStream().use { input ->
+            var total = 0L
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                total += count
+                require(total <= MAX_BYTES.toLong()) { "File exceeds 64 MiB" }
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     fun committedInboxAck(ack: Boolean, savedId: String?, itemId: String): Boolean = ack && savedId == itemId

@@ -20,8 +20,9 @@ import android.widget.TextView
 import com.oms.client.OmsApplication
 
 /**
- * Module 03: Screenshot Instant-Send Floating Pill (`ScreenshotPillController`)
- * Watches MediaStore for newly captured screenshots and pops a 3.5s non-focusable capsule.
+ * Module 03: Screenshot & Camera Photo Instant-Send Floating Pill (`ScreenshotPillController`)
+ * Watches MediaStore for newly captured screenshots (and optionally new camera photos)
+ * and pops a 4.0s non-focusable quick-send capsule.
  */
 class ScreenshotPillController(private val context: Context) {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -33,7 +34,7 @@ class ScreenshotPillController(private val context: Context) {
     private val mediaObserver = object : ContentObserver(mainHandler) {
         override fun onChange(selfChange: Boolean, uri: Uri?) {
             super.onChange(selfChange, uri)
-            checkLatestScreenshot()
+            checkLatestMediaImage()
         }
     }
 
@@ -53,7 +54,23 @@ class ScreenshotPillController(private val context: Context) {
         dismissPill()
     }
 
-    private fun checkLatestScreenshot() {
+    companion object {
+        internal fun classifyNewMediaCapture(
+            fileName: String,
+            relativePath: String,
+            cameraPillEnabled: Boolean
+        ): Pair<Boolean, Boolean> {
+            val isScreenshot = relativePath.contains("Screenshots", ignoreCase = true) ||
+                fileName.contains("Screenshot", ignoreCase = true)
+            if (isScreenshot) return true to true
+            if (!cameraPillEnabled) return false to false
+            val isCameraPhoto = relativePath.contains("DCIM/Camera", ignoreCase = true) ||
+                relativePath.contains("Pictures/Camera", ignoreCase = true)
+            return isCameraPhoto to false
+        }
+    }
+
+    private fun checkLatestMediaImage() {
         val nowSec = System.currentTimeMillis() / 1000L
         val projection = arrayOf(
             MediaStore.Images.Media._ID,
@@ -62,6 +79,7 @@ class ScreenshotPillController(private val context: Context) {
             MediaStore.Images.Media.DATE_ADDED,
             MediaStore.Images.Media.IS_PENDING
         )
+        val cameraEnabled = OmsApplication.instance?.repository?.isCameraPillEnabled() ?: true
 
         context.contentResolver.query(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
@@ -77,67 +95,89 @@ class ScreenshotPillController(private val context: Context) {
                 val dateAdded = cursor.getLong(3)
                 val isPending = cursor.getInt(4)
 
-                if (isPending == 0 &&
-                    id != lastHandledId &&
-                    (nowSec - dateAdded) <= 5L &&
-                    (relPath.contains("Screenshots", ignoreCase = true) ||
-                        name.contains("Screenshot", ignoreCase = true))
-                ) {
-                    lastHandledId = id
-                    val contentUri = ContentUris.withAppendedId(
-                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                        id
-                    )
-                    showFloatingPill(contentUri, name)
+                if (isPending == 0 && id != lastHandledId && (nowSec - dateAdded) <= 5L) {
+                    val (shouldShow, isScreenshot) = classifyNewMediaCapture(name, relPath, cameraEnabled)
+                    if (shouldShow) {
+                        lastHandledId = id
+                        val contentUri = ContentUris.withAppendedId(
+                            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                            id
+                        )
+                        showFloatingPill(contentUri, name, isScreenshot)
+                    }
                 }
             }
         }
     }
 
-    private fun showFloatingPill(screenshotUri: Uri, fileName: String) {
+    private fun showFloatingPill(imageUri: Uri, fileName: String, isScreenshot: Boolean) {
         if (!Settings.canDrawOverlays(context)) return
         dismissPill()
 
+        val defaultTag = if (isScreenshot) "ui_bug" else "default_inbox"
+        val titlePrefix = if (isScreenshot) "手机截屏" else "手机拍照"
+
         val pill = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(32, 20, 32, 20)
+            setPadding(28, 18, 28, 18)
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#EB0F172A"))
                 cornerRadius = 64f
                 setStroke(2, Color.parseColor("#38BDF8"))
             }
+            filterTouchesWhenObscured = true
         }
 
         val sendBtn = TextView(context).apply {
-            text = "🚀 青简·发Mac"
+            text = if (isScreenshot) "🚀 截屏·发Mac" else "📷 新拍图·发Mac"
             setTextColor(Color.WHITE)
-            textSize = 13.5f
-            setPadding(12, 6, 20, 6)
+            textSize = 13f
+            setPadding(10, 6, 16, 6)
             setOnClickListener { v ->
                 v.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
                 OmsApplication.instance?.transportClient?.submitItemToMacOrQueue(
-                    intentTag = "ui_bug",
+                    intentTag = defaultTag,
                     itemType = "MEDIA",
-                    title = "手机截屏：$fileName",
+                    title = "$titlePrefix：$fileName",
                     textContent = null,
                     voiceTranscript = null,
-                    fileUri = screenshotUri
+                    fileUri = imageUri
                 )
                 text = "✅ 已送达 Mac"
                 mainHandler.postDelayed({ dismissPill() }, 700L)
             }
         }
 
+        val pkbBtn = TextView(context).apply {
+            text = "📚存库"
+            setTextColor(Color.parseColor("#4ADE80"))
+            textSize = 12.5f
+            setPadding(12, 6, 12, 6)
+            setOnClickListener { v ->
+                v.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                OmsApplication.instance?.transportClient?.submitItemToMacOrQueue(
+                    intentTag = "pkb_vault",
+                    itemType = "MEDIA",
+                    title = "$titlePrefix：$fileName",
+                    textContent = null,
+                    voiceTranscript = null,
+                    fileUri = imageUri
+                )
+                sendBtn.text = "✅ 已存知识库"
+                mainHandler.postDelayed({ dismissPill() }, 700L)
+            }
+        }
+
         val voiceBtn = TextView(context).apply {
-            text = " 🎙️附言"
+            text = "🎙️附言"
             setTextColor(Color.parseColor("#38BDF8"))
-            textSize = 13.5f
-            setPadding(16, 6, 12, 6)
+            textSize = 12.5f
+            setPadding(12, 6, 10, 6)
             setOnClickListener {
                 dismissPill()
                 val intent = Intent(context, VoiceIdeaActivity::class.java).apply {
-                    putExtra("screenshot_uri", screenshotUri.toString())
-                    putExtra("intent_tag", "ui_bug")
+                    putExtra("screenshot_uri", imageUri.toString())
+                    putExtra("intent_tag", defaultTag)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 context.startActivity(intent)
@@ -145,6 +185,7 @@ class ScreenshotPillController(private val context: Context) {
         }
 
         pill.addView(sendBtn)
+        pill.addView(pkbBtn)
         pill.addView(voiceBtn)
 
         val lp = WindowManager.LayoutParams(
@@ -163,7 +204,7 @@ class ScreenshotPillController(private val context: Context) {
         try {
             windowManager.addView(pill, lp)
             currentPill = pill
-            mainHandler.postDelayed(autoDismissRunnable, 3500L)
+            mainHandler.postDelayed(autoDismissRunnable, 4200L)
         } catch (_: Throwable) {
         }
     }

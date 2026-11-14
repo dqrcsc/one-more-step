@@ -83,16 +83,25 @@ export class OmsIpcClient {
     const logDir = path.join(this.homeDir, "logs");
     fs.mkdirSync(logDir, { recursive: true });
     const outFd = fs.openSync(path.join(logDir, "omsd.log"), "a");
+    try {
+      const child = spawn(process.execPath, ["run", mainScript], {
+        detached: true,
+        stdio: ["ignore", outFd, outFd],
+        env: { ...process.env, OMS_HOME: this.homeDir },
+      });
+      child.on("error", () => {});
+      child.unref();
+    } finally {
+      try {
+        fs.closeSync(outFd);
+      } catch {
+        // ignore close error
+      }
+    }
 
-    const child = spawn(process.execPath, ["run", mainScript], {
-      detached: true,
-      stdio: ["ignore", outFd, outFd],
-      env: { ...process.env, OMS_HOME: this.homeDir },
-    });
-    child.unref();
-
-    for (let i = 0; i < 25; i++) {
-      await new Promise((r) => setTimeout(r, 120));
+    const deadlineMs = Date.now() + 15_000;
+    while (Date.now() < deadlineMs) {
+      await new Promise((r) => setTimeout(r, 150));
       if (await this.canConnectOnce()) return;
     }
   }

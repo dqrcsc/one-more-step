@@ -122,8 +122,21 @@ final class UnixSocketLineClient {
               let data = try? JSONSerialization.data(withJSONObject: dict) else { return }
         var packet = data
         packet.append(0x0A)
-        _ = packet.withUnsafeBytes { ptr in
-            Darwin.write(fd, ptr.baseAddress!, packet.count)
+        packet.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress else { return }
+            var offset = 0
+            while offset < packet.count {
+                let n = Darwin.write(fd, base.advanced(by: offset), packet.count - offset)
+                if n > 0 {
+                    offset += n
+                } else if n < 0 && errno == EINTR {
+                    continue
+                } else {
+                    Darwin.close(fd)
+                    fd = -1
+                    break
+                }
+            }
         }
     }
 }
@@ -990,6 +1003,7 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
+        guard let firstReq = requests.first else { return }
         for req in requests {
             announceCentralIfNeeded(req.central, reason: "write")
             if req.characteristic.uuid == CHAR_FRAME_PIPE_UUID, let val = req.value {
@@ -1007,8 +1021,8 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
                     ])
                 }
             }
-            peripheral.respond(to: req, withResult: .success)
         }
+        peripheral.respond(to: firstReq, withResult: .success)
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
@@ -1094,9 +1108,20 @@ for i in 0..<args.count {
     }
 }
 
+let initialParentPid = getppid()
 let ipcClient = UnixSocketLineClient(socketPath: socketPath)
 let bridge = OmsBluetoothBridge(ipc: ipcClient, initialMacInfo: initialInfo)
+let parentWatchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+if initialParentPid > 1 {
+    parentWatchdog.schedule(deadline: .now() + 2.0, repeating: 2.0)
+    parentWatchdog.setEventHandler {
+        if getppid() != initialParentPid {
+            exit(0)
+        }
+    }
+    parentWatchdog.resume()
+}
 ipcClient.connectAndListen()
-withExtendedLifetime(bridge) {
+withExtendedLifetime((bridge, parentWatchdog)) {
     RunLoop.main.run()
 }
