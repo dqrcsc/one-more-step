@@ -62,6 +62,7 @@ class OmsAccessibilityService : AccessibilityService() {
 
     private val guiMutex = Mutex()
     private val windowTracker = GuiWindowTracker()
+    private var mirrorPointSafety: MirrorPointSafety? = null
     private lateinit var guard: GuiSessionGuard
     private var activeAction: Job? = null
     private var safetyOverlay: SafetyStopOverlay? = null
@@ -127,6 +128,7 @@ class OmsAccessibilityService : AccessibilityService() {
             return
         }
         if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+            mirrorPointSafety?.onWindowsChanged(applicationWindows(collectApplicationRoots()))
             onMirrorUiEvent?.invoke()
             if (guard.hasActiveObservation && windowTracker.windowsChanged(applicationWindows(collectApplicationRoots()))) {
                 guard.invalidate("application windows changed")
@@ -136,6 +138,7 @@ class OmsAccessibilityService : AccessibilityService() {
             event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
             onMirrorUiEvent?.invoke()
             if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                mirrorPointSafety?.onWindowStateChanged(event.windowId, event.packageName?.toString())
                 val pkg = event.packageName?.toString()
                 if (!guard.hasActiveObservation) {
                     if (!pkg.isNullOrBlank() && pkg != "com.android.systemui" && !pkg.contains("inputmethod")) {
@@ -1668,11 +1671,14 @@ class OmsAccessibilityService : AccessibilityService() {
         return firstEditable
     }
 
+    private data class MirrorHit(val label: String, val password: Boolean, val node: AccessibilityNodeInfo?)
+
     private fun hitTestLiveNodeAt(
         roots: List<AccessibilityNodeInfo>,
         x: Int,
         y: Int
-    ): Pair<String, Boolean> {
+    ): MirrorHit {
+        var bestNode: AccessibilityNodeInfo? = null
         var bestLabel = ""
         var bestArea = Long.MAX_VALUE
         var hitPassword = false
@@ -1693,6 +1699,7 @@ class OmsAccessibilityService : AccessibilityService() {
                     if (area <= bestArea || bestLabel.isEmpty()) {
                         bestArea = area
                         bestLabel = label
+                        bestNode = node
                     }
                 }
                 for (i in 0 until node.childCount) {
@@ -1704,7 +1711,7 @@ class OmsAccessibilityService : AccessibilityService() {
         for (r in roots) {
             visit(r, 0)
         }
-        return bestLabel to hitPassword
+        return MirrorHit(bestLabel, hitPassword, bestNode)
     }
 
     /**
@@ -1731,6 +1738,7 @@ class OmsAccessibilityService : AccessibilityService() {
                 if (!guard.stopped) safetyOverlay?.scheduleHideActivePill(2_200L)
                 Unit
             },
+            maxDurationMs = if (type in setOf("tap", "click", "long_press", "long_click")) 65_000L else 5000L,
             checkWindow = {
                 if (!isSafeNavigation && isBlockedFinancialOrPasswordWindow(
                         rootInActiveWindow, collectApplicationRoots(), allowSelfPackage = false
@@ -1738,11 +1746,12 @@ class OmsAccessibilityService : AccessibilityService() {
                     throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password/self-package safety policy")
                 }
             }
-        ) { executeMirrorInputLocked(params, sessionStillValid) }
+        ) { deadline -> executeMirrorInputLocked(params, deadline, sessionStillValid) }
     }
 
     private suspend fun executeMirrorInputLocked(
         params: JSONObject,
+        deadline: Long,
         sessionStillValid: () -> Boolean
     ): JSONObject {
         val dm = resources.displayMetrics
@@ -1762,21 +1771,43 @@ class OmsAccessibilityService : AccessibilityService() {
         }
 
         suspend fun enforceMirrorPointSafety(tx: Int, ty: Int, normAction: String) {
-            val roots = collectApplicationRoots()
-            if (isBlockedFinancialOrPasswordWindow(rootInActiveWindow, roots, allowSelfPackage = false)) {
-                throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Payment/password/self-package safety policy")
-            }
-            val (hitLabel, hitPassword) = hitTestLiveNodeAt(roots, tx, ty)
-            if (hitPassword) {
-                throw SecurityException("ERR_SECURE_WINDOW_BLOCKED: Password field interaction is blocked")
-            }
-            if (SensitiveActionPolicy.requiresUserConfirmation(normAction, false, hitLabel)) {
-                val confirmed = safetyOverlay?.awaitUserConfirmForSensitiveAction(
-                    if (hitLabel.isNotEmpty()) "点击「$hitLabel」" else "执行 $normAction"
-                ) ?: false
-                if (!confirmed || guard.stopped || !sessionStillValid()) {
-                    throw IllegalStateException("ERR_USER_INTERRUPTED: User declined sensitive mirror action")
-                }
+            val pointSafety = MirrorPointSafety()
+            val stopEpoch = guard.stopEpoch
+            var originalTarget: AccessibilityNodeInfo? = null
+            var firstRead = true
+            mirrorPointSafety = pointSafety
+            try {
+                pointSafety.check(
+                    action = normAction,
+                    checkAuthorization = {
+                        guard.checkMirrorQueued(System.currentTimeMillis(), deadline, stopEpoch, sessionStillValid())
+                    },
+                    readSnapshot = {
+                        val roots = collectApplicationRoots()
+                        val hit = hitTestLiveNodeAt(roots, tx, ty)
+                        if (firstRead) { originalTarget = hit.node; firstRead = false }
+                        val attributes = hit.node?.let { node ->
+                            val bounds = Rect().also { node.getBoundsInScreen(it) }
+                            listOf(node.windowId.toString(), node.packageName.toString(),
+                                node.viewIdResourceName.orEmpty(), node.className.toString(), bounds.toShortString(),
+                                node.isEnabled.toString(), node.isClickable.toString(),
+                                node.isLongClickable.toString(), node.isCheckable.toString(),
+                                node.isChecked.toString(), node.isEditable.toString())
+                        }.orEmpty()
+                        MirrorPointSafety.Snapshot(
+                            applicationWindows(roots),
+                            rootInActiveWindow?.windowId?.takeIf { id -> roots.any { it.windowId == id } },
+                            hit.node, attributes, hit.label, hit.password,
+                            isBlockedFinancialOrPasswordWindow(rootInActiveWindow, roots, allowSelfPackage = false)
+                        )
+                    },
+                    refreshOriginalTarget = { originalTarget?.refresh() == true },
+                    confirm = { label ->
+                        safetyOverlay?.awaitUserConfirmForSensitiveAction("点击「$label」") ?: false
+                    }
+                )
+            } finally {
+                mirrorPointSafety = null
             }
         }
 

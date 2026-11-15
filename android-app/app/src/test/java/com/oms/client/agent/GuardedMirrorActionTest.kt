@@ -27,8 +27,8 @@ class GuardedMirrorActionTest {
                         rootPackages, passwordFocused, allowSelfPackage = true)) {
                     throw SecurityException("Blocked window")
                 }
-            }, action
-        )
+            }
+        ) { action() }
     }
 
     @Test fun splitScreenAndPasswordWindowBlockBeforeInjectionEvenWhenSelfIsAllowed() = runBlocking {
@@ -137,4 +137,16 @@ class GuardedMirrorActionTest {
             assertFalse(f.mutex.isLocked)
         }
     }
+    @Test fun confirmationBudgetDoesNotExtendAnExplicitShortDeadline() = runBlocking {
+        val gate = GuardedMirrorAction(GuiSessionGuard(), Mutex()) { 100L }
+        for ((requested, budget, expected) in listOf(
+            Triple(null, 5000L, 5100L), Triple(null, 65_000L, 65_100L),
+            Triple(1100L, 65_000L, 1100L), Triple(100_000L, 65_000L, 65_100L)
+        )) {
+            gate.run(requested, { true }, {}, { true }, {}, {}, budget) { deadline ->
+                assertEquals(expected, deadline)
+            }
+        }
+    }
+
 }

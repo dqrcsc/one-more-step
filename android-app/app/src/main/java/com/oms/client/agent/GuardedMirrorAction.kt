@@ -20,10 +20,11 @@ internal class GuardedMirrorAction(
         showStopControl: () -> Boolean,
         hideStopControl: () -> Unit,
         checkWindow: () -> Unit,
-        action: suspend () -> T
+        maxDurationMs: Long = 5000L,
+        action: suspend (Long) -> T
     ): T {
         val started = now()
-        val deadline = GuiSessionGuard.boundedDeadline(started, requestedDeadline ?: (started + 5000L), 5000L)
+        val deadline = GuiSessionGuard.boundedDeadline(started, requestedDeadline ?: (started + maxDurationMs), maxDurationMs)
         val queuedStopEpoch = guard.stopEpoch
         guard.checkAuthorization(started, deadline, sessionValid())
         return withTimeout((deadline - started).coerceAtLeast(1L)) {
@@ -35,7 +36,7 @@ internal class GuardedMirrorAction(
                     checkWindow()
                     currentCoroutineContext().ensureActive()
                     guard.checkMirrorQueued(now(), deadline, queuedStopEpoch, sessionValid())
-                    val result = action()
+                    val result = action(deadline)
                     currentCoroutineContext().ensureActive()
                     guard.checkMirrorQueued(now(), deadline, queuedStopEpoch, sessionValid())
                     result
