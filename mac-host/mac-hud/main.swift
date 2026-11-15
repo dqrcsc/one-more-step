@@ -491,7 +491,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         menu.addItem(statusEntry)
         menu.addItem(NSMenuItem.separator())
 
-        let openItem = NSMenuItem(title: "📬 打开投递详情浮窗 (\(items.count) 条)", action: #selector(openDetailFromMenu), keyEquivalent: "")
+        let openItem = NSMenuItem(title: "📬 查看最近投递（\(min(items.count, 25)) 条）", action: #selector(openDetailFromMenu), keyEquivalent: "")
         openItem.target = self
         menu.addItem(openItem)
 
@@ -876,7 +876,8 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         panel.titlebarAppearsTransparent = true
         panel.isMovableByWindowBackground = true
         panel.level = .floating
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .moveToActiveSpace]
+        // canJoinAllSpaces and moveToActiveSpace are mutually exclusive in AppKit.
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.minSize = NSSize(width: 680, height: 440)
         panel.appearance = NSAppearance(named: .darkAqua)
         panel.delegate = self
