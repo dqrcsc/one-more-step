@@ -749,7 +749,7 @@ export class OmsDaemon {
 
     this.session.on(
       "mirrorViewerChanged",
-      (count: number, newWs?: { send: (data: string | Uint8Array) => unknown }) => {
+      (count: number, newWs?: { send: (data: string | Uint8Array) => unknown }, autoStart = true) => {
         if (newWs) {
           try {
             newWs.send(JSON.stringify({ type: "mirror_status", status: this.getMirrorStatus() }));
@@ -760,7 +760,7 @@ export class OmsDaemon {
             clearTimeout(this.mirrorIdleStopTimer);
             this.mirrorIdleStopTimer = null;
           }
-          if (!this.mirrorDisposed && !this.mirrorRunning && !this.mirrorStartPending && this.session.getActiveTier() !== "DISCONNECTED") {
+          if (autoStart && !this.mirrorDisposed && !this.mirrorRunning && !this.mirrorStartPending && this.session.getActiveTier() !== "DISCONNECTED") {
             void this.startMirror({}).catch(() => {});
           }
         } else if (this.mirrorRunning || this.mirrorStartPending) {
@@ -1305,6 +1305,7 @@ export class OmsDaemon {
       activeTier: this.session.getActiveTier(),
       phoneName: this.session.getPhoneStatus()?.deviceModel,
       inboxDir: this.inbox.inboxRootDir,
+      mirrorUrl: `http://127.0.0.1:${this.config.lanPort}/mirror?hud=1`,
     };
   }
 
@@ -1542,6 +1543,7 @@ export class OmsDaemon {
     const ps = this.session.getPhoneStatus();
     return {
       running: this.mirrorRunning,
+      starting: this.mirrorStartPending,
       mode: this.mirrorRunning ? this.mirrorMode : "stopped",
       codec: "webp",
       fps,
@@ -1856,6 +1858,8 @@ export class OmsDaemon {
                 "Quartz",
                 "-framework",
                 "AVFoundation",
+                "-framework",
+                "WebKit",
                 "-o",
                 hudBin,
               ],

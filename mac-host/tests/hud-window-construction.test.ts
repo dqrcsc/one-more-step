@@ -17,6 +17,18 @@ extension OmsMacHudAppDelegate {
         precondition(panel.canBecomeKey && panel.canBecomeMain)
         precondition(!panel.isVisible)
         precondition(panel.collectionBehavior.contains(.fullScreenAuxiliary))
+        selectDetailTab(1)
+        precondition(mirrorWebView == nil, "Missing URL must not load WebKit or connect")
+        precondition(inboxContent?.isHidden == true && mirrorContent?.isHidden == false)
+        for invalid in ["http://example.com:19527/mirror?hud=1", "file:///tmp/mirror", "http://127.0.0.1:19527/inbox?hud=1", "http://user@127.0.0.1:19527/mirror?hud=1", "http://127.0.0.1:0/mirror?hud=1"] {
+            statusSnapshot.mirrorUrl = invalid
+            precondition(validatedMirrorURL() == nil)
+        }
+        statusSnapshot.mirrorUrl = "http://127.0.0.1:23671/mirror?hud=1"
+        precondition(validatedMirrorURL()?.port == 23671)
+        statusSnapshot.mirrorUrl = nil
+        selectDetailTab(0)
+        precondition(inboxContent?.isHidden == false)
         rebuildSidebarAndInspector()
         precondition(sidebarStack?.arrangedSubviews.count == 1, "Missing empty inbox state")
         for count in [1, 25, 30] {
@@ -51,7 +63,7 @@ delegate.verifyWindowConstruction()
 `;
   const swift = path.join(dir, "main.swift"), binary = path.join(dir, "window-test");
   fs.writeFileSync(swift, production + fixture);
-  execFileSync("swiftc", [swift, "-framework", "Cocoa", "-framework", "PDFKit", "-framework", "Quartz", "-framework", "AVFoundation", "-o", binary], { timeout: 45000 });
+  execFileSync("swiftc", [swift, "-framework", "Cocoa", "-framework", "PDFKit", "-framework", "Quartz", "-framework", "AVFoundation", "-framework", "WebKit", "-o", binary], { timeout: 45000 });
   const result = spawnSync(binary, { encoding: "utf8", timeout: 15000 });
   expect(result.error).toBeUndefined();
   expect(result.signal).toBeNull();

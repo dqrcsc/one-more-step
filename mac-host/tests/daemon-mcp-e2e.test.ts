@@ -389,6 +389,17 @@ describe("Modules 06 & 07: OmsDaemon + Inbox + MCP Server End-to-End", () => {
     const mirrorHtml = await mirrorHtmlResp.text();
     expect(mirrorHtml).toContain("OneMoreStep · 手机实时同屏与键鼠直控台");
 
+    // A HUD viewer connects in manual mode: the server must not start capture.
+    const manualWs = new WebSocket(`ws://127.0.0.1:${customPort}/ws/mirror?manual=1`);
+    const manualStatuses: any[] = [];
+    manualWs.onmessage = ev => {
+      if (typeof ev.data === "string") manualStatuses.push(JSON.parse(ev.data));
+    };
+    await new Promise(r => setTimeout(r, 60));
+    manualWs.close();
+    expect(manualStatuses.some(s => s.type === "mirror_status" && s.status.running === false)).toBe(true);
+    expect(manualStatuses.some(s => s.status?.running)).toBe(false);
+
     const mirrorStartResp = await fetch(`http://127.0.0.1:${customPort}/api/inbox/action`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

@@ -29,6 +29,17 @@ function fixture() {
   return { daemon, d, s, calls, setTier: (v: string) => { tier = v; }, setViewers: (v: number) => { viewers = v; } };
 }
 
+test("manual mirror viewer only receives status; HUD uses configured port", async () => {
+  const f = fixture();
+  const messages: any[] = [];
+  f.s.emit("mirrorViewerChanged", 1, { send: (data: string) => messages.push(JSON.parse(data)) }, false);
+  await Promise.resolve();
+  expect(f.calls).toEqual([]);
+  expect(messages[0].type).toBe("mirror_status");
+  f.d.config.lanPort = 23671;
+  expect(f.d.getHudStatusPayload().mirrorUrl).toBe("http://127.0.0.1:23671/mirror?hud=1");
+});
+
 test("offline AirPods handoff leaves Mac connected and reports failure", async () => {
   const f = fixture();
   f.setTier("DISCONNECTED");
@@ -95,6 +106,10 @@ test("last viewer leaving during start still arms idle stop and multiple viewers
     f.setViewers(2);
     f.s.emit("mirrorViewerChanged", 2);
     await Promise.resolve();
+    f.setViewers(1);
+    f.s.emit("mirrorViewerChanged", 1, undefined, false);
+    expect(idleTimer).toBeUndefined();
+    expect(f.calls).not.toContain("mirror.stop");
     f.setViewers(0);
     f.s.emit("mirrorViewerChanged", 0);
     expect(typeof expire).toBe("function");

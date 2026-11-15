@@ -50,6 +50,7 @@ export interface DecodedScreenFrame extends ScreenFrameHeader {
 
 export interface MirrorStatusSnapshot {
   running: boolean;
+  starting?: boolean;
   mode: "native_stream" | "legacy_poll" | "stopped";
   codec: string;
   fps: number;

@@ -3,6 +3,7 @@ import PDFKit
 import Quartz
 import AVFoundation
 import Darwin
+import WebKit
 
 // MARK: - Wire Models
 
@@ -41,6 +42,7 @@ struct HudStatusSnapshot: Codable {
     let activeTier: String?
     let phoneName: String?
     let inboxDir: String?
+    var mirrorUrl: String? = nil
 }
 
 struct HudIncomingEnvelope: Codable {
@@ -163,14 +165,24 @@ final class KeyableDetailPanel: NSPanel {
     override var canBecomeMain: Bool { true }
 
     override func cancelOperation(_ sender: Any?) {
+        if (firstResponder as? NSTextInputClient)?.hasMarkedText() == true { return }
         onEscapePressed?()
     }
 
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { // Escape
+        if event.keyCode == 53 && (firstResponder as? NSTextInputClient)?.hasMarkedText() != true { // Escape
             onEscapePressed?()
             return
         }
+        super.keyDown(with: event)
+    }
+}
+
+final class MirrorWebView: WKWebView {
+    var onEscapePressed: (() -> Void)?
+    override func keyDown(with event: NSEvent) {
+        let composing = (window?.firstResponder as? NSTextInputClient)?.hasMarkedText() ?? false
+        if event.keyCode == 53 && !composing { onEscapePressed?(); return }
         super.keyDown(with: event)
     }
 }
@@ -297,6 +309,8 @@ final class HudIpcClient {
         }
     }
 
+    var onConnectionChanged: ((Bool) -> Void)?
+
     private func connectLoop() {
         let decoder = JSONDecoder()
         while isRunning {
@@ -340,6 +354,7 @@ final class HudIpcClient {
             sockFD = fd
             generation &+= 1
             stateLock.unlock()
+            DispatchQueue.main.async { [weak self] in self?.onConnectionChanged?(true) }
             writeQueue.async { [weak self] in self?.flushPendingFrames() }
             var buffer = Data()
             var readBuf = [UInt8](repeating: 0, count: 16384)
@@ -368,6 +383,7 @@ final class HudIpcClient {
             Darwin.shutdown(fd, SHUT_RDWR)
             Darwin.close(fd)
             stateLock.unlock()
+            DispatchQueue.main.async { [weak self] in self?.onConnectionChanged?(false) }
             if isRunning {
                 Thread.sleep(forTimeInterval: 1.0)
             }
@@ -377,7 +393,7 @@ final class HudIpcClient {
 
 // MARK: - Main HUD Application Controller
 
-final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, AVAudioPlayerDelegate {
+final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, AVAudioPlayerDelegate, WKNavigationDelegate, WKUIDelegate {
     private let socketPath: String
     private let initialParentPid: pid_t
     private var ipc: HudIpcClient!
@@ -407,6 +423,15 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     private var sidebarStack: NSStackView?
     private var inspectorContainer: NSView?
     private var pinButton: NSButton?
+    private var detailTabs: NSSegmentedControl?
+    private var inboxContent: NSView?
+    private var mirrorContent: NSView?
+    private var mirrorWebView: MirrorWebView?
+    private var mirrorLoadedURL: URL?
+    private var mirrorMessage: NSTextField?
+    private var mirrorRetry: NSButton?
+    private var selectedDetailTab = 0
+    private var sleepObserver: NSObjectProtocol?
 
     init(socketPath: String, parentPid: pid_t) {
         self.socketPath = socketPath
@@ -420,7 +445,17 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         ipc.onEnvelope = { [weak self] env in
             self?.handleEnvelope(env)
         }
+        ipc.onConnectionChanged = { [weak self] connected in
+            guard let self = self, !connected else { return }
+            self.statusSnapshot.mirrorUrl = nil
+            self.destroyMirrorView()
+            self.mirrorMessage?.stringValue = "Mac 服务已断开，等待重新连接"
+        }
         ipc.start()
+        sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.destroyMirrorView()
+            self?.mirrorMessage?.stringValue = "镜像已随 Mac 休眠结束，重新加载后可手动开始"
+        }
 
         watchdogTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
@@ -432,6 +467,8 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     private func cleanupAndExit() {
+        destroyMirrorView()
+        if let token = sleepObserver { NSWorkspace.shared.notificationCenter.removeObserver(token) }
         closeActiveQLPreview()
         audioPlayer?.stop()
         ipc?.stop()
@@ -495,6 +532,10 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         openItem.target = self
         menu.addItem(openItem)
 
+        let mirrorItem = NSMenuItem(title: "📱 手机镜像…", action: #selector(openMirrorFromMenu), keyEquivalent: "")
+        mirrorItem.target = self
+        menu.addItem(mirrorItem)
+
         let markAllItem = NSMenuItem(title: "✓ 清除菜单栏未读角标", action: #selector(clearUnreadBadges), keyEquivalent: "")
         markAllItem.target = self
         menu.addItem(markAllItem)
@@ -514,6 +555,13 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         openDetailPanel(selectingItemId: items.first?.itemId)
     }
 
+    @objc private func openMirrorFromMenu() {
+        if detailPanel == nil { buildDetailPanelWindow() }
+        ipc?.sendJson(["type": "request_sync"])
+        selectDetailTab(1)
+        showDetailPanel()
+    }
+
     @objc private func clearUnreadBadges() {
         unreadItemIds.removeAll()
         updateStatusBarAppearance()
@@ -528,7 +576,12 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     private func handleEnvelope(_ env: HudIncomingEnvelope) {
         if let st = env.status {
+            let changed = statusSnapshot.mirrorUrl != st.mirrorUrl
             statusSnapshot = st
+            if changed {
+                destroyMirrorView()
+                if selectedDetailTab == 1 && detailPanel?.isVisible == true { loadMirrorView() }
+            }
         }
         switch env.type {
         case "sync_items":
@@ -802,6 +855,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     private func closeDetailPanel() {
+        destroyMirrorView()
         closeActiveQLPreview()
         audioPlayer?.stop()
         audioPlayer = nil
@@ -810,20 +864,26 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     func windowDidResignKey(_ notification: Notification) {
         guard let win = notification.object as? NSWindow, win === detailPanel else { return }
-        if !isDetailPinned {
+        if !isDetailPinned && selectedDetailTab == 0 {
             closeDetailPanel()
         }
     }
 
+    func windowDidMiniaturize(_ notification: Notification) {
+        guard let win = notification.object as? NSWindow, win === detailPanel else { return }
+        destroyMirrorView()
+    }
+
     func windowWillClose(_ notification: Notification) {
         guard let win = notification.object as? NSWindow, win === detailPanel else { return }
+        destroyMirrorView()
         closeActiveQLPreview()
         audioPlayer?.stop()
         audioPlayer = nil
     }
 
     private func openDetailPanel(selectingItemId targetId: String?) {
-        ipc.sendJson(["type": "request_sync"])
+        ipc?.sendJson(["type": "request_sync"])
         if let id = targetId {
             selectedItemId = id
             selectedAttachmentIndex = 0
@@ -836,8 +896,11 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         if detailPanel == nil {
             buildDetailPanelWindow()
         }
-        rebuildSidebarAndInspector()
+        selectDetailTab(0)
+        showDetailPanel()
+    }
 
+    private func showDetailPanel() {
         guard let panel = detailPanel else { return }
         if !panel.isVisible {
             if let screen = NSScreen.main?.visibleFrame {
@@ -859,7 +922,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     private func refreshDetailPanelIfVisible() {
         guard let panel = detailPanel, panel.isVisible else { return }
-        rebuildSidebarAndInspector()
+        if selectedDetailTab == 0 { rebuildSidebarAndInspector() }
     }
 
     private func buildDetailPanelWindow() {
@@ -867,11 +930,12 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         let winH: CGFloat = 560
         let panel = KeyableDetailPanel(
             contentRect: NSRect(x: 0, y: 0, width: winW, height: winH),
-            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
-        panel.title = "青简·咫尺 — 手机投递速览"
+        panel.title = "青简·咫尺 — 投递与手机镜像"
+        panel.isReleasedWhenClosed = false
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
         panel.isMovableByWindowBackground = true
@@ -891,16 +955,23 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         effect.blendingMode = .behindWindow
         effect.state = .active
 
+        // NSWindow derives its Auto Layout minimum from content constraints.
+        // A lazy WebView has no intrinsic height; retain a usable content area.
+        NSLayoutConstraint.activate([
+            effect.widthAnchor.constraint(greaterThanOrEqualToConstant: 680),
+            effect.heightAnchor.constraint(greaterThanOrEqualToConstant: 440)
+        ])
+
         // Top Bar
         let topBar = NSView()
         topBar.translatesAutoresizingMaskIntoConstraints = false
         effect.addSubview(topBar)
 
-        let headerTitle = NSTextField(labelWithString: "⚡ 青简·咫尺 · 手机投递内联预览（Esc 即关 · 零外部应用）")
-        headerTitle.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-        headerTitle.textColor = NSColor(calibratedWhite: 0.92, alpha: 1.0)
+        let headerTitle = NSSegmentedControl(labels: ["最近投递", "手机镜像"], trackingMode: .selectOne, target: self, action: #selector(detailTabChanged))
+        headerTitle.selectedSegment = 0
         headerTitle.translatesAutoresizingMaskIntoConstraints = false
         topBar.addSubview(headerTitle)
+        detailTabs = headerTitle
 
         let pinBtn = makePillButton(
             title: "📌 钉住窗口: 关",
@@ -918,10 +989,42 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         divider.translatesAutoresizingMaskIntoConstraints = false
         effect.addSubview(divider)
 
+        let inboxHost = NSView()
+        let mirrorHost = NSView()
+        for host in [inboxHost, mirrorHost] {
+            host.translatesAutoresizingMaskIntoConstraints = false
+            effect.addSubview(host)
+            NSLayoutConstraint.activate([
+                host.topAnchor.constraint(equalTo: divider.bottomAnchor),
+                host.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
+                host.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
+                host.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
+            ])
+        }
+        inboxContent = inboxHost
+        mirrorContent = mirrorHost
+        mirrorHost.isHidden = true
+        let message = NSTextField(wrappingLabelWithString: "手动开始镜像，不会自动唤醒手机")
+        message.translatesAutoresizingMaskIntoConstraints = false
+        message.alignment = .center
+        mirrorHost.addSubview(message)
+        mirrorMessage = message
+        let retry = NSButton(title: "重新加载", target: self, action: #selector(reloadMirrorView))
+        retry.translatesAutoresizingMaskIntoConstraints = false
+        mirrorHost.addSubview(retry)
+        mirrorRetry = retry
+        NSLayoutConstraint.activate([
+            message.centerXAnchor.constraint(equalTo: mirrorHost.centerXAnchor),
+            message.centerYAnchor.constraint(equalTo: mirrorHost.centerYAnchor, constant: -18),
+            message.widthAnchor.constraint(lessThanOrEqualTo: mirrorHost.widthAnchor, constant: -40),
+            retry.centerXAnchor.constraint(equalTo: mirrorHost.centerXAnchor),
+            retry.topAnchor.constraint(equalTo: message.bottomAnchor, constant: 12)
+        ])
+
         let vDivider = NSBox()
         vDivider.boxType = .separator
         vDivider.translatesAutoresizingMaskIntoConstraints = false
-        effect.addSubview(vDivider)
+        inboxHost.addSubview(vDivider)
 
         let scrollSidebar = NSScrollView()
         scrollSidebar.drawsBackground = false
@@ -948,12 +1051,12 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             docView.widthAnchor.constraint(equalTo: scrollSidebar.contentView.widthAnchor)
         ])
 
-        effect.addSubview(scrollSidebar)
+        inboxHost.addSubview(scrollSidebar)
         self.sidebarStack = stack
 
         let inspector = NSView()
         inspector.translatesAutoresizingMaskIntoConstraints = false
-        effect.addSubview(inspector)
+        inboxHost.addSubview(inspector)
         self.inspectorContainer = inspector
 
         NSLayoutConstraint.activate([
@@ -971,26 +1074,138 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             pinBtn.heightAnchor.constraint(equalToConstant: 24),
 
             divider.topAnchor.constraint(equalTo: topBar.bottomAnchor, constant: 4),
+            divider.heightAnchor.constraint(equalToConstant: 1),
             divider.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
 
-            scrollSidebar.topAnchor.constraint(equalTo: divider.bottomAnchor),
-            scrollSidebar.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
-            scrollSidebar.bottomAnchor.constraint(equalTo: effect.bottomAnchor),
+            scrollSidebar.topAnchor.constraint(equalTo: inboxHost.topAnchor),
+            scrollSidebar.leadingAnchor.constraint(equalTo: inboxHost.leadingAnchor),
+            scrollSidebar.bottomAnchor.constraint(equalTo: inboxHost.bottomAnchor),
             scrollSidebar.widthAnchor.constraint(equalToConstant: 245),
 
-            vDivider.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            vDivider.topAnchor.constraint(equalTo: inboxHost.topAnchor),
             vDivider.leadingAnchor.constraint(equalTo: scrollSidebar.trailingAnchor),
-            vDivider.bottomAnchor.constraint(equalTo: effect.bottomAnchor),
+            vDivider.widthAnchor.constraint(equalToConstant: 1),
+            vDivider.bottomAnchor.constraint(equalTo: inboxHost.bottomAnchor),
 
-            inspector.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            inspector.topAnchor.constraint(equalTo: inboxHost.topAnchor),
             inspector.leadingAnchor.constraint(equalTo: vDivider.trailingAnchor),
-            inspector.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
-            inspector.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
+            inspector.trailingAnchor.constraint(equalTo: inboxHost.trailingAnchor),
+            inspector.bottomAnchor.constraint(equalTo: inboxHost.bottomAnchor)
         ])
 
         panel.contentView = effect
         self.detailPanel = panel
+    }
+
+    @objc private func detailTabChanged(_ sender: NSSegmentedControl) {
+        selectDetailTab(sender.selectedSegment)
+    }
+
+    private func selectDetailTab(_ index: Int) {
+        selectedDetailTab = index == 1 ? 1 : 0
+        detailTabs?.selectedSegment = selectedDetailTab
+        inboxContent?.isHidden = selectedDetailTab == 1
+        mirrorContent?.isHidden = selectedDetailTab != 1
+        if selectedDetailTab == 1 {
+            closeActiveQLPreview()
+            audioPlayer?.stop()
+            audioPlayer = nil
+            loadMirrorView()
+        } else {
+            destroyMirrorView()
+            rebuildSidebarAndInspector()
+        }
+    }
+
+    private func validatedMirrorURL() -> URL? {
+        guard let raw = statusSnapshot.mirrorUrl, let c = URLComponents(string: raw),
+              c.scheme == "http", c.host == "127.0.0.1", c.user == nil, c.password == nil,
+              let port = c.port, (1...65535).contains(port), c.path == "/mirror", c.fragment == nil,
+              c.queryItems?.count == 1, c.queryItems?.first?.name == "hud", c.queryItems?.first?.value == "1"
+        else { return nil }
+        return c.url
+    }
+
+    @objc private func reloadMirrorView() {
+        destroyMirrorView()
+        if selectedDetailTab == 1 { loadMirrorView() }
+    }
+
+    private func loadMirrorView() {
+        guard mirrorWebView == nil, let host = mirrorContent else { return }
+        guard let url = validatedMirrorURL() else {
+            mirrorMessage?.stringValue = "镜像入口不可用，请确认 Mac 服务已连接并更新"
+            return
+        }
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .nonPersistent()
+        config.preferences.javaScriptCanOpenWindowsAutomatically = false
+        let web = MirrorWebView(frame: .zero, configuration: config)
+        web.navigationDelegate = self
+        web.uiDelegate = self
+        web.onEscapePressed = { [weak self] in self?.closeDetailPanel() }
+        web.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(web)
+        NSLayoutConstraint.activate([
+            web.topAnchor.constraint(equalTo: host.topAnchor), web.bottomAnchor.constraint(equalTo: host.bottomAnchor),
+            web.leadingAnchor.constraint(equalTo: host.leadingAnchor), web.trailingAnchor.constraint(equalTo: host.trailingAnchor)
+        ])
+        mirrorLoadedURL = url
+        mirrorWebView = web
+        mirrorMessage?.stringValue = "正在加载手机镜像…"
+        mirrorRetry?.isHidden = true
+        web.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10))
+    }
+
+    private func destroyMirrorView() {
+        guard let web = mirrorWebView else { return }
+        mirrorWebView = nil
+        mirrorLoadedURL = nil
+        web.onEscapePressed = nil
+        web.navigationDelegate = nil
+        web.uiDelegate = nil
+        web.removeFromSuperview()
+        // Unloading the document also closes sockets if its JS context is unavailable.
+        web.evaluateJavaScript("window.hostDeactivate && window.hostDeactivate()", completionHandler: nil)
+        // Do not wait for a suspended/crashed JS context before unloading its document.
+        web.load(URLRequest(url: URL(string: "about:blank")!))
+        mirrorMessage?.stringValue = "本窗口观看已结束；其他观看窗口不受影响"
+        mirrorRetry?.isHidden = false
+    }
+
+    private func mirrorPageFailed(_ webView: WKWebView, message: String) {
+        guard webView === mirrorWebView else { return }
+        destroyMirrorView()
+        mirrorMessage?.stringValue = message
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        let allowed = webView === mirrorWebView && navigationAction.targetFrame?.isMainFrame == true && navigationAction.request.url == mirrorLoadedURL
+        decisionHandler(allowed ? .allow : .cancel)
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        let response = navigationResponse.response as? HTTPURLResponse
+        let allowed = webView === mirrorWebView && response?.statusCode == 200 && response?.mimeType == "text/html"
+        decisionHandler(allowed ? .allow : .cancel)
+        if !allowed { mirrorPageFailed(webView, message: "镜像页面加载失败，请确认 Mac 服务后重新加载") }
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        mirrorPageFailed(webView, message: "无法连接本机镜像页面，请重新加载")
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        mirrorPageFailed(webView, message: "镜像页面加载中断，请重新加载")
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        mirrorPageFailed(webView, message: "镜像页面已退出，请重新加载后手动开始")
+    }
+
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        return nil
     }
 
     @objc private func togglePinDetailWindow() {

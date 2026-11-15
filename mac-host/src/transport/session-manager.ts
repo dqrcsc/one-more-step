@@ -458,7 +458,7 @@ export class PhoneSessionManager extends EventEmitter {
     const self = this;
 
     // 1. Start Tier 1: High-Speed LAN WebSocket Server
-    this.wsServer = Bun.serve<{ pipe?: ActiveTransportPipe; tier: TransportTier; remoteIp?: string; isMirrorViewer?: boolean }>({
+    this.wsServer = Bun.serve<{ pipe?: ActiveTransportPipe; tier: TransportTier; remoteIp?: string; isMirrorViewer?: boolean; manualMirror?: boolean }>({
       port: this.lanPort,
       async fetch(req, server) {
         const url = new URL(req.url);
@@ -489,7 +489,7 @@ export class PhoneSessionManager extends EventEmitter {
               { status: 403, headers: { "Content-Type": "application/json; charset=utf-8" } }
             );
           }
-          if (server.upgrade(req, { data: { tier: "LAN_WS", remoteIp: normalizedIp, isMirrorViewer: true } })) {
+          if (server.upgrade(req, { data: { tier: "LAN_WS", remoteIp: normalizedIp, isMirrorViewer: true, manualMirror: url.searchParams.get("manual") === "1" } })) {
             return undefined;
           }
           return new Response("WebSocket upgrade required", { status: 426 });
@@ -629,12 +629,12 @@ export class PhoneSessionManager extends EventEmitter {
         open(ws) {
           if (ws.data.isMirrorViewer) {
             self.mirrorViewers.add(ws);
-            if (self.latestRawScreenFrame) {
+            if (self.latestRawScreenFrame && !ws.data.manualMirror) {
               try {
                 ws.send(self.latestRawScreenFrame);
               } catch {}
             }
-            self.emit("mirrorViewerChanged", self.mirrorViewers.size, ws);
+            self.emit("mirrorViewerChanged", self.mirrorViewers.size, ws, !ws.data.manualMirror);
             return;
           }
           const tier = ws.data.tier;
@@ -675,7 +675,7 @@ export class PhoneSessionManager extends EventEmitter {
         close(ws, code, reason) {
           if (ws.data.isMirrorViewer) {
             self.mirrorViewers.delete(ws);
-            self.emit("mirrorViewerChanged", self.mirrorViewers.size);
+            self.emit("mirrorViewerChanged", self.mirrorViewers.size, undefined, false);
             return;
           }
           // Remote close reason is untrusted and may contain secrets; keep numeric code only.

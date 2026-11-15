@@ -22,6 +22,7 @@ var phase = 0
 var finished = false
 client.onEnvelope = { env in
     if env.type == "sync_items", let item = env.items?.first {
+        precondition(env.status?.mirrorUrl == "http://127.0.0.1:23671/mirror?hud=1")
         if phase == 0 && !item.processed {
             phase = 1
             for _ in 0..<100 { client.sendJson(["type": "mark_processed", "itemId": item.itemId]) }
@@ -58,7 +59,7 @@ exit(finished ? 0 : 1)
   let marks = 0, syncs = 0, connections = 0;
   let wrongId = false;
   server.on("clientConnected", () => connections++);
-  const sync = () => server.syncState([inbox.getItem(itemId)!], { activeTier: "DISCONNECTED", inboxDir });
+  const sync = () => server.syncState([inbox.getItem(itemId)!], { activeTier: "DISCONNECTED", inboxDir, mirrorUrl: "http://127.0.0.1:23671/mirror?hud=1" });
   server.on("markProcessed", (id: string) => {
     wrongId ||= id !== itemId;
     if (++marks === 1) inbox.markProcessed(id, true);

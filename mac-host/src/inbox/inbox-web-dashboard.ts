@@ -168,11 +168,12 @@ export async function handleDashboardHttpRequest(
   }
 
   if (url.pathname === "/mirror") {
+    const mirrorCsp = dashboardCspBase.replace("connect-src 'self' ws: wss:", `connect-src 'self' ${url.protocol === "https:" ? "wss" : "ws"}://${url.host}`);
     return new Response(renderMirrorStandaloneHtml(), {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store, no-cache, must-revalidate",
-        "Content-Security-Policy": `${dashboardCspBase}; frame-ancestors 'self'`,
+        "Content-Security-Policy": `${mirrorCsp}; frame-ancestors 'self'`,
         "X-Frame-Options": "SAMEORIGIN",
         "X-Content-Type-Options": "nosniff",
         "Cross-Origin-Resource-Policy": "same-origin",
@@ -1534,6 +1535,7 @@ function renderMirrorStandaloneHtml(): string {
   .btn-danger { background: #991B1B; border-color: #DC2626; }
   .workspace {
     flex: 1;
+    min-height: 0;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1545,7 +1547,7 @@ function renderMirrorStandaloneHtml(): string {
   .phone-shell {
     position: relative;
     height: 100%;
-    max-height: calc(100vh - 118px);
+    max-height: 100%;
     aspect-ratio: 9 / 20;
     background: #000;
     border-radius: 26px;
@@ -1585,7 +1587,10 @@ function renderMirrorStandaloneHtml(): string {
     gap: 12px;
   }
   .overlay-banner.show { display: flex; }
+  button:disabled { opacity: .45; cursor: default; }
   .side-dock {
+    overflow-y: auto;
+    max-height: 100%;
     display: flex;
     flex-direction: column;
     gap: 7px;
@@ -1618,7 +1623,10 @@ function renderMirrorStandaloneHtml(): string {
     background: var(--panel);
     border-top: 1px solid var(--border);
   }
+  .bottombar { flex-wrap: wrap; }
+  #resultText { padding: 4px 12px; min-height: 24px; color: var(--muted); font-size: 12px; }
   .text-in {
+    min-width: 140px;
     flex: 1;
     cursor: text;
     user-select: text;
@@ -1701,6 +1709,7 @@ function renderMirrorStandaloneHtml(): string {
     <button class="btn-sm" onclick="submitMirrorText(true)">填入并回车</button>
   </div>
 
+  <div id="resultText" role="status" aria-live="polite"></div>
   <div class="toast" id="toast"></div>
 
 <script>
@@ -1711,7 +1720,23 @@ const fxCtx = fxCanvas.getContext('2d');
 const shell = document.getElementById('phoneShell');
 
 let ws = null;
-let isRunning = true;
+const hudMode = new URLSearchParams(location.search).get('hud') === '1';
+let active = !hudMode;
+let isRunning = false;
+let generation = 0;
+let frameEpoch = 0;
+let lastFrameAt = 0;
+let blockedFrame = true;
+let reconnectTimer = null;
+let connectTimer = null;
+let staleTimer = null;
+let reconnectAttempts = 0;
+let requestSequence = 0;
+let latestFrame = null;
+let decoding = false;
+let rippleAnimation = null;
+const pendingInputs = new Map();
+const pendingHttp = new Map();
 let phoneWidth = 1080;
 let phoneHeight = 2400;
 let clientFrameTimes = [];
@@ -1720,6 +1745,7 @@ let lastWheelSentAt = 0;
 let ripples = [];
 
 function showToast(msg) {
+  document.getElementById('resultText').textContent = msg;
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.style.display = 'block';
@@ -1735,10 +1761,11 @@ function addRipple(normX, normY, normX2, normY2) {
     y2: normY2 !== undefined ? normY2 * fxCanvas.height : undefined,
     born: performance.now()
   });
-  requestAnimationFrame(renderRipples);
+  if (!rippleAnimation) rippleAnimation = requestAnimationFrame(renderRipples);
 }
 
 function renderRipples(now) {
+  rippleAnimation = null;
   fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
   ripples = ripples.filter(r => now - r.born < 420);
   for (const r of ripples) {
@@ -1761,70 +1788,98 @@ function renderRipples(now) {
     fxCtx.fill();
     fxCtx.stroke();
   }
-  if (ripples.length > 0) requestAnimationFrame(renderRipples);
+  if (ripples.length > 0) rippleAnimation = requestAnimationFrame(renderRipples);
+}
+
+function clearFrame() {
+  frameEpoch++;
+  latestFrame = null;
+  lastFrameAt = 0;
+  blockedFrame = true;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
+  clientFrameTimes = [];
+  document.getElementById('fpsBadge').textContent = '⚡ -- FPS';
+  if (pointerState) clearTimeout(pointerState.timer);
+  pointerState = null;
+  refreshControls();
+}
+
+function canControl(unlock = false) {
+  const connected = active && isRunning && ws && ws.readyState === WebSocket.OPEN;
+  return Boolean(connected && (unlock || (!blockedFrame && lastFrameAt > 0 && performance.now() - lastFrameAt < 5000)));
+}
+
+function refreshControls() {
+  document.querySelectorAll('button[onclick]').forEach(button => {
+    const action = button.getAttribute('onclick') || '';
+    if (action.includes('toggleStartStop')) return;
+    button.disabled = !canControl(action.includes('wakeAndUnlock'));
+  });
+  document.getElementById('mirrorTextInput').disabled = !canControl();
+  document.getElementById('presetSelect').disabled = !active || !isRunning;
+}
+
+function setOverlay(title, detail, unlock = false) {
+  document.getElementById('stateOverlay').classList.add('show');
+  document.getElementById('overlayTitle').textContent = title;
+  document.getElementById('overlaySub').textContent = detail;
+  document.querySelector('#stateOverlay button').hidden = !unlock;
 }
 
 function updateOverlayFlags(flags) {
-  const isSecure = Boolean(flags & 0x01);
-  const isScreenOff = Boolean(flags & 0x02);
-  const ov = document.getElementById('stateOverlay');
-  if (isSecure) {
-    ov.classList.add('show');
-    document.getElementById('overlayIcon').textContent = '🔒';
-    document.getElementById('overlayTitle').textContent = '手机当前处于安全隐私窗口';
-    document.getElementById('overlaySub').textContent = '支付、密码或受 FLAG_SECURE 保护页面已自动遮蔽，切出该页面后自动恢复实时画面';
-  } else if (isScreenOff) {
-    ov.classList.add('show');
-    document.getElementById('overlayIcon').textContent = '🌙';
-    document.getElementById('overlayTitle').textContent = '手机当前处于息屏状态';
-    document.getElementById('overlaySub').textContent = '点击下方按钮点亮屏幕（如已配置图案将自动解锁）';
-  } else {
-    ov.classList.remove('show');
+  if (flags & 7) {
+    clearFrame();
+    if (flags & 1) setOverlay('安全隐私窗口', '画面已遮蔽，请在手机上离开受保护页面');
+    else setOverlay(flags & 4 ? '手机已锁屏' : '手机已息屏', '可明确点击唤醒解锁；不会自动输入解锁凭据', true);
+    return false;
   }
+  return true;
 }
 
-async function handleBinaryScreenFrame(buf) {
-  if (buf.byteLength < 16) return;
+function handleBinaryScreenFrame(buf) {
+  if (!active || !isRunning || buf.byteLength < 16) return;
   const view = new DataView(buf);
-  const codec = view.getUint8(0);
-  const flags = view.getUint8(1);
-  const width = view.getUint16(2, false);
-  const height = view.getUint16(4, false);
-  const seq = view.getUint16(6, false);
+  if (!updateOverlayFlags(view.getUint8(1))) return;
+  if (view.getUint8(0) === 0 || buf.byteLength <= 16) return;
+  latestFrame = { buf, epoch: frameEpoch, session: generation };
+  void drainFrames();
+}
 
-  if (width > 0 && height > 0) {
-    phoneWidth = width;
-    phoneHeight = height;
-    shell.style.aspectRatio = width + ' / ' + height;
-    document.getElementById('resBadge').textContent = '📐 ' + width + '×' + height;
-  }
-
-  updateOverlayFlags(flags);
-  if (codec === 0 || buf.byteLength <= 16) return;
-
-  const imgSlice = new Uint8Array(buf, 16);
-  const mime = codec === 2 ? 'image/jpeg' : 'image/webp';
+async function drainFrames() {
+  if (decoding) return;
+  decoding = true;
   try {
-    const bmp = await createImageBitmap(new Blob([imgSlice], { type: mime }));
-    if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
-      canvas.width = bmp.width;
-      canvas.height = bmp.height;
-      fxCanvas.width = bmp.width;
-      fxCanvas.height = bmp.height;
+    while (latestFrame) {
+      const frame = latestFrame;
+      latestFrame = null;
+      const view = new DataView(frame.buf);
+      const mime = view.getUint8(0) === 2 ? 'image/jpeg' : 'image/webp';
+      let bmp;
+      try {
+        bmp = await createImageBitmap(new Blob([new Uint8Array(frame.buf, 16)], { type: mime }));
+        if (!active || !isRunning || frame.session !== generation || frame.epoch !== frameEpoch) continue;
+        phoneWidth = view.getUint16(2, false) || bmp.width;
+        phoneHeight = view.getUint16(4, false) || bmp.height;
+        shell.style.aspectRatio = phoneWidth + ' / ' + phoneHeight;
+        canvas.width = fxCanvas.width = bmp.width;
+        canvas.height = fxCanvas.height = bmp.height;
+        ctx.drawImage(bmp, 0, 0);
+        lastFrameAt = performance.now();
+        reconnectAttempts = 0;
+        blockedFrame = false;
+        document.getElementById('stateOverlay').classList.remove('show');
+        document.getElementById('resBadge').textContent = '📐 ' + phoneWidth + '×' + phoneHeight;
+        clientFrameTimes.push(lastFrameAt);
+        while (clientFrameTimes.length && lastFrameAt - clientFrameTimes[0] > 2500) clientFrameTimes.shift();
+        const fps = clientFrameTimes.length < 2 ? '1.0' : ((clientFrameTimes.length - 1) * 1000 / Math.max(150, lastFrameAt - clientFrameTimes[0])).toFixed(1);
+        document.getElementById('fpsBadge').textContent = '⚡ ' + fps + ' FPS';
+        refreshControls();
+      } catch (_) {
+        if (active && frame.session === generation) showToast('画面解码失败，正在等待下一帧');
+      } finally { if (bmp) bmp.close(); }
     }
-    ctx.drawImage(bmp, 0, 0);
-    bmp.close();
-
-    const now = performance.now();
-    clientFrameTimes.push(now);
-    while (clientFrameTimes.length > 0 && now - clientFrameTimes[0] > 2500) {
-      clientFrameTimes.shift();
-    }
-    const fps = clientFrameTimes.length >= 2
-      ? ((clientFrameTimes.length - 1) * 1000 / Math.max(150, now - clientFrameTimes[0])).toFixed(1)
-      : '1.0';
-    document.getElementById('fpsBadge').textContent = '⚡ ' + fps + ' FPS (#' + seq + ')';
-  } catch (e) {}
+  } finally { decoding = false; }
 }
 
 function applyMirrorStatus(st) {
@@ -1832,15 +1887,22 @@ function applyMirrorStatus(st) {
   isRunning = Boolean(st.running);
   const badge = document.getElementById('liveBadge');
   const btn = document.getElementById('btnStartStop');
+  if (hudMode) {
+    btn.textContent = active ? '结束观看' : '开始镜像';
+    btn.className = 'btn-sm btn-primary';
+  }
   if (st.running) {
     badge.textContent = st.mode === 'native_stream' ? '🟢 实时同屏中 (原生流)' : '🟢 实时同屏中 (兼容轮询)';
-    btn.textContent = '⏸️ 暂停';
+    if (!hudMode) btn.textContent = '⏸️ 暂停';
     btn.className = 'btn-sm btn-primary';
   } else {
     badge.textContent = '⚪ 已暂停同屏';
-    btn.textContent = '▶️ 继续同屏';
+    if (!hudMode) btn.textContent = '▶️ 继续同屏';
+    clearFrame();
+    setOverlay('镜像已停止', '结束当前观看后可重新开始');
     btn.className = 'btn-sm';
   }
+  refreshControls();
   if (st.width && st.height) {
     phoneWidth = st.width;
     phoneHeight = st.height;
@@ -1851,45 +1913,156 @@ function applyMirrorStatus(st) {
   }
 }
 
+function settleInput(reqId, ok, message) {
+  const entry = pendingInputs.get(reqId);
+  if (!entry) return;
+  clearTimeout(entry.timer);
+  pendingInputs.delete(reqId);
+  showToast(message);
+  entry.resolve(ok);
+}
+
+function cancelInputs() {
+  for (const id of [...pendingInputs.keys()]) settleInput(id, false, '连接已结束，未确认操作的结果未知；不会自动重发');
+}
+
 function sendCommand(payload) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(payload));
-    return;
+  const input = payload.type === 'input';
+  if (!active || !ws || ws.readyState !== WebSocket.OPEN || (input && !canControl(payload.inputType === 'unlock'))) {
+    showToast('当前没有可操作的新鲜画面，请先连接镜像');
+    return Promise.resolve(false);
   }
-  fetch('/api/inbox/action', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      action: payload.type === 'start' ? 'mirror_start' : payload.type === 'stop' ? 'mirror_stop' : 'mirror_input',
-      params: payload
-    })
-  }).catch(() => {});
+  if (!input) {
+    try { ws.send(JSON.stringify(payload)); } catch (_) { showToast('连接已断开'); }
+    return Promise.resolve(true);
+  }
+  if (pendingInputs.size >= 32) { showToast('操作仍在确认中，请稍后'); return Promise.resolve(false); }
+  const reqId = 'view-' + generation + '-' + (++requestSequence);
+  return new Promise(resolve => {
+    const wait = ['tap', 'long_press'].includes(payload.inputType) ? 68000 : 8000;
+    const timer = setTimeout(() => settleInput(reqId, false, '操作确认超时，结果未知；请核对手机后再操作'), wait);
+    pendingInputs.set(reqId, { resolve, timer });
+    showToast('已发送，等待手机确认');
+    try { ws.send(JSON.stringify({ ...payload, reqId })); }
+    catch (_) { settleInput(reqId, false, '发送失败，未获手机确认'); }
+  });
 }
 
 function connectMirrorWs() {
+  if (!active) return;
+  const session = ++generation;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto + '//' + location.host + '/ws/mirror');
-  ws.binaryType = 'arraybuffer';
-  ws.onopen = () => {
-    const [maxWidth, quality, maxFps] = document.getElementById('presetSelect').value.split(',').map(Number);
-    ws.send(JSON.stringify({ type: 'start', maxWidth, quality, maxFps, autoWake: true }));
-  };
-  ws.onmessage = (ev) => {
-    if (ev.data instanceof ArrayBuffer) {
-      handleBinaryScreenFrame(ev.data);
-    } else if (typeof ev.data === 'string') {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.type === 'mirror_status') applyMirrorStatus(msg.status);
-        else if (msg.type === 'mirror_error') showToast('⚠️ ' + msg.error);
-      } catch {}
+  const socket = new WebSocket(proto + '//' + location.host + '/ws/mirror' + (hudMode ? '?manual=1' : ''));
+  ws = socket;
+  socket.binaryType = 'arraybuffer';
+  let initialStatus = hudMode;
+  const current = () => active && session === generation && ws === socket;
+  clearTimeout(connectTimer);
+  connectTimer = setTimeout(() => {
+    if (current()) { showToast('镜像连接或启动超时'); socket.close(); }
+  }, 10000);
+  socket.onopen = () => {
+    if (!current()) { socket.close(); return; }
+    if (!hudMode) {
+      const [maxWidth, quality, maxFps] = document.getElementById('presetSelect').value.split(',').map(Number);
+      socket.send(JSON.stringify({ type: 'start', maxWidth, quality, maxFps, autoWake: true }));
     }
   };
-  ws.onclose = () => {
-    document.getElementById('liveBadge').textContent = '🟡 正在重连画面流...';
-    setTimeout(connectMirrorWs, 1200);
+  socket.onmessage = ev => {
+    if (!current()) return;
+    if (ev.data instanceof ArrayBuffer) handleBinaryScreenFrame(ev.data);
+    else if (typeof ev.data === 'string') {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'mirror_status') {
+          applyMirrorStatus(msg.status);
+          if (!initialStatus && !msg.status.starting) clearTimeout(connectTimer);
+          if (msg.status.running) {
+            clearTimeout(connectTimer);
+            if (initialStatus && msg.status.maxWidth) {
+              const preset = [msg.status.maxWidth, msg.status.quality, msg.status.maxFps].join(',');
+              const select = document.getElementById('presetSelect');
+              if (![...select.options].some(o => o.value === preset)) select.add(new Option('当前共享画质', preset));
+              select.value = preset;
+            }
+          }
+          if (initialStatus) {
+            initialStatus = false;
+            if (!msg.status.running && !msg.status.starting) {
+              const [maxWidth, quality, maxFps] = document.getElementById('presetSelect').value.split(',').map(Number);
+              socket.send(JSON.stringify({ type: 'start', maxWidth, quality, maxFps, autoWake: false }));
+              setOverlay('正在开始镜像', '锁屏或息屏时不会自动解锁');
+            }
+          }
+        } else if (msg.type === 'input_ack') {
+          const ok = msg.ok !== false && msg.result?.ok !== false;
+          settleInput(msg.reqId, ok, ok ? '手机已确认操作' : ('手机拒绝操作：' + (msg.result?.error || msg.result?.message || '未执行')));
+        } else if (msg.type === 'mirror_error') {
+          if (msg.reqId) settleInput(msg.reqId, false, '操作失败：' + msg.error);
+          else { hostDeactivate(); showToast('镜像失败：' + msg.error); }
+        }
+      } catch (_) { showToast('镜像响应格式异常'); }
+    }
+  };
+  socket.onclose = () => {
+    if (!current()) return;
+    clearTimeout(connectTimer);
+    ws = null;
+    isRunning = false;
+    clearFrame();
+    cancelInputs();
+    if (++reconnectAttempts > 5) {
+      hostDeactivate();
+      showToast('连接中断，请检查 Mac 与手机连接后重新开始');
+      return;
+    }
+    setOverlay('连接中断', '正在重连；不会重发旧操作');
+    document.getElementById('liveBadge').textContent = '正在重连 ' + reconnectAttempts + '/5';
+    reconnectTimer = setTimeout(connectMirrorWs, Math.min(10000, 1000 * Math.pow(2, reconnectAttempts - 1)));
   };
 }
+
+function beginWatching() {
+  if (active && ws) return;
+  active = true;
+  reconnectAttempts = 0;
+  document.getElementById('btnStartStop').textContent = hudMode ? '结束观看' : '⏸️ 暂停';
+  setOverlay('正在连接', '等待手机画面');
+  clearInterval(staleTimer);
+  staleTimer = setInterval(() => {
+    if (lastFrameAt > 0 && performance.now() - lastFrameAt >= 5000) {
+      clearFrame();
+      setOverlay('画面暂未更新', '操作已暂停，等待新画面');
+    }
+  }, 1000);
+  connectMirrorWs();
+}
+
+function hostDeactivate() {
+  active = false;
+  generation++;
+  isRunning = false;
+  clearTimeout(reconnectTimer);
+  clearTimeout(connectTimer);
+  clearInterval(staleTimer);
+  clearTimeout(window.__mirrorToast);
+  cancelAnimationFrame(rippleAnimation);
+  rippleAnimation = null;
+  ripples = [];
+  const old = ws;
+  ws = null;
+  if (old) old.close();
+  clearFrame();
+  cancelInputs();
+  clearTimeout(window.__mirrorToast);
+  for (const [abort, timer] of pendingHttp) { abort.abort(); clearTimeout(timer); }
+  pendingHttp.clear();
+  document.getElementById('btnStartStop').textContent = '开始镜像';
+  document.getElementById('liveBadge').textContent = '未开始观看';
+  setOverlay('手机镜像', '手动开始观看；结束后不影响其他观看窗口');
+}
+window.hostDeactivate = hostDeactivate;
+window.addEventListener('pagehide', hostDeactivate);
 
 function normCoords(e) {
   const rect = canvas.getBoundingClientRect();
@@ -1899,7 +2072,7 @@ function normCoords(e) {
 }
 
 canvas.addEventListener('pointerdown', (e) => {
-  if (e.button !== 0) return;
+  if (e.button !== 0 || !canControl()) return;
   canvas.focus();
   canvas.setPointerCapture(e.pointerId);
   const c = normCoords(e);
@@ -1922,7 +2095,7 @@ canvas.addEventListener('pointerdown', (e) => {
         state.longPressed = true;
         addRipple(state.startX, state.startY);
         sendCommand({ type: 'input', inputType: 'long_press', normX: state.startX, normY: state.startY, durationMs: 650 });
-        showToast('👆 长按已触发');
+
       }
     }, 520)
   };
@@ -1982,43 +2155,46 @@ canvas.addEventListener('wheel', (e) => {
   });
 }, { passive: false });
 
+canvas.addEventListener('pointercancel', () => { if (pointerState) clearTimeout(pointerState.timer); pointerState = null; });
+
 canvas.addEventListener('keydown', (e) => {
+  if (e.isComposing || e.keyCode === 229) return;
   if (e.key === 'Backspace') {
     e.preventDefault();
     sendCommand({ type: 'input', inputType: 'backspace' });
   } else if (e.key === 'Enter') {
     e.preventDefault();
     sendCommand({ type: 'input', inputType: 'enter' });
-  } else if (e.key === 'Escape') {
+  } else if (e.key === 'Escape' && !hudMode) {
     e.preventDefault();
     sendNav('back');
   }
 });
 
 window.addEventListener('paste', (e) => {
-  if (document.activeElement === document.getElementById('mirrorTextInput')) return;
+  if (document.activeElement !== canvas || !canControl()) return;
   const text = (e.clipboardData || window.clipboardData)?.getData('text');
   if (text) {
     e.preventDefault();
     sendCommand({ type: 'input', inputType: 'text', text, append: true });
-    showToast('📋 已将剪贴板文字填入手机输入框');
+
   }
 });
 
 function onTextInputKey(e) {
+  if (e.isComposing || e.keyCode === 229) return;
   if (e.key === 'Enter') {
     e.preventDefault();
     submitMirrorText(true);
   }
 }
 
-function submitMirrorText(submitEnter) {
+async function submitMirrorText(submitEnter) {
   const input = document.getElementById('mirrorTextInput');
   const text = input.value;
   if (!text) return;
-  sendCommand({ type: 'input', inputType: 'text', text, append: false, submit: Boolean(submitEnter) });
-  input.value = '';
-  showToast('⌨️ 已向手机输入文字');
+  const ok = await sendCommand({ type: 'input', inputType: 'text', text, append: false, submit: Boolean(submitEnter) });
+  if (ok && input.value === text) input.value = '';
 }
 
 function sendNav(target) {
@@ -2030,32 +2206,36 @@ function wakeAndUnlock() {
   sendCommand({ type: 'input', inputType: 'unlock' });
 }
 
-function adjustVol(direction) {
-  fetch('/api/inbox/action', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'phone_control', params: { action: 'set_volume', stream: 'music', direction } })
-  }).then(() => showToast(direction === 'up' ? '🔊 音量+' : '🔉 音量-')).catch(() => {});
+async function phoneControl(params) {
+  if (!canControl()) { showToast('当前画面不可操作'); return; }
+  const session = generation;
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), 8000);
+  pendingHttp.set(abort, timer);
+  showToast('已发送，等待手机确认');
+  try {
+    const r = await fetch('/api/inbox/action', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'phone_control', params }), signal: abort.signal
+    });
+    const d = await r.json();
+    if (session !== generation || !active) return;
+    showToast(r.ok && d.ok && d.result?.ok !== false ? '手机已确认操作' : ('操作失败：' + (d.error || d.result?.error || '未获确认')));
+  } catch (_) { if (session === generation) showToast('操作未获确认，请核对手机状态'); }
+  finally { clearTimeout(timer); pendingHttp.delete(abort); }
 }
-
-function saveCurrentScreenshot() {
-  showToast('📸 正在保存高清截屏至 Mac Inbox...');
-  fetch('/api/inbox/action', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'phone_control', params: { action: 'take_screenshot', saveToInbox: true } })
-  }).then(r => r.json()).then(d => {
-    if (d.ok) showToast('✅ 截屏已存入 Mac 收件箱');
-  }).catch(() => {});
-}
+function adjustVol(direction) { void phoneControl({ action: 'set_volume', stream: 'music', direction }); }
+function saveCurrentScreenshot() { void phoneControl({ action: 'take_screenshot', saveToInbox: true }); }
 
 function onPresetChange() {
+  if (!active || !isRunning) return;
   const [maxWidth, quality, maxFps] = document.getElementById('presetSelect').value.split(',').map(Number);
-  sendCommand({ type: 'start', maxWidth, quality, maxFps, autoWake: true });
-  showToast('✨ 已切换画质: ' + maxWidth + 'p');
+  sendCommand({ type: 'start', maxWidth, quality, maxFps, autoWake: !hudMode });
+  showToast('已请求修改共享画质，其他观看窗口也会受影响');
 }
 
 function toggleStartStop() {
+  if (hudMode) { if (active) hostDeactivate(); else beginWatching(); return; }
   if (isRunning) {
     sendCommand({ type: 'stop' });
   } else {
@@ -2064,7 +2244,7 @@ function toggleStartStop() {
   }
 }
 
-connectMirrorWs();
+if (hudMode) hostDeactivate(); else beginWatching();
 </script>
 </body>
 </html>`;

@@ -23,6 +23,7 @@ export interface HudStatusPayload {
   activeTier: string;
   phoneName?: string;
   inboxDir: string;
+  mirrorUrl?: string;
 }
 
 /**

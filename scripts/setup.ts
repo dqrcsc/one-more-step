@@ -30,7 +30,7 @@ if (process.platform === "darwin") {
     console.warn(`⚠️ Skipping Bluetooth binary compilation (${err?.message || err})`);
   }
   try {
-    execFileSync("swiftc", [hudSrc, "-framework", "Cocoa", "-framework", "PDFKit", "-framework", "Quartz", "-framework", "AVFoundation", "-o", hudBin], { stdio: "inherit" });
+    execFileSync("swiftc", [hudSrc, "-framework", "Cocoa", "-framework", "PDFKit", "-framework", "Quartz", "-framework", "AVFoundation", "-framework", "WebKit", "-o", hudBin], { stdio: "inherit" });
     console.log(`✅ Compiled macOS Native HUD helper: ${hudBin}`);
   } catch (err: any) {
     console.warn(`⚠️ Skipping Mac HUD binary compilation (${err?.message || err})`);
