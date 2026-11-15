@@ -141,10 +141,11 @@ describe("inbox durable commit and attachment validation", () => {
       return originalRename(from, to);
     }) as typeof fs.renameSync;
     try {
-      expect(() => inbox.storeSubmittedItem(request, () => undefined)).toThrow("derived view failure");
+      expect(inbox.storeSubmittedItem(request, () => undefined).itemId).toBe(request.clientItemId);
       expect(jsonLines(path.join(root, "items_index.jsonl")).map((x) => x.itemId)).toEqual([request.clientItemId]);
       expect(inbox.getItem(request.clientItemId)?.itemId).toBe(request.clientItemId);
       expect(jsonLines(queuePath)).toEqual([]);
+      expect(new InboxManager(root).getItem(request.clientItemId)?.itemId).toBe(request.clientItemId);
     } finally {
       fs.renameSync = originalRename;
     }

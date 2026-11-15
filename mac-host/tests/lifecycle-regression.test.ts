@@ -204,19 +204,30 @@ test("a late legacy screenshot cannot feed or restart a replacement mirror sessi
   await f.daemon.stopMirror();
 });
 
-test("mirror input carries an absolute deadline and preserves shorter caller limits", async () => {
+test("mirror confirmation receives 65s while shorter deadlines and ordinary controls stay bounded", async () => {
   const f = fixture();
   const sent: any[] = [];
-  f.s.callPhone = async (_method: string, payload: any) => { sent.push(payload); return { ok: true }; };
-  const before = Date.now();
-  await f.daemon.sendMirrorInput({ type: "tap", normX: 0.5, normY: 0.5 });
-  expect(sent[0].deadlineMs).toBeGreaterThanOrEqual(before + 5000);
-  expect(sent[0].deadlineMs).toBeLessThanOrEqual(Date.now() + 5000);
+  f.s.callPhone = async (_method: string, payload: any, timeout: number) => {
+    sent.push({ ...payload, timeout }); return { ok: true };
+  };
+  for (const type of ["tap", "click", "long_press", "long_click", "home", "swipe"]) {
+    const budget = ["home", "swipe"].includes(type) ? 5000 : 65000;
+    const before = Date.now();
+    await f.daemon.sendMirrorInput({ type, normX: 0.5, normY: 0.5 });
+    const payload = sent.at(-1);
+    expect(payload.deadlineMs).toBeGreaterThanOrEqual(before + budget);
+    expect(payload.deadlineMs).toBeLessThanOrEqual(Date.now() + budget);
+    expect(payload.timeout).toBeGreaterThanOrEqual(budget + 990);
+    expect(payload.timeout).toBeLessThanOrEqual(budget + 1000);
+  }
   const shorter = Date.now() + 1000;
   await f.daemon.sendMirrorInput({ type: "tap", deadlineMs: shorter });
-  expect(sent[1].deadlineMs).toBe(shorter);
+  expect(sent.at(-1).deadlineMs).toBe(shorter);
+  expect(sent.at(-1).timeout).toBeLessThanOrEqual(2000);
   await expect(f.daemon.sendMirrorInput({ type: "tap", deadlineMs: 1 })).rejects.toThrow("ERR_GUI_DEADLINE");
-  expect(sent).toHaveLength(2);
+  expect(sent).toHaveLength(7);
+  const { ipcTimeoutForAction } = await import("../src/daemon/request-timeouts.js");
+  expect(ipcTimeoutForAction("phone_mirror_input", {})).toBeGreaterThan(66000);
 });
 
 test("AirPods bridge supplies a native deadline and cancels a timed-out request", async () => {
@@ -355,4 +366,19 @@ test("late native AirPods diagnostics remain observable without completing anoth
   expect((bridge as any).pendingCmdWaiters.has("new")).toBe(true);
   (bridge as any).handleBridgeMessage({ type: "airpods_diagnostics", diagnostics: [] });
   expect(seen).toHaveLength(1);
+});
+
+
+test("OTA verified download has time to finish before the phone and IPC waiters expire", async () => {
+  const f = fixture();
+  let sent: any;
+  f.s.callPhone = async (method: string, payload: any, timeout: number) => {
+    sent = { method, payload, timeout }; return { ok: true, status: "installer_launched" };
+  };
+  const result = await f.daemon.handleIpcAction("phone_ota_update", {});
+  expect(sent.method).toBe("sys.otaUpdate");
+  expect(sent.timeout).toBe(150000);
+  expect(result.status).toBe("installer_launched");
+  const { ipcTimeoutForAction } = await import("../src/daemon/request-timeouts.js");
+  expect(ipcTimeoutForAction("phone_ota_update", {})).toBeGreaterThan(sent.timeout);
 });

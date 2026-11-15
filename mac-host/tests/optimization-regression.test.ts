@@ -281,7 +281,7 @@ describe("P1 contract & audio routing regressions", () => {
     expect(parsed.items.map((i: any) => i.itemId)).toEqual(["voice-1", "pkb-1"]);
   });
 
-  test("InboxManager moves single-use pulled_cache staging files via rename while preserving external files", () => {
+  test("InboxManager removes committed pulled_cache staging files while preserving external files", () => {
     const { dir, inbox } = createInboxFixture();
     const pulledCacheDir = path.join(inbox.inboxRootDir, "pulled_cache");
     const stagedInPulledCache = makeAttachment(pulledCacheDir, "staged.png", "image/png", "staged-bytes");

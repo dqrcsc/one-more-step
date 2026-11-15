@@ -1669,6 +1669,9 @@ export class PhoneSessionManager extends EventEmitter {
       }, effectiveTimeoutMs);
       this.outgoingStreams.set(streamId, { pipe, resolve, reject, timer: ackTimer });
     });
+    // ACK failure may arrive while the sender awaits backpressure. Observe it
+    // immediately; awaiting the original promise below still propagates the error.
+    void ackPromise.catch(() => {});
 
     try {
       this.sendSecure(pipe, encodeStreamStartFrame(startHeader));

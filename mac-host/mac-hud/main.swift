@@ -224,9 +224,21 @@ final class ClickableRowView: NSView {
 
 final class HudIpcClient {
     private let socketPath: String
-    private let ioQueue = DispatchQueue(label: "com.oms.hud.ipc")
+    private let readQueue = DispatchQueue(label: "com.oms.hud.ipc.read")
+    private let writeQueue = DispatchQueue(label: "com.oms.hud.ipc.write")
+    private let stateLock = NSLock()
     private var sockFD: Int32 = -1
+    private var generation: UInt64 = 0
     private var running = true
+    private var started = false
+    // Only accessed on writeQueue; retain unsent frames across reconnects.
+    private var pendingFrames: [Data] = []
+
+    private var isRunning: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return running
+    }
     var onEnvelope: ((HudIncomingEnvelope) -> Void)?
 
     init(socketPath: String) {
@@ -234,32 +246,60 @@ final class HudIpcClient {
     }
 
     func start() {
-        ioQueue.async { [weak self] in
-            self?.connectLoop()
-        }
+        stateLock.lock()
+        guard running && !started else { stateLock.unlock(); return }
+        started = true
+        stateLock.unlock()
+        readQueue.async { [weak self] in self?.connectLoop() }
     }
 
     func stop() {
+        stateLock.lock()
         running = false
-        if sockFD >= 0 {
-            Darwin.close(sockFD)
-            sockFD = -1
-        }
+        // The reader owns close(). shutdown wakes read/write without fd reuse races.
+        if sockFD >= 0 { Darwin.shutdown(sockFD, SHUT_RDWR) }
+        stateLock.unlock()
+        writeQueue.async { [weak self] in self?.pendingFrames.removeAll() }
     }
 
     func sendJson(_ obj: [String: Any]) {
-        ioQueue.async { [weak self] in
-            guard let self = self, self.sockFD >= 0 else { return }
-            guard let data = try? JSONSerialization.data(withJSONObject: obj, options: []) else { return }
-            var framed = data
-            framed.append(0x0A)
-            _ = writeAllFD(self.sockFD, framed)
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: []) else { return }
+        var framed = data
+        framed.append(0x0A)
+        writeQueue.async { [weak self] in
+            guard let self = self, self.isRunning else { return }
+            self.pendingFrames.append(framed)
+            self.flushPendingFrames()
+        }
+    }
+
+    private func flushPendingFrames() {
+        while !pendingFrames.isEmpty {
+            stateLock.lock()
+            // A duplicate keeps this connection alive if the reader closes its fd.
+            // Never write through a descriptor that could have been reused.
+            let fd = running && sockFD >= 0 ? Darwin.dup(sockFD) : -1
+            let writingGeneration = generation
+            stateLock.unlock()
+            guard fd >= 0 else { return }
+            let sent = writeAllFD(fd, pendingFrames[0])
+            Darwin.close(fd)
+            if sent {
+                pendingFrames.removeFirst()
+            } else {
+                stateLock.lock()
+                if sockFD >= 0 && generation == writingGeneration {
+                    Darwin.shutdown(sockFD, SHUT_RDWR)
+                }
+                stateLock.unlock()
+                return
+            }
         }
     }
 
     private func connectLoop() {
         let decoder = JSONDecoder()
-        while running {
+        while isRunning {
             let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
             if fd < 0 {
                 Thread.sleep(forTimeInterval: 1.5)
@@ -290,10 +330,20 @@ final class HudIpcClient {
                 continue
             }
 
+            // Bound writes to an unresponsive peer and suppress process-wide SIGPIPE.
+            var noSigPipe: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+            var sendTimeout = timeval(tv_sec: 2, tv_usec: 0)
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, socklen_t(MemoryLayout<timeval>.size))
+            stateLock.lock()
+            guard running else { stateLock.unlock(); Darwin.close(fd); return }
             sockFD = fd
+            generation &+= 1
+            stateLock.unlock()
+            writeQueue.async { [weak self] in self?.flushPendingFrames() }
             var buffer = Data()
             var readBuf = [UInt8](repeating: 0, count: 16384)
-            while running {
+            while isRunning {
                 let n = Darwin.read(fd, &readBuf, readBuf.count)
                 if n > 0 {
                     buffer.append(readBuf, count: n)
@@ -313,11 +363,12 @@ final class HudIpcClient {
                     break
                 }
             }
-            if sockFD == fd {
-                sockFD = -1
-            }
+            stateLock.lock()
+            sockFD = -1
+            Darwin.shutdown(fd, SHUT_RDWR)
             Darwin.close(fd)
-            if running {
+            stateLock.unlock()
+            if isRunning {
                 Thread.sleep(forTimeInterval: 1.0)
             }
         }
@@ -483,6 +534,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         case "sync_items":
             if let incoming = env.items {
                 items = incoming.sorted { $0.createdAtMs > $1.createdAtMs }
+                unreadItemIds.formIntersection(incoming.filter { !$0.processed }.map { $0.itemId })
                 if selectedItemId == nil {
                     selectedItemId = items.first?.itemId
                 }
@@ -1468,13 +1520,9 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     @objc private func markCurrentItemProcessed() {
         guard let id = selectedItemId else { return }
-        if let idx = items.firstIndex(where: { $0.itemId == id }) {
-            items[idx].processed = true
-        }
-        unreadItemIds.remove(id)
-        updateStatusBarAppearance()
+        // The host persists this change and returns sync_items. Only that snapshot
+        // may update the processed badge; queued/written IPC is not confirmation.
         ipc.sendJson(["type": "mark_processed", "itemId": id])
-        rebuildSidebarAndInspector()
     }
 
     @objc private func closeDetailButtonClicked() {

@@ -4,6 +4,9 @@ import crypto from "node:crypto";
 import { extractOtpFromText, InboxSubmitItemParams, IntentTag } from "@oms/shared-protocol";
 import { CompletedFileTransfer } from "../transport/session-manager.js";
 
+const MAX_INBOX_ITEMS = 500;
+const MAX_INDEXED_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024;
+
 const ITEM_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export interface StoredInboxFile {
@@ -55,7 +58,7 @@ export class InboxManager {
       fs.chmodSync(path.join(this.inboxRootDir, "pulled_cache"), 0o700);
     } catch {}
     this.loadExistingIndex();
-    this.writeDerivedViews();
+    this.refreshDerivedViews();
   }
 
   private loadExistingIndex(): void {
@@ -142,8 +145,12 @@ export class InboxManager {
     // UUIDv7 idempotent deduplication check
     const existing = this.itemsMap.get(params.clientItemId);
     if (existing) {
-      this.writeDerivedViews([existing.itemId]);
+      this.refreshDerivedViews([existing.itemId]);
       return existing;
+    }
+
+    if (this.itemsMap.size >= MAX_INBOX_ITEMS) {
+      throw new Error("ERR_INBOX_QUOTA: 收件箱已达500条，请先整理历史记录后重试；现有资料不会自动删除");
     }
 
     // Validate every attachment before creating an item or publishing its ID.
@@ -165,8 +172,16 @@ export class InboxManager {
       ) {
         throw new Error(`Attachment size or SHA-256 mismatch: ${att.streamId}`);
       }
-      return { att, srcAbsPath: completed.savedAbsPath, sha256 };
+      return { att, srcAbsPath: completed.savedAbsPath, sha256, sizeBytes };
     });
+
+    const indexedBytes = Array.from(this.itemsMap.values()).reduce(
+      (sum, item) => sum + item.files.reduce((bytes, file) => bytes + Math.max(0, file.sizeBytes || 0), 0), 0
+    );
+    const incomingBytes = attachments.reduce((sum, file) => sum + file.sizeBytes, 0);
+    if (indexedBytes + incomingBytes > MAX_INDEXED_ATTACHMENT_BYTES) {
+      throw new Error("ERR_INBOX_QUOTA: 已索引附件将超过2GiB，请先整理历史记录后重试；现有资料不会自动删除");
+    }
 
     const now = new Date();
     const dateFolder = now.toISOString().slice(0, 10); // YYYY-MM-DD
@@ -178,12 +193,6 @@ export class InboxManager {
     } catch {}
 
     const pulledCacheDir = path.resolve(path.join(this.inboxRootDir, "pulled_cache"));
-    const remainingRefs = new Map<string, number>();
-    for (const { srcAbsPath } of attachments) {
-      const resolvedSrc = path.resolve(srcAbsPath);
-      remainingRefs.set(resolvedSrc, (remainingRefs.get(resolvedSrc) ?? 0) + 1);
-    }
-
     const storedFiles: StoredInboxFile[] = [];
     const usedNames = new Set(["meta.json"]);
     for (const { att, srcAbsPath, sha256 } of attachments) {
@@ -198,29 +207,11 @@ export class InboxManager {
       }
       usedNames.add(safeName.toLowerCase());
       const destAbsPath = path.join(itemDir, safeName);
-      const resolvedSrc = path.resolve(srcAbsPath);
-      const refsLeft = (remainingRefs.get(resolvedSrc) ?? 1) - 1;
-      remainingRefs.set(resolvedSrc, refsLeft);
-
-      const isInsidePulledCache =
-        path.dirname(resolvedSrc) === pulledCacheDir &&
-        !resolvedSrc.endsWith(".partial");
-
-      if (isInsidePulledCache && refsLeft === 0) {
-        try {
-          fs.renameSync(resolvedSrc, destAbsPath);
-        } catch {
-          fs.copyFileSync(resolvedSrc, destAbsPath);
-          try {
-            fs.unlinkSync(resolvedSrc);
-          } catch {}
-        }
-      } else {
-        fs.copyFileSync(resolvedSrc, destAbsPath);
-      }
-      try {
-        fs.chmodSync(destAbsPath, 0o600);
-      } catch {}
+      // Keep the verified staging source until the authoritative index commits.
+      fs.copyFileSync(srcAbsPath, destAbsPath);
+      fs.chmodSync(destAbsPath, 0o600);
+      const fd = fs.openSync(destAbsPath, "r");
+      try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
       storedFiles.push({
         fileName: safeName,
         absPath: destAbsPath,
@@ -259,6 +250,11 @@ export class InboxManager {
     const next = new Map(this.itemsMap);
     next.set(stored.itemId, stored);
     this.rewriteIndex(next, [stored.itemId]);
+    for (const source of new Set(attachments.map((file) => path.resolve(file.srcAbsPath)))) {
+      if (path.dirname(source) === pulledCacheDir && !source.endsWith(".partial")) {
+        try { fs.unlinkSync(source); } catch { /* Committed data is safe; staging cleanup can retry later. */ }
+      }
+    }
 
     return stored;
   }
@@ -365,7 +361,13 @@ export class InboxManager {
 
   private atomicWrite(filePath: string, content: string): void {
     const tempPath = `${filePath}.${crypto.randomUUID()}.tmp`;
-    fs.writeFileSync(tempPath, content, { encoding: "utf8", mode: 0o600 });
+    const fd = fs.openSync(tempPath, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, content, { encoding: "utf8" });
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
     fs.renameSync(tempPath, filePath);
     try {
       fs.chmodSync(filePath, 0o600);
@@ -380,7 +382,16 @@ export class InboxManager {
     this.atomicWrite(this.indexJsonlPath, lines ? lines + "\n" : "");
     this.itemsMap.clear();
     for (const [id, item] of next) this.itemsMap.set(id, item);
-    this.writeDerivedViews(changedItemIds);
+    this.refreshDerivedViews(changedItemIds);
+  }
+
+  private refreshDerivedViews(changedItemIds?: Iterable<string>): void {
+    try {
+      this.writeDerivedViews(changedItemIds);
+    } catch (error) {
+      // The index has committed. A view failure must not cause a false delivery failure.
+      console.warn("[Inbox] Committed index; derived views need rebuilding:", error);
+    }
   }
 
   private writeDerivedViews(changedItemIds?: Iterable<string>): void {

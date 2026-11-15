@@ -1784,12 +1784,13 @@ export class OmsDaemon {
       });
     }
 
-    const deadlineMs = boundedControlDeadline(params.deadlineMs, 5000);
+    const mayRequireConfirmation = ["tap", "click", "long_press", "long_click"].includes(inputType);
+    const deadlineMs = boundedControlDeadline(params.deadlineMs, mayRequireConfirmation ? 65000 : 5000);
     const callPhone = this.session.bindPhoneSession();
     if (this.mirrorMode !== "legacy_poll") {
       try {
         return await callPhone("mirror.input", { ...params, type: inputType, deadlineMs },
-          Math.max(1, deadlineMs - Date.now()));
+          Math.max(1, deadlineMs - Date.now()) + 1000);
       } catch (err: any) {
         if (!String(err?.message || "").includes("Unknown RPC method")) throw err;
       }
@@ -2438,7 +2439,7 @@ export class OmsDaemon {
           port: this.config.lanPort,
           url: lanUrl,
           githubDownloadUrl: meta.githubDownloadUrl,
-        });
+        }, 150000);
       }
 
       // Real-Time Screen Mirroring Actions
