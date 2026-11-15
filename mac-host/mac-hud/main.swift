@@ -187,6 +187,14 @@ final class MirrorWebView: WKWebView {
     }
 }
 
+// The preview viewport determines the image size, never the source pixels.
+// NSImageView's intrinsic size otherwise raises the window's layout minimum.
+final class ScaledPreviewImageView: NSImageView {
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+    }
+}
+
 final class HoverableToastView: NSVisualEffectView {
     var onHoverChanged: ((Bool) -> Void)?
     var onCardClicked: (() -> Void)?
@@ -874,6 +882,11 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         destroyMirrorView()
     }
 
+    func windowDidChangeScreen(_ notification: Notification) {
+        guard let win = notification.object as? NSWindow, win === detailPanel else { return }
+        constrainDetailPanelToScreen()
+    }
+
     func windowWillClose(_ notification: Notification) {
         guard let win = notification.object as? NSWindow, win === detailPanel else { return }
         destroyMirrorView()
@@ -902,17 +915,24 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     private func showDetailPanel() {
         guard let panel = detailPanel else { return }
-        if !panel.isVisible {
-            if let screen = NSScreen.main?.visibleFrame {
-                let w = panel.frame.width
-                let h = panel.frame.height
-                let x = screen.midX - w / 2.0
-                let y = screen.midY - h / 2.0 + 40
-                panel.setFrameOrigin(NSPoint(x: x, y: y))
-            }
-        }
+        constrainDetailPanelToScreen(center: !panel.isVisible)
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
+    }
+
+    private func constrainDetailPanelToScreen(visibleFrame: NSRect? = nil, center: Bool = false) {
+        guard let panel = detailPanel,
+              let screen = visibleFrame ?? panel.screen?.visibleFrame ?? NSScreen.main?.visibleFrame else { return }
+        panel.maxSize = screen.size
+        var frame = panel.frame
+        frame.size.width = min(frame.width, screen.width)
+        frame.size.height = min(frame.height, screen.height)
+        if center {
+            frame.origin = NSPoint(x: screen.midX - frame.width / 2, y: screen.midY - frame.height / 2)
+        }
+        frame.origin.x = max(screen.minX, min(frame.minX, screen.maxX - frame.width))
+        frame.origin.y = max(screen.minY, min(frame.minY, screen.maxY - frame.height))
+        if frame != panel.frame { panel.setFrame(frame, display: false) }
     }
 
     private func markItemReadLocally(_ itemId: String) {
@@ -1111,11 +1131,14 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             closeActiveQLPreview()
             audioPlayer?.stop()
             audioPlayer = nil
+            // Hidden views still contribute Auto Layout minimums. Rebuild on return.
+            inspectorContainer?.subviews.forEach { $0.removeFromSuperview() }
             loadMirrorView()
         } else {
             destroyMirrorView()
             rebuildSidebarAndInspector()
         }
+        constrainDetailPanelToScreen()
     }
 
     private func validatedMirrorURL() -> URL? {
@@ -1518,7 +1541,18 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         closeActionBtn.heightAnchor.constraint(equalToConstant: 28).isActive = true
         actionBar.addArrangedSubview(closeActionBtn)
 
-        vStack.addArrangedSubview(actionBar)
+        // Keep all actions reachable without forcing the window wider than the screen.
+        let actionScroll = NSScrollView()
+        actionScroll.drawsBackground = false
+        actionScroll.hasHorizontalScroller = true
+        actionScroll.autohidesScrollers = true
+        actionScroll.translatesAutoresizingMaskIntoConstraints = false
+        actionScroll.documentView = actionBar
+        vStack.addArrangedSubview(actionScroll)
+        NSLayoutConstraint.activate([
+            actionScroll.widthAnchor.constraint(equalTo: vStack.widthAnchor, constant: -32),
+            actionScroll.heightAnchor.constraint(equalToConstant: 44)
+        ])
 
         NSLayoutConstraint.activate([
             vStack.topAnchor.constraint(equalTo: container.topAnchor),
@@ -1580,7 +1614,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         let fileUrl = URL(fileURLWithPath: file.absPath)
 
         if isImageFile(file), let img = NSImage(contentsOf: fileUrl) {
-            let imgView = NSImageView()
+            let imgView = ScaledPreviewImageView()
             imgView.image = img
             imgView.imageScaling = .scaleProportionallyUpOrDown
             imgView.translatesAutoresizingMaskIntoConstraints = false
