@@ -55,6 +55,7 @@ import com.oms.client.data.StreamRepository
 import com.oms.client.otp.OtpExtractor
 import com.oms.client.otp.OtpMatch
 import com.oms.client.service.OmsCoreForegroundService
+import com.oms.client.share.AttachmentBudget
 import com.oms.client.share.AttachmentResolver
 import com.oms.client.share.ClipboardCatcherActivity
 import com.oms.client.share.ShareInputPolicy
@@ -122,7 +123,8 @@ data class OtaCheckResult(
     val remoteSizeBytes: Long = 0L,
     val remoteUpdatedAtIso: String = "",
     val downloadUrl: String = "",
-    val message: String = ""
+    val message: String = "",
+    val integritySource: VerifiedOtaPolicy.Source? = null
 )
 
 /**
@@ -1658,53 +1660,24 @@ class OmsTransportClient(
     }
 
     private fun persistOpenedShareAttachment(
-        opened: OpenedShareAttachment?,
-        budgetTracker: LongArray
+        opened: OpenedShareAttachment?, budget: AttachmentBudget.CopyBudget
     ): Uri? {
         if (opened == null) return null
-        val input = opened.stream
-        if (input == null || opened.fileName.isBlank()) {
-            mainHandler.post {
-                android.widget.Toast.makeText(
-                    context,
-                    "附件无法读取，条目将保留待发送；请检查权限或重新选择文件",
-                    android.widget.Toast.LENGTH_LONG
-                ).show()
-            }
-            return opened.originalUri
-        }
+        val input = requireNotNull(opened.stream) { "附件无法读取，请重新分享" }
+        require(opened.fileName.isNotBlank()) { "附件名称无效，请重新分享" }
         val itemDir = File(context.filesDir, "outbox_attachments/${opened.itemId}").apply { mkdirs() }
         val target = File(itemDir, opened.fileName)
-        return try {
+        try {
             input.use { src ->
                 java.io.FileOutputStream(target).use { out ->
-                    val buf = ByteArray(65536)
-                    while (true) {
-                        val n = src.read(buf)
-                        if (n < 0) break
-                        budgetTracker[0] = budgetTracker[0] + n.toLong()
-                        require(budgetTracker[0] <= DeliveryPolicy.MAX_BYTES.toLong()) { "File exceeds 64 MiB" }
-                        out.write(buf, 0, n)
-                    }
+                    budget.copy(src, out)
                     out.fd.sync()
                 }
             }
-            Uri.fromFile(target)
-        } catch (e: Throwable) {
-            runCatching { if (target.exists()) target.delete() }
-            val msg = if (e.message?.contains("64 MiB") == true) {
-                "⚠️ 单个投递附件总大小超过 64MB 上限"
-            } else {
-                "附件无法保存，条目将保留待发送；请检查权限或重新分享"
-            }
-            mainHandler.post {
-                android.widget.Toast.makeText(
-                    context,
-                    msg,
-                    android.widget.Toast.LENGTH_LONG
-                ).show()
-            }
-            opened.originalUri // Retain the reference and queue the whole item; never silently drop an attachment.
+            return Uri.fromFile(target)
+        } catch (e: Exception) {
+            target.delete()
+            throw e
         }
     }
 
@@ -1755,17 +1728,36 @@ class OmsTransportClient(
             return itemId
         }
 
+        val pendingItem = StreamItemModel(itemId, "PHONE_TO_MAC", itemType, intentTag, title,
+            textContent, voiceTranscript, null, null, "PREPARING",
+            JSONObject().put("failureReason", "附件保存中断，请从原应用重新分享").toString(), createdAtMs)
+        repo.upsertStreamItem(pendingItem)
+        val selectionError = AttachmentResolver.selectionError(context, allPrimaryUris + listOfNotNull(extraAudioUri))
+        if (selectionError != null) {
+            repo.upsertStreamItem(pendingItem.copy(syncStatus = "FAILED",
+                metadataJson = JSONObject().put("failureReason", selectionError).toString()))
+            mainHandler.post { android.widget.Toast.makeText(context, selectionError, android.widget.Toast.LENGTH_LONG).show() }
+            return itemId
+        }
         // Open transient ContentResolver streams synchronously so ShareReceiverActivity.finish()
         // cannot revoke FLAG_GRANT_READ_URI_PERMISSION before background I/O completes.
         val usedNames = mutableSetOf<String>()
-        val openedFiles = allPrimaryUris.mapIndexedNotNull { idx, u ->
-            openShareAttachmentForPersistence(u, itemId, "att${idx + 1}", usedNames)
+        val openedFiles = allPrimaryUris.mapIndexed { idx, u ->
+            checkNotNull(openShareAttachmentForPersistence(u, itemId, "att${idx + 1}", usedNames))
         }
         val openedAudio = openShareAttachmentForPersistence(extraAudioUri, itemId, "audio", usedNames)
+        // Record owned destinations before copying. Interrupted/failed submissions can be removed
+        // through the existing per-item delete action, including any partially copied file.
+        val ownedUris = (openedFiles + listOfNotNull(openedAudio)).filter { it.fileName.isNotBlank() }
+            .map { Uri.fromFile(File(context.filesDir, "outbox_attachments/$itemId/${it.fileName}")).toString() }
+        val preparingMetadata = JSONObject(pendingItem.metadataJson ?: "{}")
+            .put("extraFileUris", JSONArray(ownedUris.drop(1)))
+        val preparingItem = pendingItem.copy(localFileUri = ownedUris.firstOrNull(), metadataJson = preparingMetadata.toString())
+        repo.upsertStreamItem(preparingItem)
         scope.launch(Dispatchers.IO) {
             try {
-                val budgetTracker = longArrayOf(0L)
-                val durableFiles = openedFiles.mapNotNull { persistOpenedShareAttachment(it, budgetTracker) }
+                val budgetTracker = AttachmentBudget.CopyBudget()
+                val durableFiles = openedFiles.map { checkNotNull(persistOpenedShareAttachment(it, budgetTracker)) }
                 val durableAudio = persistOpenedShareAttachment(openedAudio, budgetTracker)
                 val metaObj = JSONObject()
                 if (durableFiles.size > 1) {
@@ -1807,6 +1799,11 @@ class OmsTransportClient(
                 )
                 repo.upsertStreamItem(item)
                 flushOutboxQueue()
+            } catch (e: Exception) {
+                val reason = "附件保存失败：${e.message ?: "无法读取"}；请从原应用重新分享"
+                repo.upsertStreamItem(preparingItem.copy(syncStatus = "FAILED",
+                    metadataJson = JSONObject(preparingItem.metadataJson ?: "{}").put("failureReason", reason).toString()))
+                mainHandler.post { android.widget.Toast.makeText(context, reason, android.widget.Toast.LENGTH_LONG).show() }
             } finally {
                 openedFiles.forEach { opened -> runCatching { opened.stream?.close() } }
                 runCatching { openedAudio?.stream?.close() }
@@ -1852,9 +1849,9 @@ class OmsTransportClient(
                 return null
             }
             val bytes = if (uri.scheme == "file" && uri.path != null) {
-                File(uri.path!!).takeIf { it.exists() }?.inputStream()?.use { DeliveryPolicy.readBounded(it) }
+                File(uri.path!!).takeIf { it.exists() }?.inputStream()?.use { java.io.ByteArrayOutputStream().also { out -> AttachmentBudget.CopyBudget().copy(it, out) }.toByteArray() }
             } else {
-                context.contentResolver.openInputStream(uri)?.use { DeliveryPolicy.readBounded(it) }
+                context.contentResolver.openInputStream(uri)?.use { java.io.ByteArrayOutputStream().also { out -> AttachmentBudget.CopyBudget().copy(it, out) }.toByteArray() }
             } ?: return null
 
             val meta = AttachmentResolver.describeUri(
@@ -1866,6 +1863,16 @@ class OmsTransportClient(
         } catch (_: Throwable) {
             null
         }
+    }
+
+    fun retryQuotaRejectedItem(itemId: String) {
+        val item = repo.getStreamItem(itemId) ?: return
+        val metadata = runCatching { JSONObject(item.metadataJson ?: "{}") }.getOrNull() ?: return
+        if (item.direction != "PHONE_TO_MAC" || item.syncStatus != "FAILED" || metadata.optString("failureCode") != "INBOX_QUOTA") return
+        metadata.remove("failureCode")
+        metadata.remove("failureReason")
+        repo.upsertStreamItem(item.copy(syncStatus = "QUEUED", metadataJson = metadata.toString()))
+        flushOutboxQueue()
     }
 
     fun flushOutboxQueue() {
@@ -1882,10 +1889,13 @@ class OmsTransportClient(
                         val source = activeSource()
                         val attachments = JSONArray()
                         var totalAttachmentBytes = 0L
+                        val originalSizes = mutableListOf<Long?>()
                         fun attach(uri: String?) {
                             if (uri.isNullOrBlank()) return
                             val (rawBytes, rawMime, rawName) = readUriBytesAndMime(uri, item.itemId.takeLast(8))
-                                ?: throw IllegalStateException("Queued attachment is unavailable")
+                                ?: throw IllegalArgumentException("附件无法读取或超过 30 MiB，请从原应用重新分享")
+                            originalSizes.add(rawBytes.size.toLong())
+                            AttachmentBudget.validateSizes(originalSizes)
                             val (bytes, mime, name) = if (source.tier == "BT_RFCOMM" && rawMime.startsWith("image/") && rawBytes.size > 100 * 1024) {
                                 val compressed = ScopedStorageExecutor.compressToWebpIfPossible(
                                     rawBytes,
@@ -1907,14 +1917,17 @@ class OmsTransportClient(
                                 .put("sha256", OmsFrameProtocol.sha256Hex(bytes)))
                         }
                         val metadata = item.metadataJson?.takeIf { it.isNotBlank() }?.let { JSONObject(it) }
-                        attach(item.localFileUri)
-                        val extraFileArr = metadata?.optJSONArray("extraFileUris")
-                        if (extraFileArr != null) {
-                            for (i in 0 until extraFileArr.length()) {
-                                attach(extraFileArr.optString(i, ""))
+                        val attachmentUris = buildList {
+                            item.localFileUri?.takeIf { it.isNotBlank() }?.let { add(it) }
+                            val extras = metadata?.optJSONArray("extraFileUris")
+                            if (extras != null) for (i in 0 until extras.length()) {
+                                extras.optString(i).takeIf { it.isNotBlank() }?.let { add(it) }
                             }
+                            metadata?.optString("extraAudioUri")?.takeIf { it.isNotBlank() }?.let { add(it) }
                         }
-                        attach(metadata?.optString("extraAudioUri", ""))
+                        AttachmentBudget.validateCount(attachmentUris.size)
+                        AttachmentBudget.validateSizes(attachmentUris.map { AttachmentResolver.describeUri(context, Uri.parse(it)).sizeBytes })
+                        attachmentUris.forEach { attach(it) }
                         val request = JSONObject().put("jsonrpc", "2.0")
                             .put("id", "inbox_${UUID.randomUUID()}").put("method", "inbox.submitItem")
                             .put("params", JSONObject().put("clientItemId", item.itemId).put("intentTag", item.intentTag)
@@ -1933,8 +1946,17 @@ class OmsTransportClient(
                         if (DeliveryPolicy.committedInboxAck(result.optBoolean("ack"), result.optString("savedId"), item.itemId)) {
                             repo.updateSyncStatus(item.itemId, "DELIVERED", result.optString("macPath"))
                         }
-                    } catch (_: Exception) {
-                        // Keep QUEUED: a send/write/timeout/error is never proof of durable delivery.
+                    } catch (e: IllegalArgumentException) {
+                        val failedMeta = runCatching { JSONObject(item.metadataJson ?: "{}") }.getOrDefault(JSONObject())
+                        failedMeta.put("failureReason", e.message ?: "附件无效，请重新分享")
+                        repo.upsertStreamItem(item.copy(syncStatus = "FAILED", metadataJson = failedMeta.toString()))
+                    } catch (e: Exception) {
+                        if (DeliveryPolicy.isInboxQuotaError(e.message)) {
+                            val failedMeta = runCatching { JSONObject(item.metadataJson ?: "{}") }.getOrDefault(JSONObject())
+                            failedMeta.put("failureReason", e.message).put("failureCode", "INBOX_QUOTA")
+                            repo.upsertStreamItem(item.copy(syncStatus = "FAILED", metadataJson = failedMeta.toString()))
+                        }
+                        // Network failures remain QUEUED; quota rejection is visible and explicitly retryable.
                     }
                 }
             } finally {
@@ -2031,30 +2053,35 @@ class OmsTransportClient(
         }
     }
 
+    private val otaInstaller = VerifiedOtaInstaller(context)
+
+    private suspend fun installVerifiedOta(ota: OtaCheckResult) {
+        check(ota.ok && ota.hasUpdate) { ota.message.ifBlank { "当前没有可安装的更新" } }
+        val metadata = VerifiedOtaPolicy.Metadata(ota.downloadUrl, ota.remoteSha256, ota.remoteSizeBytes,
+            ota.remoteVersionName, ota.remoteVersionCode.toLong(), ota.integritySource)
+        val client = if (ota.downloadUrl.startsWith("http://")) buildLanOkHttpClient() else baseHttpClient
+        otaInstaller.install(metadata, client)
+    }
+
+    fun installOtaUpdate(ota: OtaCheckResult, onResult: (String) -> Unit) {
+        scope.launch {
+            val message = try {
+                installVerifiedOta(ota)
+                "APK 校验通过，已打开系统安装器，请确认安装"
+            } catch (e: Exception) { "更新未安装：${e.message ?: "下载或校验失败"}" }
+            mainHandler.post { onResult(message) }
+        }
+    }
+
     fun checkOtaUpdate(onResult: (OtaCheckResult) -> Unit) {
         scope.launch {
             val (localVerName, localVerCode, localSha) = getInstalledApkInfo()
-            var paired = repo.getPairedMac()
-            if (paired == null) {
-                mainHandler.post {
-                    onResult(
-                        OtaCheckResult(
-                            ok = false,
-                            hasUpdate = false,
-                            localVersionName = localVerName,
-                            localVersionCode = localVerCode,
-                            localSha256 = localSha,
-                            message = "🔒 尚未绑定 Mac，请先完成 1 对 1 安全配对"
-                        )
-                    )
-                }
-                return@launch
-            }
-            val port = paired.lanPort
+            val paired = repo.getPairedMac()
+            val port = paired?.lanPort ?: 19527
 
             // 1. Priority 1: Query Mac directly over the active encrypted channel (works over LAN_WS, BT_RFCOMM, and WAN_WEBRTC!)
             val activeSrc = runCatching { activeSource() }.getOrNull()
-            if (activeSrc != null) {
+            if (activeSrc != null && paired != null) {
                 try {
                     val rpcReq = JSONObject()
                         .put("jsonrpc", "2.0")
@@ -2087,6 +2114,8 @@ class OmsTransportClient(
                             } else {
                                 ghUrl
                             }
+                            VerifiedOtaPolicy.Metadata(resolvedDownloadUrl, remoteSha, remoteSize, remoteVerName,
+                                remoteVerCode.toLong(), VerifiedOtaPolicy.Source.AUTHENTICATED_RPC).validate()
                             val hasUpdate = OtaVersionPolicy.hasMacHostUpdate(
                                 localVersionName = localVerName,
                                 localVersionCode = localVerCode,
@@ -2107,6 +2136,7 @@ class OmsTransportClient(
                                         remoteVersionName = remoteVerName,
                                         remoteVersionCode = remoteVerCode,
                                         remoteSha256 = remoteSha,
+                                        integritySource = VerifiedOtaPolicy.Source.AUTHENTICATED_RPC,
                                         remoteSizeBytes = remoteSize,
                                         remoteUpdatedAtIso = remoteUpdatedIso,
                                         downloadUrl = resolvedDownloadUrl,
@@ -2122,84 +2152,17 @@ class OmsTransportClient(
                         }
                     }
                 } catch (_: Throwable) {
-                    // Fallback to LAN HTTP or GitHub Release API if Mac daemon has not yet updated to support apk.getVersion
+                    // Only the HTTPS GitHub API is a trusted fallback for update metadata.
                 }
             }
 
-            // 2. Priority 2: Probe Mac LAN HTTP /apk/version if reachable
-            var ip = paired.lanIps.firstOrNull {
-                val info = probeMacHttpInfo(it, port, 1500, checkTcpFirst = false)
-                info != null && info.macId == paired!!.macId
-            }
-            if (ip == null && activeSrc?.tier != "BT_RFCOMM") {
-                val discovered = discoverMacOnLan(port, paired.macId, allowSubnetScan = false)
-                if (discovered != null) {
-                    paired = discovered
-                    ip = discovered.lanIps.firstOrNull()
-                }
-            }
-            if (!ip.isNullOrBlank()) {
-                val versionUrl = "http://$ip:$port/apk/version?t=${System.currentTimeMillis()}"
-                val downloadUrl = "http://$ip:$port/OneMoreStep.apk?t=${System.currentTimeMillis()}"
-                try {
-                    val client = buildLanOkHttpClient()
-                    val req = Request.Builder().url(versionUrl).get().build()
-                    client.newCall(req).execute().use { resp ->
-                        if (resp.isSuccessful) {
-                            val bodyStr = resp.body?.string() ?: "{}"
-                            val json = JSONObject(bodyStr)
-                            val available = json.optBoolean("available", false)
-                            val remoteVerCode = json.optInt("versionCode", 0)
-                            val remoteVerName = json.optString("versionName", "1.1.0")
-                            val remoteSha = json.optString("sha256", "")
-                            val remoteSize = json.optLong("sizeBytes", 0L)
-                            val remoteUpdatedIso = json.optString("updatedAtIso", "")
-
-                            if (available && remoteSha.isNotBlank()) {
-                                val hasUpdate = OtaVersionPolicy.hasMacHostUpdate(
-                                    localVersionName = localVerName,
-                                    localVersionCode = localVerCode,
-                                    localSha256 = localSha,
-                                    remoteVersionName = remoteVerName,
-                                    remoteVersionCode = remoteVerCode,
-                                    remoteSha256 = remoteSha
-                                )
-
-                                mainHandler.post {
-                                    onResult(
-                                        OtaCheckResult(
-                                            ok = true,
-                                            hasUpdate = hasUpdate,
-                                            localVersionName = localVerName,
-                                            localVersionCode = localVerCode,
-                                            localSha256 = localSha,
-                                            remoteVersionName = remoteVerName,
-                                            remoteVersionCode = remoteVerCode,
-                                            remoteSha256 = remoteSha,
-                                            remoteSizeBytes = remoteSize,
-                                            remoteUpdatedAtIso = remoteUpdatedIso,
-                                            downloadUrl = downloadUrl,
-                                            message = if (hasUpdate) {
-                                                "发现新版本 v$remoteVerName"
-                                            } else {
-                                                "✅ 当前已是最新版本 (v$localVerName)"
-                                            }
-                                        )
-                                    )
-                                }
-                                return@launch
-                            }
-                        }
-                    }
-                } catch (_: Throwable) {
-                }
-            }
-
+            // Plain HTTP /apk/version cannot authenticate a digest, even on a paired LAN.
             // 3. Priority 3: Fallback to GitHub Releases API when LAN HTTP is isolated/unreachable
             try {
                 val ghClient = baseHttpClient.newBuilder()
                     .connectTimeout(5, TimeUnit.SECONDS)
                     .readTimeout(6, TimeUnit.SECONDS)
+                    .followRedirects(false)
                     .build()
                 val ghReq = Request.Builder()
                     .url("https://api.github.com/repos/dqrcsc/one-more-step/releases/latest")
@@ -2220,7 +2183,7 @@ class OmsTransportClient(
                                 val apkAsset = (0 until assets.length())
                                     .map { assets.getJSONObject(it) }
                                     .firstOrNull { it.optString("name", "").endsWith(".apk", ignoreCase = true) }
-                                    ?: assets.getJSONObject(0)
+                                    ?: throw IllegalStateException("GitHub Release 没有 APK")
                                 assetUrl = apkAsset.optString("browser_download_url", assetUrl)
                                 assetSize = apkAsset.optLong("size", 0L)
                                 assetUpdatedIso = apkAsset.optString("updated_at", assetUpdatedIso)
@@ -2229,6 +2192,8 @@ class OmsTransportClient(
                                     assetSha256 = digest.substringAfter(':').trim()
                                 }
                             }
+                            VerifiedOtaPolicy.Metadata(assetUrl, assetSha256, assetSize, tagName, 0,
+                                VerifiedOtaPolicy.Source.GITHUB_HTTPS).validate()
                             val hasUpdate = OtaVersionPolicy.hasGithubReleaseUpdate(
                                 localVersionName = localVerName,
                                 releaseTagName = tagName,
@@ -2244,8 +2209,9 @@ class OmsTransportClient(
                                         localVersionCode = localVerCode,
                                         localSha256 = localSha,
                                         remoteVersionName = tagName,
-                                        remoteVersionCode = if (hasUpdate) localVerCode + 1 else localVerCode,
-                                        remoteSha256 = assetSha256.ifBlank { "github_release" },
+                                        remoteVersionCode = 0,
+                                        remoteSha256 = assetSha256,
+                                        integritySource = VerifiedOtaPolicy.Source.GITHUB_HTTPS,
                                         remoteSizeBytes = assetSize,
                                         remoteUpdatedAtIso = assetUpdatedIso,
                                         downloadUrl = assetUrl,
@@ -2689,34 +2655,13 @@ class OmsTransportClient(
                         JSONObject().put("ok", ok)
                     }
                     "sys.otaUpdate" -> {
-                        val paired = repo.getPairedMac()
-                        val ip = params.optString("ip").takeIf { it.isNotBlank() }
-                            ?: paired?.lanIps?.firstOrNull()
-                            ?: "127.0.0.1"
-                        val port = params.optInt("port", paired?.lanPort ?: 19527)
-                        val ghUrl = params.optString("githubDownloadUrl").takeIf { it.isNotBlank() }
-                        val rawUrl = params.optString("url").takeIf { it.isNotBlank() }
-                            ?: "http://$ip:$port/OneMoreStep.apk?t=${System.currentTimeMillis()}"
-                        val url = if (source.tier == "BT_RFCOMM" && !ghUrl.isNullOrBlank() &&
-                            probeMacHttpInfo(ip, port, 1000, checkTcpFirst = false) == null
-                        ) {
-                            ghUrl
-                        } else {
-                            rawUrl
-                        }
-                        mainHandler.post {
-                            try {
-                                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
-                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                }
-                                context.startActivity(intent)
-                            } catch (_: Throwable) {
-                            }
-                        }
-                        JSONObject().apply {
-                            put("ok", true)
-                            put("url", url)
-                        }
+                        // Re-query authenticated metadata; a caller-supplied bare URL is not an integrity source.
+                        val checked = CompletableDeferred<OtaCheckResult>()
+                        checkOtaUpdate { checked.complete(it) }
+                        val ota = checked.await()
+                        installVerifiedOta(ota)
+                        JSONObject().put("ok", true).put("status", "installer_launched")
+                            .put("message", "APK 已验证，请在手机系统安装器中确认；尚未确认安装完成")
                     }
                     "alarm.set" -> AlarmExecutor.setSystemAlarm(context, params)
                     "calendar.list" -> CalendarExecutor.listEvents(context, params)

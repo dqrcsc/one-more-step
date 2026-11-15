@@ -91,6 +91,8 @@ object DeliveryPolicy {
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
+    fun isInboxQuotaError(message: String?): Boolean = message?.startsWith("ERR_INBOX_QUOTA:") == true
+
     fun committedInboxAck(ack: Boolean, savedId: String?, itemId: String): Boolean = ack && savedId == itemId
     fun approvalCanDispatch(expiresAtMs: Long, nowMs: Long, status: String): Boolean =
         status == "PENDING_APPROVAL" && expiresAtMs > nowMs

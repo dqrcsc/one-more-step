@@ -64,6 +64,7 @@ class StreamRepository(context: Context) :
     private var pairedMacLoaded = false
 
     init {
+        writableDatabase.execSQL("UPDATE stream_items SET sync_status = 'FAILED' WHERE sync_status = 'PREPARING'")
         refreshFlow()
     }
 
@@ -311,7 +312,7 @@ class StreamRepository(context: Context) :
     }
 
     fun isCameraPillEnabled(): Boolean {
-        return prefs.getBoolean("camera_pill_enabled", true)
+        return prefs.getBoolean("camera_pill_enabled", false)
     }
 
     fun setCameraPillEnabled(enabled: Boolean) {

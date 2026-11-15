@@ -5,6 +5,12 @@ import org.junit.Test
 import java.security.MessageDigest
 
 class DeliveryPolicyTest {
+    @org.junit.Test fun `quota rejection is distinguished from retryable network errors`() {
+        org.junit.Assert.assertTrue(DeliveryPolicy.isInboxQuotaError("ERR_INBOX_QUOTA: 收件箱已满"))
+        org.junit.Assert.assertFalse(DeliveryPolicy.isInboxQuotaError("Host acknowledgement timed out"))
+        org.junit.Assert.assertFalse(DeliveryPolicy.isInboxQuotaError(null))
+    }
+
     private val id = "019a1234-1234-7123-8123-123456789abc"
     private fun header(bytes: ByteArray = byteArrayOf(1, 2, 3), chunkSize: Int = 2) = DeliveryPolicy.Header(
         id, bytes.size.toLong(), chunkSize, ((bytes.size + chunkSize - 1) / chunkSize).coerceAtLeast(1),

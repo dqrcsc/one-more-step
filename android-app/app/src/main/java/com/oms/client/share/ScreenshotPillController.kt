@@ -79,7 +79,7 @@ class ScreenshotPillController(private val context: Context) {
             MediaStore.Images.Media.DATE_ADDED,
             MediaStore.Images.Media.IS_PENDING
         )
-        val cameraEnabled = OmsApplication.instance?.repository?.isCameraPillEnabled() ?: true
+        val cameraEnabled = OmsApplication.instance?.repository?.isCameraPillEnabled() ?: false
 
         context.contentResolver.query(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
@@ -143,7 +143,7 @@ class ScreenshotPillController(private val context: Context) {
                     voiceTranscript = null,
                     fileUri = imageUri
                 )
-                text = "✅ 已送达 Mac"
+                text = "正在保存，查看首页状态"
                 mainHandler.postDelayed({ dismissPill() }, 700L)
             }
         }
@@ -163,7 +163,7 @@ class ScreenshotPillController(private val context: Context) {
                     voiceTranscript = null,
                     fileUri = imageUri
                 )
-                sendBtn.text = "✅ 已存知识库"
+                sendBtn.text = "正在保存，查看首页状态"
                 mainHandler.postDelayed({ dismissPill() }, 700L)
             }
         }

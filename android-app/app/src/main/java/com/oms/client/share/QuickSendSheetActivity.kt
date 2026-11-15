@@ -211,20 +211,28 @@ fun QuickSendSheetScreen(
         }
     }
 
-    val photoPickerLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickMultipleVisualMedia(12)
-    ) { uris ->
-        uris.forEach { u ->
-            if (u !in selectedUris) selectedUris.add(u)
+    fun addSelection(uris: List<Uri>): Boolean {
+        val next = (selectedUris + uris).distinct()
+        val error = AttachmentResolver.selectionError(context, next + listOfNotNull(recordedAudioFile?.let { Uri.fromFile(it) }))
+        if (error != null) {
+            Toast.makeText(context, error, Toast.LENGTH_LONG).show()
+            return false
         }
+        selectedUris.clear()
+        selectedUris.addAll(next)
+        return true
+    }
+
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(AttachmentBudget.MAX_COUNT)
+    ) { uris ->
+        addSelection(uris)
     }
 
     val documentPickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
-        uris.forEach { u ->
-            if (u !in selectedUris) selectedUris.add(u)
-        }
+        addSelection(uris)
     }
 
     val audioPermLauncher = rememberLauncherForActivityResult(
@@ -264,6 +272,11 @@ fun QuickSendSheetScreen(
         val audioFile = recordedAudioFile
         if (selectedUris.isEmpty() && cleanText.isEmpty() && audioFile == null) {
             Toast.makeText(context, "请先选择图片/文件、粘贴剪贴板或输入内容", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val selectionError = AttachmentResolver.selectionError(context, selectedUris + listOfNotNull(audioFile?.let { Uri.fromFile(it) }))
+        if (selectionError != null) {
+            Toast.makeText(context, selectionError, Toast.LENGTH_LONG).show()
             return
         }
         val tc = OmsApplication.instance?.transportClient
@@ -306,9 +319,9 @@ fun QuickSendSheetScreen(
             additionalFileUris = extraFiles
         )
         val summary = when {
-            metas.isNotEmpty() -> "🚀 已发送 ${metas.size} 个附件至 Mac (#$selectedTag)"
-            audioFile != null -> "🚀 语音 (${recordedAudioSec}秒) 已发往 Mac"
-            else -> "🚀 内容已发往 Mac (#$selectedTag)"
+            metas.isNotEmpty() -> "正在保存 ${metas.size} 个附件，投递状态请查看首页"
+            audioFile != null -> "正在保存语音，投递状态请查看首页"
+            else -> "内容已加入发送队列"
         }
         Toast.makeText(context, summary, Toast.LENGTH_SHORT).show()
         onDismiss()
@@ -382,7 +395,7 @@ fun QuickSendSheetScreen(
                                 item = img,
                                 selected = isChosen,
                                 onToggle = {
-                                    if (isChosen) selectedUris.remove(img.uri) else selectedUris.add(img.uri)
+                                    if (isChosen) selectedUris.remove(img.uri) else addSelection(listOf(img.uri))
                                 }
                             )
                         }
@@ -423,8 +436,9 @@ fun QuickSendSheetScreen(
                             val txt = clipItem?.coerceToText(context)?.toString()?.trim().orEmpty()
                             val clipUri = clipItem?.uri
                             if (clipUri != null && ShareInputPolicy.isSafeExternalStreamUri(clipUri, context.applicationInfo?.dataDir)) {
-                                if (clipUri !in selectedUris) selectedUris.add(clipUri)
-                                Toast.makeText(context, "📋 已添加剪贴板文件附件", Toast.LENGTH_SHORT).show()
+                                if (addSelection(listOf(clipUri))) {
+                                    Toast.makeText(context, "📋 已添加剪贴板文件附件", Toast.LENGTH_SHORT).show()
+                                }
                             } else if (txt.isNotEmpty()) {
                                 noteText = if (noteText.isBlank()) txt else "$noteText\n$txt"
                                 Toast.makeText(context, "📋 已读取剪贴板文本", Toast.LENGTH_SHORT).show()

@@ -185,7 +185,7 @@ class VoiceIdeaActivity : Activity() {
             fileUri = primaryUri,
             extraAudioUri = if (screenshotUri != null && audioFile != null) Uri.fromFile(audioFile) else null
         )
-        Toast.makeText(this, "✅ 已加入待发送队列", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "正在保存，投递状态请查看首页", Toast.LENGTH_SHORT).show()
         finish()
     }
 

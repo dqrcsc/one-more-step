@@ -86,6 +86,7 @@ import com.oms.client.data.StreamItemModel
 import com.oms.client.otp.OtpExtractor
 import com.oms.client.otp.OtpMatch
 import com.oms.client.service.OmsCoreForegroundService
+import com.oms.client.share.AttachmentBudget
 import com.oms.client.share.AttachmentResolver
 import com.oms.client.transport.OtaCheckResult
 import com.oms.client.xiaomi.XiaomiAdaptationHelper
@@ -246,20 +247,23 @@ fun OneMoreStepMainScreen() {
     var selectedTag by remember { mutableStateOf("default_inbox") }
     val stagedAttachmentUris = remember { mutableStateListOf<Uri>() }
 
+    fun addStagedAttachments(uris: List<Uri>) {
+        val next = (stagedAttachmentUris + uris).distinct()
+        val error = AttachmentResolver.selectionError(context, next)
+        if (error != null) Toast.makeText(context, error, Toast.LENGTH_LONG).show()
+        else { stagedAttachmentUris.clear(); stagedAttachmentUris.addAll(next) }
+    }
+
     val photoPickerLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickMultipleVisualMedia(12)
+        ActivityResultContracts.PickMultipleVisualMedia(AttachmentBudget.MAX_COUNT)
     ) { uris ->
-        uris.forEach { u ->
-            if (u !in stagedAttachmentUris) stagedAttachmentUris.add(u)
-        }
+        addStagedAttachments(uris)
     }
 
     val documentPickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
-        uris.forEach { u ->
-            if (u !in stagedAttachmentUris) stagedAttachmentUris.add(u)
-        }
+        addStagedAttachments(uris)
     }
 
     // Filter, Search, Voice Recording & OTA states
@@ -394,15 +398,10 @@ fun OneMoreStepMainScreen() {
             confirmButton = {
                 Button(
                     onClick = {
-                        val url = ota.downloadUrl
                         pendingOtaDialog = null
-                        try {
-                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
-                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            }
-                            context.startActivity(intent)
-                        } catch (e: Throwable) {
-                            Toast.makeText(context, "打开下载链接失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "正在下载并校验 APK…", Toast.LENGTH_LONG).show()
+                        app.transportClient.installOtaUpdate(ota) { message ->
+                            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF16A34A))
@@ -1066,7 +1065,7 @@ fun OneMoreStepMainScreen() {
                                         )
                                         composerText = ""
                                         stagedAttachmentUris.clear()
-                                        Toast.makeText(context, "🚀 语音 (${sec}秒) 已发送至 Mac！", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(context, "正在保存语音，投递状态请查看首页", Toast.LENGTH_SHORT).show()
                                     }
                                 },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF16A34A)),
@@ -1161,7 +1160,7 @@ fun OneMoreStepMainScreen() {
                                     composerText = ""
                                     stagedAttachmentUris.clear()
                                     if (attached.isNotEmpty()) {
-                                        Toast.makeText(context, "🚀 已发送 ${attached.size} 个附件至 Mac", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(context, "正在保存 ${attached.size} 个附件，投递状态请查看首页", Toast.LENGTH_SHORT).show()
                                     }
                                 }
                             },
@@ -1193,7 +1192,7 @@ fun XiaomiPermissionWizardCard(context: Context, onDismiss: (() -> Unit)? = null
         mutableStateOf(app?.repository?.isAutoSyncOtpEnabled() ?: true)
     }
     var cameraPillEnabled by remember {
-        mutableStateOf(app?.repository?.isCameraPillEnabled() ?: true)
+        mutableStateOf(app?.repository?.isCameraPillEnabled() ?: false)
     }
     val health = remember(refreshTick) { XiaomiAdaptationHelper.inspectAll(context) }
     Card(
@@ -1546,6 +1545,8 @@ fun StreamTimelineCard(item: StreamItemModel) {
                     val statusLabel = when (item.syncStatus) {
                         "DELIVERED" -> "✓ 已送达"
                         "QUEUED" -> "⏳ 待发送"
+                        "PREPARING" -> "正在保存附件"
+                        "FAILED" -> "发送失败"
                         "EXPIRED" -> "审批已过期"
                         "PENDING_APPROVAL" -> "⚠️ 待审批"
                         "APPROVED" -> "✅ 已批准"
@@ -1586,6 +1587,14 @@ fun StreamTimelineCard(item: StreamItemModel) {
                     }
                 }
                 names.joinToString(" · ")
+            }
+
+            if (item.syncStatus == "FAILED") {
+                val failedMeta = runCatching { JSONObject(item.metadataJson ?: "{}") }.getOrDefault(JSONObject())
+                Text(failedMeta.optString("failureReason", "请从原应用重新分享"), color = Color(0xFFFBBF24), fontSize = 12.sp)
+                if (failedMeta.optString("failureCode") == "INBOX_QUOTA") {
+                    TextButton(onClick = { app.transportClient.retryQuotaRejectedItem(item.itemId) }) { Text("Mac 整理后重试") }
+                }
             }
 
             // 2. Body Row (Compact 2-line preview with optional image thumbnail vs Full Expanded View)

@@ -19,6 +19,12 @@ data class ResolvedAttachmentMeta(
  * shared / picked URIs (Album images, PDF, Word .doc/.docx, Excel .xls/.xlsx, PPT, Markdown, ZIP, etc.).
  */
 object AttachmentResolver {
+    fun selectionError(context: Context, uris: List<Uri>): String? = try {
+        AttachmentBudget.validateCount(uris.size)
+        AttachmentBudget.validateSizes(uris.map { describeUri(context, it).sizeBytes })
+        null
+    } catch (e: IllegalArgumentException) { e.message }
+
 
     private val EXT_TO_MIME = mapOf(
         // Images

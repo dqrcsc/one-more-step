@@ -97,6 +97,11 @@ class ShareReceiverActivity : ComponentActivity() {
         val sharedText = incoming.getStringExtra(Intent.EXTRA_TEXT).orEmpty()
         val sharedSubject = incoming.getStringExtra(Intent.EXTRA_SUBJECT)
 
+        AttachmentResolver.selectionError(this, extractedUris)?.let {
+            Toast.makeText(this, it, Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
         if (extractedUris.isEmpty() && sharedText.isBlank()) {
             val hadRawStream = hasAnyRawStreamAttempt(incoming)
             Toast.makeText(
@@ -214,7 +219,7 @@ class ShareReceiverActivity : ComponentActivity() {
         )
         Toast.makeText(
             this,
-            if (uris.size > 1) "✅ 已合并投递 ${uris.size} 个文件至 Mac (#$intentTag)" else "✅ 已发往 Mac (#$intentTag)",
+            if (uris.isNotEmpty()) "正在保存附件，投递状态请查看首页" else "内容已加入发送队列",
             Toast.LENGTH_SHORT
         ).show()
     }
