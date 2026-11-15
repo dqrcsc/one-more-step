@@ -1755,6 +1755,7 @@ let latestFrame = null;
 let decoding = false;
 let rippleAnimation = null;
 const pendingInputs = new Map();
+let textSubmission = null;
 const pendingHttp = new Map();
 let phoneWidth = 1080;
 let phoneHeight = 2400;
@@ -1833,7 +1834,7 @@ function refreshControls() {
   document.querySelectorAll('button[onclick]').forEach(button => {
     const action = button.getAttribute('onclick') || '';
     if (action.includes('toggleStartStop')) return;
-    button.disabled = !canControl(action.includes('wakeAndUnlock'));
+    button.disabled = !canControl(action.includes('wakeAndUnlock')) || (action.includes('submitMirrorText') && textSubmission !== null);
   });
   document.getElementById('mirrorTextInput').disabled = !canControl();
   document.getElementById('presetSelect').disabled = !active || !isRunning;
@@ -2061,6 +2062,7 @@ function beginWatching() {
 function hostDeactivate() {
   active = false;
   generation++;
+  textSubmission = null;
   isRunning = false;
   clearTimeout(reconnectTimer);
   clearTimeout(connectTimer);
@@ -2210,11 +2212,20 @@ function onTextInputKey(e) {
 }
 
 async function submitMirrorText(submitEnter) {
+  if (textSubmission !== null) { showToast('文字仍在确认中，请稍后'); return; }
   const input = document.getElementById('mirrorTextInput');
   const text = input.value;
   if (!text) return;
-  const ok = await sendCommand({ type: 'input', inputType: 'text', text, append: false, submit: Boolean(submitEnter) });
-  if (ok && input.value === text) input.value = '';
+  const token = {};
+  const session = generation;
+  textSubmission = token;
+  refreshControls();
+  try {
+    const ok = await sendCommand({ type: 'input', inputType: 'text', text, append: false, submit: Boolean(submitEnter) });
+    if (ok && active && session === generation && textSubmission === token && input.value === text) input.value = '';
+  } finally {
+    if (textSubmission === token) { textSubmission = null; refreshControls(); }
+  }
 }
 
 function sendNav(target) {

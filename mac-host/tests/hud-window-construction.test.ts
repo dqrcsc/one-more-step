@@ -83,6 +83,23 @@ extension OmsMacHudAppDelegate {
         precondition(actions.hasHorizontalScroller && actions.documentView!.frame.width > actions.contentView.bounds.width,
             "Narrow action row must scroll to reach all buttons")
         precondition(close.frame.maxX <= actions.documentView!.bounds.maxX && close.frame.height > 0)
+        let existingPane = inspectorContainer!.subviews.first!
+        let textView = descendants(inspectorContainer!).compactMap { $0 as? NSTextView }.first!
+        textView.setSelectedRange(NSRange(location: 1, length: 4))
+        handleEnvelope(HudIncomingEnvelope(type: "sync_items", items: items, item: nil, toast: nil, status: nil, itemId: nil))
+        precondition(inspectorContainer!.subviews.first === existingPane, "Unchanged sync replaced detail")
+        precondition(textView.selectedRange() == NSRange(location: 1, length: 4), "Sync lost text selection")
+        items.append(HudInboxItem(itemId: "other", receivedAt: "", createdAtMs: 1,
+            intentTag: "default_inbox", title: "Other", textContent: "Unrelated update", voiceTranscript: nil,
+            sourceApp: nil, otpCode: nil, otpSender: nil, processed: false, files: []))
+        refreshDetailPanelIfVisible()
+        precondition(sidebarStack?.arrangedSubviews.count == 2)
+        precondition(inspectorContainer!.subviews.first === existingPane, "Unrelated item replaced detail")
+        items[0].processed = true
+        refreshDetailPanelIfVisible()
+        precondition(inspectorContainer!.subviews.first !== existingPane, "Changed detail failed to refresh")
+        items[0].processed = false
+        refreshDetailPanelIfVisible()
         precondition(!panel.hidesOnDeactivate, "System hides pinned panel on app switch")
         precondition(panel.level == .normal)
         pinButton?.performClick(nil)
@@ -117,6 +134,12 @@ extension OmsMacHudAppDelegate {
         precondition(viewer.scroll.magnification == 1)
         viewer.fitImage()
         precondition(viewer.scroll.magnification < 1)
+        viewer.scroll.magnification = 0.7
+        NotificationCenter.default.post(name: NSScrollView.didEndLiveMagnifyNotification, object: viewer.scroll)
+        viewer.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: viewer.window))
+        precondition(abs(viewer.scroll.magnification - 0.7) < 0.001, "Resize discarded gesture zoom")
+        viewer.fitImage()
+        precondition(viewer.scroll.magnification < 0.7, "Explicit fit no longer works")
         viewer.window?.cancelOperation(nil)
         precondition(imagePreview == nil && !viewer.window!.isVisible && panel.isVisible)
         precondition(image.accessibilityPerformPress())

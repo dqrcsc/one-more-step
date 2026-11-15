@@ -7,7 +7,7 @@ import WebKit
 
 // MARK: - Wire Models
 
-struct HudStoredFile: Codable {
+struct HudStoredFile: Codable, Equatable {
     let fileName: String
     let absPath: String
     let mimeType: String
@@ -15,7 +15,7 @@ struct HudStoredFile: Codable {
     let sha256: String?
 }
 
-struct HudInboxItem: Codable {
+struct HudInboxItem: Codable, Equatable {
     let itemId: String
     let receivedAt: String
     let createdAtMs: Double
@@ -229,6 +229,7 @@ final class ImagePreviewController: NSWindowController, NSWindowDelegate {
     let scroll = NSScrollView()
     private let imageSize: NSSize
     private var fitsWindow = true
+    private var magnificationObserver: NSObjectProtocol?
     var onClose: (() -> Void)?
 
     init(image: NSImage, title: String, screen: NSRect) {
@@ -268,6 +269,9 @@ final class ImagePreviewController: NSWindowController, NSWindowDelegate {
         imageView.image = image
         imageView.imageScaling = .scaleProportionallyUpOrDown
         scroll.documentView = imageView
+        magnificationObserver = NotificationCenter.default.addObserver(
+            forName: NSScrollView.didEndLiveMagnifyNotification, object: scroll, queue: .main
+        ) { [weak self] _ in self?.fitsWindow = false }
         content.addSubview(scroll)
         NSLayoutConstraint.activate([
             toolbar.centerXAnchor.constraint(equalTo: content.centerXAnchor),
@@ -279,6 +283,9 @@ final class ImagePreviewController: NSWindowController, NSWindowDelegate {
         ])
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+    deinit {
+        if let observer = magnificationObserver { NotificationCenter.default.removeObserver(observer) }
+    }
     @objc func fitImage() {
         fitsWindow = true
         window?.layoutIfNeeded()
@@ -534,6 +541,8 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     // Subviews inside detail panel
     private var sidebarStack: NSStackView?
     private var inspectorContainer: NSView?
+    private var renderedInspectorItem: HudInboxItem?
+    private var renderedAttachmentIndex: Int?
     private var pinButton: NSButton?
     private var detailTabs: NSSegmentedControl?
     private var inboxContent: NSView?
@@ -1055,7 +1064,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     private func refreshDetailPanelIfVisible() {
         guard let panel = detailPanel, panel.isVisible else { return }
-        if selectedDetailTab == 0 { rebuildSidebarAndInspector() }
+        if selectedDetailTab == 0 { rebuildSidebarAndInspector(preserveInspector: true) }
     }
 
     private func buildDetailPanelWindow() {
@@ -1387,7 +1396,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         }
     }
 
-    private func rebuildSidebarAndInspector() {
+    private func rebuildSidebarAndInspector(preserveInspector: Bool = false) {
         guard let stack = sidebarStack else { return }
         stack.arrangedSubviews.forEach { v in
             stack.removeArrangedSubview(v)
@@ -1411,6 +1420,9 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             }
         }
 
+        // Background sync must not reset text selection, document scroll or playback.
+        if preserveInspector && currentSelectedItem() == renderedInspectorItem &&
+            selectedAttachmentIndex == renderedAttachmentIndex && inspectorContainer?.subviews.isEmpty == false { return }
         rebuildInspectorPane()
     }
 
@@ -1477,6 +1489,8 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         audioPlayer = nil
 
         guard let container = inspectorContainer else { return }
+        renderedInspectorItem = currentSelectedItem()
+        renderedAttachmentIndex = selectedAttachmentIndex
         container.subviews.forEach { $0.removeFromSuperview() }
 
         guard let currentId = selectedItemId,
@@ -1509,7 +1523,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         titleLbl.maximumNumberOfLines = 2
         vStack.addArrangedSubview(titleLbl)
 
-        let statusBadge = item.processed ? "✓ 已处理" : "● 未读"
+        let statusBadge = item.processed ? "✓ 已处理" : "● 待处理"
         let subInfo = "\(tagDisplayLabel(item.intentTag))  ·  \(formatTimeLabel(item.createdAtMs))  ·  \(statusBadge)"
         let subLbl = NSTextField(labelWithString: subInfo)
         subLbl.font = NSFont.systemFont(ofSize: 11.5)

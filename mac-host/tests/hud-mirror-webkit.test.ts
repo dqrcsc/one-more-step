@@ -60,7 +60,7 @@ extension OmsMacHudAppDelegate {
         }
         require(js(web, "canControl() && canvas.width === 1") as? Bool == true, "WebP frame was not rendered")
         // Calling JS handlers exercises the actual renderer without touching a real phone.
-        _ = js(web, "document.getElementById('mirrorTextInput').value = 'fixture'; void submitMirrorText(false)")
+        require(js(web, "document.getElementById('mirrorTextInput').value = 'fixture'; void submitMirrorText(false); void submitMirrorText(true); [...document.querySelectorAll('button[onclick]')].filter(b => b.getAttribute('onclick').includes('submitMirrorText')).every(b => b.disabled) && !document.getElementById('mirrorTextInput').disabled") as? Bool == true, "Pending text submit buttons not gated or draft editor disabled")
         pump(0.3)
         require(js(web, "document.getElementById('mirrorTextInput').value") as? String == "", "ACK did not clear text")
         detailPanel?.setContentSize(NSSize(width: 680, height: 440))
@@ -157,7 +157,7 @@ delegate.verifyMirror()
           ws.send(JSON.stringify({ type: 'mirror_status', status: { running: true } }));
           ws.send(frame);
         } else if (m.type === 'input') {
-          inputs++; ws.send(JSON.stringify({ type: 'input_ack', reqId: m.reqId, ok: true, result: { ok: true } }));
+          inputs++; setTimeout(() => ws.send(JSON.stringify({ type: 'input_ack', reqId: m.reqId, ok: true, result: { ok: true } })), 100);
         } else if (m.type === 'stop') globalStops++;
       },
       close() { closed++; }
