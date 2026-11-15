@@ -39,7 +39,8 @@ async function page(hud = true) {
   const context = vm.createContext({
     document, location: url, URLSearchParams, WebSocket: Socket, ArrayBuffer, DataView, Uint8Array, Blob,
     performance: { now: () => now }, console, Option: class { constructor(public text: string, public value: string) {} },
-    createImageBitmap: async () => ({ width: 640, height: 1422, close() {} }),
+    // Decode completion must cross an event-loop turn, as a real image decoder can.
+    createImageBitmap: () => new Promise(resolve => setImmediate(() => resolve({ width: 640, height: 1422, close() {} }))),
     setTimeout: (fn: () => void, delay: number) => { timers.set(++id, { fn, delay }); return id; },
     setInterval: (fn: () => void, delay: number) => { timers.set(++id, { fn, delay }); return id; },
     clearTimeout: (i: number) => timers.delete(i), clearInterval: (i: number) => timers.delete(i),
@@ -55,15 +56,22 @@ async function page(hud = true) {
     view.setUint8(0, 1); view.setUint8(1, flags); view.setUint16(2, 640); view.setUint16(4, 1422);
     return buf;
   };
+  const settleFrames = async () => {
+    const deadline = Date.now() + 1000;
+    while (run('decoding')) {
+      if (Date.now() >= deadline) throw new Error('Synthetic frame decoding did not settle');
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  };
   const start = async () => {
     run('toggleStartStop()');
     const socket = Socket.all.at(-1)!;
     socket.open(); socket.receive({ type: 'mirror_status', status: { running: false } });
     socket.receive({ type: 'mirror_status', status: { running: true } });
-    socket.receive(frame()); await Promise.resolve(); await Promise.resolve();
+    socket.receive(frame()); await settleFrames();
     return socket;
   };
-  return { run, get, start, frame, context, timers, events, sockets: Socket.all,
+  return { run, get, start, frame, settleFrames, context, timers, events, sockets: Socket.all,
     counts: () => ({ draws, clears, fetches }), advance: (ms: number) => now += ms };
 }
 
@@ -111,7 +119,7 @@ test('locked/secure frames, stale decoding and composition never cause hidden in
   const before = p.counts().draws;
   ws.receive(p.frame(4));
   resolve({ width: 640, height: 1422, close() {} });
-  await Promise.resolve(); await Promise.resolve();
+  await p.settleFrames();
   expect(p.counts().draws).toBe(before);
   expect(p.get('mirrorTextInput').disabled).toBe(true);
   const count = ws.sent.length;
@@ -143,7 +151,7 @@ test('pending start is joined without duplicate start; close cancels unacknowled
   ws.receive({ type: 'mirror_status', status: { running: false, starting: true } });
   expect(ws.sent).toEqual([]);
   ws.receive({ type: 'mirror_status', status: { running: true } });
-  ws.receive(p.frame()); await Promise.resolve(); await Promise.resolve();
+  ws.receive(p.frame()); await p.settleFrames();
   const promise = p.run("sendCommand({type:'input',inputType:'tap'})");
   expect([...p.timers.values()].some(t => t.delay === 68000)).toBe(true);
   p.run('hostDeactivate()');
