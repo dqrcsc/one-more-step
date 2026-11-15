@@ -57,6 +57,7 @@ extension OmsMacHudAppDelegate {
             files: [HudStoredFile(fileName: "tall.png", absPath: imageURL.path,
                 mimeType: "image/png", sizeBytes: 1, sha256: nil)])]
         selectedItemId = "tall"
+        panel.setContentSize(NSSize(width: 840, height: 560))
         panel.alphaValue = 0
         panel.orderBack(nil)
         rebuildSidebarAndInspector()
@@ -72,6 +73,9 @@ extension OmsMacHudAppDelegate {
         precondition(panel.frame.height == 440, "Hidden inspector constrains mirror")
         selectDetailTab(0)
         settle()
+        precondition(panel.frame.height == panel.screen!.visibleFrame.height, "Inbox did not use maximum usable height")
+        panel.setContentSize(NSSize(width: 680, height: 440))
+        settle()
         precondition(panel.frame.width == 680 && panel.frame.height < 560, "Narrow inbox cannot fit")
         func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
         let close = descendants(inspectorContainer!).compactMap { $0 as? NSButton }.first { $0.title.hasSuffix("(Esc)") }!
@@ -79,6 +83,47 @@ extension OmsMacHudAppDelegate {
         precondition(actions.hasHorizontalScroller && actions.documentView!.frame.width > actions.contentView.bounds.width,
             "Narrow action row must scroll to reach all buttons")
         precondition(close.frame.maxX <= actions.documentView!.bounds.maxX && close.frame.height > 0)
+        precondition(!panel.hidesOnDeactivate, "System hides pinned panel on app switch")
+        precondition(panel.level == .normal)
+        pinButton?.performClick(nil)
+        precondition(isDetailPinned && panel.level == .floating)
+        precondition(pinButton!.title == pinButton!.attributedTitle.string)
+        windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: panel))
+        precondition(panel.isVisible, "Pinned inbox hid on focus loss")
+        pinButton?.performClick(nil)
+        precondition(!isDetailPinned && panel.level == .normal)
+        windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: panel))
+        precondition(!panel.isVisible, "Unpinned inbox stayed on focus loss")
+        panel.orderBack(nil)
+        let image = descendants(inspectorContainer!).compactMap { $0 as? ScaledPreviewImageView }.first!
+        let click = NSEvent.mouseEvent(with: .leftMouseUp, location: image.convert(NSPoint(x: image.bounds.midX, y: image.bounds.midY), to: nil), modifierFlags: [], timestamp: 0,
+            windowNumber: panel.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        image.mouseDown(with: click)
+        image.mouseUp(with: click)
+        guard let viewer = imagePreview else { fatalError("Image click did not open preview") }
+        precondition(viewer.window!.isVisible && panel.isVisible)
+        precondition(viewer.window!.parent === panel)
+        precondition(panel.screen!.visibleFrame.contains(viewer.window!.frame))
+        windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: panel))
+        precondition(panel.isVisible, "Opening image dismissed parent")
+        let fit = viewer.scroll.magnification
+        precondition(fit > 0 && fit < 1, "Tall image not fitted")
+        precondition(6000 * fit <= viewer.scroll.contentView.frame.height + 1)
+        viewer.zoomIn()
+        precondition(viewer.scroll.magnification > fit)
+        viewer.zoomOut()
+        precondition(abs(viewer.scroll.magnification - fit) < 0.001)
+        viewer.actualSize()
+        precondition(viewer.scroll.magnification == 1)
+        viewer.fitImage()
+        precondition(viewer.scroll.magnification < 1)
+        viewer.window?.cancelOperation(nil)
+        precondition(imagePreview == nil && !viewer.window!.isVisible && panel.isVisible)
+        precondition(image.accessibilityPerformPress())
+        let other = imagePreview!
+        closeDetailPanel()
+        precondition(imagePreview == nil && !other.window!.isVisible && !panel.isVisible)
+        panel.orderBack(nil)
         // Simulate a smaller usable region, keeping AppKit on the actual display.
         let visible = panel.screen!.visibleFrame
         let screen = NSRect(x: visible.minX + 50, y: visible.minY + 50, width: 1024, height: 700)

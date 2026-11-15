@@ -13,7 +13,7 @@ async function page(hud = true) {
   const nodes = new Map<string, any>();
   const get = (name: string) => {
     if (!nodes.has(name)) nodes.set(name, {
-      style: {}, textContent: '', value: name === 'presetSelect' ? '640,72,8' : '', width: 640, height: 1422,
+      style: { setProperty() {} }, textContent: '', value: name === 'presetSelect' ? '640,72,8' : '', width: 640, height: 1422,
       options: [{ value: '640,72,8' }], disabled: false, hidden: false,
       classList: { add() {}, remove() {} },
       getContext: () => ({ clearRect: () => clears++, drawImage: () => draws++ }),

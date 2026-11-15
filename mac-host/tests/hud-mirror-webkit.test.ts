@@ -40,6 +40,10 @@ extension OmsMacHudAppDelegate {
         statusSnapshot.mirrorUrl = CommandLine.arguments[1]
         selectDetailTab(1)
         guard let web = mirrorWebView else { require(false, "WebView missing"); return }
+        let visible = detailPanel!.screen!.visibleFrame
+        require(detailPanel!.frame.height == visible.height && detailPanel!.frame.minY == visible.minY, "Mirror did not open at usable maximum height")
+        require(detailPanel!.frame.width == 840, "Height fit changed window width")
+        require(pinButton?.isHidden == true, "Inbox-only pin visible in mirror")
         require(!web.configuration.websiteDataStore.isPersistent, "Persistent WebKit store")
         let end = Date().addingTimeInterval(10)
         while Date() < end {
@@ -62,12 +66,27 @@ extension OmsMacHudAppDelegate {
         detailPanel?.setContentSize(NSSize(width: 680, height: 440))
         detailPanel?.layoutIfNeeded()
         detailPanel?.contentView?.layoutSubtreeIfNeeded()
-        _ = js(web, "shell.style.aspectRatio = '9 / 20'")
+        _ = js(web, "shell.style.aspectRatio = '9 / 20'; shell.style.setProperty('--phone-ratio', '0.45')")
         pump(0.1)
         require(js(web, "(() => { const r = shell.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.right <= innerWidth && r.bottom <= document.querySelector('.bottombar').getBoundingClientRect().top + 1 && document.querySelector('.bottombar').getBoundingClientRect().bottom <= innerHeight; })()") as? Bool == true, "Minimum window clips mirror or controls: " + String(describing: js(web, "JSON.stringify({w:innerWidth,h:innerHeight,shell:shell.getBoundingClientRect(),bar:document.querySelector('.bottombar').getBoundingClientRect()})")))
+        for size in [NSSize(width: 680, height: 440), NSSize(width: 840, height: visible.height)] {
+            detailPanel?.setContentSize(size)
+            detailPanel?.layoutIfNeeded()
+            for ratio in ["9 / 20", "20 / 9"] {
+                _ = js(web, "shell.style.aspectRatio = '\(ratio)'; shell.style.setProperty('--phone-ratio', String(\(ratio == "9 / 20" ? 0.45 : 20.0 / 9.0))); canvas.width = \(ratio == "9 / 20" ? 900 : 2000); canvas.height = \(ratio == "9 / 20" ? 2000 : 900)")
+                pump(0.1)
+                require(js(web, "(() => { const c = canvas.getBoundingClientRect(), d = document.querySelector('.side-dock').getBoundingClientRect(); return c.left >= 0 && c.right <= innerWidth && d.right <= innerWidth && Math.abs(c.width / c.height - canvas.width / canvas.height) < 0.005; })()") as? Bool == true, "Aspect or viewport mismatch: " + String(describing: js(web, "JSON.stringify({w:innerWidth,h:innerHeight,canvas:canvas.getBoundingClientRect(),shell:shell.getBoundingClientRect(),box:getComputedStyle(shell).boxSizing,ratio:getComputedStyle(shell).aspectRatio,cssHeight:getComputedStyle(shell).height,cssWidth:getComputedStyle(shell).width,dock:document.querySelector('.side-dock').getBoundingClientRect()})")))
+            }
+        }
+        detailPanel?.setContentSize(NSSize(width: 680, height: 440))
+        detailPanel?.layoutIfNeeded()
+        _ = js(web, "document.getElementById('appBadge').textContent = 'com.example.' + 'longpackage'.repeat(12); document.getElementById('resultText').textContent = 'DiagnosticMessage'.repeat(30)")
+        pump(0.1)
+        require(js(web, "(() => { const b = document.querySelector('.bottombar').getBoundingClientRect(), c = canvas.getBoundingClientRect(); return document.body.scrollWidth <= innerWidth && b.bottom <= innerHeight && c.width > 0 && c.height > 0; })()") as? Bool == true, "Long status clips controls or canvas")
         windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: detailPanel))
         require(mirrorWebView === web, "Mirror was destroyed on focus loss")
         selectDetailTab(0)
+        require(pinButton?.isHidden == false, "Inbox pin not restored")
         let unloadEnd = Date().addingTimeInterval(3)
         while Date() < unloadEnd {
             if js(web, "typeof window.hostDeactivate") as? String != "function" { break }
@@ -76,6 +95,7 @@ extension OmsMacHudAppDelegate {
         require(mirrorWebView == nil, "WebView retained after switching tabs")
         require(js(web, "typeof window.hostDeactivate") as? String != "function", "Old page was not unloaded")
         selectDetailTab(1)
+        require(detailPanel!.frame.height == visible.height, "Re-enter did not restore maximum height")
         guard let second = mirrorWebView else { require(false, "Reopen missing"); return }
         pump(0.5)
         require(js(second, "active") as? Bool == false, "Reopen started capture")
@@ -84,8 +104,10 @@ extension OmsMacHudAppDelegate {
         require(second.url?.host == "127.0.0.1", "External navigation escaped")
         windowDidMiniaturize(Notification(name: NSWindow.didMiniaturizeNotification, object: detailPanel))
         require(mirrorWebView == nil, "Minimized view retained viewer")
-        selectDetailTab(1)
+        windowDidDeminiaturize(Notification(name: NSWindow.didDeminiaturizeNotification, object: detailPanel))
         guard let third = mirrorWebView else { require(false, "Reload missing"); return }
+        pump(0.5)
+        require(js(third, "active") as? Bool == false, "Restore from minimize auto-started capture")
         webViewWebContentProcessDidTerminate(third)
         require(mirrorWebView == nil && mirrorRetry?.isHidden == false, "Process termination not recoverable")
         selectDetailTab(1)

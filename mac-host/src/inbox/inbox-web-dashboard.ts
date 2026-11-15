@@ -1502,12 +1502,17 @@ function renderMirrorStandaloneHtml(): string {
     flex-wrap: wrap;
   }
   .topbar-left {
+    min-width: 0;
+    max-width: 100%;
     display: flex;
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
   }
   .pill {
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
     font-size: 11px;
     font-weight: 600;
     padding: 3px 8px;
@@ -1544,11 +1549,21 @@ function renderMirrorStandaloneHtml(): string {
     overflow: hidden;
     position: relative;
   }
-  .phone-shell {
-    position: relative;
+  .phone-stage {
+    flex: 1;
+    min-width: 0;
     height: 100%;
-    max-height: 100%;
-    aspect-ratio: 9 / 20;
+    container-type: size;
+    display: grid;
+    place-items: center;
+  }
+  .phone-shell {
+    --phone-ratio: 0.45;
+    position: relative;
+    box-sizing: content-box;
+    width: min(calc(100cqw - 6px), calc((100cqh - 6px) * var(--phone-ratio)));
+    height: min(calc(100cqh - 6px), calc((100cqw - 6px) / var(--phone-ratio)));
+    aspect-ratio: var(--phone-ratio);
     background: #000;
     border-radius: 26px;
     border: 3px solid #334155;
@@ -1589,6 +1604,7 @@ function renderMirrorStandaloneHtml(): string {
   .overlay-banner.show { display: flex; }
   button:disabled { opacity: .45; cursor: default; }
   .side-dock {
+    flex-shrink: 0;
     overflow-y: auto;
     max-height: 100%;
     display: flex;
@@ -1624,7 +1640,8 @@ function renderMirrorStandaloneHtml(): string {
     border-top: 1px solid var(--border);
   }
   .bottombar { flex-wrap: wrap; }
-  #resultText { padding: 4px 12px; min-height: 24px; color: var(--muted); font-size: 12px; }
+  .topbar, .bottombar { flex-shrink: 0; }
+  #resultText { padding: 4px 12px; min-height: 24px; max-height: 60px; flex-shrink: 0; overflow-y: auto; overflow-wrap: anywhere; color: var(--muted); font-size: 12px; }
   .text-in {
     min-width: 140px;
     flex: 1;
@@ -1671,6 +1688,7 @@ function renderMirrorStandaloneHtml(): string {
   </div>
 
   <div class="workspace">
+    <div class="phone-stage">
     <div class="phone-shell" id="phoneShell">
       <canvas id="mirrorCanvas" width="640" height="1422" tabindex="0"></canvas>
       <canvas id="fxCanvas" width="640" height="1422"></canvas>
@@ -1680,6 +1698,7 @@ function renderMirrorStandaloneHtml(): string {
         <div style="font-size:12px;color:var(--muted);line-height:1.5;" id="overlaySub">点击下方按钮立即点亮屏幕并自动解锁</div>
         <button class="btn-sm btn-primary" style="padding:9px 16px;font-size:13px;" onclick="wakeAndUnlock()">☀️ 点亮并解锁屏幕</button>
       </div>
+    </div>
     </div>
 
     <div class="side-dock">
@@ -1862,6 +1881,7 @@ async function drainFrames() {
         phoneWidth = view.getUint16(2, false) || bmp.width;
         phoneHeight = view.getUint16(4, false) || bmp.height;
         shell.style.aspectRatio = phoneWidth + ' / ' + phoneHeight;
+        shell.style.setProperty('--phone-ratio', String(phoneWidth / phoneHeight));
         canvas.width = fxCanvas.width = bmp.width;
         canvas.height = fxCanvas.height = bmp.height;
         ctx.drawImage(bmp, 0, 0);

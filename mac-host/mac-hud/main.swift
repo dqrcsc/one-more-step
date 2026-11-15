@@ -190,9 +190,112 @@ final class MirrorWebView: WKWebView {
 // The preview viewport determines the image size, never the source pixels.
 // NSImageView's intrinsic size otherwise raises the window's layout minimum.
 final class ScaledPreviewImageView: NSImageView {
+    var onOpen: (() -> Void)?
     override var intrinsicContentSize: NSSize {
         NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
     }
+    override var acceptsFirstResponder: Bool { onOpen != nil }
+    override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self) }
+    override func mouseUp(with event: NSEvent) {
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onOpen?() }
+    }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 36 || event.keyCode == 49 { onOpen?() }
+        else { super.keyDown(with: event) }
+    }
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if onOpen != nil { addCursorRect(bounds, cursor: .pointingHand) }
+    }
+    override func accessibilityPerformPress() -> Bool {
+        guard let open = onOpen else { return false }
+        open()
+        return true
+    }
+}
+
+final class CenteredImageClipView: NSClipView {
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var rect = super.constrainBoundsRect(proposedBounds)
+        if let document = documentView {
+            if document.frame.width < rect.width { rect.origin.x = (document.frame.width - rect.width) / 2 }
+            if document.frame.height < rect.height { rect.origin.y = (document.frame.height - rect.height) / 2 }
+        }
+        return rect
+    }
+}
+
+final class ImagePreviewController: NSWindowController, NSWindowDelegate {
+    let scroll = NSScrollView()
+    private let imageSize: NSSize
+    private var fitsWindow = true
+    var onClose: (() -> Void)?
+
+    init(image: NSImage, title: String, screen: NSRect) {
+        imageSize = image.size
+        let panel = KeyableDetailPanel(contentRect: NSRect(x: 0, y: 0, width: 900, height: 650),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        super.init(window: panel)
+        panel.title = title
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.level = .floating
+        panel.minSize = NSSize(width: 360, height: 280)
+        panel.maxSize = screen.size
+        panel.setFrame(NSRect(x: screen.midX - min(1100, screen.width) / 2, y: screen.minY,
+            width: min(1100, screen.width), height: screen.height), display: false)
+        panel.delegate = self
+        panel.onEscapePressed = { [weak self] in self?.close() }
+
+        guard let content = panel.contentView else { return }
+        let toolbar = NSStackView()
+        toolbar.spacing = 8
+        for (label, action) in [("−", #selector(zoomOut)), ("+", #selector(zoomIn)),
+            ("适应窗口", #selector(fitImage)), ("100%", #selector(actualSize)), ("关闭 (Esc)", #selector(closePreview))] {
+            toolbar.addArrangedSubview(NSButton(title: label, target: self, action: action))
+        }
+        toolbar.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(toolbar)
+        scroll.contentView = CenteredImageClipView()
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.allowsMagnification = true
+        scroll.minMagnification = 0.01
+        scroll.maxMagnification = 8
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        let imageView = NSImageView(frame: NSRect(origin: .zero, size: imageSize))
+        imageView.image = image
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        scroll.documentView = imageView
+        content.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            toolbar.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            toolbar.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
+            scroll.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 8),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor)
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+    @objc func fitImage() {
+        fitsWindow = true
+        window?.layoutIfNeeded()
+        let viewport = scroll.contentView.frame.size
+        let scale = min(viewport.width / max(1, imageSize.width), viewport.height / max(1, imageSize.height))
+        setZoom(min(1, scale))
+    }
+    private func setZoom(_ scale: CGFloat) {
+        scroll.setMagnification(min(scroll.maxMagnification, max(scroll.minMagnification, scale)),
+            centeredAt: NSPoint(x: imageSize.width / 2, y: imageSize.height / 2))
+    }
+    @objc func zoomIn() { fitsWindow = false; setZoom(scroll.magnification * 1.25) }
+    @objc func zoomOut() { fitsWindow = false; setZoom(scroll.magnification / 1.25) }
+    @objc func actualSize() { fitsWindow = false; setZoom(1) }
+    @objc func closePreview() { close() }
+    func windowDidResize(_ notification: Notification) { if fitsWindow { fitImage() } }
+    func windowWillClose(_ notification: Notification) { onClose?() }
 }
 
 final class HoverableToastView: NSVisualEffectView {
@@ -424,6 +527,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     private var selectedItemId: String?
     private var selectedAttachmentIndex = 0
     private var activeQLPreview: QLPreviewView?
+    private var imagePreview: ImagePreviewController?
     private var audioPlayer: AVAudioPlayer?
     private weak var audioPlayButton: NSButton?
 
@@ -863,6 +967,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     private func closeDetailPanel() {
+        closeImagePreview()
         destroyMirrorView()
         closeActiveQLPreview()
         audioPlayer?.stop()
@@ -872,23 +977,31 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     func windowDidResignKey(_ notification: Notification) {
         guard let win = notification.object as? NSWindow, win === detailPanel else { return }
-        if !isDetailPinned && selectedDetailTab == 0 {
+        if !isDetailPinned && selectedDetailTab == 0 && imagePreview == nil {
             closeDetailPanel()
         }
     }
 
     func windowDidMiniaturize(_ notification: Notification) {
         guard let win = notification.object as? NSWindow, win === detailPanel else { return }
+        closeImagePreview()
         destroyMirrorView()
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        guard let win = notification.object as? NSWindow, win === detailPanel else { return }
+        constrainDetailPanelToScreen(maximizeHeight: true)
+        if selectedDetailTab == 1 { loadMirrorView() } // Capture still requires an explicit start.
     }
 
     func windowDidChangeScreen(_ notification: Notification) {
         guard let win = notification.object as? NSWindow, win === detailPanel else { return }
-        constrainDetailPanelToScreen()
+        constrainDetailPanelToScreen(maximizeHeight: true)
     }
 
     func windowWillClose(_ notification: Notification) {
         guard let win = notification.object as? NSWindow, win === detailPanel else { return }
+        closeImagePreview()
         destroyMirrorView()
         closeActiveQLPreview()
         audioPlayer?.stop()
@@ -915,18 +1028,18 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     private func showDetailPanel() {
         guard let panel = detailPanel else { return }
-        constrainDetailPanelToScreen(center: !panel.isVisible)
+        constrainDetailPanelToScreen(center: !panel.isVisible, maximizeHeight: true)
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
     }
 
-    private func constrainDetailPanelToScreen(visibleFrame: NSRect? = nil, center: Bool = false) {
+    private func constrainDetailPanelToScreen(visibleFrame: NSRect? = nil, center: Bool = false, maximizeHeight: Bool = false) {
         guard let panel = detailPanel,
               let screen = visibleFrame ?? panel.screen?.visibleFrame ?? NSScreen.main?.visibleFrame else { return }
         panel.maxSize = screen.size
         var frame = panel.frame
         frame.size.width = min(frame.width, screen.width)
-        frame.size.height = min(frame.height, screen.height)
+        frame.size.height = maximizeHeight ? screen.height : min(frame.height, screen.height)
         if center {
             frame.origin = NSPoint(x: screen.midX - frame.width / 2, y: screen.midY - frame.height / 2)
         }
@@ -959,7 +1072,8 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
         panel.isMovableByWindowBackground = true
-        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        panel.level = isDetailPinned ? .floating : .normal
         // canJoinAllSpaces and moveToActiveSpace are mutually exclusive in AppKit.
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.minSize = NSSize(width: 680, height: 440)
@@ -994,13 +1108,14 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         detailTabs = headerTitle
 
         let pinBtn = makePillButton(
-            title: "📌 钉住窗口: 关",
+            title: "📌 置顶常驻: 关",
             bg: NSColor(calibratedWhite: 1.0, alpha: 0.10),
             fg: NSColor(calibratedWhite: 0.85, alpha: 1.0),
             action: #selector(togglePinDetailWindow)
         )
         pinBtn.translatesAutoresizingMaskIntoConstraints = false
         topBar.addSubview(pinBtn)
+        pinBtn.toolTip = "开启：置顶且切换 App 后保持显示；关闭：投递窗口失焦后收起"
         self.pinButton = pinBtn
 
         // Horizontal Split: Sidebar (240pt) + Right Inspector
@@ -1123,8 +1238,12 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     private func selectDetailTab(_ index: Int) {
+        closeImagePreview()
         selectedDetailTab = index == 1 ? 1 : 0
+        detailPanel?.level = (selectedDetailTab == 1 || isDetailPinned) ? .floating : .normal
         detailTabs?.selectedSegment = selectedDetailTab
+        // Pinning only controls auto-dismiss on the inbox tab; mirror always stays open.
+        pinButton?.isHidden = selectedDetailTab == 1
         inboxContent?.isHidden = selectedDetailTab == 1
         mirrorContent?.isHidden = selectedDetailTab != 1
         if selectedDetailTab == 1 {
@@ -1138,7 +1257,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             destroyMirrorView()
             rebuildSidebarAndInspector()
         }
-        constrainDetailPanelToScreen()
+        constrainDetailPanelToScreen(maximizeHeight: true)
     }
 
     private func validatedMirrorURL() -> URL? {
@@ -1233,10 +1352,39 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     @objc private func togglePinDetailWindow() {
         isDetailPinned.toggle()
-        pinButton?.title = isDetailPinned ? "📌 钉住窗口: 开" : "📌 钉住窗口: 关"
+        detailPanel?.level = (isDetailPinned || selectedDetailTab == 1) ? .floating : .normal
+        pinButton?.title = isDetailPinned ? "📌 置顶常驻: 开" : "📌 置顶常驻: 关"
         pinButton?.layer?.backgroundColor = isDetailPinned
             ? NSColor(calibratedRed: 0.01, green: 0.52, blue: 0.78, alpha: 0.85).cgColor
             : NSColor(calibratedWhite: 1.0, alpha: 0.10).cgColor
+    }
+
+    private func closeImagePreview() {
+        guard let viewer = imagePreview else { return }
+        imagePreview = nil
+        viewer.onClose = nil
+        if let window = viewer.window { detailPanel?.removeChildWindow(window) }
+        viewer.close()
+    }
+
+    private func openImagePreview(image: NSImage, title: String) {
+        guard let parent = detailPanel,
+              let screen = parent.screen?.visibleFrame ?? NSScreen.main?.visibleFrame else { return }
+        closeImagePreview()
+        let viewer = ImagePreviewController(image: image, title: title, screen: screen)
+        imagePreview = viewer
+        viewer.onClose = { [weak self, weak viewer] in
+            guard let self = self else { return }
+            if let window = viewer?.window { self.detailPanel?.removeChildWindow(window) }
+            self.imagePreview = nil
+            self.detailPanel?.makeKeyAndOrderFront(nil)
+        }
+        if let window = viewer.window {
+            window.alphaValue = parent.alphaValue
+            parent.addChildWindow(window, ordered: .above)
+            window.makeKeyAndOrderFront(nil)
+            viewer.fitImage()
+        }
     }
 
     private func rebuildSidebarAndInspector() {
@@ -1617,6 +1765,9 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             let imgView = ScaledPreviewImageView()
             imgView.image = img
             imgView.imageScaling = .scaleProportionallyUpOrDown
+            imgView.toolTip = "点击放大查看图片"
+            imgView.setAccessibilityLabel("放大查看图片")
+            imgView.onOpen = { [weak self] in self?.openImagePreview(image: img, title: file.fileName) }
             imgView.translatesAutoresizingMaskIntoConstraints = false
             wrapper.addSubview(imgView)
             NSLayoutConstraint.activate([
