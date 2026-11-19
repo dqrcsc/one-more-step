@@ -323,6 +323,7 @@ fun OneMoreStepMainScreen() {
 
     val macCount = remember(streamItems) { streamItems.count { it.direction == "MAC_TO_PHONE" } }
     val phoneCount = remember(streamItems) { streamItems.count { it.direction == "PHONE_TO_MAC" } }
+    val wechatCount = remember(streamItems) { streamItems.count { it.intentTag == "wechat_context" } }
     val approvalCount = remember(streamItems) {
         streamItems.count { it.itemType == "APPROVAL" && it.syncStatus == "PENDING_APPROVAL" }
     }
@@ -333,6 +334,7 @@ fun OneMoreStepMainScreen() {
             val tabMatch = when (filterTab) {
                 "MAC_TO_PHONE" -> item.direction == "MAC_TO_PHONE"
                 "PHONE_TO_MAC" -> item.direction == "PHONE_TO_MAC"
+                "WECHAT_CONTEXT" -> item.intentTag == "wechat_context"
                 "PENDING_APPROVAL" -> item.itemType == "APPROVAL" && item.syncStatus == "PENDING_APPROVAL"
                 else -> true
             }
@@ -792,6 +794,7 @@ fun OneMoreStepMainScreen() {
             ) {
                 val tabs = buildList {
                     add("ALL" to "全部 (${streamItems.size})")
+                    add("WECHAT_CONTEXT" to "💬 微信尺素 ($wechatCount)")
                     add("MAC_TO_PHONE" to "🤖 Mac推来 ($macCount)")
                     add("PHONE_TO_MAC" to "📱 我发出的 ($phoneCount)")
                     if (approvalCount > 0 || filterTab == "PENDING_APPROVAL") {
@@ -800,12 +803,13 @@ fun OneMoreStepMainScreen() {
                 }
                 tabs.forEach { (key, label) ->
                     val active = filterTab == key
+                    val activeColor = if (key == "WECHAT_CONTEXT") Color(0xFF059669) else Color(0xFF0284C7)
                     OutlinedButton(
                         onClick = { filterTab = key },
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                         modifier = Modifier.height(30.dp),
                         colors = ButtonDefaults.outlinedButtonColors(
-                            containerColor = if (active) Color(0xFF0284C7) else Color(0xFF1E293B)
+                            containerColor = if (active) activeColor else Color(0xFF1E293B)
                         )
                     ) {
                         Text(label, color = Color.White, fontSize = 11.sp, maxLines = 1, softWrap = false)
@@ -861,7 +865,11 @@ fun OneMoreStepMainScreen() {
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = "📭 当前分类暂无记录\n底部可直接发消息，或截屏/分享直达 Mac",
+                    text = if (filterTab == "WECHAT_CONTEXT") {
+                        "💬 暂无微信尺素伴读记录\n在微信转发文章后会自动同步伴读卡片到此，支持耳机通勤朗读"
+                    } else {
+                        "📭 当前分类暂无记录\n底部可直接发消息，或截屏/分享直达 Mac"
+                    },
                     color = Color(0xFF64748B),
                     fontSize = 13.sp
                 )
@@ -1504,6 +1512,8 @@ fun StreamTimelineCard(item: StreamItemModel) {
         colors = CardDefaults.cardColors(
             containerColor = if (item.itemType == "APPROVAL") {
                 Color(0xFF312E81)
+            } else if (item.intentTag == "wechat_context") {
+                Color(0xFF0B2922)
             } else if (isFromPhone) {
                 Color(0xFF0F2942)
             } else {
@@ -1525,8 +1535,14 @@ fun StreamTimelineCard(item: StreamItemModel) {
                     modifier = Modifier.weight(1f)
                 ) {
                     Text(
-                        text = if (isFromPhone) "📱 手机➔Mac (#${item.intentTag})" else "🤖 Mac➔手机",
-                        color = Color(0xFF38BDF8),
+                        text = if (item.intentTag == "wechat_context") {
+                            "💬 微信尺素 · 伴读"
+                        } else if (isFromPhone) {
+                            "📱 手机➔Mac (#${item.intentTag})"
+                        } else {
+                            "🤖 Mac➔手机"
+                        },
+                        color = if (item.intentTag == "wechat_context") Color(0xFF4ADE80) else Color(0xFF38BDF8),
                         fontSize = 11.sp,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1,

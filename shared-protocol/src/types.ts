@@ -87,7 +87,13 @@ export enum OmsErrorCode {
 
 export type TransportTier = "LAN_WS" | "BT_RFCOMM" | "WAN_WEBRTC" | "DISCONNECTED";
 export type PresenceState = "AT_DESK" | "AWAY";
-export type IntentTag = "default_inbox" | "pkb_vault" | "voice_idea" | "ui_bug" | "sms_otp";
+export type IntentTag =
+  | "default_inbox"
+  | "pkb_vault"
+  | "voice_idea"
+  | "ui_bug"
+  | "sms_otp"
+  | "wechat_context";
 export type NotificationLevel = "silent" | "normal" | "urgent";
 
 export interface JsonRpcRequest<TParams = unknown> {

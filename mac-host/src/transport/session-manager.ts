@@ -22,6 +22,7 @@ import {
   FrameStreamDecoder,
   FrameType,
   generateUuidV7,
+  IntentTag,
   JsonRpcMessage,
   JsonRpcRequest,
   JsonRpcResponse,
@@ -1632,6 +1633,7 @@ export class PhoneSessionManager extends EventEmitter {
     mimeType: string;
     data: Uint8Array;
     title?: string;
+    intentTag?: IntentTag;
     enableCommuteTts?: boolean;
     timeoutMs?: number;
   }): Promise<{ streamId: string; sha256: string }> {
@@ -1651,6 +1653,7 @@ export class PhoneSessionManager extends EventEmitter {
       chunkSize,
       totalChunks,
       sha256,
+      intentTag: opts.intentTag,
       title: opts.title,
       enableCommuteTts: opts.enableCommuteTts,
     };

@@ -52,6 +52,33 @@ extension OmsMacHudAppDelegate {
         selectedItemId = nil
         rebuildSidebarAndInspector()
         precondition(sidebarStack?.arrangedSubviews.count == 1)
+
+        // Verify WeChat Context tab & multi-line title hit-testing routes clicks to ClickableRowView
+        selectDetailTab(2)
+        precondition(wechatContent?.isHidden == false && inboxContent?.isHidden == true && mirrorContent?.isHidden == true)
+        wxArticles = [
+            HudWeChatArticleSummary(id: 156, title: "DeepSeek SuperAgent architecture and engineering practice long wrapping title", author: "A", url: "https://example.com/156",
+                user_notes: "", status: "light_done", triage: "process_later", process_level: "light",
+                short_summary: "Summary 1", source_md_path: "", note_md_path: "", created_at: "2026-11-18T10:00:00Z", isFallbackNote: false),
+            HudWeChatArticleSummary(id: 155, title: "Enterprise AI knowledge base compilation and semantic layer long wrapping title", author: "B", url: "https://example.com/155",
+                user_notes: "", status: "light_done", triage: "process_later", process_level: "light",
+                short_summary: "Summary 2", source_md_path: "", note_md_path: "", created_at: "2026-11-18T09:00:00Z", isFallbackNote: false)
+        ]
+        selectedWxArticleId = 156
+        rebuildWeChatSidebar()
+        panel.contentView?.layoutSubtreeIfNeeded()
+        guard let wxStack = wxSidebarStack, wxStack.arrangedSubviews.count == 2,
+              let secondRow = wxStack.arrangedSubviews[1] as? ClickableRowView,
+              let titleLabel = secondRow.subviews.last as? NSTextField else {
+            fatalError("Missing WeChat sidebar rows")
+        }
+        precondition(!titleLabel.isSelectable, "Wrapping label must not swallow clicks via text selection")
+        let titleMidInRow = NSPoint(x: titleLabel.frame.midX, y: titleLabel.frame.midY)
+        let titleMidInStackSuper = secondRow.convert(titleMidInRow, to: wxStack.superview)
+        precondition(wxStack.hitTest(titleMidInStackSuper) === secondRow, "Clicking on wrapping article title must hit ClickableRowView")
+        secondRow.onClick?()
+        precondition(selectedWxArticleId == 155, "Clicking second WeChat row must select article 155")
+
         closeDetailPanel()
         print("APPKIT_WINDOW_AND_INBOX_LAYOUT_OK")
     }

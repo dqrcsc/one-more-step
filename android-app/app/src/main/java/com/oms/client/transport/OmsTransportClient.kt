@@ -2390,11 +2390,12 @@ class OmsTransportClient(
             try {
                 check(transfer.partFile.renameTo(savedFile)) { "Unable to commit stream file" }
                 val enableTts = transfer.header.optBoolean("enableCommuteTts", false)
+                val intentTag = transfer.header.optString("intentTag", "default_inbox").ifBlank { "default_inbox" }
                 val preview = if (fileName.endsWith(".md") || fileName.endsWith(".txt")) {
                     readPreviewFromFile(savedFile, 256 * 1024)
                 } else "收到 Mac 推送文件：$fileName (${transfer.validated.totalBytes / 1024} KB)"
                 repo.upsertStreamItem(StreamItemModel(streamId, "MAC_TO_PHONE", if (enableTts) "COMMUTE_READER" else "FILE",
-                    "default_inbox", transfer.header.optString("title", fileName), preview, null,
+                    intentTag, transfer.header.optString("title", fileName), preview, null,
                     Uri.fromFile(savedFile).toString(), null, "DELIVERED",
                     JSONObject().put("enableCommuteTts", enableTts).put("sha256", transfer.validated.sha256)
                         .put("totalBytes", transfer.validated.totalBytes).toString(), System.currentTimeMillis()))
@@ -2669,12 +2670,13 @@ class OmsTransportClient(
                     "calendar.delete" -> CalendarExecutor.deleteEvent(context, params)
                     "notify.send" -> {
                         val res = NotificationExecutor.sendNotification(context, params)
+                        val notifyTag = params.optString("intentTag", "default_inbox").ifBlank { "default_inbox" }
                         repo.upsertStreamItem(
                             StreamItemModel(
                                 itemId = OmsFrameProtocol.generateUuidV7(),
                                 direction = "MAC_TO_PHONE",
                                 itemType = "TEXT",
-                                intentTag = "default_inbox",
+                                intentTag = notifyTag,
                                 title = params.optString("title", "Mac AI 通知"),
                                 textContent = params.optString("body", ""),
                                 voiceTranscript = null,

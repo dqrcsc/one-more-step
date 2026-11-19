@@ -37,10 +37,11 @@ if (process.platform === "darwin") {
   }
 }
 
-// 2. Link global CLI `oms` to ~/.local/bin/oms
+// 2. Link global CLI `oms` (and `wx-ctx` compatibility wrapper) to ~/.local/bin/
 const cliSrc = path.join(repoRoot, "mac-host/src/cli/index.ts");
 const localBinDir = path.join(os.homedir(), ".local/bin");
 const omsBinLink = path.join(localBinDir, "oms");
+const wxCtxBinPath = path.join(localBinDir, "wx-ctx");
 try {
   fs.chmodSync(cliSrc, 0o755);
   fs.mkdirSync(localBinDir, { recursive: true });
@@ -49,12 +50,18 @@ try {
   }
   fs.symlinkSync(cliSrc, omsBinLink);
   console.log(`✅ Linked global CLI: ${omsBinLink} -> ${cliSrc}`);
+
+  const wxWrapper = `#!/usr/bin/env bash\nexec "${omsBinLink}" wx "$@"\n`;
+  fs.writeFileSync(wxCtxBinPath, wxWrapper, { encoding: "utf8", mode: 0o755 });
+  fs.chmodSync(wxCtxBinPath, 0o755);
+  console.log(`✅ Linked WeChat Context CLI alias: ${wxCtxBinPath} -> oms wx`);
 } catch (err: any) {
   console.warn(`⚠️ Could not link ${omsBinLink}: ${err?.message || err}`);
 }
 
-// 3. Install global Agent Skill to ~/.codex/skills/one-more-step/SKILL.md
+// 3. Install unified global Agent Skill (+ references/) to ~/.codex/skills/one-more-step/
 const skillTemplatePath = path.join(repoRoot, "skills/one-more-step/SKILL.md");
+const skillRefsSrcDir = path.join(repoRoot, "skills/one-more-step/references");
 const globalSkillDir = path.join(os.homedir(), ".codex/skills/one-more-step");
 const globalSkillPath = path.join(globalSkillDir, "SKILL.md");
 if (fs.existsSync(skillTemplatePath)) {
@@ -63,7 +70,22 @@ if (fs.existsSync(skillTemplatePath)) {
     const rendered = raw.replaceAll("{{PROJECT_ROOT}}", repoRoot);
     fs.mkdirSync(globalSkillDir, { recursive: true });
     fs.writeFileSync(globalSkillPath, rendered, "utf8");
-    console.log(`✅ Installed global AI Agent Skill: ${globalSkillPath}`);
+    if (fs.existsSync(skillRefsSrcDir)) {
+      const globalRefsDir = path.join(globalSkillDir, "references");
+      fs.mkdirSync(globalRefsDir, { recursive: true });
+      for (const entry of fs.readdirSync(skillRefsSrcDir)) {
+        const srcFile = path.join(skillRefsSrcDir, entry);
+        if (fs.statSync(srcFile).isFile()) {
+          const refRaw = fs.readFileSync(srcFile, "utf8");
+          fs.writeFileSync(
+            path.join(globalRefsDir, entry),
+            refRaw.replaceAll("{{PROJECT_ROOT}}", repoRoot),
+            "utf8"
+          );
+        }
+      }
+    }
+    console.log(`✅ Installed unified global AI Agent Skill: ${globalSkillPath}`);
   } catch (err: any) {
     console.warn(`⚠️ Could not install global Skill: ${err?.message || err}`);
   }

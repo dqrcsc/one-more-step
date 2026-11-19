@@ -7,7 +7,7 @@ import WebKit
 
 // MARK: - Wire Models
 
-struct HudStoredFile: Codable {
+struct HudStoredFile: Codable, Equatable {
     let fileName: String
     let absPath: String
     let mimeType: String
@@ -15,7 +15,7 @@ struct HudStoredFile: Codable {
     let sha256: String?
 }
 
-struct HudInboxItem: Codable {
+struct HudInboxItem: Codable, Equatable {
     let itemId: String
     let receivedAt: String
     let createdAtMs: Double
@@ -36,6 +36,8 @@ struct HudToastPayload: Codable {
     let subtitle: String?
     let soundName: String?
     let itemId: String?
+    let channel: String?
+    let wechatArticleId: Int?
 }
 
 struct HudStatusSnapshot: Codable {
@@ -43,6 +45,11 @@ struct HudStatusSnapshot: Codable {
     let phoneName: String?
     let inboxDir: String?
     var mirrorUrl: String? = nil
+    var wechatRunning: Bool? = nil
+    var wechatConfigured: Bool? = nil
+    var wechatLastPoll: String? = nil
+    var wechatApiBaseUrl: String? = nil
+    var wechatConfigUrl: String? = nil
 }
 
 struct HudIncomingEnvelope: Codable {
@@ -52,6 +59,35 @@ struct HudIncomingEnvelope: Codable {
     let toast: HudToastPayload?
     let status: HudStatusSnapshot?
     let itemId: String?
+    let wechatArticleId: Int?
+}
+
+struct HudWeChatArticleSummary: Codable, Equatable {
+    let id: Int
+    let title: String
+    let author: String
+    let url: String
+    let user_notes: String
+    let status: String
+    let triage: String
+    let process_level: String
+    let short_summary: String
+    let source_md_path: String
+    let note_md_path: String
+    let created_at: String
+    let isFallbackNote: Bool?
+}
+
+struct HudWeChatOverviewResponse: Codable {
+    let ok: Bool
+    let articles: [HudWeChatArticleSummary]?
+}
+
+struct HudWeChatArticleDetailResponse: Codable {
+    let ok: Bool
+    let article: HudWeChatArticleSummary?
+    let noteMarkdown: String?
+    let sourceMarkdown: String?
 }
 
 // MARK: - Helpers
@@ -93,12 +129,13 @@ private func formatTimeLabel(_ ms: Double) -> String {
     return fmt.string(from: date)
 }
 
-private func tagDisplayLabel(_ tag: String) -> String {
+    private func tagDisplayLabel(_ tag: String) -> String {
     switch tag {
     case "pkb_vault": return "📚 存知识库"
     case "voice_idea": return "💡 语音闪念"
     case "ui_bug": return "🐛 修UI报错"
     case "sms_otp": return "🔑 验证码"
+    case "wechat_context": return "💬 微信尺素"
     default: return "📥 默认Inbox"
     }
 }
@@ -187,6 +224,124 @@ final class MirrorWebView: WKWebView {
     }
 }
 
+// The preview viewport determines the image size, never the source pixels.
+// NSImageView's intrinsic size otherwise raises the window's layout minimum.
+final class ScaledPreviewImageView: NSImageView {
+    var onOpen: (() -> Void)?
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+    }
+    override var acceptsFirstResponder: Bool { onOpen != nil }
+    override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self) }
+    override func mouseUp(with event: NSEvent) {
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onOpen?() }
+    }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 36 || event.keyCode == 49 { onOpen?() }
+        else { super.keyDown(with: event) }
+    }
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if onOpen != nil { addCursorRect(bounds, cursor: .pointingHand) }
+    }
+    override func accessibilityPerformPress() -> Bool {
+        guard let open = onOpen else { return false }
+        open()
+        return true
+    }
+}
+
+final class CenteredImageClipView: NSClipView {
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var rect = super.constrainBoundsRect(proposedBounds)
+        if let document = documentView {
+            if document.frame.width < rect.width { rect.origin.x = (document.frame.width - rect.width) / 2 }
+            if document.frame.height < rect.height { rect.origin.y = (document.frame.height - rect.height) / 2 }
+        }
+        return rect
+    }
+}
+
+final class ImagePreviewController: NSWindowController, NSWindowDelegate {
+    let scroll = NSScrollView()
+    private let imageSize: NSSize
+    private var fitsWindow = true
+    private var magnificationObserver: NSObjectProtocol?
+    var onClose: (() -> Void)?
+
+    init(image: NSImage, title: String, screen: NSRect) {
+        imageSize = image.size
+        let panel = KeyableDetailPanel(contentRect: NSRect(x: 0, y: 0, width: 900, height: 650),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        super.init(window: panel)
+        panel.title = title
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.level = .floating
+        panel.minSize = NSSize(width: 360, height: 280)
+        panel.maxSize = screen.size
+        panel.setFrame(NSRect(x: screen.midX - min(1100, screen.width) / 2, y: screen.minY,
+            width: min(1100, screen.width), height: screen.height), display: false)
+        panel.delegate = self
+        panel.onEscapePressed = { [weak self] in self?.close() }
+
+        guard let content = panel.contentView else { return }
+        let toolbar = NSStackView()
+        toolbar.spacing = 8
+        for (label, action) in [("−", #selector(zoomOut)), ("+", #selector(zoomIn)),
+            ("适应窗口", #selector(fitImage)), ("100%", #selector(actualSize)), ("关闭 (Esc)", #selector(closePreview))] {
+            toolbar.addArrangedSubview(NSButton(title: label, target: self, action: action))
+        }
+        toolbar.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(toolbar)
+        scroll.contentView = CenteredImageClipView()
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.allowsMagnification = true
+        scroll.minMagnification = 0.01
+        scroll.maxMagnification = 8
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        let imageView = NSImageView(frame: NSRect(origin: .zero, size: imageSize))
+        imageView.image = image
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        scroll.documentView = imageView
+        magnificationObserver = NotificationCenter.default.addObserver(
+            forName: NSScrollView.didEndLiveMagnifyNotification, object: scroll, queue: .main
+        ) { [weak self] _ in self?.fitsWindow = false }
+        content.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            toolbar.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            toolbar.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
+            scroll.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 8),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor)
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+    deinit {
+        if let observer = magnificationObserver { NotificationCenter.default.removeObserver(observer) }
+    }
+    @objc func fitImage() {
+        fitsWindow = true
+        window?.layoutIfNeeded()
+        let viewport = scroll.contentView.frame.size
+        let scale = min(viewport.width / max(1, imageSize.width), viewport.height / max(1, imageSize.height))
+        setZoom(min(1, scale))
+    }
+    private func setZoom(_ scale: CGFloat) {
+        scroll.setMagnification(min(scroll.maxMagnification, max(scroll.minMagnification, scale)),
+            centeredAt: NSPoint(x: imageSize.width / 2, y: imageSize.height / 2))
+    }
+    @objc func zoomIn() { fitsWindow = false; setZoom(scroll.magnification * 1.25) }
+    @objc func zoomOut() { fitsWindow = false; setZoom(scroll.magnification / 1.25) }
+    @objc func actualSize() { fitsWindow = false; setZoom(1) }
+    @objc func closePreview() { close() }
+    func windowDidResize(_ notification: Notification) { if fitsWindow { fitImage() } }
+    func windowWillClose(_ notification: Notification) { onClose?() }
+}
+
 final class HoverableToastView: NSVisualEffectView {
     var onHoverChanged: ((Bool) -> Void)?
     var onCardClicked: (() -> Void)?
@@ -227,6 +382,22 @@ final class HoverableToastView: NSVisualEffectView {
 
 final class ClickableRowView: NSView {
     var onClick: (() -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        return true
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // Route clicks anywhere inside the row (including multi-line wrapping NSTextFields)
+        // directly to ClickableRowView so subview text cells never swallow mouseDown.
+        return super.hitTest(point) != nil ? self : nil
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
     override func mouseDown(with event: NSEvent) {
         onClick?()
     }
@@ -408,6 +579,8 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     private var toastPanel: NonActivatingToastPanel?
     private var toastDismissTimer: Timer?
     private var currentToastItem: HudInboxItem?
+    private var currentToastChannel: String = "phone"
+    private var currentToastWeChatArticleId: Int?
     private var copyFeedbackButton: NSButton?
 
     // Detail panel state
@@ -416,15 +589,25 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     private var selectedItemId: String?
     private var selectedAttachmentIndex = 0
     private var activeQLPreview: QLPreviewView?
+    private var imagePreview: ImagePreviewController?
     private var audioPlayer: AVAudioPlayer?
     private weak var audioPlayButton: NSButton?
 
     // Subviews inside detail panel
     private var sidebarStack: NSStackView?
     private var inspectorContainer: NSView?
+    private var renderedInspectorItem: HudInboxItem?
+    private var renderedAttachmentIndex: Int?
     private var pinButton: NSButton?
     private var detailTabs: NSSegmentedControl?
     private var inboxContent: NSView?
+    private var wechatContent: NSView?
+    private var wxSidebarStack: NSStackView?
+    private var wxInspectorContainer: NSView?
+    private var wxArticles: [HudWeChatArticleSummary] = []
+    private var selectedWxArticleId: Int?
+    private var currentWxDetail: HudWeChatArticleDetailResponse?
+    private var selectedWxDocSegment: Int = 0
     private var mirrorContent: NSView?
     private var mirrorWebView: MirrorWebView?
     private var mirrorLoadedURL: URL?
@@ -522,15 +705,31 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     private func showStatusContextMenu() {
         let menu = NSMenu()
         let tier = statusSnapshot.activeTier ?? "DISCONNECTED"
-        let tierDesc = tier == "DISCONNECTED" ? "⚪ 手机当前未连接" : "🟢 已连接 (\(tier))"
+        let tierDesc = tier == "DISCONNECTED" ? "⚪ 手机当前未连接" : "🟢 手机已连 (\(tier))"
         let statusEntry = NSMenuItem(title: tierDesc, action: nil, keyEquivalent: "")
         statusEntry.isEnabled = false
         menu.addItem(statusEntry)
+
+        let wxDesc: String
+        if statusSnapshot.wechatRunning == true && statusSnapshot.wechatConfigured == true {
+            wxDesc = "🟢 微信尺素：ClawBot 在线"
+        } else if statusSnapshot.wechatRunning == true {
+            wxDesc = "🟠 微信尺素：待扫码绑定"
+        } else {
+            wxDesc = "⚪ 微信尺素：待命"
+        }
+        let wxEntry = NSMenuItem(title: wxDesc, action: nil, keyEquivalent: "")
+        wxEntry.isEnabled = false
+        menu.addItem(wxEntry)
         menu.addItem(NSMenuItem.separator())
 
         let openItem = NSMenuItem(title: "📬 查看最近投递（\(min(items.count, 25)) 条）", action: #selector(openDetailFromMenu), keyEquivalent: "")
         openItem.target = self
         menu.addItem(openItem)
+
+        let wxItem = NSMenuItem(title: "💬 微信尺素伴读收件箱…", action: #selector(openWeChatFromMenu), keyEquivalent: "")
+        wxItem.target = self
+        menu.addItem(wxItem)
 
         let mirrorItem = NSMenuItem(title: "📱 手机镜像…", action: #selector(openMirrorFromMenu), keyEquivalent: "")
         mirrorItem.target = self
@@ -553,6 +752,10 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     @objc private func openDetailFromMenu() {
         openDetailPanel(selectingItemId: items.first?.itemId)
+    }
+
+    @objc private func openWeChatFromMenu() {
+        openWeChatDetailTab(articleId: nil)
     }
 
     @objc private func openMirrorFromMenu() {
@@ -582,6 +785,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
                 destroyMirrorView()
                 if selectedDetailTab == 1 && detailPanel?.isVisible == true { loadMirrorView() }
             }
+            updateStatusBarAppearance()
         }
         switch env.type {
         case "sync_items":
@@ -607,6 +811,9 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             }
             updateStatusBarAppearance()
             refreshDetailPanelIfVisible()
+            if env.toast?.channel == "wechat" && selectedDetailTab == 2 && detailPanel?.isVisible == true {
+                fetchWeChatOverviewForHud(selectingArticleId: env.toast?.wechatArticleId)
+            }
             if let toast = env.toast {
                 let matched = env.item ?? toast.itemId.flatMap { id in items.first(where: { $0.itemId == id }) }
                 presentTopRightToast(toast: toast, item: matched)
@@ -618,6 +825,9 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             }
             let targetId = env.itemId ?? env.item?.itemId ?? items.first?.itemId
             openDetailPanel(selectingItemId: targetId)
+
+        case "peek_wechat":
+            openWeChatDetailTab(articleId: env.wechatArticleId)
 
         default:
             break
@@ -643,6 +853,9 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         toastPanel?.orderOut(nil)
         toastPanel = nil
         currentToastItem = item
+        currentToastChannel = toast.channel ?? "phone"
+        currentToastWeChatArticleId = toast.wechatArticleId
+        let isWeChatToast = (currentToastChannel == "wechat")
 
         if let sndName = toast.soundName, !sndName.isEmpty {
             NSSound(named: NSSound.Name(sndName))?.play()
@@ -676,7 +889,9 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         root.layer?.cornerRadius = 14
         root.layer?.masksToBounds = true
         root.layer?.borderWidth = 1
-        root.layer?.borderColor = NSColor(calibratedRed: 0.22, green: 0.74, blue: 0.97, alpha: 0.42).cgColor
+        root.layer?.borderColor = isWeChatToast
+            ? NSColor(calibratedRed: 0.29, green: 0.87, blue: 0.50, alpha: 0.48).cgColor
+            : NSColor(calibratedRed: 0.22, green: 0.74, blue: 0.97, alpha: 0.42).cgColor
 
         root.onHoverChanged = { [weak self] hovering in
             if hovering {
@@ -690,9 +905,11 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         }
 
         // Top Header Row
-        let brandLabel = NSTextField(labelWithString: "⚡ 青简·咫尺")
+        let brandLabel = NSTextField(labelWithString: isWeChatToast ? "💬 青简·尺素" : "⚡ 青简·咫尺")
         brandLabel.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
-        brandLabel.textColor = NSColor(calibratedRed: 0.22, green: 0.74, blue: 0.97, alpha: 1.0)
+        brandLabel.textColor = isWeChatToast
+            ? NSColor(calibratedRed: 0.29, green: 0.87, blue: 0.50, alpha: 1.0)
+            : NSColor(calibratedRed: 0.22, green: 0.74, blue: 0.97, alpha: 1.0)
         brandLabel.frame = NSRect(x: 14, y: cardH - 26, width: 92, height: 16)
         root.addSubview(brandLabel)
 
@@ -758,8 +975,10 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
         // Bottom Action Buttons
         let detailBtn = makePillButton(
-            title: "🔍 查看详情",
-            bg: NSColor(calibratedRed: 0.01, green: 0.52, blue: 0.78, alpha: 0.92),
+            title: isWeChatToast ? "💬 查看伴读" : "🔍 查看详情",
+            bg: isWeChatToast
+                ? NSColor(calibratedRed: 0.09, green: 0.64, blue: 0.29, alpha: 0.92)
+                : NSColor(calibratedRed: 0.01, green: 0.52, blue: 0.78, alpha: 0.92),
             fg: .white,
             action: #selector(openDetailFromToast)
         )
@@ -823,9 +1042,15 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     @objc private func openDetailFromToast() {
+        let isWeChat = (currentToastChannel == "wechat")
+        let wxId = currentToastWeChatArticleId
         let targetId = currentToastItem?.itemId ?? items.first?.itemId
         dismissToastAnimated()
-        openDetailPanel(selectingItemId: targetId)
+        if isWeChat {
+            openWeChatDetailTab(articleId: wxId)
+        } else {
+            openDetailPanel(selectingItemId: targetId)
+        }
     }
 
     @objc private func copyToastPayloadClicked(_ sender: NSButton) {
@@ -855,6 +1080,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     private func closeDetailPanel() {
+        closeImagePreview()
         destroyMirrorView()
         closeActiveQLPreview()
         audioPlayer?.stop()
@@ -864,18 +1090,31 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     func windowDidResignKey(_ notification: Notification) {
         guard let win = notification.object as? NSWindow, win === detailPanel else { return }
-        if !isDetailPinned && selectedDetailTab == 0 {
+        if !isDetailPinned && (selectedDetailTab == 0 || selectedDetailTab == 2) && imagePreview == nil {
             closeDetailPanel()
         }
     }
 
     func windowDidMiniaturize(_ notification: Notification) {
         guard let win = notification.object as? NSWindow, win === detailPanel else { return }
+        closeImagePreview()
         destroyMirrorView()
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        guard let win = notification.object as? NSWindow, win === detailPanel else { return }
+        constrainDetailPanelToScreen(maximizeHeight: true)
+        if selectedDetailTab == 1 { loadMirrorView() } // Capture still requires an explicit start.
+    }
+
+    func windowDidChangeScreen(_ notification: Notification) {
+        guard let win = notification.object as? NSWindow, win === detailPanel else { return }
+        constrainDetailPanelToScreen(maximizeHeight: true)
     }
 
     func windowWillClose(_ notification: Notification) {
         guard let win = notification.object as? NSWindow, win === detailPanel else { return }
+        closeImagePreview()
         destroyMirrorView()
         closeActiveQLPreview()
         audioPlayer?.stop()
@@ -902,17 +1141,24 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     private func showDetailPanel() {
         guard let panel = detailPanel else { return }
-        if !panel.isVisible {
-            if let screen = NSScreen.main?.visibleFrame {
-                let w = panel.frame.width
-                let h = panel.frame.height
-                let x = screen.midX - w / 2.0
-                let y = screen.midY - h / 2.0 + 40
-                panel.setFrameOrigin(NSPoint(x: x, y: y))
-            }
-        }
+        constrainDetailPanelToScreen(center: !panel.isVisible, maximizeHeight: true)
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
+    }
+
+    private func constrainDetailPanelToScreen(visibleFrame: NSRect? = nil, center: Bool = false, maximizeHeight: Bool = false) {
+        guard let panel = detailPanel,
+              let screen = visibleFrame ?? panel.screen?.visibleFrame ?? NSScreen.main?.visibleFrame else { return }
+        panel.maxSize = screen.size
+        var frame = panel.frame
+        frame.size.width = min(frame.width, screen.width)
+        frame.size.height = maximizeHeight ? screen.height : min(frame.height, screen.height)
+        if center {
+            frame.origin = NSPoint(x: screen.midX - frame.width / 2, y: screen.midY - frame.height / 2)
+        }
+        frame.origin.x = max(screen.minX, min(frame.minX, screen.maxX - frame.width))
+        frame.origin.y = max(screen.minY, min(frame.minY, screen.maxY - frame.height))
+        if frame != panel.frame { panel.setFrame(frame, display: false) }
     }
 
     private func markItemReadLocally(_ itemId: String) {
@@ -922,7 +1168,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     private func refreshDetailPanelIfVisible() {
         guard let panel = detailPanel, panel.isVisible else { return }
-        if selectedDetailTab == 0 { rebuildSidebarAndInspector() }
+        if selectedDetailTab == 0 { rebuildSidebarAndInspector(preserveInspector: true) }
     }
 
     private func buildDetailPanelWindow() {
@@ -939,7 +1185,8 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
         panel.isMovableByWindowBackground = true
-        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        panel.level = isDetailPinned ? .floating : .normal
         // canJoinAllSpaces and moveToActiveSpace are mutually exclusive in AppKit.
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.minSize = NSSize(width: 680, height: 440)
@@ -967,20 +1214,21 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         topBar.translatesAutoresizingMaskIntoConstraints = false
         effect.addSubview(topBar)
 
-        let headerTitle = NSSegmentedControl(labels: ["最近投递", "手机镜像"], trackingMode: .selectOne, target: self, action: #selector(detailTabChanged))
+        let headerTitle = NSSegmentedControl(labels: ["📬 最近投递", "📱 手机镜像", "💬 微信尺素"], trackingMode: .selectOne, target: self, action: #selector(detailTabChanged))
         headerTitle.selectedSegment = 0
         headerTitle.translatesAutoresizingMaskIntoConstraints = false
         topBar.addSubview(headerTitle)
         detailTabs = headerTitle
 
         let pinBtn = makePillButton(
-            title: "📌 钉住窗口: 关",
+            title: "📌 置顶常驻: 关",
             bg: NSColor(calibratedWhite: 1.0, alpha: 0.10),
             fg: NSColor(calibratedWhite: 0.85, alpha: 1.0),
             action: #selector(togglePinDetailWindow)
         )
         pinBtn.translatesAutoresizingMaskIntoConstraints = false
         topBar.addSubview(pinBtn)
+        pinBtn.toolTip = "开启：置顶且切换 App 后保持显示；关闭：投递窗口失焦后收起"
         self.pinButton = pinBtn
 
         // Horizontal Split: Sidebar (240pt) + Right Inspector
@@ -990,8 +1238,9 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         effect.addSubview(divider)
 
         let inboxHost = NSView()
+        let wechatHost = NSView()
         let mirrorHost = NSView()
-        for host in [inboxHost, mirrorHost] {
+        for host in [inboxHost, wechatHost, mirrorHost] {
             host.translatesAutoresizingMaskIntoConstraints = false
             effect.addSubview(host)
             NSLayoutConstraint.activate([
@@ -1002,8 +1251,11 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             ])
         }
         inboxContent = inboxHost
+        wechatContent = wechatHost
         mirrorContent = mirrorHost
+        wechatHost.isHidden = true
         mirrorHost.isHidden = true
+        buildWeChatSplitView(in: wechatHost)
         let message = NSTextField(wrappingLabelWithString: "手动开始镜像，不会自动唤醒手机")
         message.translatesAutoresizingMaskIntoConstraints = false
         message.alignment = .center
@@ -1103,19 +1355,433 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     private func selectDetailTab(_ index: Int) {
-        selectedDetailTab = index == 1 ? 1 : 0
+        closeImagePreview()
+        selectedDetailTab = (0...2).contains(index) ? index : 0
+        detailPanel?.level = (selectedDetailTab == 1 || isDetailPinned) ? .floating : .normal
         detailTabs?.selectedSegment = selectedDetailTab
-        inboxContent?.isHidden = selectedDetailTab == 1
+        // Pinning controls auto-dismiss on inbox & wechat tabs; mirror always stays open.
+        pinButton?.isHidden = selectedDetailTab == 1
+        inboxContent?.isHidden = selectedDetailTab != 0
         mirrorContent?.isHidden = selectedDetailTab != 1
+        wechatContent?.isHidden = selectedDetailTab != 2
         if selectedDetailTab == 1 {
             closeActiveQLPreview()
             audioPlayer?.stop()
             audioPlayer = nil
+            inspectorContainer?.subviews.forEach { $0.removeFromSuperview() }
             loadMirrorView()
+        } else if selectedDetailTab == 2 {
+            destroyMirrorView()
+            closeActiveQLPreview()
+            audioPlayer?.stop()
+            audioPlayer = nil
+            inspectorContainer?.subviews.forEach { $0.removeFromSuperview() }
+            fetchWeChatOverviewForHud(selectingArticleId: selectedWxArticleId)
         } else {
             destroyMirrorView()
             rebuildSidebarAndInspector()
         }
+        constrainDetailPanelToScreen(maximizeHeight: true)
+    }
+
+    private func openWeChatDetailTab(articleId: Int?) {
+        ipc?.sendJson(["type": "request_sync"])
+        if let aid = articleId, aid > 0 {
+            selectedWxArticleId = aid
+        }
+        if detailPanel == nil {
+            buildDetailPanelWindow()
+        }
+        selectDetailTab(2)
+        showDetailPanel()
+    }
+
+    private func buildWeChatSplitView(in host: NSView) {
+        let leftHeader = NSView()
+        leftHeader.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(leftHeader)
+
+        let refreshBtn = makePillButton(
+            title: "🔄 刷新",
+            bg: NSColor(calibratedWhite: 1.0, alpha: 0.10),
+            fg: .white,
+            action: #selector(refreshWeChatHudClicked)
+        )
+        refreshBtn.translatesAutoresizingMaskIntoConstraints = false
+        leftHeader.addSubview(refreshBtn)
+
+        let cfgBtn = makePillButton(
+            title: "⚙️ 尺素配置",
+            bg: NSColor(calibratedRed: 0.09, green: 0.64, blue: 0.29, alpha: 0.32),
+            fg: NSColor(calibratedRed: 0.53, green: 0.94, blue: 0.67, alpha: 1.0),
+            action: #selector(openWeChatConfigInBrowser)
+        )
+        cfgBtn.translatesAutoresizingMaskIntoConstraints = false
+        leftHeader.addSubview(cfgBtn)
+
+        let scrollSidebar = NSScrollView()
+        scrollSidebar.drawsBackground = false
+        scrollSidebar.hasVerticalScroller = true
+        scrollSidebar.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        stack.edgeInsets = NSEdgeInsets(top: 6, left: 8, bottom: 8, right: 8)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let docView = FlippedContainerView()
+        docView.translatesAutoresizingMaskIntoConstraints = false
+        docView.addSubview(stack)
+        scrollSidebar.documentView = docView
+
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: docView.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: docView.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: docView.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: docView.bottomAnchor),
+            docView.widthAnchor.constraint(equalTo: scrollSidebar.contentView.widthAnchor)
+        ])
+        host.addSubview(scrollSidebar)
+        self.wxSidebarStack = stack
+
+        let vDivider = NSBox()
+        vDivider.boxType = .separator
+        vDivider.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(vDivider)
+
+        let inspector = NSView()
+        inspector.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(inspector)
+        self.wxInspectorContainer = inspector
+
+        NSLayoutConstraint.activate([
+            leftHeader.topAnchor.constraint(equalTo: host.topAnchor, constant: 6),
+            leftHeader.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 8),
+            leftHeader.widthAnchor.constraint(equalToConstant: 239),
+            leftHeader.heightAnchor.constraint(equalToConstant: 28),
+
+            refreshBtn.leadingAnchor.constraint(equalTo: leftHeader.leadingAnchor),
+            refreshBtn.centerYAnchor.constraint(equalTo: leftHeader.centerYAnchor),
+            refreshBtn.widthAnchor.constraint(equalToConstant: 84),
+            refreshBtn.heightAnchor.constraint(equalToConstant: 24),
+
+            cfgBtn.trailingAnchor.constraint(equalTo: leftHeader.trailingAnchor),
+            cfgBtn.centerYAnchor.constraint(equalTo: leftHeader.centerYAnchor),
+            cfgBtn.widthAnchor.constraint(equalToConstant: 108),
+            cfgBtn.heightAnchor.constraint(equalToConstant: 24),
+
+            scrollSidebar.topAnchor.constraint(equalTo: leftHeader.bottomAnchor, constant: 4),
+            scrollSidebar.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+            scrollSidebar.bottomAnchor.constraint(equalTo: host.bottomAnchor),
+            scrollSidebar.widthAnchor.constraint(equalToConstant: 255),
+
+            vDivider.topAnchor.constraint(equalTo: host.topAnchor),
+            vDivider.leadingAnchor.constraint(equalTo: scrollSidebar.trailingAnchor),
+            vDivider.widthAnchor.constraint(equalToConstant: 1),
+            vDivider.bottomAnchor.constraint(equalTo: host.bottomAnchor),
+
+            inspector.topAnchor.constraint(equalTo: host.topAnchor),
+            inspector.leadingAnchor.constraint(equalTo: vDivider.trailingAnchor),
+            inspector.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+            inspector.bottomAnchor.constraint(equalTo: host.bottomAnchor)
+        ])
+    }
+
+    private func validatedLoopbackURL(_ raw: String?) -> URL? {
+        guard let raw = raw, let c = URLComponents(string: raw),
+              c.scheme == "http", c.host == "127.0.0.1", c.user == nil, c.password == nil,
+              let port = c.port, (1...65535).contains(port)
+        else { return nil }
+        return c.url
+    }
+
+    @objc private func refreshWeChatHudClicked() {
+        fetchWeChatOverviewForHud(selectingArticleId: selectedWxArticleId)
+    }
+
+    @objc private func openWeChatConfigInBrowser() {
+        let raw = statusSnapshot.wechatConfigUrl ?? "http://127.0.0.1:19527/wechat/config"
+        if let url = validatedLoopbackURL(raw) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func fetchWeChatOverviewForHud(selectingArticleId: Int?) {
+        let baseRaw = statusSnapshot.wechatApiBaseUrl ?? "http://127.0.0.1:19527/api/wechat"
+        guard let url = validatedLoopbackURL("\(baseRaw)/overview?limit=50") else { return }
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
+        req.httpMethod = "GET"
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let self = self, let data = data,
+                  let decoded = try? JSONDecoder().decode(HudWeChatOverviewResponse.self, from: data),
+                  decoded.ok else { return }
+            DispatchQueue.main.async {
+                self.wxArticles = decoded.articles ?? []
+                if let explicit = selectingArticleId, explicit > 0 {
+                    self.selectedWxArticleId = explicit
+                } else if self.selectedWxArticleId == nil {
+                    self.selectedWxArticleId = self.wxArticles.first?.id
+                }
+                self.rebuildWeChatSidebar()
+                if let aid = self.selectedWxArticleId {
+                    self.fetchWeChatArticleDetailForHud(articleId: aid)
+                } else {
+                    self.renderWeChatEmptyInspector("暂无微信转发文章记录")
+                }
+            }
+        }.resume()
+    }
+
+    private func fetchWeChatArticleDetailForHud(articleId: Int) {
+        let baseRaw = statusSnapshot.wechatApiBaseUrl ?? "http://127.0.0.1:19527/api/wechat"
+        guard let url = validatedLoopbackURL("\(baseRaw)/article?id=\(articleId)") else { return }
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
+        req.httpMethod = "GET"
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let self = self, let data = data,
+                  let decoded = try? JSONDecoder().decode(HudWeChatArticleDetailResponse.self, from: data),
+                  decoded.ok else { return }
+            DispatchQueue.main.async {
+                self.currentWxDetail = decoded
+                self.renderWeChatInspector()
+            }
+        }.resume()
+    }
+
+    private func rebuildWeChatSidebar() {
+        guard let stack = wxSidebarStack else { return }
+        stack.arrangedSubviews.forEach { v in
+            stack.removeArrangedSubview(v)
+            v.removeFromSuperview()
+        }
+        if wxArticles.isEmpty {
+            let empty = NSTextField(wrappingLabelWithString: "暂无微信文章记录\n在手机微信转发公众号、视频或网页给 ClawBot 即可自动归档")
+            empty.font = NSFont.systemFont(ofSize: 12)
+            empty.textColor = NSColor(calibratedWhite: 0.62, alpha: 1.0)
+            empty.alignment = .center
+            stack.addArrangedSubview(empty)
+            return
+        }
+        for art in wxArticles {
+            let isSelected = (art.id == selectedWxArticleId)
+            let row = ClickableRowView()
+            row.translatesAutoresizingMaskIntoConstraints = false
+            row.wantsLayer = true
+            row.layer?.cornerRadius = 8
+            row.layer?.backgroundColor = isSelected
+                ? NSColor(calibratedRed: 0.16, green: 0.72, blue: 0.40, alpha: 0.28).cgColor
+                : NSColor(calibratedWhite: 1.0, alpha: 0.04).cgColor
+            row.layer?.borderWidth = isSelected ? 1 : 0
+            row.layer?.borderColor = NSColor(calibratedRed: 0.29, green: 0.87, blue: 0.50, alpha: 0.65).cgColor
+            let targetId = art.id
+            row.onClick = { [weak self] in
+                self?.selectedWxArticleId = targetId
+                self?.rebuildWeChatSidebar()
+                self?.fetchWeChatArticleDetailForHud(articleId: targetId)
+            }
+
+            let badgeIcon = art.process_level == "deep" ? "💎" : (art.triage == "deep" ? "🔥" : (art.triage == "reference" ? "📎" : "📌"))
+            let topMeta = NSTextField(labelWithString: "\(badgeIcon) #\(art.id) · \(String(art.created_at.prefix(10)))")
+            topMeta.isSelectable = false
+            topMeta.font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
+            topMeta.textColor = NSColor(calibratedWhite: 0.66, alpha: 1.0)
+            topMeta.translatesAutoresizingMaskIntoConstraints = false
+            row.addSubview(topMeta)
+
+            let titleLbl = NSTextField(wrappingLabelWithString: art.title.isEmpty ? art.url : art.title)
+            titleLbl.isSelectable = false
+            titleLbl.font = NSFont.systemFont(ofSize: 12.5, weight: isSelected ? .semibold : .medium)
+            titleLbl.textColor = .white
+            titleLbl.maximumNumberOfLines = 2
+            titleLbl.cell?.truncatesLastVisibleLine = true
+            titleLbl.translatesAutoresizingMaskIntoConstraints = false
+            row.addSubview(titleLbl)
+
+            stack.addArrangedSubview(row)
+            NSLayoutConstraint.activate([
+                row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16),
+                topMeta.topAnchor.constraint(equalTo: row.topAnchor, constant: 7),
+                topMeta.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 9),
+                topMeta.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -9),
+                titleLbl.topAnchor.constraint(equalTo: topMeta.bottomAnchor, constant: 3),
+                titleLbl.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 9),
+                titleLbl.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -9),
+                titleLbl.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -8)
+            ])
+        }
+    }
+
+    private func renderWeChatEmptyInspector(_ text: String) {
+        guard let box = wxInspectorContainer else { return }
+        box.subviews.forEach { $0.removeFromSuperview() }
+        let lbl = NSTextField(wrappingLabelWithString: text)
+        lbl.font = NSFont.systemFont(ofSize: 13)
+        lbl.textColor = NSColor(calibratedWhite: 0.65, alpha: 1.0)
+        lbl.alignment = .center
+        lbl.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(lbl)
+        NSLayoutConstraint.activate([
+            lbl.centerXAnchor.constraint(equalTo: box.centerXAnchor),
+            lbl.centerYAnchor.constraint(equalTo: box.centerYAnchor)
+        ])
+    }
+
+    private func renderWeChatInspector() {
+        guard let box = wxInspectorContainer, let detail = currentWxDetail, let art = detail.article else {
+            renderWeChatEmptyInspector("选择左侧微信文章查看伴读与原文")
+            return
+        }
+        box.subviews.forEach { $0.removeFromSuperview() }
+
+        let titleField = NSTextField(wrappingLabelWithString: "#\(art.id) \(art.title.isEmpty ? "未命名文章" : art.title)")
+        titleField.font = NSFont.systemFont(ofSize: 15, weight: .bold)
+        titleField.textColor = .white
+        titleField.maximumNumberOfLines = 2
+        titleField.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(titleField)
+
+        let metaText = [
+            art.author.isEmpty ? nil : "✍️ \(art.author)",
+            "📊 \(art.status) (\(art.process_level))",
+            art.user_notes.isEmpty ? nil : "💬 批注: \(art.user_notes)"
+        ].compactMap { $0 }.joined(separator: "  ·  ")
+        let metaField = NSTextField(labelWithString: metaText)
+        metaField.font = NSFont.systemFont(ofSize: 11.5)
+        metaField.textColor = NSColor(calibratedWhite: 0.72, alpha: 1.0)
+        metaField.lineBreakMode = .byTruncatingTail
+        metaField.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(metaField)
+
+        let actionRow = NSStackView()
+        actionRow.orientation = .horizontal
+        actionRow.spacing = 8
+        actionRow.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(actionRow)
+
+        let docSeg = NSSegmentedControl(labels: ["📒 伴读笔记", "💡 初筛摘要", "📄 归档原文"], trackingMode: .selectOne, target: self, action: #selector(wxDocSegmentChanged(_:)))
+        docSeg.selectedSegment = selectedWxDocSegment
+        actionRow.addArrangedSubview(docSeg)
+
+        let phoneBtn = makePillButton(
+            title: "📱 推到手机朗读",
+            bg: NSColor(calibratedRed: 0.09, green: 0.64, blue: 0.29, alpha: 0.88),
+            fg: .white,
+            action: #selector(pushSelectedWeChatToPhoneClicked(_:))
+        )
+        phoneBtn.widthAnchor.constraint(equalToConstant: 118).isActive = true
+        phoneBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        actionRow.addArrangedSubview(phoneBtn)
+
+        let copyBtn = makePillButton(
+            title: "📋 复制内容",
+            bg: NSColor(calibratedWhite: 1.0, alpha: 0.12),
+            fg: .white,
+            action: #selector(copySelectedWeChatContentClicked(_:))
+        )
+        copyBtn.widthAnchor.constraint(equalToConstant: 92).isActive = true
+        copyBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        actionRow.addArrangedSubview(copyBtn)
+
+        if !art.note_md_path.isEmpty {
+            let revealBtn = makePillButton(
+                title: "📂 Finder",
+                bg: NSColor(calibratedWhite: 1.0, alpha: 0.10),
+                fg: .white,
+                action: #selector(revealSelectedWeChatNoteInFinder)
+            )
+            revealBtn.widthAnchor.constraint(equalToConstant: 78).isActive = true
+            revealBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
+            actionRow.addArrangedSubview(revealBtn)
+        }
+
+        let scroll = NSScrollView()
+        scroll.drawsBackground = true
+        scroll.backgroundColor = NSColor(calibratedRed: 0.05, green: 0.07, blue: 0.12, alpha: 0.88)
+        scroll.hasVerticalScroller = true
+        scroll.wantsLayer = true
+        scroll.layer?.cornerRadius = 10
+        scroll.layer?.borderWidth = 1
+        scroll.layer?.borderColor = NSColor(calibratedWhite: 1.0, alpha: 0.10).cgColor
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+
+        let bodyContent: String
+        switch selectedWxDocSegment {
+        case 1:
+            bodyContent = art.short_summary.isEmpty ? "（暂无初筛摘要）" : art.short_summary
+        case 2:
+            bodyContent = detail.sourceMarkdown ?? "（本地原文文件不存在或尚未抓取）"
+        default:
+            bodyContent = detail.noteMarkdown ?? (art.short_summary.isEmpty ? "（暂无伴读笔记）" : art.short_summary)
+        }
+
+        let textView = NSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.textColor = NSColor(calibratedWhite: 0.94, alpha: 1.0)
+        textView.font = NSFont.systemFont(ofSize: 13)
+        textView.textContainerInset = NSSize(width: 12, height: 12)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.string = bodyContent
+        scroll.documentView = textView
+        box.addSubview(scroll)
+
+        NSLayoutConstraint.activate([
+            titleField.topAnchor.constraint(equalTo: box.topAnchor, constant: 12),
+            titleField.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 14),
+            titleField.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -14),
+
+            metaField.topAnchor.constraint(equalTo: titleField.bottomAnchor, constant: 4),
+            metaField.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 14),
+            metaField.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -14),
+
+            actionRow.topAnchor.constraint(equalTo: metaField.bottomAnchor, constant: 10),
+            actionRow.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 14),
+
+            scroll.topAnchor.constraint(equalTo: actionRow.bottomAnchor, constant: 10),
+            scroll.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 14),
+            scroll.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -14),
+            scroll.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -14)
+        ])
+    }
+
+    @objc private func wxDocSegmentChanged(_ sender: NSSegmentedControl) {
+        selectedWxDocSegment = sender.selectedSegment
+        renderWeChatInspector()
+    }
+
+    @objc private func pushSelectedWeChatToPhoneClicked(_ sender: NSButton) {
+        guard let art = currentWxDetail?.article else { return }
+        ipc?.sendJson([
+            "type": "push_wechat_to_phone",
+            "articleId": art.id,
+            "title": art.title
+        ])
+        sender.title = "✓ 已请求同步"
+    }
+
+    @objc private func copySelectedWeChatContentClicked(_ sender: NSButton) {
+        guard let detail = currentWxDetail, let art = detail.article else { return }
+        let txt: String
+        switch selectedWxDocSegment {
+        case 1: txt = art.short_summary
+        case 2: txt = detail.sourceMarkdown ?? ""
+        default: txt = detail.noteMarkdown ?? art.short_summary
+        }
+        if !txt.isEmpty {
+            copyStringToPasteboard(txt)
+            sender.title = "✓ 已复制"
+        }
+    }
+
+    @objc private func revealSelectedWeChatNoteInFinder() {
+        guard let path = currentWxDetail?.article?.note_md_path, !path.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 
     private func validatedMirrorURL() -> URL? {
@@ -1210,13 +1876,42 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     @objc private func togglePinDetailWindow() {
         isDetailPinned.toggle()
-        pinButton?.title = isDetailPinned ? "📌 钉住窗口: 开" : "📌 钉住窗口: 关"
+        detailPanel?.level = (isDetailPinned || selectedDetailTab == 1) ? .floating : .normal
+        pinButton?.title = isDetailPinned ? "📌 置顶常驻: 开" : "📌 置顶常驻: 关"
         pinButton?.layer?.backgroundColor = isDetailPinned
             ? NSColor(calibratedRed: 0.01, green: 0.52, blue: 0.78, alpha: 0.85).cgColor
             : NSColor(calibratedWhite: 1.0, alpha: 0.10).cgColor
     }
 
-    private func rebuildSidebarAndInspector() {
+    private func closeImagePreview() {
+        guard let viewer = imagePreview else { return }
+        imagePreview = nil
+        viewer.onClose = nil
+        if let window = viewer.window { detailPanel?.removeChildWindow(window) }
+        viewer.close()
+    }
+
+    private func openImagePreview(image: NSImage, title: String) {
+        guard let parent = detailPanel,
+              let screen = parent.screen?.visibleFrame ?? NSScreen.main?.visibleFrame else { return }
+        closeImagePreview()
+        let viewer = ImagePreviewController(image: image, title: title, screen: screen)
+        imagePreview = viewer
+        viewer.onClose = { [weak self, weak viewer] in
+            guard let self = self else { return }
+            if let window = viewer?.window { self.detailPanel?.removeChildWindow(window) }
+            self.imagePreview = nil
+            self.detailPanel?.makeKeyAndOrderFront(nil)
+        }
+        if let window = viewer.window {
+            window.alphaValue = parent.alphaValue
+            parent.addChildWindow(window, ordered: .above)
+            window.makeKeyAndOrderFront(nil)
+            viewer.fitImage()
+        }
+    }
+
+    private func rebuildSidebarAndInspector(preserveInspector: Bool = false) {
         guard let stack = sidebarStack else { return }
         stack.arrangedSubviews.forEach { v in
             stack.removeArrangedSubview(v)
@@ -1240,6 +1935,9 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             }
         }
 
+        // Background sync must not reset text selection, document scroll or playback.
+        if preserveInspector && currentSelectedItem() == renderedInspectorItem &&
+            selectedAttachmentIndex == renderedAttachmentIndex && inspectorContainer?.subviews.isEmpty == false { return }
         rebuildInspectorPane()
     }
 
@@ -1306,6 +2004,8 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         audioPlayer = nil
 
         guard let container = inspectorContainer else { return }
+        renderedInspectorItem = currentSelectedItem()
+        renderedAttachmentIndex = selectedAttachmentIndex
         container.subviews.forEach { $0.removeFromSuperview() }
 
         guard let currentId = selectedItemId,
@@ -1338,7 +2038,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         titleLbl.maximumNumberOfLines = 2
         vStack.addArrangedSubview(titleLbl)
 
-        let statusBadge = item.processed ? "✓ 已处理" : "● 未读"
+        let statusBadge = item.processed ? "✓ 已处理" : "● 待处理"
         let subInfo = "\(tagDisplayLabel(item.intentTag))  ·  \(formatTimeLabel(item.createdAtMs))  ·  \(statusBadge)"
         let subLbl = NSTextField(labelWithString: subInfo)
         subLbl.font = NSFont.systemFont(ofSize: 11.5)
@@ -1518,7 +2218,18 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         closeActionBtn.heightAnchor.constraint(equalToConstant: 28).isActive = true
         actionBar.addArrangedSubview(closeActionBtn)
 
-        vStack.addArrangedSubview(actionBar)
+        // Keep all actions reachable without forcing the window wider than the screen.
+        let actionScroll = NSScrollView()
+        actionScroll.drawsBackground = false
+        actionScroll.hasHorizontalScroller = true
+        actionScroll.autohidesScrollers = true
+        actionScroll.translatesAutoresizingMaskIntoConstraints = false
+        actionScroll.documentView = actionBar
+        vStack.addArrangedSubview(actionScroll)
+        NSLayoutConstraint.activate([
+            actionScroll.widthAnchor.constraint(equalTo: vStack.widthAnchor, constant: -32),
+            actionScroll.heightAnchor.constraint(equalToConstant: 44)
+        ])
 
         NSLayoutConstraint.activate([
             vStack.topAnchor.constraint(equalTo: container.topAnchor),
@@ -1580,9 +2291,12 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         let fileUrl = URL(fileURLWithPath: file.absPath)
 
         if isImageFile(file), let img = NSImage(contentsOf: fileUrl) {
-            let imgView = NSImageView()
+            let imgView = ScaledPreviewImageView()
             imgView.image = img
             imgView.imageScaling = .scaleProportionallyUpOrDown
+            imgView.toolTip = "点击放大查看图片"
+            imgView.setAccessibilityLabel("放大查看图片")
+            imgView.onOpen = { [weak self] in self?.openImagePreview(image: img, title: file.fileName) }
             imgView.translatesAutoresizingMaskIntoConstraints = false
             wrapper.addSubview(imgView)
             NSLayoutConstraint.activate([

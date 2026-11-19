@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { OmsIpcClient } from "../daemon/ipc-client.js";
 import { OmsDaemon } from "../daemon/oms-daemon.js";
 import { OmsMcpServer } from "../mcp/server.js";
@@ -182,12 +182,13 @@ async function main() {
     }
 
     if (sub === "logs") {
+      const targetLog = flags.wx || flags.wechat ? path.join(homeDir, "logs", "wechat.log") : logFile;
       const lines = flags.lines ? Number(flags.lines) : 50;
-      if (!fs.existsSync(logFile)) {
-        console.log(`No daemon log file yet at ${logFile}`);
+      if (!fs.existsSync(targetLog)) {
+        console.log(`No daemon log file yet at ${targetLog}`);
         return;
       }
-      const content = fs.readFileSync(logFile, "utf8").split("\n");
+      const content = fs.readFileSync(targetLog, "utf8").split("\n");
       console.log(content.slice(-lines).join("\n"));
       return;
     }
@@ -340,6 +341,7 @@ async function main() {
       const autoCopy = parseBoolFlag(flags["auto-copy"]);
       const autoPreview = parseBoolFlag(flags["auto-preview"]);
       const autoOtp = parseBoolFlag(flags["auto-otp"]);
+      const autoWxPhone = parseBoolFlag(flags["auto-wx-phone"]);
       const preferredTtsVoice =
         typeof flags["tts-voice"] === "string"
           ? flags["tts-voice"]
@@ -362,6 +364,7 @@ async function main() {
         autoCopyTextToClipboard: autoCopy,
         autoPreviewImageOnMac: autoPreview,
         autoSyncOtpToMac: autoOtp,
+        autoSyncWeChatToPhone: autoWxPhone,
         preferredTtsVoice,
         unlockPattern,
         unlockPin,
@@ -915,10 +918,77 @@ async function main() {
       break;
     }
 
+    case "wx":
+    case "wechat": {
+      const wxSub = (sub || "list").toLowerCase();
+      if (wxSub === "status") {
+        const res = await ipc.call("wechat.status", {});
+        console.log(JSON.stringify(res, null, 2));
+        break;
+      }
+      if (wxSub === "peek") {
+        const articleId = positional[1] ? Number(positional[1]) : undefined;
+        const res = await ipc.call("wechat.peek", {
+          ...(articleId && Number.isFinite(articleId) ? { articleId } : {}),
+        });
+        console.log(JSON.stringify(res, null, 2));
+        break;
+      }
+      if (wxSub === "to-phone" || wxSub === "sync-phone") {
+        const articleId = positional[1] ? Number(positional[1]) : Number(flags.article || 0);
+        if (!articleId || !Number.isFinite(articleId)) {
+          throw new Error("Usage: oms wx to-phone <articleId>");
+        }
+        const res = await ipc.call("wechat.sync_to_phone", { articleId }, 35000);
+        console.log(JSON.stringify(res, null, 2));
+        break;
+      }
+      if (wxSub === "web") {
+        const st = await ipc.call("phone_presence_status", { refresh: false });
+        const url = `http://127.0.0.1:${st.lanPort || 19527}/inbox?module=wechat`;
+        console.log(`💬 Opening WeChat Context Dashboard Tab: ${url}`);
+        if (process.env.OMS_DISABLE_OSASCRIPT !== "1") {
+          execFile("open", [url]);
+        }
+        break;
+      }
+      if (wxSub === "config-web") {
+        const st = await ipc.call("phone_presence_status", { refresh: false });
+        const url = `http://127.0.0.1:${st.lanPort || 19527}/wechat/config`;
+        console.log(`⚙️ Opening WeChat Context Config Workbench: ${url}`);
+        if (process.env.OMS_DISABLE_OSASCRIPT !== "1") {
+          execFile("open", [url]);
+        }
+        break;
+      }
+
+      const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
+      const wxCliEntry = path.join(repoRoot, "wechat-context", "src", "cli.ts");
+      const wechatHome = process.env.OMS_WECHAT_HOME || path.join(homeDir, "wechat");
+      const forwardArgs = rawArgs.slice(1);
+      const child = spawnSync(
+        process.execPath,
+        ["run", wxCliEntry, ...(forwardArgs.length > 0 ? forwardArgs : ["list", "--json"])],
+        {
+          cwd: fs.existsSync(wechatHome) ? wechatHome : repoRoot,
+          env: {
+            ...process.env,
+            OMS_HOME: homeDir,
+            OMS_WECHAT_HOME: wechatHome,
+            BUN_CONFIG_DNS_TIME_TO_LIVE_SECONDS: "0",
+          },
+          stdio: "inherit",
+        }
+      );
+      process.exit(child.status ?? 0);
+    }
+
     default:
-      console.log(`OneMoreStep CLI (oms) - Mac AI <-> Xiaomi Android Bidirectional Bridge
+      console.log(`OneMoreStep CLI (oms) - Mac AI <-> Xiaomi Android & WeChat ClawBot Bridge
 Commands:
-  oms status [--live]                                  Inspect live presence, transport tier, battery, temp, audio, storage & permissions
+  oms status [--live]                                  Inspect live presence, transport tier, WeChat worker, battery, temp, audio & permissions
+  oms wx <list|show|recent|inbox|schedule|tasks|sync|ingest|reanalyze|push|doctor|login|peek|to-phone>
+                                                       Unified WeChat-as-Context (青简·尺素) article inbox, deep-read, schedules & WeChat push
   oms airpods [status|mac|phone|auto <on|off>|pause <on|off>]
                                                        Seamless AirPods auto-switch between Mac & Android on audio output + media pause
   oms phone <status|find|say|voices|stop-tts|volume|screenshot|open|launch|unlock|call|hangup|home|back|lock>

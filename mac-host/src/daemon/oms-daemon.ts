@@ -35,11 +35,15 @@ import { InboxManager, StoredInboxItem } from "../inbox/inbox-manager.js";
 import { handleDashboardHttpRequest } from "../inbox/inbox-web-dashboard.js";
 import { DingTalkConfig, DingTalkPlugin } from "../plugins/dingtalk.js";
 import { HudStatusPayload, MacHudServer } from "../hud/mac-hud-server.js";
+import { ManagedWeChatEvent, WeChatBridgeSupervisor } from "../wechat/wechat-supervisor.js";
 
 export interface OmsHostConfig {
   lanPort: number;
   wanRelayWssUrl?: string;
   enableBluetoothBridge: boolean;
+  enableWeChatBridge?: boolean;
+  wechatInternalPort?: number;
+  autoSyncWeChatToPhone?: boolean;
   autoCopyTextToClipboard?: boolean;
   autoPreviewImageOnMac?: boolean;
   autoSyncOtpToMac?: boolean;
@@ -102,8 +106,10 @@ export class OmsDaemon {
   public readonly inbox: InboxManager;
   public readonly session: PhoneSessionManager;
   public readonly dingtalk: DingTalkPlugin;
+  public readonly wechat: WeChatBridgeSupervisor;
 
   private readonly configPath: string;
+  private readonly wechatPendingPhoneQueuePath: string;
   private readonly identityPath: string;
   private readonly trustedDevicesPath: string;
   private readonly config: OmsHostConfig;
@@ -167,8 +173,10 @@ export class OmsDaemon {
     this.ensureSecureDir(path.join(this.homeDir, "logs"));
     this.ensureSecureDir(path.join(this.homeDir, "cache"));
     this.ensureSecureDir(path.join(this.homeDir, "cache", "tts"));
+    this.ensureSecureDir(path.join(this.homeDir, "wechat"));
 
     this.configPath = path.join(this.homeDir, "config.json");
+    this.wechatPendingPhoneQueuePath = path.join(this.homeDir, "wechat", "pending_phone_sync.json");
     this.identityPath = path.join(this.homeDir, "keystore", "host_identity.json");
     this.trustedDevicesPath = path.join(this.homeDir, "keystore", "trusted_devices.json");
     this.ipcSocketPath = path.join(this.homeDir, "run", "omsd.sock");
@@ -184,6 +192,19 @@ export class OmsDaemon {
 
     this.inbox = new InboxManager(path.join(this.homeDir, "inbox"));
     this.dingtalk = new DingTalkPlugin(this.config.dingtalk);
+
+    const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
+    this.wechat = new WeChatBridgeSupervisor({
+      omsHomeDir: this.homeDir,
+      wechatHomeDir: process.env.OMS_WECHAT_HOME || path.join(this.homeDir, "wechat"),
+      serverEntryPath: path.join(repoRoot, "wechat-context", "src", "server.ts"),
+      internalPort: this.config.wechatInternalPort || 19528,
+      logFilePath: path.join(this.homeDir, "logs", "wechat.log"),
+    });
+    this.wechat.on("statusChanged", () => this.syncMacHudState());
+    this.wechat.on("wechatEvent", (evt: ManagedWeChatEvent) => {
+      void this.handleManagedWeChatEvent(evt);
+    });
 
     this.session = new PhoneSessionManager({
       hostIdentity: this.identity,
@@ -300,6 +321,7 @@ export class OmsDaemon {
     autoCopyTextToClipboard: boolean;
     autoPreviewImageOnMac: boolean;
     autoSyncOtpToMac: boolean;
+    autoSyncWeChatToPhone: boolean;
     autoSwitchAirpods: boolean;
     pauseOtherOnAirpodsSwitch: boolean;
     preferredAirpodsMac?: string;
@@ -312,6 +334,7 @@ export class OmsDaemon {
       autoCopyTextToClipboard: this.config.autoCopyTextToClipboard !== false,
       autoPreviewImageOnMac: this.config.autoPreviewImageOnMac !== false,
       autoSyncOtpToMac: this.config.autoSyncOtpToMac !== false,
+      autoSyncWeChatToPhone: this.config.autoSyncWeChatToPhone !== false,
       autoSwitchAirpods: this.config.autoSwitchAirpods !== false,
       pauseOtherOnAirpodsSwitch: this.config.pauseOtherOnAirpodsSwitch !== false,
       preferredAirpodsMac: this.config.preferredAirpodsMac,
@@ -326,6 +349,7 @@ export class OmsDaemon {
     autoCopyTextToClipboard?: boolean;
     autoPreviewImageOnMac?: boolean;
     autoSyncOtpToMac?: boolean;
+    autoSyncWeChatToPhone?: boolean;
     autoSwitchAirpods?: boolean;
     pauseOtherOnAirpodsSwitch?: boolean;
     preferredAirpodsMac?: string;
@@ -333,18 +357,7 @@ export class OmsDaemon {
     unlockPattern?: string;
     unlockPin?: string;
     unlockBounds?: string;
-  }): {
-    autoCopyTextToClipboard: boolean;
-    autoPreviewImageOnMac: boolean;
-    autoSyncOtpToMac: boolean;
-    autoSwitchAirpods: boolean;
-    pauseOtherOnAirpodsSwitch: boolean;
-    preferredAirpodsMac?: string;
-    preferredTtsVoice: string;
-    hasUnlockPattern: boolean;
-    hasUnlockPin: boolean;
-    unlockBounds?: string;
-  } {
+  }) {
     if (typeof prefs.autoCopyTextToClipboard === "boolean") {
       this.config.autoCopyTextToClipboard = prefs.autoCopyTextToClipboard;
     }
@@ -353,6 +366,9 @@ export class OmsDaemon {
     }
     if (typeof prefs.autoSyncOtpToMac === "boolean") {
       this.config.autoSyncOtpToMac = prefs.autoSyncOtpToMac;
+    }
+    if (typeof prefs.autoSyncWeChatToPhone === "boolean") {
+      this.config.autoSyncWeChatToPhone = prefs.autoSyncWeChatToPhone;
     }
     if (typeof prefs.autoSwitchAirpods === "boolean") {
       this.config.autoSwitchAirpods = prefs.autoSwitchAirpods;
@@ -685,6 +701,7 @@ export class OmsDaemon {
       }
       this.syncAirpodsConfigToBridgeAndPhone();
       this.syncMacHudState();
+      void this.flushPendingWeChatPhoneQueue();
     });
 
     this.session.on("airpodsDiagnostics", (diagnostics) => {
@@ -1301,12 +1318,223 @@ export class OmsDaemon {
   }
 
   private getHudStatusPayload(): HudStatusPayload {
+    const wxSnap = this.wechat.getCachedSnapshot();
     return {
       activeTier: this.session.getActiveTier(),
       phoneName: this.session.getPhoneStatus()?.deviceModel,
       inboxDir: this.inbox.inboxRootDir,
       mirrorUrl: `http://127.0.0.1:${this.config.lanPort}/mirror?hud=1`,
+      wechatRunning: wxSnap.running,
+      wechatConfigured: wxSnap.credentialsConfigured,
+      wechatLastPoll: wxSnap.lastPoll ?? undefined,
+      wechatApiBaseUrl: `http://127.0.0.1:${this.config.lanPort}/api/wechat`,
+      wechatConfigUrl: `http://127.0.0.1:${this.config.lanPort}/wechat/config`,
     };
+  }
+
+  public peekWeChatInHud(articleId?: number): { ok: boolean; hudActive: boolean; articleId?: number } {
+    if (this.hudServer?.isConnected()) {
+      const delivered = this.hudServer.peekWeChat(articleId, {
+        status: this.getHudStatusPayload(),
+      });
+      return { ok: delivered, hudActive: true, articleId };
+    }
+    return { ok: false, hudActive: false, articleId };
+  }
+
+  private enqueuePendingWeChatPhoneItem(entry: {
+    key: string;
+    title: string;
+    markdown: string;
+    createdAtMs: number;
+  }): void {
+    try {
+      let queue: Array<{ key: string; title: string; markdown: string; createdAtMs: number }> = [];
+      if (fs.existsSync(this.wechatPendingPhoneQueuePath)) {
+        queue = JSON.parse(fs.readFileSync(this.wechatPendingPhoneQueuePath, "utf8"));
+        if (!Array.isArray(queue)) queue = [];
+      }
+      queue = queue.filter((q) => q.key !== entry.key);
+      queue.push(entry);
+      if (queue.length > 25) {
+        queue = queue.slice(queue.length - 25);
+      }
+      this.writeSecureFileAtomic(this.wechatPendingPhoneQueuePath, JSON.stringify(queue, null, 2));
+    } catch {
+      // ignore queue write errors
+    }
+  }
+
+  public async pushWeChatNoteToPhone(opts: {
+    articleId?: number;
+    title?: string;
+    markdown?: string;
+    queueIfOffline?: boolean;
+  }): Promise<{ ok: boolean; queuedOffline?: boolean; streamId?: string; title?: string; error?: string }> {
+    let title = (opts.title || "").trim();
+    let markdown = (opts.markdown || "").trim();
+    const articleId = Number(opts.articleId || 0);
+
+    if ((!markdown || !title) && articleId > 0 && this.wechat.isRunning()) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${this.wechat.internalPort}/api/article?id=${articleId}`, {
+          headers: { Host: `127.0.0.1:${this.wechat.internalPort}` },
+          signal: AbortSignal.timeout(3000),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as Record<string, any>;
+          const art = data.article || {};
+          title = title || `💬 ${art.title || `微信文章 #${articleId}`}`;
+          markdown =
+            markdown ||
+            String(data.noteMarkdown || art.short_summary || art.digest || "").trim();
+        }
+      } catch {
+        // fallback to provided fields
+      }
+    }
+
+    if (!markdown) {
+      return { ok: false, error: "未找到可同步的微信伴读或初筛内容" };
+    }
+    const finalTitle = title.startsWith("💬") ? title : `💬 ${title || "微信尺素伴读"}`;
+    const safeStem = (finalTitle.replace(/^💬\s*/, "").replace(/[^\p{L}\p{N}_-]+/gu, "_").slice(0, 48) || "wechat_note");
+    const fileName = `wx_${articleId > 0 ? `${articleId}_` : ""}${safeStem}.md`;
+
+    if (this.session.getActiveTier() === "DISCONNECTED") {
+      if (opts.queueIfOffline !== false) {
+        this.enqueuePendingWeChatPhoneItem({
+          key: articleId > 0 ? `article_${articleId}` : `wx_${Date.now()}`,
+          title: finalTitle,
+          markdown,
+          createdAtMs: Date.now(),
+        });
+        return { ok: true, queuedOffline: true, title: finalTitle };
+      }
+      return { ok: false, error: "手机当前离线，无法立即推送至手机时间流" };
+    }
+
+    try {
+      const bytes = new TextEncoder().encode(markdown);
+      const pushed = await this.session.pushStreamToPhone({
+        fileName,
+        mimeType: "text/markdown",
+        data: bytes,
+        title: finalTitle,
+        intentTag: "wechat_context",
+        enableCommuteTts: true,
+      });
+      return { ok: true, streamId: pushed.streamId, title: finalTitle };
+    } catch (err: any) {
+      if (opts.queueIfOffline !== false) {
+        this.enqueuePendingWeChatPhoneItem({
+          key: articleId > 0 ? `article_${articleId}` : `wx_${Date.now()}`,
+          title: finalTitle,
+          markdown,
+          createdAtMs: Date.now(),
+        });
+        return { ok: true, queuedOffline: true, title: finalTitle };
+      }
+      return { ok: false, error: err?.message || String(err) };
+    }
+  }
+
+  private async flushPendingWeChatPhoneQueue(): Promise<void> {
+    if (this.session.getActiveTier() === "DISCONNECTED") return;
+    if (!fs.existsSync(this.wechatPendingPhoneQueuePath)) return;
+    let queue: Array<{ key: string; title: string; markdown: string; createdAtMs: number }> = [];
+    try {
+      queue = JSON.parse(fs.readFileSync(this.wechatPendingPhoneQueuePath, "utf8"));
+      if (!Array.isArray(queue) || queue.length === 0) return;
+    } catch {
+      return;
+    }
+
+    const remaining: typeof queue = [];
+    for (const item of queue) {
+      if (this.session.getActiveTier() === "DISCONNECTED") {
+        remaining.push(item);
+        continue;
+      }
+      try {
+        const bytes = new TextEncoder().encode(item.markdown);
+        const safeStem = item.title.replace(/^💬\s*/, "").replace(/[^\p{L}\p{N}_-]+/gu, "_").slice(0, 48) || "wechat_note";
+        await this.session.pushStreamToPhone({
+          fileName: `${item.key}_${safeStem}.md`,
+          mimeType: "text/markdown",
+          data: bytes,
+          title: item.title,
+          intentTag: "wechat_context",
+          enableCommuteTts: true,
+        });
+      } catch {
+        remaining.push(item);
+      }
+    }
+
+    try {
+      if (remaining.length === 0) {
+        fs.unlinkSync(this.wechatPendingPhoneQueuePath);
+      } else {
+        this.writeSecureFileAtomic(this.wechatPendingPhoneQueuePath, JSON.stringify(remaining, null, 2));
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  private async handleManagedWeChatEvent(evt: ManagedWeChatEvent): Promise<void> {
+    await this.wechat.refreshHealth(true).catch(() => {});
+    this.syncMacHudState();
+
+    const toastTitle =
+      evt.eventType === "article"
+        ? `💬 初筛完成 · ${evt.title}`
+        : evt.title;
+    const toastSubtitle =
+      evt.eventType === "article"
+        ? "点击在「微信尺素」Tab 内联查看伴读笔记"
+        : "青简·尺素 · 点击打开面板查看详情";
+
+    if (this.hudServer?.isConnected()) {
+      this.hudServer.notify(
+        {
+          title: toastTitle,
+          message: evt.summary.slice(0, 220),
+          subtitle: toastSubtitle,
+          channel: "wechat",
+          wechatArticleId: evt.articleId,
+        },
+        {
+          items: this.inbox.queryLatest({ limit: 25 }),
+          status: this.getHudStatusPayload(),
+        }
+      );
+    } else {
+      this.showMacDesktopNotification(toastTitle, evt.summary.slice(0, 180), toastSubtitle);
+    }
+
+    if (
+      this.config.autoSyncWeChatToPhone !== false &&
+      (evt.eventType === "article" || (evt.eventType === "schedule" && evt.taskKind === "digest"))
+    ) {
+      let fullMarkdown = evt.summary;
+      const candidatePath = evt.notePath || evt.depositedPath;
+      if (candidatePath && fs.existsSync(candidatePath)) {
+        try {
+          const raw = fs.readFileSync(candidatePath, "utf8").trim();
+          if (raw) fullMarkdown = raw;
+        } catch {
+          // fallback to summary
+        }
+      }
+      await this.pushWeChatNoteToPhone({
+        articleId: evt.articleId,
+        title: evt.title,
+        markdown: fullMarkdown,
+        queueIfOffline: true,
+      }).catch(() => {});
+    }
   }
 
   public syncMacHudState(): void {
@@ -1880,7 +2108,23 @@ export class OmsDaemon {
           this.inbox.markProcessed(id, true);
           this.syncMacHudState();
         });
+        this.hudServer.on("pushWeChatToPhone", (payload: { articleId?: number; title?: string; markdown?: string }) => {
+          void this.pushWeChatNoteToPhone({
+            articleId: payload.articleId,
+            title: payload.title,
+            markdown: payload.markdown,
+            queueIfOffline: true,
+          });
+        });
         await this.hudServer.start().catch(() => {});
+      }
+
+      if (
+        this.config.enableWeChatBridge !== false &&
+        process.env.OMS_DISABLE_WECHAT_WORKER !== "1" &&
+        (this.config.enableWeChatBridge === true || process.env.OMS_DISABLE_OSASCRIPT !== "1")
+      ) {
+        this.wechat.start();
       }
     }
 
@@ -2019,7 +2263,26 @@ export class OmsDaemon {
           })),
           airpodsStatus: this.getAirpodsStatusSnapshot(),
           phoneStatus: this.session.getPhoneStatus(),
+          wechatStatus: await this.wechat.refreshHealth(Boolean(params.force)),
         };
+      }
+
+      case "wechat.status": {
+        return await this.wechat.refreshHealth(true);
+      }
+
+      case "wechat.peek": {
+        const articleId = params.articleId !== undefined ? Number(params.articleId) : undefined;
+        return this.peekWeChatInHud(Number.isFinite(articleId) ? articleId : undefined);
+      }
+
+      case "wechat.sync_to_phone": {
+        return await this.pushWeChatNoteToPhone({
+          articleId: params.articleId !== undefined ? Number(params.articleId) : undefined,
+          title: typeof params.title === "string" ? params.title : undefined,
+          markdown: typeof params.markdown === "string" ? params.markdown : undefined,
+          queueIfOffline: params.queueIfOffline !== false,
+        });
       }
 
       case "airpods.status": {
@@ -2111,6 +2374,7 @@ export class OmsDaemon {
           typeof params.autoCopyTextToClipboard === "boolean" ||
           typeof params.autoPreviewImageOnMac === "boolean" ||
           typeof params.autoSyncOtpToMac === "boolean" ||
+          typeof params.autoSyncWeChatToPhone === "boolean" ||
           typeof params.autoSwitchAirpods === "boolean" ||
           typeof params.pauseOtherOnAirpodsSwitch === "boolean" ||
           typeof params.preferredAirpodsMac === "string" ||
@@ -2123,6 +2387,7 @@ export class OmsDaemon {
             autoCopyTextToClipboard: params.autoCopyTextToClipboard,
             autoPreviewImageOnMac: params.autoPreviewImageOnMac,
             autoSyncOtpToMac: params.autoSyncOtpToMac,
+            autoSyncWeChatToPhone: params.autoSyncWeChatToPhone,
             autoSwitchAirpods: params.autoSwitchAirpods,
             pauseOtherOnAirpodsSwitch: params.pauseOtherOnAirpodsSwitch,
             preferredAirpodsMac: params.preferredAirpodsMac,
@@ -2203,6 +2468,7 @@ export class OmsDaemon {
           mimeType,
           data: bytes,
           title: params.title || fileName,
+          intentTag: (params.intentTag as IntentTag) || undefined,
           enableCommuteTts: Boolean(params.enableCommuteTts),
         });
 
@@ -3002,8 +3268,10 @@ export class OmsDaemon {
 
   public static generateLaunchAgentPlist(repoRootPath: string): string {
     const bunPath = process.execPath;
+    const homeDir = os.homedir();
     const daemonScript = path.join(repoRootPath, "mac-host/src/daemon/main.ts");
-    const logPath = path.join(os.homedir(), ".one_more_step/logs/omsd.log");
+    const logPath = path.join(homeDir, ".one_more_step/logs/omsd.log");
+    const safePath = `${homeDir}/.local/bin:${homeDir}/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`;
     return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -3016,6 +3284,17 @@ export class OmsDaemon {
         <string>run</string>
         <string>${daemonScript}</string>
     </array>
+    <key>WorkingDirectory</key>
+    <string>${repoRootPath}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${homeDir}</string>
+        <key>PATH</key>
+        <string>${safePath}</string>
+        <key>BUN_CONFIG_DNS_TIME_TO_LIVE_SECONDS</key>
+        <string>0</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -3030,6 +3309,7 @@ export class OmsDaemon {
 
   public async stop(): Promise<void> {
     this.mirrorDisposed = true;
+    await this.wechat.stop().catch(() => {});
     // Drain an outstanding start and send its compensating stop before closing transport.
     if (this.mirrorRunning || this.mirrorStartPending) {
       await this.stopMirror().catch(() => {});

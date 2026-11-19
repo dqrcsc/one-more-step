@@ -17,6 +17,8 @@ export interface HudToastPayload {
   subtitle?: string;
   soundName?: string;
   itemId?: string;
+  channel?: "phone" | "wechat";
+  wechatArticleId?: number;
 }
 
 export interface HudStatusPayload {
@@ -24,6 +26,11 @@ export interface HudStatusPayload {
   phoneName?: string;
   inboxDir: string;
   mirrorUrl?: string;
+  wechatRunning?: boolean;
+  wechatConfigured?: boolean;
+  wechatLastPoll?: string;
+  wechatApiBaseUrl?: string;
+  wechatConfigUrl?: string;
 }
 
 /**
@@ -148,6 +155,12 @@ export class MacHudServer extends EventEmitter {
       this.emit("markProcessed", msg.itemId);
     } else if (msg.type === "request_sync") {
       this.emit("requestSync");
+    } else if (msg.type === "push_wechat_to_phone") {
+      this.emit("pushWeChatToPhone", {
+        articleId: typeof msg.articleId === "number" ? msg.articleId : Number(msg.articleId || 0),
+        title: typeof msg.title === "string" ? msg.title : undefined,
+        markdown: typeof msg.markdown === "string" ? msg.markdown : undefined,
+      });
     }
   }
 
@@ -197,6 +210,19 @@ export class MacHudServer extends EventEmitter {
       type: "peek",
       ...(itemId ? { itemId } : {}),
       ...(opts?.item ? { item: opts.item } : {}),
+      ...(opts?.status ? { status: opts.status } : {}),
+    });
+  }
+
+  public peekWeChat(
+    articleId?: number,
+    opts?: {
+      status?: HudStatusPayload;
+    }
+  ): boolean {
+    return this.sendEnvelope({
+      type: "peek_wechat",
+      ...(typeof articleId === "number" && articleId > 0 ? { wechatArticleId: articleId } : {}),
       ...(opts?.status ? { status: opts.status } : {}),
     });
   }

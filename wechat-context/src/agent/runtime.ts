@@ -1,0 +1,2313 @@
+import { extractionNotice, type AsrEvidence, type ExtractionQuality } from "../extractor/quality.ts";
+import { asrEvidenceNotice } from "../extractor/asr_quality.ts";
+import { normalizeTranscriptPunctuation, renderAsrTranscript, transcriptReviewNotice } from "../extractor/transcript_text.ts";
+import { decodeArtifactPaths } from "../storage.ts";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, extname, join, relative, resolve } from "node:path";
+import { AppConfig, emitOmsManagedEvent, notifyExternalWebhookIfConfigured } from "../config.ts";
+import { ArticleRecord, ContextDatabase, ConversationTurnRecord, TriageLevel } from "../db.ts";
+import { ClawBotMessage, unpackClawBotMessage, UnpackedClawBotMessage } from "../clawbot/client.ts";
+import { downloadAndDecryptCdnMedia } from "../clawbot/media.ts";
+import { asrFailureReasons, transcribeAudioFromMedia } from "../extractor/asr.ts";
+import {
+  getPlatformDisplayLabel,
+  sanitizeSharedLinkMessage,
+} from "../extractor/sanitizer.ts";
+import {
+  isWeChatArticleUrl,
+  normalizeExternalWebUrl,
+  saveRawWebArticleToVault,
+} from "../extractor/web.ts";
+import { sanitizeSlug } from "../extractor/wechat.ts";
+import { normalizeWeChatUrl } from "../pipeline.ts";
+import { ANALYSIS_CONTEXT_POLICY, formatAnalysisContext, loadAnalysisContext } from "../vault/analysis_context.ts";
+import { ARTICLE_REVIEW_POLICY } from "../vault/analysis_policy.ts";
+import {
+  createIdeaSeedInVault,
+  createInboxCaptureInVault,
+  findSiblingMultiFormatFiles,
+  findVaultFilesByQuery,
+  gatherVaultArchitectureContext,
+  gatherVaultContext,
+} from "../vault/context.ts";
+import {
+  DeliverableFormat,
+  detectRequestedFormats,
+  detectWantsFileDelivery,
+  ensureMultiFormatDeliverables,
+  isDocumentGenerationTask,
+} from "./doc_exporter.ts";
+import { callAgentLlm, getFastModel, getProModel, MultimodalImageInput } from "./llm.ts";
+import {
+  AgentIntentKind,
+  classifyMessageIntent,
+  detectExplicitCliBackend,
+  findPriorComplexTaskTurn,
+  IntentDecision,
+} from "./router.ts";
+import {
+  executeTieredAgentTask,
+  getPreferredCliBackend,
+  selectAgyModel,
+  SubagentBackend,
+} from "./subagent_cli.ts";
+import {
+  formatLiveTaskStatusReport,
+  isTaskStatusQuery,
+  TaskProgressReporter,
+} from "./progress.ts";
+import {
+  describeCronExpression,
+  formatZonedDateTime,
+  getNextCronRunMs,
+  isValidCronExpression,
+} from "../scheduler/cron.ts";
+import { parseNaturalScheduleSpec } from "../scheduler/time_parser.ts";
+import { syncScheduledTasksToVaultQueue } from "../scheduler/vault_sync.ts";
+import { TaskSchedulerEngine } from "../scheduler/engine.ts";
+import { WeChatClawBotClient } from "../clawbot/client.ts";
+import type { ScheduledActionPayload, ScheduledTaskKind } from "../db.ts";
+
+export interface IntentExecutionContext {
+  config: AppConfig;
+  db: ContextDatabase;
+  messageKey: string;
+  senderId: string;
+  rawMessage: ClawBotMessage;
+  unpacked: UnpackedClawBotMessage;
+  decision: IntentDecision;
+  recentTurns: ConversationTurnRecord[];
+  recentArticle: ArticleRecord | null;
+  referencedArticle: ArticleRecord | null;
+  markTriageCallback?: (
+    id: number,
+    triage: TriageLevel,
+    level?: "raw" | "light" | "deep"
+  ) => ArticleRecord | null;
+  sendProgressCallback?: (senderId: string, text: string) => Promise<void>;
+}
+
+export interface IntentExecutionResult {
+  replyText: string;
+  mediaDeliveries?: Array<{
+    mediaType: "file" | "image";
+    mediaPath: string;
+  }>;
+  modelUsed: string;
+  relatedArticleId?: number | null;
+  depositedPath?: string;
+  missingFormats?: DeliverableFormat[];
+  outcome?: "success" | "partial" | "failed";
+  error?: string;
+}
+
+export type IntentHandlerFn = (
+  ctx: IntentExecutionContext
+) => Promise<IntentExecutionResult>;
+
+export class WeChatAgentRuntime {
+  private handlers = new Map<AgentIntentKind, IntentHandlerFn>();
+
+  constructor(
+    private config: AppConfig,
+    private db: ContextDatabase,
+    private markTriageCallback?: IntentExecutionContext["markTriageCallback"],
+    private sendProgressCallback?: IntentExecutionContext["sendProgressCallback"]
+  ) {
+    this.registerDefaultHandlers();
+  }
+
+  public updateConfig(config: AppConfig): void {
+    this.config = config;
+  }
+
+  /**
+   * Extensibility hook: Register or override any Intent Handler at runtime.
+   */
+  public registerIntentHandler(
+    intent: AgentIntentKind,
+    handler: IntentHandlerFn
+  ): void {
+    this.handlers.set(intent, handler);
+  }
+
+  private registerDefaultHandlers(): void {
+    this.handlers.set("capture_idea", (ctx) => this.handleCaptureIdea(ctx));
+    this.handlers.set("capture_inbox", (ctx) => this.handleCaptureInbox(ctx));
+    this.handlers.set("manage_schedule", (ctx) => this.handleManageSchedule(ctx));
+    this.handlers.set("ingest_link", (ctx) => this.handleIngestLink(ctx));
+    this.handlers.set("article_followup", (ctx) => this.handleArticleFollowup(ctx));
+    this.handlers.set("vault_query", (ctx) => this.handleVaultQuery(ctx));
+    this.handlers.set("web_search", (ctx) => this.handleWebSearch(ctx));
+    this.handlers.set("multimodal_ingest", (ctx) => this.handleMultimodalIngest(ctx));
+    this.handlers.set("generate_image", (ctx) => this.handleGenerateImage(ctx));
+    this.handlers.set("delegate_subagent", (ctx) => this.handleDelegateSubagent(ctx));
+    this.handlers.set("send_file", (ctx) => this.handleSendFile(ctx));
+    this.handlers.set("general_assistant", (ctx) => this.handleGeneralAssistant(ctx));
+  }
+
+  /**
+   * Process a single ClawBotMessage through the Intent Router and execute the matched Intent Handler.
+   */
+  public async processClawBotMessage(params: {
+    messageKey: string;
+    senderId: string;
+    rawMessage: ClawBotMessage;
+  }): Promise<IntentExecutionResult> {
+    const { messageKey, senderId, rawMessage } = params;
+    const unpacked = unpackClawBotMessage(rawMessage);
+
+    // Fast-path for live task progress / status queries ("进度" / "状态" / "还在跑吗")
+    if (isTaskStatusQuery(unpacked.userText) && unpacked.mediaItems.length === 0) {
+      const statusText = formatLiveTaskStatusReport(
+        this.db,
+        senderId,
+        this.config.taskHeartbeatSeconds ?? 25
+      );
+      const msgHash = createHash("sha256").update(messageKey).digest("hex");
+      this.db.queueReply(`message_${msgHash}`, senderId, statusText);
+      return {
+        replyText: statusText,
+        modelUsed: "task_status_monitor",
+      };
+    }
+
+    const recentArticle = this.db.db
+      .query("SELECT * FROM articles WHERE sender_id = ? ORDER BY id DESC LIMIT 1")
+      .get(senderId) as ArticleRecord | null;
+
+    const referencedArticle = this.resolveReferencedArticle(unpacked, senderId);
+    const recentTurns = this.db.getRecentConversationTurns(senderId, 6);
+
+    const decision = await classifyMessageIntent({
+      config: this.config,
+      unpacked,
+      recentTurns,
+      recentArticle,
+      referencedArticle,
+    });
+
+    const handler =
+      this.handlers.get(decision.intent) ??
+      ((ctx: IntentExecutionContext) => this.handleGeneralAssistant(ctx));
+
+    const result = await handler({
+      config: this.config,
+      db: this.db,
+      messageKey,
+      senderId,
+      rawMessage,
+      unpacked,
+      decision,
+      recentTurns,
+      recentArticle,
+      referencedArticle,
+      markTriageCallback: this.markTriageCallback,
+      sendProgressCallback: this.sendProgressCallback,
+    });
+
+    // Queue text reply and any media attachments into reply_outbox
+    const msgHash = createHash("sha256").update(messageKey).digest("hex");
+    if (result.replyText.trim()) {
+      this.db.queueReply(`message_${msgHash}`, senderId, result.replyText);
+    }
+    if (result.mediaDeliveries?.length) {
+      for (let i = 0; i < result.mediaDeliveries.length; i++) {
+        const md = result.mediaDeliveries[i];
+        this.db.queueMediaReply(
+          `media_${msgHash}_${i}`,
+          senderId,
+          md.mediaType,
+          md.mediaPath
+        );
+      }
+    }
+
+    // Record turn into conversation_turns for multi-turn memory
+    this.db.recordConversationTurn({
+      messageKey,
+      senderId,
+      userText:
+        unpacked.userText ||
+        (unpacked.mediaItems.length > 0
+          ? `[多媒体消息: ${unpacked.mediaItems.map((m) => m.kind).join(",")}]`
+          : ""),
+      refText: unpacked.refContext?.quotedText || unpacked.refContext?.title || "",
+      mediaSummary: unpacked.mediaItems
+        .map((m) => `${m.kind}:${m.fileName || "unnamed"}`)
+        .join(", "),
+      intent: decision.intent,
+      complexity: decision.complexity,
+      modelUsed: result.modelUsed,
+      relatedArticleId: result.relatedArticleId ?? decision.targetArticleId ?? null,
+      depositedPath: result.depositedPath ?? "",
+      assistantReply: result.replyText,
+    });
+
+    return result;
+  }
+
+  private resolveReferencedArticle(
+    unpacked: UnpackedClawBotMessage,
+    senderId: string
+  ): ArticleRecord | null {
+    const ref = unpacked.refContext;
+    if (!ref) return null;
+
+    if (ref.embeddedUrl) {
+      const byUrl = this.db.findByUrlOrMsgid(ref.embeddedUrl);
+      if (byUrl) return byUrl;
+    }
+    const combinedRef = [ref.title, ref.quotedText].filter(Boolean).join("\n");
+    if (combinedRef) {
+      return this.db.findArticleByQuery(combinedRef, senderId);
+    }
+    return null;
+  }
+
+  private isStandaloneMode(): boolean {
+    return (
+      this.config.vaultMode === "standalone" ||
+      this.config.vaultEnabled === false
+    );
+  }
+
+  private getOutputsDir(): string {
+    if (this.isStandaloneMode()) {
+      return join(this.config.vaultRoot, "outputs");
+    }
+    if (
+      this.config.vaultMode === "generic_folder" &&
+      !existsSync(join(this.config.vaultRoot, "05_outputs"))
+    ) {
+      return join(this.config.vaultRoot, "outputs");
+    }
+    return join(this.config.vaultRoot, "05_outputs", "research_notes");
+  }
+
+  // ============================================================================
+  // 1. Intent: capture_idea (03_ideas/seeds/)
+  // ============================================================================
+  private async handleCaptureIdea(
+    ctx: IntentExecutionContext
+  ): Promise<IntentExecutionResult> {
+    const verbatimThought = ctx.unpacked.userText
+      .replace(/^(?:想法|灵感|观点|我有(?:一)?个想法|idea)\s*[:：]\s*/i, "")
+      .trim();
+    const coreSummary = ctx.decision.slots.coreContent?.trim() || "";
+    const refQuote =
+      ctx.unpacked.refContext?.partialText?.trim() ||
+      ctx.unpacked.refContext?.quotedText?.trim() ||
+      "";
+    const baseThought = verbatimThought || coreSummary;
+    const rawThought = [
+      coreSummary &&
+      verbatimThought &&
+      coreSummary !== verbatimThought &&
+      !verbatimThought.includes(coreSummary)
+        ? `> **核心提炼**：${coreSummary}`
+        : "",
+      baseThought,
+      refQuote && !baseThought.includes(refQuote)
+        ? `> **引用原文片段**：\n> ${refQuote.replace(/\r?\n/g, "\n> ")}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    const targetArticle =
+      (ctx.decision.targetArticleId
+        ? this.db.getArticleById(ctx.decision.targetArticleId)
+        : null) ??
+      ctx.referencedArticle ??
+      ctx.recentArticle;
+
+    const vaultCtx = gatherVaultContext(
+      this.config.vaultRoot,
+      rawThought,
+      this.config.vaultLayout
+    );
+    const relatedNodes =
+      vaultCtx.matchedNotes.length > 0
+        ? vaultCtx.matchedNotes.map((m) => m.wikiLink)
+        : targetArticle
+          ? safeParseJsonArray(targetArticle.related_vault_nodes)
+          : [];
+
+    const seedPath = createIdeaSeedInVault({
+      ideasSeedsDir: this.config.ideasSeedsDir,
+      thoughtText: rawThought,
+      slug: ctx.decision.slots.ideaSlug || "wechat_thought",
+      captureId: ctx.messageKey,
+      sourceMdPath: targetArticle?.source_md_path || undefined,
+      sourceUrl: targetArticle?.url || undefined,
+      relatedVaultNodes: relatedNodes,
+    });
+
+    let modelUsed = "local_rule";
+    let aiReflection = "";
+    if (this.config.llm.apiKey) {
+      try {
+        const llmRes = await callAgentLlm({
+          config: this.config,
+          tier: ctx.decision.complexity,
+          systemPrompt: `你是用户的第二大脑思考伙伴。用户刚刚记录了一条个人想法并已存入 03_ideas/seeds/。
+请用 80~180 字简短回应：
+1. 提炼该想法最有价值的 1 个张力或切入点；
+2. 指出它与知识库命中节点的潜在连接或可追问的下一步问题。保持干练、有启发性。`,
+          userPrompt: `【用户的想法】\n${rawThought}\n\n【关联文章】\n${targetArticle?.title || "无"}\n\n【命中知识库节点】\n${relatedNodes.join("、") || "暂无"}`,
+          temperature: 0.3,
+        });
+        aiReflection = `\n\n✨ 思考共鸣（${llmRes.modelUsed}）：\n${llmRes.text}`;
+        modelUsed = llmRes.modelUsed;
+      } catch {}
+    }
+
+    void notifyExternalWebhookIfConfigured(
+      this.config,
+      "idea",
+      `新想法已捕获 (${basename(seedPath)})`,
+      rawThought.slice(0, 300)
+    ).catch(() => {});
+    emitOmsManagedEvent({
+      eventType: "idea",
+      title: `💡 微信想法已捕获 (${basename(seedPath)})`,
+      summary: rawThought.slice(0, 300),
+      depositedPath: seedPath,
+    });
+
+    return {
+      replyText: `💡 想法已保存：03_ideas/seeds/${basename(seedPath)}${
+        relatedNodes.length > 0
+          ? `\n🔗 关联节点：${relatedNodes.slice(0, 4).join("、")}`
+          : ""
+      }${aiReflection}`,
+      modelUsed,
+      relatedArticleId: targetArticle?.id ?? null,
+      depositedPath: seedPath,
+    };
+  }
+
+  // ============================================================================
+  // 2. Intent: capture_inbox (01_inputs/inbox/)
+  // ============================================================================
+  private async handleCaptureInbox(
+    ctx: IntentExecutionContext
+  ): Promise<IntentExecutionResult> {
+    const inboxDir =
+      this.config.inboxDir || join(this.config.vaultRoot, "01_inputs", "inbox");
+    const verbatimText = ctx.unpacked.userText.trim();
+    const coreSummary = ctx.decision.slots.coreContent?.trim() || "";
+    const refQuote =
+      ctx.unpacked.refContext?.partialText?.trim() ||
+      ctx.unpacked.refContext?.quotedText?.trim() ||
+      "";
+    const baseBody = verbatimText || coreSummary;
+    const bodyText = [
+      coreSummary &&
+      verbatimText &&
+      coreSummary !== verbatimText &&
+      !verbatimText.includes(coreSummary)
+        ? `> **核心提炼**：${coreSummary}`
+        : "",
+      baseBody,
+      refQuote && !baseBody.includes(refQuote)
+        ? `> **引用上下文**：\n> ${refQuote.replace(/\r?\n/g, "\n> ")}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    const titleSource = coreSummary || baseBody;
+    const title =
+      ctx.decision.slots.ideaTitle?.trim() ||
+      titleSource.slice(0, 36).replace(/\r?\n/g, " ");
+
+    const filePath = createInboxCaptureInVault({
+      inboxDir,
+      title,
+      bodyText,
+      slug: ctx.decision.slots.ideaSlug || "wechat_memo",
+      captureId: ctx.messageKey,
+    });
+
+    return {
+      replyText: `📥 备忘/速记已存入收集箱：01_inputs/inbox/${basename(filePath)}`,
+      modelUsed: getFastModel(this.config),
+      depositedPath: filePath,
+    };
+  }
+
+  // ============================================================================
+  // 3. Intent: ingest_link (WeChat MP + Medium + YouTube + XHS + Douyin + Web URLs)
+  // ============================================================================
+  private async handleIngestLink(
+    ctx: IntentExecutionContext
+  ): Promise<IntentExecutionResult> {
+    const sanitized = sanitizeSharedLinkMessage(
+      ctx.unpacked.userText,
+      ctx.decision.slots.url || ctx.unpacked.urls[0]
+    );
+    const rawUrl = sanitized.url;
+
+    if (!rawUrl) {
+      return this.handleGeneralAssistant(ctx);
+    }
+
+    const isWeChat = isWeChatArticleUrl(rawUrl);
+    const normalizedUrl = isWeChat
+      ? normalizeWeChatUrl(rawUrl)
+      : normalizeExternalWebUrl(rawUrl);
+
+    const inlineNote = sanitized.wasShareBoilerplateStripped
+      ? sanitized.userNotes
+      : ctx.decision.slots.userNotes ?? sanitized.userNotes;
+
+    const fallbackTitle =
+      ctx.decision.slots.ideaTitle?.trim() ||
+      sanitized.extractedTitle ||
+      undefined;
+
+    const { record, isNew } = this.db.enqueueArticle({
+      msgid: ctx.messageKey,
+      url: normalizedUrl,
+      title: fallbackTitle,
+      user_notes: inlineNote,
+      sender_id: ctx.senderId,
+      channel: "clawbot",
+      waitSeconds: inlineNote ? 0 : this.config.annotationWaitSeconds,
+    });
+
+    if (ctx.decision.slots.triageHint) {
+      this.db.updateArticle(record.id, { triage: ctx.decision.slots.triageHint });
+    }
+
+    const kindLabel = getPlatformDisplayLabel(sanitized.platform);
+    return {
+      replyText: isNew
+        ? `⏳ 已收到${kindLabel} #${record.id}，将抓取并生成初筛笔记；可继续补充批注。`
+        : `已记录${kindLabel} #${record.id} 的补充批注，已有原文和伴读笔记保持不变。`,
+      modelUsed: "fast_router",
+      relatedArticleId: record.id,
+    };
+  }
+
+  // ============================================================================
+  // 4. Intent: article_followup (annotate / triage / qa / deepen)
+  // ============================================================================
+  private async handleArticleFollowup(
+    ctx: IntentExecutionContext
+  ): Promise<IntentExecutionResult> {
+    const target =
+      (ctx.decision.targetArticleId
+        ? this.db.getArticleById(ctx.decision.targetArticleId)
+        : null) ??
+      ctx.referencedArticle ??
+      ctx.recentArticle;
+
+    if (!target) {
+      return this.handleGeneralAssistant(ctx);
+    }
+
+    const subAction = ctx.decision.slots.articleSubAction || "annotate";
+
+    if (subAction === "triage") {
+      const triage: TriageLevel =
+        ctx.decision.slots.triageHint || "process_now";
+      if (
+        ctx.markTriageCallback &&
+        target.source_md_path &&
+        existsSync(target.source_md_path) &&
+        target.note_md_path &&
+        existsSync(target.note_md_path)
+      ) {
+        ctx.markTriageCallback(target.id, triage);
+      } else {
+        this.db.updateArticle(target.id, { triage });
+      }
+      return {
+        replyText:
+          triage === "process_now"
+            ? `📌 文章 #${target.id} 已加入优先深读队列。`
+            : `📌 文章 #${target.id}《${target.title || target.url}》分诊已更新为：${triage}`,
+        modelUsed: getFastModel(this.config),
+        relatedArticleId: target.id,
+      };
+    }
+
+    if (subAction === "annotate") {
+      const updatedNotes = target.user_notes
+        ? `${target.user_notes}\n${ctx.unpacked.userText}`
+        : ctx.unpacked.userText;
+      this.db.updateArticle(target.id, { user_notes: updatedNotes });
+      return {
+        replyText: `📝 已记录文章 #${target.id}《${target.title || "待抓取"}》的批注：${ctx.unpacked.userText}\n（你可以随时针对该文章继续提问，或发送「深读」标记为优先处理）`,
+        modelUsed: "local_rule",
+        relatedArticleId: target.id,
+      };
+    }
+
+    // Sub-action: "qa" or "deepen" -> Answer questions or perform deep analysis on the article!
+    const sourceText =
+      target.source_md_path && existsSync(target.source_md_path)
+        ? readFileSync(target.source_md_path, "utf-8").slice(0, 18_000)
+        : target.short_summary || target.digest || "（文章正在抓取或暂无本地全文）";
+
+    const noteText =
+      target.note_md_path && existsSync(target.note_md_path)
+        ? readFileSync(target.note_md_path, "utf-8").slice(0, 6_000)
+        : "";
+
+    const vaultCtx = this.config.vaultEnabled === false
+      ? { matchedNotes: [] }
+      : gatherVaultContext(
+          this.config.vaultRoot,
+          `${target.title}\n${target.user_notes}\n${ctx.unpacked.userText}`,
+          { ...this.config.vaultLayout,
+            excludePaths: [target.source_md_path, target.note_md_path].filter(Boolean),
+            excludeSourceUrls: [target.url],
+          }
+        );
+    const analysisBackground = loadAnalysisContext(this.config.analysisContextFile);
+
+    const tier = subAction === "deepen" ? "deep" : ctx.decision.complexity;
+    if (!this.config.llm.apiKey && !this.config.llm.allowCodexFallback) {
+      return {
+        replyText: `📖 文章 #${target.id}《${target.title}》摘要：\n${target.short_summary || target.digest}\n（配置 LLM_API_KEY 后支持全文深度追问）`,
+        modelUsed: "local_fallback",
+        relatedArticleId: target.id,
+      };
+    }
+
+    const llmRes = await executeTieredAgentTask({
+      config: this.config,
+      complexity: tier,
+      preferredBackend: ctx.decision.slots.subagentTarget || "agy",
+      systemPrompt: `你是用户的个人知识库深度阅读搭档。用户正在手机微信上针对已入库的文章 #${target.id}《${target.title}》进行追问或要求深度拆解。
+请严格基于文章原文与用户知识库既有上下文直接回答。
+${ANALYSIS_CONTEXT_POLICY}
+${ARTICLE_REVIEW_POLICY}
+要求：
+- 手机微信阅读友好，分段清晰；精读建议 800–1600 字，普通追问按问题需要回答；
+- 如果用户引用了特定片段（partial_text），重点围绕该片段展开；
+- 明确区分原文事实与你的推演判断；初筛是待复核分析，不能当作原文证据。
+- 精读时才讨论具体笔记链接，逐项说明支持、修正、反驳或适用边界；只基于实际提供的材料，片段不足时将关系标为待全文核验，不宣称读完笔记或已建立双向链接。
+- 具体关系需桌面精读核对全文后再写入；普通追问不主动罗列笔记链接。`,
+      userPrompt: `【用户的问题/指令】
+${ctx.unpacked.userText}
+
+【文章已有批注】
+${target.user_notes || "（无）"}
+
+【当前观点与业务背景快照】
+${formatAnalysisContext(analysisBackground)}
+
+${
+  ctx.unpacked.refContext?.partialText
+    ? `【用户高亮引用的片段】\n${ctx.unpacked.refContext.partialText}\n\n`
+    : ""
+}【伴读初筛卡内容】
+${noteText}
+
+【文章原文内容（节选）】
+${sourceText}
+
+【精读候选笔记片段（未核验语义关系）】
+${vaultCtx.matchedNotes.map((m) => `${m.wikiLink}: ${m.excerpt}`).join("\n\n") || "（无直接命中）"}`,
+      temperature: 0.25,
+    });
+
+    return {
+      replyText: `📖 针对《${target.title || `#${target.id}`}》的回应（${llmRes.modelUsed}）：\n\n${llmRes.text}${analysisBackground.warnings.length ? `\n\n⚠️ 背景材料未完整采用：${analysisBackground.warnings.join("；")}` : ""}`,
+      modelUsed: llmRes.modelUsed,
+      relatedArticleId: target.id,
+    };
+  }
+
+  // ============================================================================
+  // 5. Intent: vault_query (Personal Knowledge Base Q&A & Retrieval)
+  // ============================================================================
+  private async handleVaultQuery(
+    ctx: IntentExecutionContext
+  ): Promise<IntentExecutionResult> {
+    const query =
+      ctx.decision.slots.searchQuery?.trim() || ctx.unpacked.userText.trim();
+    const matchedFiles = findVaultFilesByQuery(
+      this.config.vaultRoot,
+      query,
+      6,
+      this.config.vaultLayout?.searchDirs
+    );
+    const vaultCtx = gatherVaultContext(
+      this.config.vaultRoot,
+      query,
+      this.config.vaultLayout
+    );
+    const matchedArticles = this.db
+      .listArticles({ limit: 20 })
+      .filter(
+        (a) =>
+          a.title.toLowerCase().includes(query.toLowerCase()) ||
+          a.short_summary.toLowerCase().includes(query.toLowerCase()) ||
+          a.user_notes.toLowerCase().includes(query.toLowerCase())
+      )
+      .slice(0, 4);
+
+    if (!this.config.llm.apiKey && !this.config.llm.allowCodexFallback) {
+      const lines = [
+        `🔍 知识库检索结果（关键词：${query}）：`,
+        matchedFiles.length > 0
+          ? matchedFiles
+              .map((m, i) => `${i + 1}. ${m.wikiLink} (\`${m.relativePath}\`)\n   ${m.excerpt.slice(0, 120)}...`)
+              .join("\n")
+          : "未找到直接匹配的笔记文件。",
+      ];
+      return {
+        replyText: lines.join("\n\n"),
+        modelUsed: "local_search",
+      };
+    }
+
+    const notesEvidence =
+      matchedFiles.length > 0
+        ? matchedFiles
+            .map(
+              (m, i) =>
+                `[笔记 ${i + 1}] ${m.wikiLink} (路径: ${m.relativePath})\n内容节选:\n${m.excerpt}`
+            )
+            .join("\n\n---\n\n")
+        : "（未检索到直接匹配的 Markdown 笔记）";
+
+    const articlesEvidence =
+      matchedArticles.length > 0
+        ? matchedArticles
+            .map(
+              (a) =>
+                `- 文章 #${a.id}《${a.title}》(${a.author}) [${a.process_level}/${a.triage}]\n  摘要: ${a.short_summary.slice(0, 200)}`
+            )
+            .join("\n")
+        : "（未命中相关收藏文章）";
+
+    const progress =
+      ctx.decision.complexity === "deep"
+        ? new TaskProgressReporter({
+            db: this.db,
+            messageKey: ctx.messageKey,
+            senderId: ctx.senderId,
+            taskTitle: "知识库深度推演",
+            sendProgressCallback: ctx.sendProgressCallback,
+            heartbeatIntervalSeconds: this.config.taskHeartbeatSeconds ?? 25,
+          })
+        : null;
+
+    if (progress) {
+      await progress.start(`正在检索知识库并调用深度模型推演（命中 ${matchedFiles.length} 篇笔记）`);
+    }
+
+    try {
+      const llmRes = await executeTieredAgentTask({
+        config: this.config,
+        complexity: ctx.decision.complexity,
+        preferredBackend: ctx.decision.slots.subagentTarget || "agy",
+        onStageChange: progress
+          ? (stage, opts) => progress.updateStage(stage, opts)
+          : undefined,
+        onActivity: progress
+          ? (detail) => progress.updateActivity(detail)
+          : undefined,
+        systemPrompt: `你是用户的个人知识库（${this.config.vaultRoot}）随身顾问。
+请严格依据下方检索到的知识库真实笔记与收藏文章回答用户的查询。
+规则：
+1. 必须引用具体的笔记名（如 [[笔记名]] 或相对路径），绝不编造不存在的笔记；
+2. 若知识库中尚无直接记录，请如实说明检索范围，并基于用户当前主线（now.md）给出补充建议；
+3. 排版适合手机微信阅读，重点突出，控制在 250~550 字以内。`,
+        userPrompt: `【用户查询】
+${ctx.unpacked.userText}
+
+【00_home/now.md 当前关注】
+${vaultCtx.nowSummary}
+
+【00_home/queue.md 待办队列】
+${vaultCtx.queueSummary}
+
+【检索到的知识库笔记证据】
+${notesEvidence}
+
+【检索到的微信收藏文章】
+${articlesEvidence}`,
+        temperature: 0.2,
+      });
+
+      return {
+        replyText: `📚 知识库查询（${llmRes.modelUsed}）：\n\n${llmRes.text}`,
+        modelUsed: llmRes.modelUsed,
+      };
+    } finally {
+      progress?.stop("知识库深度推演完成");
+    }
+  }
+
+  // ============================================================================
+  // 5.5 Intent: web_search (Real-Time Public Information Search via Google Search Grounding)
+  // ============================================================================
+  private async handleWebSearch(
+    ctx: IntentExecutionContext
+  ): Promise<IntentExecutionResult> {
+    if (!this.config.llm.apiKey) {
+      return {
+        replyText: "⚠️ 尚未配置 LLM_API_KEY，无法执行实时联网公开信息检索。",
+        modelUsed: "local_fallback",
+        outcome: "failed", error: "LLM_API_KEY not configured",
+      };
+    }
+
+    const vaultCtx = gatherVaultContext(
+      this.config.vaultRoot,
+      ctx.unpacked.userText,
+      this.config.vaultLayout
+    );
+
+    const llmRes = await callAgentLlm({
+      config: this.config,
+      tier: ctx.decision.complexity,
+      enableWebSearch: true,
+      systemPrompt: `你是用户的随身调研助理兼知识库顾问。请通过 Google Search 实时检索公开互联网信息来回答用户的问题。
+要求：
+1. 事实准确、时效性强，给出具体结论、数据或时间节点；
+2. 结合用户当前关注的研究方向（00_home/now.md）提炼对用户最有参考价值的信号；
+3. 手机微信阅读友好，分段清晰，控制在 250~550 字以内。`,
+      userPrompt: `【用户联网检索请求】
+${ctx.unpacked.userText}
+
+【用户当前研究焦点参考 (00_home/now.md)】
+${vaultCtx.nowSummary}`,
+      temperature: 0.2,
+    });
+
+    const sourceDomains =
+      llmRes.sources && llmRes.sources.length > 0
+        ? `\n\n🌐 检索来源：${llmRes.sources
+            .slice(0, 5)
+            .map((s) => s.title)
+            .join(" · ")}`
+        : "";
+
+    return {
+      replyText: `🌐 公开信息检索（${llmRes.modelUsed}）：\n\n${llmRes.text}${sourceDomains}\n\n（💡 提示：回复「把刚才搜到的存进收集箱」或「存成想法」可直接归档入库）`,
+      modelUsed: llmRes.modelUsed,
+    };
+  }
+
+  // ============================================================================
+  // 6. Intent: multimodal_ingest (C2C Image / File AES-128-ECB Decrypt & Vision)
+  // ============================================================================
+  private async handleMultimodalIngest(
+    ctx: IntentExecutionContext
+  ): Promise<IntentExecutionResult> {
+    const inboxDir =
+      this.config.inboxDir || join(this.config.vaultRoot, "01_inputs", "inbox");
+    const assetsDir = join(inboxDir, "assets");
+    const papersDir =
+      this.config.papersDir || join(this.config.vaultRoot, "01_inputs", "papers");
+
+    const downloadedPaths: string[] = [];
+    const imageInputs: MultimodalImageInput[] = [];
+    const textSnippets: string[] = [];
+    const previewWarnings: string[] = [];
+    const unreadableApiFiles: string[] = [];
+    const containsVideo = ctx.unpacked.mediaItems.some(item => item.kind === "video");
+    const attachmentWarnings: string[] = [];
+    const videoSourceSnippets: string[] = [];
+    const modelVideoSnippets: string[] = [];
+    const processedVideos: number[] = [];
+    const partialVideos: number[] = [];
+    const videoReasons: string[] = [];
+    const videoEvidence: AsrEvidence[] = [];
+    const videoEngines = new Set<string>();
+    let videoCount = 0;
+
+    for (const [mediaIndex, item] of ctx.unpacked.mediaItems.entries()) {
+      if (
+        item.kind !== "image" &&
+        item.kind !== "file" &&
+        item.kind !== "video"
+      ) {
+        continue;
+      }
+
+      if (item.kind === "video") {
+        const index = ++videoCount;
+        let videoPath = "";
+        try {
+          const downloaded = await downloadAndDecryptCdnMedia({
+            media: item.media,
+            hexAesKeyFallback: item.hexAesKeyFallback,
+            saveDir: join(this.config.dataDir, "tmp_video"),
+            suggestedFileName: `video_${randomUUID()}.mp4`,
+          });
+          videoPath = downloaded.filePath;
+          const asrRes = await transcribeAudioFromMedia({
+            mediaPath: videoPath, config: this.config, hintTitle: ctx.unpacked.userText,
+          });
+          const transcript = asrRes.transcript.trim();
+          for (const reason of asrRes.extractionQuality?.reasons ?? []) videoReasons.push(`video_${index}:${reason}`);
+          for (const issue of asrRes.toolIssues ?? []) videoReasons.push(`video_${index}:asr_tool_${issue}`);
+          videoEvidence.push(...(asrRes.extractionQuality?.asrEvidence ?? []).map(e => ({...e, videoIndex: index})));
+          if (transcript) {
+            processedVideos.push(index);
+            if (asrRes.extractionQuality?.status === "partial") partialVideos.push(index);
+            videoEngines.add(asrRes.engineUsed);
+            const heading = `【微信视频 ${index} 口播转写稿（${asrRes.engineUsed}）】`;
+            videoSourceSnippets.push(`${heading}\n${renderAsrTranscript(transcript, asrRes.extractionQuality)}`);
+            modelVideoSnippets.push(`${heading}\n自动转写未经核对，仅代表口播，不包括全部画面。\n${transcriptReviewNotice(transcript)}\n${asrEvidenceNotice(asrRes.extractionQuality)}\n${normalizeTranscriptPunctuation(transcript)}`);
+          } else {
+            videoReasons.push(`video_${index}:asr_empty`);
+            if (asrRes.extractionQuality?.asrEvidence?.some(e=>e.timingAvailable)) videoSourceSnippets.push(`【微信视频 ${index} 未取得转写】\n${renderAsrTranscript("", asrRes.extractionQuality)}`);
+          }
+        } catch (error) {
+          if (videoPath) {
+            for (const reason of asrFailureReasons(error)) videoReasons.push(`video_${index}:${reason}`);
+          } else videoReasons.push(`video_${index}:download_or_decrypt_failed`);
+        } finally {
+          if (videoPath) {
+            try { if (existsSync(videoPath)) unlinkSync(videoPath); } catch {}
+          }
+        }
+        continue;
+      }
+
+      const targetSaveDir =
+        item.kind === "file" && item.fileName?.toLowerCase().endsWith(".pdf")
+          ? papersDir
+          : assetsDir;
+
+      let downloaded: Awaited<ReturnType<typeof downloadAndDecryptCdnMedia>>;
+      try {
+        downloaded = await downloadAndDecryptCdnMedia({
+          media: item.media,
+          hexAesKeyFallback: item.hexAesKeyFallback,
+          saveDir: targetSaveDir,
+          suggestedFileName: item.fileName,
+        });
+      } catch (err) {
+        if (!containsVideo) throw err;
+        // Preserve independently acquired video evidence in mixed messages, in either order.
+        attachmentWarnings.push(`⚠️ 非视频附件（消息媒体序号 ${mediaIndex + 1}）下载或解密失败，未归档或解析该附件。`);
+        continue;
+      }
+
+      downloadedPaths.push(downloaded.filePath);
+
+      if (downloaded.mimeType.startsWith("image/")) {
+        imageInputs.push({
+          mimeType: downloaded.mimeType,
+          base64Data: downloaded.buffer.toString("base64"),
+        });
+      } else if (
+        ["md", "txt", "json"].includes(downloaded.ext) &&
+        downloaded.buffer.length < 200_000
+      ) {
+        const text = downloaded.buffer.toString("utf-8");
+        if (text.length > 8000) previewWarnings.push(`⚠️ 文件《${basename(downloaded.filePath)}》内嵌预览仅含前 8000/${text.length} 个 UTF-16 码元，不能据此认定已读全文；原文件已保存，本地 CLI 可另行读取全文。`);
+        textSnippets.push(`文件《${basename(downloaded.filePath)}》内容：\n${text.slice(0, 8000)}`);
+      } else {
+        unreadableApiFiles.push(basename(downloaded.filePath));
+      }
+    }
+
+    if (downloadedPaths.length === 0 && videoCount === 0 && unreadableApiFiles.length === 0) {
+      return this.handleGeneralAssistant(ctx);
+    }
+
+    const videoQuality: ExtractionQuality | undefined = videoCount ? {
+      status: processedVideos.length === videoCount && !partialVideos.length ? "complete" : processedVideos.length ? "partial" : "unavailable",
+      reasons: videoReasons, ...(videoEvidence.length ? {asrEvidence: videoEvidence} : {}), totalVideos: videoCount, processedVideos,
+      ...(partialVideos.length ? { partialVideos } : {}),
+      missingVideos: Array.from({ length: videoCount }, (_, i) => i + 1).filter(i => !processedVideos.includes(i)),
+    } : undefined;
+    const qualityNotice = extractionNotice(videoQuality);
+    const modelSnippets = [qualityNotice, ...attachmentWarnings, ...previewWarnings, ...textSnippets, ...modelVideoSnippets].filter(Boolean).join("\n\n");
+    const archiveSnippets = [...attachmentWarnings, ...textSnippets, ...videoSourceSnippets].join("\n\n");
+
+    let extractedAnalysis = "";
+    let analysisWarning = "";
+    let modelUsed = "local_decrypt";
+
+    const userInstruction =
+      ctx.unpacked.userText.trim() ||
+      "请提取这张图片/文件中的核心文字、架构要点或关键信息，并整理为结构化 Markdown 笔记（200~450字）。";
+
+    // Hierarchical cascade for multimodal understanding:
+    // Tier 1: Local CLI (agy / codex) -> Tier 2: Pro Model (gemini-2.5-pro) -> Tier 3: Fast Model (gemini-2.5-flash)
+    const preferredBackend: SubagentBackend =
+      ctx.decision.slots.subagentTarget ||
+      (/codex/i.test(ctx.unpacked.userText) ? "codex" : "agy");
+
+    try {
+      if (videoCount && !processedVideos.length && !downloadedPaths.length) throw new Error("本次未取得视频转写，未调用模型分析");
+      const tieredRes = await executeTieredAgentTask({
+        config: this.config,
+        complexity: ctx.decision.complexity,
+        forceCliFirst: true,
+        apiFallbackBlockedReason: unreadableApiFiles.length > 0
+          ? `当前 API 不支持读取这些附件正文：${unreadableApiFiles.join("、")}。本地 CLI 未完成解析；请使用可读取该文件的 CLI，或提供文本/图片后重试。`
+          : undefined,
+        preferredBackend,
+        preferredAgyModel: selectAgyModel(
+          ctx.unpacked.userText,
+          ctx.decision.complexity
+        ),
+        workingDir: this.config.vaultRoot,
+        imagePaths: downloadedPaths,
+        cliPrompt: `你是用户的多模态知识采集助手。用户在微信上发来了图片或文件附件，已解密保存在本地。
+请直接读取这些本地文件，提取其中的核心内容（如截图文字、架构图逻辑、书页摘录或文档核心论点），输出清晰的 Markdown 摘要。
+【用户说明】
+${userInstruction}
+
+${modelSnippets}`,
+        systemPrompt: `你是用户的多模态知识采集助手。用户在微信上发来了图片或文件附件。
+请提取其中的核心内容（如截图文字、架构图逻辑、书页摘录或文档核心论点），输出清晰的 Markdown 摘要。`,
+        userPrompt: `【用户附带说明】\n${userInstruction}\n\n${modelSnippets}`,
+        images: imageInputs,
+        temperature: 0.2,
+      });
+      extractedAnalysis = tieredRes.text;
+      modelUsed = tieredRes.modelUsed;
+    } catch (err: any) {
+      analysisWarning = `已归档，未解析：${err?.message || err}`;
+      modelUsed = "local_archive";
+    }
+
+    const targetMode = ctx.decision.slots.multimodalTarget || "inbox";
+    let depositedPath = downloadedPaths[0] || "";
+
+    if (videoCount > 0 && downloadedPaths.length === 0 && targetMode !== "idea") {
+      const videoDir =
+        this.config.videoDir || join(this.config.vaultRoot, "01_inputs", "video");
+      const videoTitle =
+        ctx.unpacked.userText.trim().slice(0, 48) || "微信视频语音转写记录";
+      depositedPath = await saveRawWebArticleToVault({
+        articlesDir: videoDir,
+        article: {
+          url: `https://wx.qq.com/video/${encodeURIComponent(ctx.messageKey)}`,
+          title: videoTitle,
+          author: "微信视频",
+          publishDate: "",
+          digest: modelVideoSnippets.join(" ").slice(0, 180),
+          markdownBody: [
+            qualityNotice,
+            archiveSnippets,
+            analysisWarning,
+            extractedAnalysis ? `## 初步提炼\n\n${extractedAnalysis}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n\n"),
+          imageUrls: [],
+          extractorUsed: "native_http",
+          mediaKind: "video",
+          sourceType: "wechat_video",
+          transcriptEngine: [...videoEngines].join(", ") || "unavailable",
+          extractionQuality: videoQuality,
+        },
+        slug: "wechat_video_transcript",
+        userNotes: ctx.unpacked.userText,
+      });
+    } else if (targetMode === "idea") {
+      depositedPath = createIdeaSeedInVault({
+        ideasSeedsDir: this.config.ideasSeedsDir,
+        thoughtText: [
+          ctx.unpacked.userText,
+          extractedAnalysis,
+          qualityNotice,
+          archiveSnippets,
+          analysisWarning,
+          ...previewWarnings,
+        ]
+          .filter(Boolean)
+          .join("\n\n"),
+        attachedAssetRelPaths: downloadedPaths.map(path => relative(this.config.ideasSeedsDir, path)),
+        slug: "wechat_multimodal_idea",
+        captureId: ctx.messageKey,
+        extractionQuality: videoQuality,
+      });
+    } else {
+      depositedPath = createInboxCaptureInVault({
+        inboxDir,
+        title:
+          ctx.unpacked.userText.slice(0, 36) ||
+          (downloadedPaths[0]
+            ? `微信多媒体采集 (${basename(downloadedPaths[0])})`
+            : "微信视频采集"),
+        bodyText: [previewWarnings.join("\n"), (
+          (videoCount ? [qualityNotice, analysisWarning, extractedAnalysis, archiveSnippets, ctx.unpacked.userText].filter(Boolean).join("\n\n") : extractedAnalysis) ||
+          [analysisWarning, textSnippets.join("\n\n"), ctx.unpacked.userText]
+            .filter(Boolean)
+            .join("\n\n") ||
+          ctx.unpacked.userText ||
+          (downloadedPaths[0]
+            ? `已解密保存附件：${basename(downloadedPaths[0])}`
+            : "已接收媒体附件")
+        )].filter(Boolean).join("\n\n"),
+        slug: "wechat_media_capture",
+        captureId: ctx.messageKey,
+        extractionQuality: videoQuality,
+        attachedAssetRelPaths: downloadedPaths.map(path => relative(inboxDir, path)),
+      });
+    }
+
+    const relSaved = relative(this.config.vaultRoot, depositedPath);
+    return {
+      replyText: [
+        videoCount > 0
+          ? `🎬 已归档视频口播采集记录：\`${relSaved}\`（转写 ${processedVideos.length}/${videoCount}；不代表完整画面解析）`
+          : `🖼️ 已解密并归档媒体文件：\`${relSaved}\``,
+        qualityNotice,
+        ...attachmentWarnings,
+        ...previewWarnings,
+        extractedAnalysis ? `\n📋 内容提炼（${modelUsed}）：\n${extractedAnalysis}` : "",
+        analysisWarning ? `\n⚠️ ${analysisWarning}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      modelUsed,
+      depositedPath,
+    };
+  }
+
+  // ============================================================================
+  // 6.5 Intent: generate_image (Tier 1: AGY CLI -> Tier 2: Pro Model -> Tier 3: Fast Model)
+  // ============================================================================
+  private async handleGenerateImage(
+    ctx: IntentExecutionContext
+  ): Promise<IntentExecutionResult> {
+    const priorImageTurn = [...ctx.recentTurns]
+      .reverse()
+      .find((t) => t.intent === "generate_image");
+    const isRetryOrCorrection =
+      ctx.decision.slots.isTaskRetryOrCorrection === true ||
+      /(?:不是这个|你看看我之前的需求|按我之前的需求|刚才没生成|重新帮我生成|重新生成)/i.test(
+        ctx.unpacked.userText
+      );
+    const basePrompt =
+      ctx.decision.slots.imagePrompt?.trim() ||
+      ctx.decision.slots.coreContent?.trim() ||
+      ctx.unpacked.userText.trim();
+    const imagePrompt =
+      isRetryOrCorrection &&
+      priorImageTurn &&
+      !basePrompt.includes(priorImageTurn.user_text.slice(0, 20))
+        ? `${priorImageTurn.user_text}\n\n【用户最新补充/重试说明】：${ctx.unpacked.userText.trim()}`
+        : basePrompt;
+
+    const explicitCli =
+      detectExplicitCliBackend(ctx.unpacked.userText) ||
+      detectExplicitCliBackend(imagePrompt);
+    const preferredBackend: SubagentBackend =
+      explicitCli ||
+      ctx.decision.slots.subagentTarget ||
+      ctx.decision.subagentTarget ||
+      "agy";
+
+    const hbSec = this.config.taskHeartbeatSeconds ?? 25;
+    const progress = new TaskProgressReporter({
+      db: this.db,
+      messageKey: ctx.messageKey,
+      senderId: ctx.senderId,
+      taskTitle: "视觉生图任务",
+      sendProgressCallback: ctx.sendProgressCallback,
+      heartbeatIntervalSeconds: hbSec,
+    });
+
+    const hbHint =
+      hbSec > 0 ? `，处理期间每 ${hbSec} 秒会同步一次进度` : "";
+    await progress.start(
+      `正在调用视觉生成引擎 [${preferredBackend}] 制作图片`,
+      `🎨 已收到生图请求，正在调用视觉生成引擎 [${preferredBackend}] 制作图片${hbHint}，完成后立即发给你…`
+    );
+
+    try {
+      const tieredRes = await executeTieredAgentTask({
+        config: this.config,
+        complexity: "deep",
+        forceCliFirst: true,
+        preferredBackend,
+        preferredAgyModel: selectAgyModel(imagePrompt, "deep"),
+        workingDir: this.config.vaultRoot,
+        expectGeneratedImage: true,
+        onStageChange: (stage, opts) => progress.updateStage(stage, opts),
+        onActivity: (detail) => progress.updateActivity(detail),
+        cliPrompt: `用户在微信上请求生成一张图片。
+【用户生图需求】
+${imagePrompt}
+
+${
+  ctx.unpacked.refContext?.quotedText
+    ? `【用户引用的上下文】\n${ctx.unpacked.refContext.quotedText}\n`
+    : ""
+}请调用你的内置生图能力（AGY 请调用 image-generator 子智能体，Codex 请直接调用内置 image_gen 工具）生成高质量图片，并在回复中简要说明图片的设计构图亮点（100字以内）。`,
+        systemPrompt: `你是用户的视觉架构师。当本地生图 CLI 不可用时，请为用户生成清晰的可视化字符架构图 / Mermaid 结构图与高精度生图 Prompt 规范。`,
+        userPrompt: `【用户生图需求】\n${imagePrompt}`,
+        temperature: 0.3,
+      });
+
+      if (tieredRes.generatedImages.length > 0) {
+        return {
+          replyText: `🎨 已通过子智能体 [${tieredRes.modelUsed}] 生成图片，正在加密回传微信：\n\n${tieredRes.text}`,
+          mediaDeliveries: tieredRes.generatedImages.map((imgPath) => ({
+            mediaType: "image" as const,
+            mediaPath: imgPath,
+          })),
+          modelUsed: tieredRes.modelUsed,
+          depositedPath: tieredRes.generatedImages[0],
+        };
+      }
+
+      const cliFailStep = tieredRes.tierPath.find(
+        (s) => s.startsWith("cli:") && s.includes("(failed:")
+      );
+      const cliFailNote = cliFailStep
+        ? `\n> ⚠️ 本地 CLI 生图未完成（\`${cliFailStep.slice(0, 180)}\`），已自动降级由云端模型提供分镜与 Prompt：\n`
+        : "";
+
+      return {
+        replyText: `🎨 视觉生成响应（${tieredRes.modelUsed}）：${cliFailNote}\n${tieredRes.text}`,
+        modelUsed: tieredRes.modelUsed,
+        outcome: "partial",
+      };
+    } catch (err: any) {
+      return {
+        replyText: `⚠️ 调用生图链路失败：${err?.message || err}`,
+        modelUsed: `${preferredBackend}_error`,
+        outcome: "failed", error: err?.message || String(err),
+      };
+    } finally {
+      progress.stop("视觉生图任务结束");
+    }
+  }
+
+  // ============================================================================
+  // 6.8 Intent: delegate_subagent (Compound Research, Document Synthesis & CLI Governance)
+  // ============================================================================
+  private async handleDelegateSubagent(
+    ctx: IntentExecutionContext
+  ): Promise<IntentExecutionResult> {
+    // Reconstruct full task requirement if user is correcting or retrying a prior turn
+    const priorComplexTurn = findPriorComplexTaskTurn(ctx.recentTurns);
+    const isRetryOrCorrection =
+      ctx.decision.slots.isTaskRetryOrCorrection === true ||
+      /(?:不是这个.*(?:帮我生成|指南|需求)|你看看我之前的需求|按我之前的需求|刚才没生成|重新帮我生成|重新生成)/i.test(
+        ctx.unpacked.userText
+      );
+
+    const effectiveRequirement =
+      isRetryOrCorrection &&
+      priorComplexTurn &&
+      !ctx.unpacked.userText.includes(priorComplexTurn.user_text.slice(0, 30))
+        ? `${priorComplexTurn.user_text}\n\n【用户最新补充/纠偏要求】：${ctx.unpacked.userText}`
+        : ctx.decision.slots.coreContent?.trim() || ctx.unpacked.userText.trim();
+
+    const explicitCli =
+      detectExplicitCliBackend(ctx.unpacked.userText) ||
+      detectExplicitCliBackend(effectiveRequirement);
+    const backend: SubagentBackend =
+      explicitCli ||
+      ctx.decision.slots.subagentTarget ||
+      getPreferredCliBackend(
+        this.config,
+        /agy|antigravity|opus|sonnet/i.test(effectiveRequirement) ? "agy" : "codex"
+      );
+
+    const requestedFormats = detectRequestedFormats(
+      effectiveRequirement,
+      ctx.decision.slots.requestedFormats
+    );
+    const wantsFileDelivery =
+      detectWantsFileDelivery(
+        effectiveRequirement,
+        ctx.decision.slots.wantsFileDelivery
+      ) || requestedFormats.length > 0;
+    const isDocGen =
+      isDocumentGenerationTask(effectiveRequirement) ||
+      requestedFormats.length > 0 ||
+      isRetryOrCorrection;
+    const needsWebSearch =
+      ctx.decision.slots.needsWebSearch === true ||
+      /(?:搜一下|搜索|查一下|检索|网上|karpathy|arxiv|最新)/i.test(
+        effectiveRequirement
+      );
+
+    // Only include targetArticle if explicitly referenced or matched by ID — never pollute unrelated tasks!
+    const targetArticle =
+      (ctx.decision.targetArticleId
+        ? this.db.getArticleById(ctx.decision.targetArticleId)
+        : null) ??
+      ctx.referencedArticle ??
+      (/(?:这篇文章|刚才那篇|上一篇)/.test(ctx.unpacked.userText)
+        ? ctx.recentArticle
+        : null);
+
+    const hbSec = this.config.taskHeartbeatSeconds ?? 25;
+    const progress = new TaskProgressReporter({
+      db: this.db,
+      messageKey: ctx.messageKey,
+      senderId: ctx.senderId,
+      taskTitle: isDocGen ? "深度研究与多格式文档生成" : "子智能体复杂任务",
+      sendProgressCallback: ctx.sendProgressCallback,
+      heartbeatIntervalSeconds: hbSec,
+    });
+
+    try {
+      // Send immediate progress notice to WeChat and start periodic heartbeat timer
+      const fmtLabel =
+        requestedFormats.length > 0
+          ? `并生成【${requestedFormats.map((f) => f.toUpperCase()).join(" / ")}】文件`
+          : "";
+      const hbNotice =
+        hbSec > 0
+          ? `，处理期间每 ${hbSec} 秒会自动回传一次进度（也可随时发「进度」查看状态）`
+          : `（可随时发「进度」查看状态）`;
+      await progress.start(
+        "阶段 1/4：正在检索知识库上下文与外部资料",
+        `⏳ 已收到复合任务：正在检索外部资料与你的知识库上下文${fmtLabel}${hbNotice}…`
+      );
+
+      const articleContext = targetArticle
+        ? `\n【关联文章 #${targetArticle.id}】\n- 标题：${targetArticle.title}\n- 原文路径：${targetArticle.source_md_path}\n- 伴读笔记路径：${targetArticle.note_md_path}\n- 摘要：${targetArticle.short_summary || targetArticle.digest}\n`
+        : "";
+
+      const refBlock = ctx.unpacked.refContext?.quotedText
+        ? `\n【用户引用的微信消息】\n${ctx.unpacked.refContext.quotedText}\n`
+        : "";
+
+      const historyBlock =
+        ctx.recentTurns.length > 0
+          ? `\n【最近多轮对话历史】\n` +
+            ctx.recentTurns
+              .map(
+                (t, i) =>
+                  `[${i + 1}] 用户: ${t.user_text}\n    助手: ${t.assistant_reply.slice(0, 260)}${
+                    t.deposited_path ? `\n    已生成文件: ${t.deposited_path}` : ""
+                  }`
+              )
+              .join("\n") +
+            "\n"
+          : "";
+
+      const vaultCtx = gatherVaultContext(
+        this.config.vaultRoot,
+        effectiveRequirement,
+        this.config.vaultLayout
+      );
+      const archCtx = gatherVaultArchitectureContext(
+        this.config.vaultRoot,
+        effectiveRequirement
+      );
+
+      // Step 1: If task requires external web search (e.g. "搜一下 Andrej Karpathy 的 LLM Wiki"),
+      // perform fast grounded web search first so both CLI and Pro LLM have verified facts & links.
+      let webSearchEvidence = "";
+      if (needsWebSearch && this.config.llm.apiKey) {
+        await progress.updateStage(
+          "阶段 1/4：正在通过 Google Search 实时检索外部公开资料",
+          { detail: `已匹配本地知识库 ${vaultCtx.matchedNotes.length} 篇相关节点` }
+        );
+        try {
+          const webRes = await callAgentLlm({
+            config: this.config,
+            tier: "fast",
+            enableWebSearch: true,
+            timeoutMs: 30_000,
+            temperature: 0.1,
+            systemPrompt: `你是研究取证助手。请通过 Google Search 检索用户任务中提到的外部人物、项目、概念或原文链接，输出准确的事实要点与来源 URL。`,
+            userPrompt: `请检索以下任务涉及的外部公开资料与核心事实：\n${effectiveRequirement}`,
+          });
+          const srcLinks =
+            webRes.sources && webRes.sources.length > 0
+              ? "\n参考来源链接：\n" +
+                webRes.sources
+                  .slice(0, 6)
+                  .map((s) => `- [${s.title}](${s.uri})`)
+                  .join("\n")
+              : "";
+          webSearchEvidence = `\n【实时联网检索外部事实证据 (${webRes.modelUsed})】\n${webRes.text}${srcLinks}\n`;
+        } catch (webErr) {
+          console.warn("[DelegateSubagent] Pre-search warning:", webErr);
+        }
+      }
+
+      const datePrefix = new Date().toISOString().slice(0, 10).replace(/-/g, "_");
+      const rawSlug =
+        ctx.decision.slots.documentSlug ||
+        ctx.decision.slots.ideaSlug ||
+        (effectiveRequirement.toLowerCase().includes("llm") &&
+        effectiveRequirement.toLowerCase().includes("wiki")
+          ? "llm_wiki_beginner_guide"
+          : "knowledge_base_guide");
+      const docSlug = sanitizeSlug(rawSlug) || "knowledge_base_guide";
+      const outputDir = this.getOutputsDir();
+      mkdirSync(outputDir, { recursive: true });
+      const targetMdPath = join(outputDir, `${datePrefix}_${docSlug}.md`);
+
+      // When the user requests multi-format document generation & file delivery on WeChat
+      // without forcing a specific CLI, use our fast Pro synthesis + deterministic HTML/PDF compiler
+      // so it completes in ~35s instead of timing out in 7m inside heavy CLI sub-loops.
+      const useFastProDocPipeline =
+        isDocGen && !explicitCli && Boolean(this.config.llm.apiKey);
+
+      await progress.updateStage(
+        useFastProDocPipeline
+          ? `阶段 2/4：外部与知识库取证完成，正在调用深度模型 [${getProModel(this.config)}] 撰写完整文档`
+          : `阶段 2/4：正在调用本地智能体 [${backend}] 深度处理任务`,
+        {
+          detail: webSearchEvidence
+            ? "已完成联网事实核验与知识库架构注入"
+            : `已加载 ${vaultCtx.matchedNotes.length} 篇知识库关联笔记`,
+        }
+      );
+
+      const tieredRes = await executeTieredAgentTask({
+        config: this.config,
+        complexity: "deep",
+        forceCliFirst: !useFastProDocPipeline,
+        skipCliTier: useFastProDocPipeline,
+        cliTimeoutMs: isDocGen ? 120_000 : 180_000,
+        preferredBackend: backend,
+        preferredAgyModel: selectAgyModel(effectiveRequirement, "deep"),
+        workingDir: this.config.vaultRoot,
+        enableWebSearch: needsWebSearch && !webSearchEvidence,
+        onStageChange: (stage, opts) => progress.updateStage(stage, opts),
+        onActivity: (detail) => progress.updateActivity(detail),
+        cliPrompt: `你正在作为用户的后台子智能体（通过微信 ClawBot 远程唤起）在本地执行任务。
+个人知识库根目录：${this.config.vaultRoot}
+微信上下文项目目录：${this.config.projectRoot}
+${articleContext}${refBlock}${historyBlock}${webSearchEvidence}
+【用户核心任务指令】
+${effectiveRequirement}
+
+执行要求：
+1. 若涉及个人知识库维护、深读加工或写指南/笔记，请遵循知识库根目录 AGENTS.md 的目录与 Frontmatter 规范；
+2. ${
+          isDocGen
+            ? `请将撰写的完整中文 Markdown 正文直接保存至：${targetMdPath}（注意：无需耗时调用外部插件渲染 PDF/图片，宿主流水线会自动将你的 Markdown 编译为配套的 HTML 与 PDF 并推送到用户微信！）；`
+            : "若创建或修改了文件，请在回复末尾列出完整绝对路径；"
+        }
+3. 最终输出的总结将直接发送到用户的手机微信，请保持结论清晰、条理分明（建议 200~500 字）。`,
+        systemPrompt: isDocGen
+          ? `你是用户的深度知识工程与技术写作专家（个人知识库根目录：${this.config.vaultRoot}）。
+用户要求结合外部检索资料与他的个人知识库构建实践，撰写一份结构完整、适合目标读者（如新手）阅读的中文指南/报告，并导出为文件（${
+              requestedFormats.length > 0
+                ? requestedFormats.map((f) => f.toUpperCase()).join(" / ")
+                : "MD"
+            }）发送到微信。
+
+请按以下两段式格式严格输出（使用 \`===DOCUMENT_MARKDOWN===\` 作为唯一分隔符）：
+第一部分（分隔符之前）：发送给用户微信聊天窗口的精炼导读总结（200~400字，说明指南的核心结构、包含的模块与使用方式）；
+\`===DOCUMENT_MARKDOWN===\`
+第二部分（分隔符之后）：完整的、可直接发布分享的中文 Markdown 正文（包含 YAML frontmatter、清晰的一至三级标题、对比表格、最小可用目录结构示例、可复制的 AGENTS.md / 提示词模板、完整上手演练步骤以及跨任务 AI 共用上下文验证方法。分享版正文不要泄露本机私人绝对路径 \`/Users/...\`）。`
+          : `你是用户的深度知识工程与研究智能体（个人知识库根目录：${this.config.vaultRoot}）。
+请结合用户的当前关注主线（00_home/now.md）、最近多轮对话、外部检索证据与知识库笔记，深入完成用户的任务指令。`,
+        userPrompt: `${articleContext}${refBlock}${historyBlock}${webSearchEvidence}
+【00_home/now.md 当前关注】
+${vaultCtx.nowSummary}
+
+${archCtx ? `【个人知识库构建过程、组织架构与跨任务共享协议证据】\n${archCtx}\n` : ""}
+【相关知识库节点检索结果】
+${vaultCtx.matchedNotes.map((m) => `${m.wikiLink} (${m.relativePath}):\n${m.excerpt}`).join("\n\n") || "（无直接命中）"}
+
+【用户核心任务指令】
+${effectiveRequirement}`,
+        temperature: 0.25,
+      });
+
+      let replySummaryText = tieredRes.text.trim();
+      let generatedMarkdownContent = "";
+
+      if (replySummaryText.includes("===DOCUMENT_MARKDOWN===")) {
+        const parts = replySummaryText.split("===DOCUMENT_MARKDOWN===");
+        replySummaryText = parts[0].trim();
+        generatedMarkdownContent = parts.slice(1).join("\n").trim();
+      } else if (
+        isDocGen &&
+        tieredRes.generatedFiles.length === 0 &&
+        (replySummaryText.startsWith("---") ||
+          replySummaryText.startsWith("# ") ||
+          replySummaryText.length > 900)
+      ) {
+        generatedMarkdownContent = replySummaryText;
+        replySummaryText = extractDocumentExecutiveSummary(
+          generatedMarkdownContent,
+          [],
+          this.config.vaultRoot
+        );
+      }
+
+      // Clean any surrounding ```markdown fences if model wrapped the document body
+      if (generatedMarkdownContent) {
+        generatedMarkdownContent = generatedMarkdownContent
+          .replace(/^```(?:markdown|md)?\r?\n/i, "")
+          .replace(/\r?\n```$/, "")
+          .trim();
+      }
+
+      const mediaDeliveries: Array<{ mediaType: "file" | "image"; mediaPath: string }> = [];
+      for (const imgPath of tieredRes.generatedImages) {
+        mediaDeliveries.push({ mediaType: "image", mediaPath: imgPath });
+      }
+
+      let allDeliverableFiles = [...tieredRes.generatedFiles];
+
+      if (isDocGen || requestedFormats.length > 0 || generatedMarkdownContent) {
+        const formatsToBuild: DeliverableFormat[] =
+          requestedFormats.length > 0 ? requestedFormats : ["md"];
+
+        await progress.updateStage(
+          `阶段 3/4：内容撰写完成，正在编译多格式文档 (${formatsToBuild
+            .map((f) => f.toUpperCase())
+            .join(" / ")})`,
+          {
+            detail: `正文约 ${generatedMarkdownContent.length || replySummaryText.length} 字`,
+          }
+        );
+
+        // Choose unique file stem if targetMdPath already exists and wasn't created in this run
+        let finalStem = `${datePrefix}_${docSlug}`;
+        const existingPrimaryMd = allDeliverableFiles.find((f) =>
+          f.toLowerCase().endsWith(".md")
+        );
+        if (
+          !existingPrimaryMd &&
+          existsSync(join(outputDir, `${finalStem}.md`)) &&
+          generatedMarkdownContent
+        ) {
+          finalStem = `${datePrefix}_${docSlug}_${createHash("sha256")
+            .update(ctx.messageKey)
+            .digest("hex")
+            .slice(0, 6)}`;
+        }
+
+        allDeliverableFiles = await ensureMultiFormatDeliverables({
+          markdownPath: existingPrimaryMd,
+          markdownContent: generatedMarkdownContent || undefined,
+          outputDir,
+          baseFileStem: finalStem,
+          title: ctx.decision.slots.documentTitle || "知识库构建与跨任务共用上下文学习指南",
+          existingFiles: allDeliverableFiles,
+          requestedFormats: formatsToBuild,
+        });
+      }
+
+      if (wantsFileDelivery || isDocGen) {
+        for (const fPath of allDeliverableFiles) {
+          if (existsSync(fPath)) {
+            mediaDeliveries.push({ mediaType: "file", mediaPath: fPath });
+          }
+        }
+      }
+
+      const missingFormats = requestedFormats.filter(fmt => !allDeliverableFiles.some(p => p.toLowerCase().endsWith(`.${fmt}`)));
+      const outcome = missingFormats.length ? (allDeliverableFiles.length ? "partial" : "failed") : "success";
+      const missingNotice = missingFormats.length ? `\n⚠️ 未生成所请求格式：${missingFormats.map(f => f.toUpperCase()).join("、")}` : "";
+      const fileListBanner =
+        allDeliverableFiles.length > 0
+          ? `\n\n📎 已生成并为你推送文件（共 ${allDeliverableFiles.length} 个）：\n` +
+            allDeliverableFiles.map((f) => `- \`${basename(f)}\``).join("\n")
+          : "";
+
+      void notifyExternalWebhookIfConfigured(
+        this.config,
+        "plan",
+        ctx.decision.slots.documentTitle || "研究报告 / 复杂任务已完成",
+        `${replySummaryText.slice(0, 300)}${fileListBanner}`
+      ).catch(() => {});
+      emitOmsManagedEvent({
+        eventType: "plan",
+        title: ctx.decision.slots.documentTitle || "微信远程异步任务已完成",
+        summary: `${replySummaryText.slice(0, 360)}${fileListBanner}`,
+        files: allDeliverableFiles,
+      });
+
+      return {
+        replyText: `🤖 ${outcome === "success" ? "任务执行完成" : outcome === "partial" ? "任务部分完成" : "未完成所请求的文件交付"} [${tieredRes.modelUsed}]：\n\n${replySummaryText}${fileListBanner}${missingNotice}`,
+        outcome, missingFormats,
+        mediaDeliveries: mediaDeliveries.length > 0 ? mediaDeliveries : undefined,
+        modelUsed: tieredRes.modelUsed,
+        relatedArticleId: targetArticle?.id ?? null,
+        depositedPath:
+          allDeliverableFiles.length > 0
+            ? JSON.stringify(allDeliverableFiles)
+            : tieredRes.generatedImages[0] || undefined,
+      };
+    } catch (err: any) {
+      return {
+        replyText: `⚠️ 任务执行出错 [${backend}]：${err?.message || err}`,
+        modelUsed: `${backend}_error`,
+        outcome: "failed", error: err?.message || String(err),
+      };
+    } finally {
+      progress.stop("阶段 4/4：任务执行完毕，已入队推送微信");
+    }
+  }
+
+  // ============================================================================
+  // 7. Intent: send_file (C2C AES-128-ECB Upload & Multi-Format File Delivery)
+  // ============================================================================
+  private async resolveFileDelivery(paths: string[], requestedFormats: DeliverableFormat[]) {
+    if (paths.length > 1 && (requestedFormats.length === 0 || paths.filter(p => p.toLowerCase().endsWith(".md")).length > 1)) {
+      const remaining = new Set(paths);
+      const files: string[] = [];
+      const missing = new Set<DeliverableFormat>();
+      for (const source of paths.filter((p) => p.toLowerCase().endsWith(".md"))) {
+        const sourceStem = basename(source).slice(0, -3);
+        const family = paths.filter((p) => {
+          if (resolve(p, "..") !== resolve(source, "..")) return false;
+          const name = basename(p);
+          if (p === source || name === `${sourceStem}.html` || name === `${sourceStem}.pdf`) return true;
+          return name.startsWith(`${sourceStem}_export_`) && /^[a-f0-9]{16}\.(html|pdf)$/i.test(name.slice(`${sourceStem}_export_`.length));
+        });
+        const formats = requestedFormats.length ? requestedFormats : [...new Set(family.map((p) => p.split(".").pop()!.toLowerCase() as DeliverableFormat))];
+        const delivery = await this.resolveFileDelivery([source], formats);
+        files.push(...delivery.files);
+        delivery.missingFormats.forEach((fmt) => missing.add(fmt));
+        family.forEach((p) => remaining.delete(p));
+      }
+      if (requestedFormats.length === 0) files.push(...remaining);
+      const missingFormats = [...missing];
+      return { files, missingFormats, warning: missingFormats.length
+        ? `\n⚠️ 未生成或无法获取所请求格式：${missingFormats.map((fmt) => fmt.toUpperCase()).join("、")}；未使用旧版本替代。`
+        : "" };
+    }
+    const markdownPath = paths.find((p) => p.toLowerCase().endsWith(".md"));
+    const formats = requestedFormats;
+    let files: string[];
+    if (markdownPath && formats.length > 0) {
+      files = await ensureMultiFormatDeliverables({
+        markdownPath,
+        outputDir: resolve(markdownPath, ".."),
+        baseFileStem: basename(markdownPath, ".md"),
+        existingFiles: paths,
+        requestedFormats: formats,
+      });
+    } else if (/\.(md|html|pdf)$/i.test(paths[0] || "")) {
+      files = findSiblingMultiFormatFiles(paths[0], requestedFormats.length ? requestedFormats : ["md", "html", "pdf"]);
+    } else {
+      files = requestedFormats.length ? [] : paths;
+    }
+    const missingFormats = formats.filter((fmt) => !files.some((p) => p.toLowerCase().endsWith(`.${fmt}`)));
+    const warning = missingFormats.length
+      ? `\n⚠️ 未生成或无法获取所请求格式：${missingFormats.map((fmt) => fmt.toUpperCase()).join("、")}；未使用旧版本替代。`
+      : "";
+    return { files, missingFormats, warning };
+  }
+
+  private async handleSendFile(
+    ctx: IntentExecutionContext
+  ): Promise<IntentExecutionResult> {
+    const targetArticle =
+      (ctx.decision.targetArticleId
+        ? this.db.getArticleById(ctx.decision.targetArticleId)
+        : null) ??
+      ctx.referencedArticle ??
+      ctx.recentArticle;
+
+    const fileTarget = ctx.decision.slots.fileTarget || "latest_note";
+    const fileQuery = ctx.decision.slots.fileQuery || ctx.unpacked.userText;
+    const requestedFormats = detectRequestedFormats(
+      ctx.unpacked.userText,
+      ctx.decision.slots.requestedFormats
+    );
+
+    // 1. Check if user is asking for recently generated files from a prior turn
+    if (
+      fileTarget === "recent_generated" ||
+      (!ctx.decision.slots.fileTarget && !targetArticle && !ctx.decision.slots.fileQuery &&
+        /(?:文件呢|刚生成|刚才生成|学习指南|新手指南)/i.test(ctx.unpacked.userText))
+    ) {
+      const priorTurnWithFiles = [...ctx.recentTurns]
+        .reverse()
+        .find((t) => Boolean(t.deposited_path) && !/^\[\s*\]$/.test(t.deposited_path.trim()));
+
+      if (priorTurnWithFiles?.deposited_path) {
+        const paths = decodeArtifactPaths(priorTurnWithFiles.deposited_path).filter(p => existsSync(p));
+        if (paths.length > 0) {
+          const delivery = await this.resolveFileDelivery(paths, requestedFormats);
+          const allSiblings = delivery.files;
+          return {
+            replyText: `📎 正在为你推送刚生成的文件（共 ${allSiblings.length} 个）：\n${allSiblings
+              .map((p) => `- \`${basename(p)}\``)
+              .join("\n")}${delivery.warning}`,
+            missingFormats: delivery.missingFormats,
+            outcome: delivery.missingFormats.length ? (delivery.files.length ? "partial" : "failed") : "success",
+            mediaDeliveries: allSiblings.map((p) => ({
+              mediaType: "file" as const,
+              mediaPath: p,
+            })),
+            modelUsed: getFastModel(this.config),
+            depositedPath: JSON.stringify(allSiblings),
+          };
+        }
+      }
+
+      return { replyText: "⚠️ 未找到当前会话关联的文件，请提供明确的文档名称。", modelUsed: getFastModel(this.config), outcome: "failed", error: "No conversation artifact" };
+    }
+
+    let filePathToSend = "";
+    let fileDescription = "";
+
+    if (
+      fileTarget === "latest_source" &&
+      targetArticle?.source_md_path &&
+      existsSync(targetArticle.source_md_path)
+    ) {
+      filePathToSend = targetArticle.source_md_path;
+      fileDescription = `文章 #${targetArticle.id}《${targetArticle.title}》原文 Markdown`;
+    } else if (
+      fileTarget === "latest_note" &&
+      targetArticle?.note_md_path &&
+      existsSync(targetArticle.note_md_path)
+    ) {
+      filePathToSend = targetArticle.note_md_path;
+      fileDescription = `文章 #${targetArticle.id}《${targetArticle.title}》伴读笔记`;
+    } else if (fileQuery) {
+      const vaultMatches = findVaultFilesByQuery(this.config.vaultRoot, fileQuery, 1);
+      if (vaultMatches.length > 0 && existsSync(vaultMatches[0].absolutePath)) {
+        filePathToSend = vaultMatches[0].absolutePath;
+        fileDescription = `知识库笔记 ${vaultMatches[0].wikiLink} (${vaultMatches[0].relativePath})`;
+      } else if (targetArticle?.note_md_path && existsSync(targetArticle.note_md_path)) {
+        filePathToSend = targetArticle.note_md_path;
+        fileDescription = `文章 #${targetArticle.id}《${targetArticle.title}》伴读笔记`;
+      }
+    }
+
+    if (!filePathToSend || !existsSync(filePathToSend)) {
+      return {
+        replyText: `⚠️ 未找到要发送的本地笔记文件（请确认文章已完成抓取，或提供准确的知识库笔记名称）。`,
+        outcome: "failed", error: "File not found",
+        modelUsed: getFastModel(this.config),
+      };
+    }
+
+    const delivery = requestedFormats.length > 0 || filePathToSend.includes("05_outputs") || filePathToSend.includes("/outputs/")
+      ? await this.resolveFileDelivery([filePathToSend], requestedFormats)
+      : { files: [filePathToSend], missingFormats: [], warning: "" };
+    const filesToSend = delivery.files;
+
+    return {
+      replyText: `📎 正在为你推送文件：${fileDescription}\n文件列表：${filesToSend
+        .map((f) => `\`${basename(f)}\``)
+        .join("、")}${delivery.warning}`,
+      missingFormats: delivery.missingFormats,
+      outcome: delivery.missingFormats.length ? (delivery.files.length ? "partial" : "failed") : "success",
+      mediaDeliveries: filesToSend.map((f) => ({
+        mediaType: "file" as const,
+        mediaPath: f,
+      })),
+      modelUsed: getFastModel(this.config),
+      relatedArticleId: targetArticle?.id ?? null,
+      depositedPath: JSON.stringify(filesToSend),
+    };
+  }
+
+  // ============================================================================
+  // 8. Intent: general_assistant (Conversational Personal Assistant)
+  // ============================================================================
+  private async handleGeneralAssistant(
+    ctx: IntentExecutionContext
+  ): Promise<IntentExecutionResult> {
+    const text = ctx.unpacked.userText.trim();
+
+    if (/^(?:\/help|help|帮助|功能|菜单)$/i.test(text)) {
+      const cliChainLabel = (this.config.llm.cliRoutingChain ?? ["agy", "codex"]).join(" -> ") || "agy -> codex";
+      return {
+        replyText: [
+          `🤖 你的随身个人助理 & 第二大脑（分层高可用路由架构）已就绪：`,
+          `0️⃣ 意图识别层：${getFastModel(this.config)}（降级 -> 本地确定性规则路由）`,
+          `1️⃣ 重度/视觉首选层：本地 CLI 子智能体路由链（${cliChainLabel}）`,
+          `2️⃣ 一级云端降级层：Pro 模型（${getProModel(this.config)}）`,
+          `3️⃣ 终极云端兜底层：Fast 模型（${getFastModel(this.config)}）`,
+          ``,
+          `支持自然语言直接交互（无需固定前缀，支持文字、语音、图片、文件、引用追问）：`,
+          `1️⃣ 发链接：公众号或任意外部网页 -> 自动抓取、防盗链存图、生成伴读卡`,
+          `2️⃣ 聊想法：直接说出你的思考/灵感 -> 自动沉淀至 03_ideas/seeds/`,
+          `3️⃣ 记备忘：随手记待办或摘抄 -> 自动存入 01_inputs/inbox/`,
+          `4️⃣ 查知识库 / 联网搜：检索本地笔记，或通过 Google Search 实时检索公开信息`,
+          `5️⃣ 发图片/PDF：本地 AES 解密归档 + 转交本地 CLI 视觉理解提炼`,
+          `6️⃣ 画图生成：说“画一张...架构图发给我” -> AGY 生成图片并加密直发微信`,
+          `7️⃣ 唤起子智能体：说“让 codex / agy / opencode / claude 帮我...”`,
+          `8️⃣ 要文件：说“把刚才那篇伴读笔记发文件给我” -> 原生文件直达微信`,
+          `9️⃣ 定时任务与待办提醒：说“提醒我下午4点半回电话”、“待办：买咖啡豆（默认20:00提醒）”、“每天早上8点半搜AI动态发早报”、“查看我的待办”`,
+        ].join("\n"),
+        modelUsed: "system_help",
+      };
+    }
+
+    if (!this.config.llm.apiKey && !this.config.llm.allowCodexFallback) {
+      // Preserve legacy fallback message when LLM API key is empty
+      const attached = this.db.attachUserNoteToRecentArticle(ctx.senderId, text, 15);
+      return {
+        replyText: attached
+          ? `已保存文章 #${attached.id} 的批注；已有笔记不会自动重写，请在电脑端结合批注继续深读。`
+          : "请发送公众号链接，或使用「想法：...」保存个人想法。",
+        modelUsed: "local_fallback",
+        relatedArticleId: attached?.id ?? null,
+      };
+    }
+
+    const recentTurns = this.db.getRecentConversationTurns(ctx.senderId, 6);
+    const historyBlock =
+      recentTurns.length > 0
+        ? recentTurns
+            .map((t) => `用户: ${t.user_text}\n助手: ${t.assistant_reply}`)
+            .join("\n\n")
+        : "（新对话）";
+
+    const vaultCtx = gatherVaultContext(
+      this.config.vaultRoot,
+      text,
+      this.config.vaultLayout
+    );
+    const llmRes = await executeTieredAgentTask({
+      config: this.config,
+      complexity: ctx.decision.complexity,
+      preferredBackend: ctx.decision.slots.subagentTarget || "agy",
+      systemPrompt: `你是用户的随身个人助理兼知识工程搭档（连接着用户的个人知识库 ${this.config.vaultRoot}）。
+用户在手机微信上与你对话。
+请结合用户的当前关注主线（00_home/now.md）、最近对话记忆以及检索到的相关知识库笔记，提供高质量、有洞察力、条理清晰的回答。
+- 手机微信阅读友好，控制在 150~450 字以内（除非用户明确要求长文）；
+- 若探讨出了值得沉淀的原创观点，可在结尾提醒用户说“把刚才聊的存成想法”即可一键归档到 03_ideas/seeds/。`,
+      userPrompt: `【最近对话历史】
+${historyBlock}
+
+${
+  ctx.unpacked.refContext?.quotedText
+    ? `【用户引用的消息】\n${ctx.unpacked.refContext.quotedText}\n\n`
+    : ""
+}【用户当前研究主线 (00_home/now.md)】
+${vaultCtx.nowSummary}
+
+【相关知识库笔记参考】
+${vaultCtx.matchedNotes.map((m) => `${m.wikiLink}: ${m.excerpt}`).join("\n\n") || "（无特定命中）"}
+
+【用户最新消息】
+${text}`,
+      temperature: 0.35,
+    });
+
+    return {
+      replyText: llmRes.text,
+      modelUsed: llmRes.modelUsed,
+    };
+  }
+
+  // ============================================================================
+  // 9. Intent: manage_schedule (Scheduled Tasks, Digests & Todo Reminders)
+  // ============================================================================
+  private async handleManageSchedule(
+    ctx: IntentExecutionContext
+  ): Promise<IntentExecutionResult> {
+    const rawText = (
+      ctx.decision.slots.coreContent ||
+      ctx.unpacked.userText ||
+      ""
+    ).trim();
+    // A router hint must not override the explicit target in the user's text.
+    const taskQuery = ctx.unpacked.userText?.trim() || rawText;
+    const tz = "Asia/Shanghai";
+    const nowMs = Date.now();
+
+    let subAction = ctx.decision.slots.scheduleSubAction;
+    if (!subAction) {
+      if (
+        /^(?:查看|看看|列出|显示|查询|我的)?\s*(?:所有|全部|当前)?\s*(?:待办|提醒|定时任务|周期任务|早报|日报|日程)/i.test(
+          rawText
+        )
+      ) {
+        subAction = "list";
+      } else if (
+        /^(?:完成|已完成|做完了|搞定了|勾掉|done|complete)/i.test(rawText) ||
+        /(?:标记为|设为)?(?:完成|已完成|做完了)$/i.test(rawText)
+      ) {
+        subAction = "complete";
+      } else if (
+        /^(?:取消|删除|关掉|关闭|停用|暂停|cancel|delete)/i.test(rawText)
+      ) {
+        subAction = "cancel";
+      } else if (
+        /^(?:立即执行|现在执行|现在跑一次|马上执行|立即触发|触发|测试执行|run)/i.test(
+          rawText
+        )
+      ) {
+        subAction = "run_now";
+      } else if (
+        /^(?:把|将).*(?:改到|推迟到|推迟|延后|提前到|调整到|改为|设为)/i.test(
+          rawText
+        )
+      ) {
+        subAction = "update";
+      } else {
+        subAction = "create";
+      }
+    }
+
+    // 1. LIST
+    if (subAction === "list") {
+      const queuePath = syncScheduledTasksToVaultQueue(this.config, this.db);
+      const activeOnce = this.db.listScheduledTasks({
+        status: ["active", "running"],
+        scheduleType: "once",
+        limit: 30,
+      });
+      const activeCron = this.db.listScheduledTasks({
+        status: ["active", "running", "paused"],
+        scheduleType: "cron",
+        limit: 30,
+      });
+      const recentCompleted = this.db
+        .listScheduledTasks({
+          status: ["completed"],
+          limit: 5,
+        })
+        .slice(0, 5);
+
+      const lines: string[] = [
+        `⏰ 【我的待办与定时任务】`,
+        "",
+        `📌 待处理事项与单次提醒 (${activeOnce.length} 项)：`,
+      ];
+
+      if (activeOnce.length === 0) {
+        lines.push("  • 暂无待处理单次提醒");
+      } else {
+        for (const item of activeOnce) {
+          const dueStr = item.next_run_at
+            ? formatZonedDateTime(item.next_run_at, item.timezone || tz)
+            : "待定";
+          const fallbackTag = item.is_default_time ? " [默认20:00]" : "";
+          lines.push(`  • #${item.id} ${item.title} — ⏰ ${dueStr}${fallbackTag}`);
+        }
+      }
+
+      lines.push("", `🔄 周期性信息收集与定时任务 (${activeCron.length} 项)：`);
+      if (activeCron.length === 0) {
+        lines.push("  • 暂无周期性定时任务");
+      } else {
+        for (const item of activeCron) {
+          const desc = item.cron_expr
+            ? describeCronExpression(item.cron_expr)
+            : "周期任务";
+          const nextStr = item.next_run_at
+            ? formatZonedDateTime(item.next_run_at, item.timezone || tz)
+            : "已暂停";
+          lines.push(
+            `  • #${item.id} ${item.title} — ${desc} (下次: ${nextStr})`
+          );
+        }
+      }
+
+      if (recentCompleted.length > 0) {
+        lines.push("", `✅ 最近已完成 (${recentCompleted.length} 项)：`);
+        for (const item of recentCompleted) {
+          lines.push(`  • #${item.id} ${item.title}`);
+        }
+      }
+
+      if (queuePath) {
+        lines.push(
+          "",
+          `🗂️ 已同步至知识库：\`${relative(this.config.vaultRoot, queuePath)}\``
+        );
+      }
+      lines.push(
+        `💡 发送「完成 #ID」、「把 #ID 改到明早9点」或「取消 #ID」即可管理。`
+      );
+
+      return {
+        replyText: lines.join("\n"),
+        modelUsed: "schedule_manager",
+        depositedPath: queuePath || undefined,
+      };
+    }
+
+    // 2. COMPLETE
+    if (subAction === "complete") {
+      const target = this.db.findScheduledTaskByQuery(taskQuery, {
+        senderId: ctx.senderId,
+        activeOnly: true,
+      });
+
+      if (!target) {
+        return {
+          replyText: `未找到匹配的待处理事项或提醒。你可以发送「查看我的待办」确认编号 #ID。`,
+          modelUsed: "schedule_manager",
+        };
+      }
+
+      const nowIso = new Date(nowMs).toISOString();
+      const updated = this.db.updateScheduledTask(target.id, {
+        status: "completed",
+        next_run_at: null,
+        last_run_at: nowIso,
+      })!;
+      const queuePath = syncScheduledTasksToVaultQueue(this.config, this.db);
+
+      return {
+        replyText: [
+          `✅ 已标记完成：#${updated.id}「${updated.title}」`,
+          queuePath
+            ? `🗂️ 已同步更新至 \`${relative(this.config.vaultRoot, queuePath)}\``
+            : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        modelUsed: "schedule_manager",
+        depositedPath: queuePath || undefined,
+      };
+    }
+
+    // 3. CANCEL / PAUSE
+    if (subAction === "cancel") {
+      const target = this.db.findScheduledTaskByQuery(taskQuery, {
+        senderId: ctx.senderId,
+        activeOnly: true,
+      });
+
+      if (!target) {
+        return {
+          replyText: `未找到可取消的待办或定时任务。请发送「查看我的待办」查看当前有效编号 #ID。`,
+          modelUsed: "schedule_manager",
+        };
+      }
+
+      const isPause = /^暂停/.test(taskQuery);
+      const updated = this.db.updateScheduledTask(target.id, {
+        status: isPause ? "paused" : "cancelled",
+        next_run_at: null,
+      })!;
+      const queuePath = syncScheduledTasksToVaultQueue(this.config, this.db);
+
+      return {
+        replyText: [
+          `🗑️ 已${isPause ? "暂停" : "取消"}任务：#${updated.id}「${updated.title}」`,
+          queuePath
+            ? `🗂️ 已同步更新至 \`${relative(this.config.vaultRoot, queuePath)}\``
+            : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        modelUsed: "schedule_manager",
+        depositedPath: queuePath || undefined,
+      };
+    }
+
+    // 4. UPDATE (Reschedule)
+    if (subAction === "update") {
+      const target = this.db.findScheduledTaskByQuery(taskQuery, {
+        senderId: ctx.senderId,
+        activeOnly: false,
+      });
+
+      if (!target) {
+        return {
+          replyText: `未找到要修改的待办或定时任务。请使用「把 #ID 改到明天上午10点」指定任务。`,
+          modelUsed: "schedule_manager",
+        };
+      }
+
+      const updateTarget = taskQuery.replace(/^(?:把|将|修改|调整|推迟|改期)\s*/, "").trim();
+      const titleForm = [target.title, `「${target.title}」`, `“${target.title}”`, `"${target.title}"`]
+        .find(name => updateTarget.toLowerCase().startsWith(name.toLowerCase()));
+      const updateText = titleForm ? updateTarget.slice(titleForm.length).trim() : updateTarget;
+      const afterClause =
+        updateText.match(
+          /(?:改到|推迟到|推迟|延后|提前到|调整到|改为|设为)\s*(.+)$/i
+        )?.[1] || taskQuery;
+      const spec = parseNaturalScheduleSpec(afterClause, {
+        nowMs,
+        timezone: target.timezone || tz,
+      });
+
+      const newScheduleType =
+        spec.scheduleType === "cron" ? "cron" : target.schedule_type === "cron" && spec.cronExpr ? "cron" : "once";
+      const newCronExpr =
+        newScheduleType === "cron" ? spec.cronExpr || target.cron_expr : "";
+      const newNextRunAt = spec.nextRunAt;
+
+      const updated = this.db.updateScheduledTask(target.id, {
+        schedule_type: newScheduleType,
+        cron_expr: newCronExpr,
+        next_run_at: newNextRunAt,
+        is_default_time: 0,
+        status: "active",
+      })!;
+      const queuePath = syncScheduledTasksToVaultQueue(this.config, this.db);
+
+      return {
+        replyText: [
+          `🔄 已更新任务 #${updated.id}「${updated.title}」`,
+          newScheduleType === "cron"
+            ? `⏱️ 新周期：${describeCronExpression(newCronExpr)} (\`${newCronExpr}\`)`
+            : "",
+          `⏰ 下次触发时间：${formatZonedDateTime(newNextRunAt, updated.timezone || tz)}`,
+          queuePath
+            ? `🗂️ 已同步更新至 \`${relative(this.config.vaultRoot, queuePath)}\``
+            : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        modelUsed: "schedule_manager",
+        depositedPath: queuePath || undefined,
+      };
+    }
+
+    // 5. RUN NOW
+    if (subAction === "run_now") {
+      const target = this.db.findScheduledTaskByQuery(taskQuery, {
+        senderId: ctx.senderId,
+        activeOnly: false,
+      });
+
+      if (!target) {
+        return {
+          replyText: `未找到指定的定时任务。请发送「查看我的定时任务」确认 #ID。`,
+          modelUsed: "schedule_manager",
+        };
+      }
+
+      const engine = new TaskSchedulerEngine(
+        this.config,
+        this.db,
+        new WeChatClawBotClient(this.db)
+      );
+      try {
+        const outcomes = await engine.tick({ nowMs, forceTaskId: target.id });
+        const first = outcomes[0];
+        return {
+          replyText: first?.status === "succeeded"
+            ? `⚡ 任务 #${target.id}「${target.title}」已执行，回执已入队（尚不代表微信送达）`
+            : `⚠️ 任务 #${target.id}「${target.title}」未成功执行（${first?.status || "未执行"}）${first?.summary ? `：${first.summary}` : ""}`,
+          modelUsed: "schedule_manager",
+          depositedPath: first?.depositedPath,
+        };
+      } catch (error: any) {
+        return { replyText: `⚠️ 任务 #${target.id}「${target.title}」：${error?.message || "执行失败"}`, modelUsed: "schedule_manager" };
+      }
+    }
+
+    // 6. CREATE (Default)
+    const spec = parseNaturalScheduleSpec(rawText, { nowMs, timezone: tz });
+
+    let scheduleType: "once" | "cron" = spec.scheduleType;
+    let cronExpr = spec.cronExpr;
+    let nextRunAt = spec.nextRunAt;
+    let isDefaultTime = spec.isDefaultTime;
+
+    // Allow LLM router slot overrides when natural parser fell back to default 20:00
+    if (
+      isDefaultTime &&
+      ctx.decision.slots.cronExpr &&
+      isValidCronExpression(ctx.decision.slots.cronExpr)
+    ) {
+      scheduleType = "cron";
+      cronExpr = ctx.decision.slots.cronExpr.trim();
+      nextRunAt = getNextCronRunMs(cronExpr, nowMs, tz);
+      isDefaultTime = false;
+    } else if (isDefaultTime && ctx.decision.slots.runAtIso) {
+      const parsedIsoMs = Date.parse(ctx.decision.slots.runAtIso);
+      if (Number.isFinite(parsedIsoMs) && parsedIsoMs > nowMs) {
+        scheduleType = "once";
+        nextRunAt = parsedIsoMs;
+        isDefaultTime = false;
+      }
+    }
+
+    let taskKind: ScheduledTaskKind = spec.taskKind;
+    if (ctx.decision.slots.scheduleTaskKind === "digest") {
+      taskKind = "digest";
+    } else if (
+      ctx.decision.slots.scheduleTaskKind === "todo" &&
+      taskKind !== "digest"
+    ) {
+      taskKind = "todo";
+    }
+
+    const linkedArticleId = ctx.decision.targetArticleId ?? null;
+    const linkedArticle = linkedArticleId
+      ? this.db.getArticleById(linkedArticleId)
+      : null;
+
+    let title = spec.cleanedTitle || ctx.decision.slots.ideaTitle || rawText;
+    if (
+      linkedArticle &&
+      linkedArticle.title &&
+      /(?:这篇|这篇文章|刚才那篇)/.test(title)
+    ) {
+      title = `${title.replace(/(?:这篇|这篇文章|刚才那篇)/g, `《${linkedArticle.title}》`)}`;
+    }
+    title = title.slice(0, 80);
+
+    const needsWebSearch =
+      ctx.decision.slots.needsWebSearch === true ||
+      /(?:搜|检索|动态|最新|资讯|新闻|外部|arxiv|web)/i.test(rawText);
+
+    const actionPayload: ScheduledActionPayload =
+      taskKind === "digest"
+        ? {
+            executor: needsWebSearch ? "web_search_digest" : "vault_digest",
+            prompt: rawText,
+            searchQueries: ctx.decision.slots.searchQuery
+              ? [ctx.decision.slots.searchQuery]
+              : undefined,
+            includeVaultNow: true,
+            includeRecentArticlesHours: 24,
+            archiveToVault: true,
+            relatedArticleId: linkedArticleId ?? undefined,
+          }
+        : {
+            executor: "reminder_push",
+            prompt: rawText,
+            relatedArticleId: linkedArticleId ?? undefined,
+          };
+
+    const created = this.db.createScheduledTask({
+      senderId: ctx.senderId,
+      title,
+      taskKind,
+      scheduleType,
+      cronExpr,
+      timezone: tz,
+      nextRunAt,
+      isDefaultTime,
+      actionPayload,
+      status: "active",
+      relatedArticleId: linkedArticleId,
+    });
+
+    const queuePath = syncScheduledTasksToVaultQueue(this.config, this.db);
+    const nextRunFormatted = created.next_run_at
+      ? formatZonedDateTime(created.next_run_at, tz)
+      : "待定";
+
+    const replyLines: string[] = [];
+    if (created.schedule_type === "cron") {
+      replyLines.push(
+        `🔄 【周期性定时任务已创建】#${created.id}`,
+        `📌 标题：${created.title}`,
+        `⏱️ 周期规则：${describeCronExpression(created.cron_expr)} (\`${created.cron_expr}\`)`,
+        `📅 首次触发：${nextRunFormatted}`,
+        `📂 默认归档：每次执行将自动归档完整 Markdown 笔记至 \`${
+          this.config.vaultEnabled !== false &&
+          this.config.vaultMode !== "standalone" &&
+          this.config.vaultMode !== "generic_folder"
+            ? "05_outputs/digests/"
+            : "digests/"
+        }\``
+      );
+    } else {
+      const kindHeader =
+        created.task_kind === "todo"
+          ? `📌 【待办事项已创建】#${created.id}`
+          : `⏰ 【定时提醒已创建】#${created.id}`;
+      replyLines.push(kindHeader, `📝 事项：${created.title}`);
+      if (created.is_default_time) {
+        replyLines.push(
+          `🔔 提醒时间：${nextRunFormatted}（未指定具体时间，已默认分配 20:00 晚间兜底提醒）`
+        );
+      } else {
+        replyLines.push(`🔔 提醒时间：${nextRunFormatted}`);
+      }
+      if (linkedArticle) {
+        replyLines.push(
+          `📄 关联文章：#${linkedArticle.id}《${linkedArticle.title || linkedArticle.url}》`
+        );
+      }
+    }
+
+    if (queuePath) {
+      replyLines.push(
+        `🗂️ 队列同步：已写入 \`${relative(this.config.vaultRoot, queuePath)}\``
+      );
+    }
+    replyLines.push(
+      "",
+      `💡 可随时发送「完成 #${created.id}」、「把 #${created.id} 改到明早9点」或「取消 #${created.id}」。`
+    );
+
+    return {
+      replyText: replyLines.join("\n"),
+      modelUsed: "schedule_manager",
+      relatedArticleId: linkedArticleId,
+      depositedPath: queuePath || undefined,
+    };
+  }
+}
+
+function safeParseJsonArray(raw: string): string[] {
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+function extractDocumentExecutiveSummary(
+  markdown: string,
+  deliverableFiles: string[],
+  vaultRoot: string
+): string {
+  const stripped = markdown.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n+/, "").trim();
+  const lines = stripped.split(/\r?\n/);
+  let title = "";
+  const headings: string[] = [];
+  const introParagraphs: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const h1 = trimmed.match(/^#\s+(.+)$/);
+    if (h1 && !title) {
+      title = h1[1].trim();
+      continue;
+    }
+    const h2 = trimmed.match(/^##\s+(.+)$/);
+    if (h2) {
+      headings.push(h2[1].trim());
+      continue;
+    }
+    if (
+      headings.length === 0 &&
+      introParagraphs.length < 2 &&
+      !trimmed.startsWith("#") &&
+      !trimmed.startsWith("|") &&
+      !trimmed.startsWith("```") &&
+      trimmed.length > 20
+    ) {
+      introParagraphs.push(trimmed);
+    }
+  }
+
+  const parts: string[] = [];
+  if (title) {
+    parts.push(`📘 **《${title}》**`);
+  }
+  if (introParagraphs.length > 0) {
+    parts.push(introParagraphs.join("\n\n").slice(0, 260));
+  }
+  if (headings.length > 0) {
+    parts.push(
+      `**核心章节目录**：\n` +
+        headings
+          .slice(0, 9)
+          .map((h) => `• ${h}`)
+          .join("\n")
+    );
+  }
+  if (deliverableFiles.length > 0) {
+    parts.push(
+      `**知识库归档路径**：\n` +
+        deliverableFiles
+          .map((f) => `- \`${relative(vaultRoot, f)}\``)
+          .join("\n")
+    );
+  }
+  return parts.join("\n\n") || stripped.slice(0, 400);
+}

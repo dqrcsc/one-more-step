@@ -100,7 +100,18 @@ export async function handleDashboardHttpRequest(
   url: URL,
   clientIp = "127.0.0.1"
 ): Promise<Response | null> {
+  const isWeChatRoute =
+    url.pathname === "/wechat" ||
+    url.pathname.startsWith("/wechat/") ||
+    url.pathname === "/config" ||
+    url.pathname.startsWith("/api/wechat") ||
+    url.pathname.startsWith("/api/config") ||
+    url.pathname === "/api/schedules" ||
+    url.pathname === "/api/ingest" ||
+    url.pathname === "/api/push";
+
   const isDashboardRoute =
+    isWeChatRoute ||
     url.pathname === "/inbox" ||
     url.pathname === "/dashboard" ||
     url.pathname === "/mirror" ||
@@ -153,6 +164,49 @@ export async function handleDashboardHttpRequest(
 
   const dashboardCspBase =
     "default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; frame-src 'self'; object-src 'none'; base-uri 'none'";
+
+  if (isWeChatRoute) {
+    if (url.pathname === "/wechat") {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: "/inbox?module=wechat" },
+      });
+    }
+    if (url.pathname === "/api/wechat/to-phone" && req.method === "POST") {
+      try {
+        const body = (await req.json()) as Record<string, any>;
+        const res = await daemon.pushWeChatNoteToPhone({
+          articleId: body.articleId !== undefined ? Number(body.articleId) : undefined,
+          title: typeof body.title === "string" ? body.title : undefined,
+          markdown: typeof body.markdown === "string" ? body.markdown : undefined,
+          queueIfOffline: true,
+        });
+        return Response.json(res, { status: res.ok ? 200 : 400 });
+      } catch (err: any) {
+        return Response.json({ ok: false, error: err?.message || String(err) }, { status: 400 });
+      }
+    }
+
+    let upstreamPath = url.pathname;
+    if (url.pathname === "/wechat/config" || url.pathname === "/config") {
+      upstreamPath = "/config";
+    } else if (url.pathname === "/api/wechat/health") {
+      upstreamPath = "/health";
+    } else if (url.pathname.startsWith("/api/wechat/")) {
+      upstreamPath = "/api/" + url.pathname.slice("/api/wechat/".length);
+    }
+
+    const proxied = await daemon.wechat.proxyLoopbackRequest(req, upstreamPath, url.search);
+    if (upstreamPath === "/config" && proxied.status === 200) {
+      const headers = new Headers(proxied.headers);
+      headers.set("X-Frame-Options", "SAMEORIGIN");
+      return new Response(await proxied.arrayBuffer(), {
+        status: proxied.status,
+        headers,
+      });
+    }
+    return proxied;
+  }
 
   if (url.pathname === "/inbox" || url.pathname === "/dashboard") {
     return new Response(renderDashboardHtml(), {
@@ -329,6 +383,7 @@ export async function handleDashboardHttpRequest(
             autoCopyTextToClipboard: body.autoCopyTextToClipboard,
             autoPreviewImageOnMac: body.autoPreviewImageOnMac,
             autoSyncOtpToMac: body.autoSyncOtpToMac,
+            autoSyncWeChatToPhone: body.autoSyncWeChatToPhone,
             autoSwitchAirpods: body.autoSwitchAirpods,
             pauseOtherOnAirpodsSwitch: body.pauseOtherOnAirpodsSwitch,
             preferredAirpodsMac: body.preferredAirpodsMac,
@@ -802,7 +857,7 @@ function renderDashboardHtml(): string {
 <div class="container">
   <div class="header-bar">
     <div class="title-block">
-      <h1>📬 OneMoreStep · Mac 实时收件箱看板</h1>
+      <h1>⚡ 青简 · Mac 实时收件箱看板 & 微信尺素总控台</h1>
       <div class="status-line" id="statusLine">正在同步连接状态...</div>
     </div>
     <div class="toggles-box">
@@ -818,6 +873,10 @@ function renderDashboardHtml(): string {
         <input type="checkbox" id="chkAutoPreview" onchange="savePrefs()"/>
         🖼️ 收到图片自动弹窗预览
       </label>
+      <label class="toggle-label" title="微信尺素完成新文章初筛或定时早报时，静默同步伴读卡片至手机时间流「微信尺素」Tab 供通勤朗读">
+        <input type="checkbox" id="chkAutoWxPhone" onchange="savePrefs()"/>
+        💬 微信伴读自动入手机流
+      </label>
       <label class="toggle-label" title="识别到 Mac 或小米手机开始输出音频时，自动把已配对的 AirPods 切换到发声设备并暂停对端播放">
         <input type="checkbox" id="chkAutoAirpods" onchange="savePrefs()"/>
         🎧 AirPods 自动切换 & 暂停对端
@@ -826,6 +885,16 @@ function renderDashboardHtml(): string {
     </div>
   </div>
 
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;padding:8px 12px;background:#0F172A;border:1px solid #1E293B;border-radius:12px;flex-wrap:wrap;">
+    <div class="tabs" id="topModuleTabs">
+      <button class="tab active" data-mod="phone" onclick="switchTopModule('phone')">📬 手机协同流 (咫尺)</button>
+      <button class="tab" data-mod="wechat" onclick="switchTopModule('wechat')">💬 微信尺素 (文章 · 速记 · 定时任务)</button>
+      <button class="tab" data-mod="wxconfig" onclick="switchTopModule('wxconfig')">⚙️ 尺素模型与路由配置</button>
+    </div>
+    <div id="wxQuickBadge" style="font-size:12px;color:#94A3B8;">微信尺素状态同步中...</div>
+  </div>
+
+  <div id="modulePhoneWrap">
   <div class="composer-card" id="devicePanel">
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
       <div style="font-size:14px;font-weight:700;color:#38BDF8;">
@@ -872,13 +941,14 @@ function renderDashboardHtml(): string {
 
   <div class="composer-card">
     <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:#38BDF8;">
-      🚀 从 Mac 反向发送消息 / 笔记 / 剪贴板到小米手机
+      🚀 从 Mac 反向发送消息 / 笔记 / 剪贴板到小米手机或手机微信
     </div>
     <div class="composer-row">
       <input class="input" id="pushTitle" placeholder="标题 (可选)" style="width:180px;" />
-      <textarea class="textarea" id="pushText" placeholder="输入文字、链接或 Markdown 笔记，一键推送至手机时间流或手机剪贴板..."></textarea>
+      <textarea class="textarea" id="pushText" placeholder="输入文字、链接或 Markdown 笔记，一键推送至手机时间流、手机微信或手机剪贴板..."></textarea>
       <div style="display:flex;flex-direction:column;gap:6px;">
         <button class="btn" onclick="pushToPhone()">📤 推送到手机时间流</button>
+        <button class="btn btn-green" onclick="pushToWeChat()">💬 推送到手机微信</button>
         <button class="btn btn-secondary" onclick="syncPhoneClip()">📋 写入手机剪贴板</button>
       </div>
     </div>
@@ -901,6 +971,46 @@ function renderDashboardHtml(): string {
   </div>
 
   <div id="itemsContainer" class="items-list"></div>
+  </div><!-- /modulePhoneWrap -->
+
+  <div id="moduleWeChatWrap" style="display:none;">
+    <div class="composer-card" style="margin-bottom:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+        <div style="font-size:14px;font-weight:700;color:#4ADE80;">💬 青简·尺素 — 微信文章收件箱、伴读精粹与定时任务</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <button class="btn btn-secondary" onclick="fetchWeChatOverview(true)">🔄 刷新尺素列表</button>
+          <button class="btn btn-secondary" onclick="switchTopModule('wxconfig')">⚙️ 模型与路由设置</button>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        <input class="input" id="wxIngestUrl" placeholder="粘贴微信公众号 / 小红书 / YouTube / 网页链接手动抓取归档..." style="flex:1;min-width:260px;" />
+        <input class="input" id="wxIngestNote" placeholder="关注点批注 (可选)" style="width:220px;" />
+        <button class="btn btn-green" onclick="ingestWeChatUrl()">📥 抓取并生成伴读</button>
+      </div>
+    </div>
+
+    <div class="filter-bar" style="margin-bottom:12px;">
+      <div class="tabs" id="wxSubTabs">
+        <button class="tab active" data-wxsub="articles" onclick="setWxSubTab('articles')">📄 文章收件箱</button>
+        <button class="tab" data-wxsub="turns" onclick="setWxSubTab('turns')">📝 微信速记与对话</button>
+        <button class="tab" data-wxsub="schedules" onclick="setWxSubTab('schedules')">⏰ 定时提醒与早报</button>
+      </div>
+      <input class="input" id="wxSearchInput" placeholder="🔍 搜索文章标题、摘要或批注..." oninput="renderWeChatList()" style="width:240px;padding:7px 11px;"/>
+    </div>
+
+    <div style="display:grid;grid-template-columns:360px 1fr;gap:14px;align-items:start;">
+      <div id="wxListPane" style="background:#111827;border:1px solid #1F2937;border-radius:12px;max-height:72vh;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:6px;"></div>
+      <div id="wxDetailPane" style="background:#111827;border:1px solid #1F2937;border-radius:12px;min-height:480px;max-height:72vh;overflow-y:auto;padding:18px;">
+        <div style="color:#94A3B8;font-size:13px;">👈 从左侧选择一篇文章、速记或定时任务查看详情</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="moduleWxConfigWrap" style="display:none;">
+    <div style="background:#111827;border:1px solid #1F2937;border-radius:12px;overflow:hidden;">
+      <iframe id="wxConfigFrame" src="about:blank" style="width:100%;height:82vh;border:none;display:block;"></iframe>
+    </div>
+  </div>
 </div>
 
 <div class="lightbox" id="lightbox" onclick="closeLightbox()">
@@ -980,16 +1090,18 @@ async function savePrefs() {
   const autoSyncOtpToMac = document.getElementById('chkAutoOtp').checked;
   const autoCopyTextToClipboard = document.getElementById('chkAutoCopy').checked;
   const autoPreviewImageOnMac = document.getElementById('chkAutoPreview').checked;
+  const autoSyncWeChatToPhone = document.getElementById('chkAutoWxPhone').checked;
   const autoSwitchAirpods = document.getElementById('chkAutoAirpods').checked;
   await callAction({
     action: 'update_preferences',
     autoSyncOtpToMac,
     autoCopyTextToClipboard,
     autoPreviewImageOnMac,
+    autoSyncWeChatToPhone,
     autoSwitchAirpods,
     pauseOtherOnAirpodsSwitch: autoSwitchAirpods
   });
-  showToast('✅ 已保存 Mac 自动联动与 AirPods 自动切换设置');
+  showToast('✅ 已保存 Mac 自动联动、微信伴读入流与 AirPods 自动切换设置');
 }
 
 async function switchAirpodsToMac() {
@@ -1064,6 +1176,29 @@ async function pushToPhone() {
     showToast('🚀 已推送到小米手机时间流！');
   } else {
     showToast('⚠️ 推送失败: ' + (res.error || '手机未连接'));
+  }
+}
+
+async function pushToWeChat() {
+  const title = document.getElementById('pushTitle').value.trim();
+  const text = document.getElementById('pushText').value.trim();
+  if (!text) return showToast('⚠️ 请先输入要发送到手机微信的内容');
+  showToast('💬 正在推送到手机微信...');
+  try {
+    const res = await fetch('/api/wechat/push', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: title || undefined, text })
+    });
+    const data = await res.json();
+    if (data.ok && data.failedCount === 0) {
+      document.getElementById('pushText').value = '';
+      showToast('✅ 已发送到手机微信 (' + (data.sentCount || 1) + ' 条)！');
+    } else {
+      showToast('⚠️ 微信发送状态: sent=' + (data.sentCount || 0) + ', pending=' + (data.pendingCount || 0) + ', failed=' + (data.failedCount || 0) + (data.error ? (' · ' + data.error) : ''));
+    }
+  } catch (e) {
+    showToast('⚠️ 微信推送失败: ' + (e.message || e));
   }
 }
 
@@ -1291,12 +1426,28 @@ async function fetchInbox() {
       (batt ? '<span class="badge">' + batt + '</span>' : '') +
       (fgBadge ? '<span class="badge">' + fgBadge + '</span>' : '');
 
+    const wxSt = st.wechatStatus || {};
+    const wxBadgeEl = document.getElementById('wxQuickBadge');
+    if (wxBadgeEl) {
+      if (wxSt.running && wxSt.credentialsConfigured) {
+        wxBadgeEl.innerHTML = '🟢 微信尺素：ClawBot 长轮询在线' + (wxSt.activeAgentTasksCount > 0 ? (' · 🤖 运行中任务 ' + wxSt.activeAgentTasksCount) : '');
+        wxBadgeEl.style.color = '#4ADE80';
+      } else if (wxSt.running) {
+        wxBadgeEl.innerHTML = '🟠 微信尺素：服务已启动 (待扫码绑定)';
+        wxBadgeEl.style.color = '#FBBF24';
+      } else {
+        wxBadgeEl.innerHTML = '⚪ 微信尺素：受管子进程待命';
+        wxBadgeEl.style.color = '#94A3B8';
+      }
+    }
+
     renderDevicePanel(st);
 
     if (data.preferences && !window.__prefsLoaded) {
       document.getElementById('chkAutoOtp').checked = data.preferences.autoSyncOtpToMac !== false;
       document.getElementById('chkAutoCopy').checked = data.preferences.autoCopyTextToClipboard !== false;
       document.getElementById('chkAutoPreview').checked = data.preferences.autoPreviewImageOnMac !== false;
+      document.getElementById('chkAutoWxPhone').checked = data.preferences.autoSyncWeChatToPhone !== false;
       document.getElementById('chkAutoAirpods').checked = data.preferences.autoSwitchAirpods !== false;
       window.__prefsLoaded = true;
     }
@@ -1454,6 +1605,274 @@ function toggleInlineMirror() {
     callAction({ action: 'mirror_stop' }).catch(() => {});
   }
 }
+
+let activeTopModule = 'phone';
+let activeWxSubTab = 'articles';
+let wxOverviewData = { articles: [], turns: [], schedules: [], agentTasks: [], status: {} };
+let selectedWxArticleId = null;
+let selectedWxTurnId = null;
+let selectedWxDocMode = 'note';
+
+function switchTopModule(mod) {
+  activeTopModule = mod;
+  document.querySelectorAll('#topModuleTabs .tab').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.mod === mod);
+  });
+  document.getElementById('modulePhoneWrap').style.display = mod === 'phone' ? 'block' : 'none';
+  document.getElementById('moduleWeChatWrap').style.display = mod === 'wechat' ? 'block' : 'none';
+  document.getElementById('moduleWxConfigWrap').style.display = mod === 'wxconfig' ? 'block' : 'none';
+  if (mod === 'wechat') {
+    fetchWeChatOverview(true);
+  } else if (mod === 'wxconfig') {
+    const f = document.getElementById('wxConfigFrame');
+    if (f.src === 'about:blank' || !f.src.includes('/wechat/config')) {
+      f.src = '/wechat/config';
+    }
+  }
+}
+
+function setWxSubTab(sub) {
+  activeWxSubTab = sub;
+  document.querySelectorAll('#wxSubTabs .tab').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.wxsub === sub);
+  });
+  renderWeChatList();
+}
+
+async function fetchWeChatOverview(autoSelectFirst) {
+  try {
+    const res = await fetch('/api/wechat/overview?limit=80');
+    const data = await res.json();
+    if (!data.ok) return;
+    wxOverviewData = data;
+    renderWeChatList();
+    if (autoSelectFirst && activeWxSubTab === 'articles' && !selectedWxArticleId && (data.articles || []).length > 0) {
+      selectWxArticle(data.articles[0].id);
+    }
+  } catch (e) {
+    // ignore transient load error
+  }
+}
+
+function renderWeChatList() {
+  const pane = document.getElementById('wxListPane');
+  const q = (document.getElementById('wxSearchInput').value || '').trim().toLowerCase();
+  if (!pane) return;
+
+  if (activeWxSubTab === 'articles') {
+    const list = (wxOverviewData.articles || []).filter(a => {
+      if (!q) return true;
+      const hay = ((a.title || '') + ' ' + (a.short_summary || '') + ' ' + (a.user_notes || '') + ' ' + (a.author || '')).toLowerCase();
+      return hay.includes(q);
+    });
+    if (list.length === 0) {
+      pane.innerHTML = '<div style="padding:18px;color:#94A3B8;font-size:12px;text-align:center;">暂无匹配的微信文章记录</div>';
+      return;
+    }
+    pane.innerHTML = list.map(a => {
+      const active = Number(selectedWxArticleId) === Number(a.id);
+      const triageBadge = a.process_level === 'deep' ? '💎 精读' : a.triage === 'deep' ? '🔥 建议深读' : a.triage === 'reference' ? '📎 备查' : '📌 待处理';
+      const timeStr = (a.created_at || '').slice(0, 16).replace('T', ' ');
+      return '<div onclick="selectWxArticle(' + Number(a.id) + ')" style="cursor:pointer;padding:10px 12px;border-radius:10px;border:1px solid ' + (active ? '#4ADE80' : '#1F2937') + ';background:' + (active ? 'rgba(74,222,128,0.10)' : '#0B1120') + ';">' +
+        '<div style="display:flex;justify-content:space-between;gap:6px;font-size:11px;color:#94A3B8;margin-bottom:4px;">' +
+          '<span>#' + Number(a.id) + ' · ' + escapeHtml(triageBadge) + '</span>' +
+          '<span>' + escapeHtml(timeStr) + '</span>' +
+        '</div>' +
+        '<div style="font-size:13px;font-weight:600;color:#F8FAFC;line-height:1.35;">' + escapeHtml(a.title || a.url || '未命名文章') + '</div>' +
+        (a.user_notes ? '<div style="margin-top:4px;font-size:11px;color:#FBBF24;">💬 批注: ' + escapeHtml(a.user_notes.slice(0, 60)) + '</div>' : '') +
+      '</div>';
+    }).join('');
+    return;
+  }
+
+  if (activeWxSubTab === 'turns') {
+    const turns = (wxOverviewData.turns || []).filter(t => !q || ((t.user_text || '') + ' ' + (t.assistant_reply || '')).toLowerCase().includes(q));
+    if (turns.length === 0) {
+      pane.innerHTML = '<div style="padding:18px;color:#94A3B8;font-size:12px;text-align:center;">暂无微信对话与速记</div>';
+      return;
+    }
+    pane.innerHTML = turns.map(t => {
+      const active = Number(selectedWxTurnId) === Number(t.id);
+      const timeStr = (t.created_at || '').slice(0, 16).replace('T', ' ');
+      return '<div onclick="selectWxTurn(' + Number(t.id) + ')" style="cursor:pointer;padding:10px 12px;border-radius:10px;border:1px solid ' + (active ? '#38BDF8' : '#1F2937') + ';background:' + (active ? 'rgba(56,189,248,0.10)' : '#0B1120') + ';">' +
+        '<div style="display:flex;justify-content:space-between;font-size:11px;color:#94A3B8;margin-bottom:4px;">' +
+          '<span>#' + Number(t.id) + ' · ' + escapeHtml(t.intent || 'chat') + '</span>' +
+          '<span>' + escapeHtml(timeStr) + '</span>' +
+        '</div>' +
+        '<div style="font-size:12.5px;color:#F8FAFC;line-height:1.35;">' + escapeHtml((t.user_text || '').slice(0, 80)) + '</div>' +
+      '</div>';
+    }).join('');
+    return;
+  }
+
+  const tasks = wxOverviewData.schedules || [];
+  if (tasks.length === 0) {
+    pane.innerHTML = '<div style="padding:18px;color:#94A3B8;font-size:12px;text-align:center;">暂无定时提醒与早报任务</div>';
+    return;
+  }
+  pane.innerHTML = tasks.map(s => {
+    const nextStr = s.next_run_at ? new Date(s.next_run_at).toLocaleString('zh-CN', { hour12: false }) : '已结束';
+    return '<div onclick="renderWxScheduleDetail(' + Number(s.id) + ')" style="cursor:pointer;padding:10px 12px;border-radius:10px;border:1px solid #1F2937;background:#0B1120;">' +
+      '<div style="display:flex;justify-content:space-between;font-size:11px;color:#94A3B8;margin-bottom:4px;">' +
+        '<span>#' + Number(s.id) + ' · ' + escapeHtml(s.schedule_type === 'cron' ? '🔄 周期' : '⏰ 单次') + ' (' + escapeHtml(s.status) + ')</span>' +
+        '<span>下次: ' + escapeHtml(nextStr) + '</span>' +
+      '</div>' +
+      '<div style="font-size:13px;font-weight:600;color:#F8FAFC;">' + escapeHtml(s.title) + '</div>' +
+    '</div>';
+  }).join('');
+}
+
+async function selectWxArticle(id) {
+  selectedWxArticleId = id;
+  renderWeChatList();
+  const detail = document.getElementById('wxDetailPane');
+  detail.innerHTML = '<div style="color:#94A3B8;font-size:13px;">正在读取文章伴读详情...</div>';
+  try {
+    const res = await fetch('/api/wechat/article?id=' + encodeURIComponent(id));
+    const data = await res.json();
+    if (!data.ok || !data.article) {
+      detail.innerHTML = '<div style="color:#F87171;">读取失败: ' + escapeHtml(data.error || '未知错误') + '</div>';
+      return;
+    }
+    window.__currentWxArticleDetail = data;
+    renderCurrentWxArticleDetail();
+  } catch (e) {
+    detail.innerHTML = '<div style="color:#F87171;">读取异常: ' + escapeHtml(e.message || e) + '</div>';
+  }
+}
+
+function setWxDocMode(mode) {
+  selectedWxDocMode = mode;
+  renderCurrentWxArticleDetail();
+}
+
+function renderCurrentWxArticleDetail() {
+  const data = window.__currentWxArticleDetail;
+  if (!data || !data.article) return;
+  const a = data.article;
+  const detail = document.getElementById('wxDetailPane');
+  const bodyText = selectedWxDocMode === 'source'
+    ? (data.sourceMarkdown || '（本地原文文件不存在或未抓取）')
+    : selectedWxDocMode === 'summary'
+      ? (a.short_summary || a.digest || '（暂无初筛摘要）')
+      : (data.noteMarkdown || a.short_summary || '（暂无伴读笔记）');
+
+  detail.innerHTML =
+    '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:12px;">' +
+      '<div>' +
+        '<div style="font-size:17px;font-weight:700;color:#F8FAFC;margin-bottom:6px;">#' + Number(a.id) + ' ' + escapeHtml(a.title || '未命名文章') + '</div>' +
+        '<div style="font-size:12px;color:#94A3B8;display:flex;gap:10px;flex-wrap:wrap;">' +
+          (a.author ? ('<span>✍️ ' + escapeHtml(a.author) + '</span>') : '') +
+          '<span>📊 状态: ' + escapeHtml(a.status) + ' (' + escapeHtml(a.process_level) + ')</span>' +
+          (a.url ? ('<a href="' + escapeHtml(a.url) + '" target="_blank" rel="noreferrer" style="color:#38BDF8;">🔗 查看源网页</a>') : '') +
+        '</div>' +
+      '</div>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
+        '<button class="btn btn-green" onclick="syncWxArticleToPhone(' + Number(a.id) + ')">📱 推到手机「微信尺素」通勤朗读</button>' +
+        '<button class="btn btn-secondary" onclick="copyCurrentWxDoc()">📋 复制当前内容</button>' +
+      '</div>' +
+    '</div>' +
+    (a.user_notes ? ('<div style="background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.35);border-radius:8px;padding:8px 12px;margin-bottom:12px;font-size:12.5px;color:#FDE68A;">💬 你的批注：' + escapeHtml(a.user_notes) + '</div>') : '') +
+    '<div style="display:flex;gap:6px;margin-bottom:12px;">' +
+      '<button class="tab ' + (selectedWxDocMode === 'note' ? 'active' : '') + '" onclick="setWxDocMode(\'note\')">📒 伴读笔记 (_note.md)</button>' +
+      '<button class="tab ' + (selectedWxDocMode === 'summary' ? 'active' : '') + '" onclick="setWxDocMode(\'summary\')">💡 微信初筛摘要</button>' +
+      '<button class="tab ' + (selectedWxDocMode === 'source' ? 'active' : '') + '" onclick="setWxDocMode(\'source\')">📄 归档原文 (_source.md)</button>' +
+    '</div>' +
+    '<pre style="white-space:pre-wrap;word-break:break-word;background:#090D16;border:1px solid #1E293B;border-radius:10px;padding:14px;font-size:13px;line-height:1.65;color:#E2E8F0;margin:0;font-family:-apple-system,BlinkMacSystemFont,\'PingFang SC\',sans-serif;">' + escapeHtml(bodyText) + '</pre>';
+}
+
+function copyCurrentWxDoc() {
+  const data = window.__currentWxArticleDetail;
+  if (!data || !data.article) return;
+  const txt = selectedWxDocMode === 'source'
+    ? (data.sourceMarkdown || '')
+    : selectedWxDocMode === 'summary'
+      ? (data.article.short_summary || '')
+      : (data.noteMarkdown || data.article.short_summary || '');
+  if (txt) copyText(txt, '微信尺素内容');
+}
+
+async function syncWxArticleToPhone(articleId) {
+  showToast('📱 正在同步伴读笔记至小米手机「微信尺素」时间流...');
+  try {
+    const res = await fetch('/api/wechat/to-phone', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ articleId })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(data.queuedOffline ? '📥 手机当前离线，已加入待同步队列（连上后自动送达）' : '✅ 已送达小米手机「微信尺素」Tab，可直接通勤朗读！');
+    } else {
+      showToast('⚠️ 同步失败: ' + (data.error || '未知错误'));
+    }
+  } catch (e) {
+    showToast('⚠️ 同步异常: ' + (e.message || e));
+  }
+}
+
+async function selectWxTurn(turnId) {
+  selectedWxTurnId = turnId;
+  renderWeChatList();
+  const detail = document.getElementById('wxDetailPane');
+  try {
+    const res = await fetch('/api/wechat/article?turnId=' + encodeURIComponent(turnId));
+    const data = await res.json();
+    if (!data.ok || !data.turn) return;
+    const t = data.turn;
+    detail.innerHTML =
+      '<div style="font-size:15px;font-weight:700;margin-bottom:8px;">📝 微信对话 / 速记 #' + Number(t.id) + ' (' + escapeHtml(t.intent || 'chat') + ')</div>' +
+      '<div style="font-size:12px;color:#94A3B8;margin-bottom:12px;">🕒 ' + escapeHtml(t.created_at || '') + (t.model_used ? (' · 🤖 ' + escapeHtml(t.model_used)) : '') + '</div>' +
+      '<div style="background:#090D16;border:1px solid #1E293B;border-radius:10px;padding:12px;margin-bottom:12px;white-space:pre-wrap;font-size:13px;">👤 发送内容：\n' + escapeHtml(t.user_text || '') + '</div>' +
+      (t.assistant_reply ? ('<div style="background:#0B1526;border:1px solid #1E3A5F;border-radius:10px;padding:12px;margin-bottom:12px;white-space:pre-wrap;font-size:13px;">🤖 尺素回复：\n' + escapeHtml(t.assistant_reply) + '</div>') : '') +
+      (data.depositedMarkdown ? ('<div style="font-size:12px;color:#4ADE80;margin-bottom:6px;">📂 归档文件内容：</div><pre style="white-space:pre-wrap;background:#090D16;border:1px solid #1E293B;border-radius:10px;padding:12px;font-size:12.5px;line-height:1.6;">' + escapeHtml(data.depositedMarkdown) + '</pre>') : '');
+  } catch {}
+}
+
+function renderWxScheduleDetail(id) {
+  const s = (wxOverviewData.schedules || []).find(x => Number(x.id) === Number(id));
+  if (!s) return;
+  const detail = document.getElementById('wxDetailPane');
+  detail.innerHTML =
+    '<div style="font-size:16px;font-weight:700;margin-bottom:8px;">⏰ #' + Number(s.id) + ' ' + escapeHtml(s.title) + '</div>' +
+    '<div style="font-size:12.5px;color:#94A3B8;margin-bottom:12px;">类型: ' + escapeHtml(s.task_kind) + ' · 规则: ' + escapeHtml(s.cron_expr || '单次触发') + ' · 状态: ' + escapeHtml(s.status) + ' · 已执行 ' + Number(s.run_count || 0) + ' 次</div>' +
+    (s.last_result_summary ? ('<pre style="white-space:pre-wrap;background:#090D16;border:1px solid #1E293B;border-radius:10px;padding:14px;font-size:13px;line-height:1.6;">' + escapeHtml(s.last_result_summary) + '</pre>') : '<div style="color:#94A3B8;font-size:13px;">尚未产生执行摘要记录</div>');
+}
+
+async function ingestWeChatUrl() {
+  const url = document.getElementById('wxIngestUrl').value.trim();
+  const note = document.getElementById('wxIngestNote').value.trim();
+  if (!url) return showToast('⚠️ 请先粘贴需要归档的链接');
+  showToast('📥 正在抓取并生成伴读笔记，请稍候...');
+  try {
+    const res = await fetch('/api/wechat/ingest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, note: note || undefined })
+    });
+    const data = await res.json();
+    if (data.ok && data.article) {
+      document.getElementById('wxIngestUrl').value = '';
+      document.getElementById('wxIngestNote').value = '';
+      showToast('✅ 抓取归档完成：#' + data.article.id);
+      await fetchWeChatOverview(false);
+      selectWxArticle(data.article.id);
+    } else {
+      showToast('⚠️ 抓取失败: ' + (data.error || '请检查链接'));
+    }
+  } catch (e) {
+    showToast('⚠️ 请求异常: ' + (e.message || e));
+  }
+}
+
+(function initModuleFromQuery() {
+  try {
+    const q = new URLSearchParams(location.search);
+    const m = q.get('module');
+    if (m === 'wechat' || m === 'wx') switchTopModule('wechat');
+    else if (m === 'wxconfig' || m === 'config') switchTopModule('wxconfig');
+  } catch {}
+})();
 </script>
 </body>
 </html>`;
@@ -1502,12 +1921,17 @@ function renderMirrorStandaloneHtml(): string {
     flex-wrap: wrap;
   }
   .topbar-left {
+    min-width: 0;
+    max-width: 100%;
     display: flex;
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
   }
   .pill {
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
     font-size: 11px;
     font-weight: 600;
     padding: 3px 8px;
@@ -1544,11 +1968,21 @@ function renderMirrorStandaloneHtml(): string {
     overflow: hidden;
     position: relative;
   }
-  .phone-shell {
-    position: relative;
+  .phone-stage {
+    flex: 1;
+    min-width: 0;
     height: 100%;
-    max-height: 100%;
-    aspect-ratio: 9 / 20;
+    container-type: size;
+    display: grid;
+    place-items: center;
+  }
+  .phone-shell {
+    --phone-ratio: 0.45;
+    position: relative;
+    box-sizing: content-box;
+    width: min(calc(100cqw - 6px), calc((100cqh - 6px) * var(--phone-ratio)));
+    height: min(calc(100cqh - 6px), calc((100cqw - 6px) / var(--phone-ratio)));
+    aspect-ratio: var(--phone-ratio);
     background: #000;
     border-radius: 26px;
     border: 3px solid #334155;
@@ -1589,6 +2023,7 @@ function renderMirrorStandaloneHtml(): string {
   .overlay-banner.show { display: flex; }
   button:disabled { opacity: .45; cursor: default; }
   .side-dock {
+    flex-shrink: 0;
     overflow-y: auto;
     max-height: 100%;
     display: flex;
@@ -1624,7 +2059,8 @@ function renderMirrorStandaloneHtml(): string {
     border-top: 1px solid var(--border);
   }
   .bottombar { flex-wrap: wrap; }
-  #resultText { padding: 4px 12px; min-height: 24px; color: var(--muted); font-size: 12px; }
+  .topbar, .bottombar { flex-shrink: 0; }
+  #resultText { padding: 4px 12px; min-height: 24px; max-height: 60px; flex-shrink: 0; overflow-y: auto; overflow-wrap: anywhere; color: var(--muted); font-size: 12px; }
   .text-in {
     min-width: 140px;
     flex: 1;
@@ -1671,6 +2107,7 @@ function renderMirrorStandaloneHtml(): string {
   </div>
 
   <div class="workspace">
+    <div class="phone-stage">
     <div class="phone-shell" id="phoneShell">
       <canvas id="mirrorCanvas" width="640" height="1422" tabindex="0"></canvas>
       <canvas id="fxCanvas" width="640" height="1422"></canvas>
@@ -1680,6 +2117,7 @@ function renderMirrorStandaloneHtml(): string {
         <div style="font-size:12px;color:var(--muted);line-height:1.5;" id="overlaySub">点击下方按钮立即点亮屏幕并自动解锁</div>
         <button class="btn-sm btn-primary" style="padding:9px 16px;font-size:13px;" onclick="wakeAndUnlock()">☀️ 点亮并解锁屏幕</button>
       </div>
+    </div>
     </div>
 
     <div class="side-dock">
@@ -1736,6 +2174,7 @@ let latestFrame = null;
 let decoding = false;
 let rippleAnimation = null;
 const pendingInputs = new Map();
+let textSubmission = null;
 const pendingHttp = new Map();
 let phoneWidth = 1080;
 let phoneHeight = 2400;
@@ -1814,7 +2253,7 @@ function refreshControls() {
   document.querySelectorAll('button[onclick]').forEach(button => {
     const action = button.getAttribute('onclick') || '';
     if (action.includes('toggleStartStop')) return;
-    button.disabled = !canControl(action.includes('wakeAndUnlock'));
+    button.disabled = !canControl(action.includes('wakeAndUnlock')) || (action.includes('submitMirrorText') && textSubmission !== null);
   });
   document.getElementById('mirrorTextInput').disabled = !canControl();
   document.getElementById('presetSelect').disabled = !active || !isRunning;
@@ -1862,6 +2301,7 @@ async function drainFrames() {
         phoneWidth = view.getUint16(2, false) || bmp.width;
         phoneHeight = view.getUint16(4, false) || bmp.height;
         shell.style.aspectRatio = phoneWidth + ' / ' + phoneHeight;
+        if (shell.style.setProperty) shell.style.setProperty('--phone-ratio', String(phoneWidth / phoneHeight));
         canvas.width = fxCanvas.width = bmp.width;
         canvas.height = fxCanvas.height = bmp.height;
         ctx.drawImage(bmp, 0, 0);
@@ -2041,6 +2481,7 @@ function beginWatching() {
 function hostDeactivate() {
   active = false;
   generation++;
+  textSubmission = null;
   isRunning = false;
   clearTimeout(reconnectTimer);
   clearTimeout(connectTimer);
@@ -2190,11 +2631,20 @@ function onTextInputKey(e) {
 }
 
 async function submitMirrorText(submitEnter) {
+  if (textSubmission !== null) { showToast('文字仍在确认中，请稍后'); return; }
   const input = document.getElementById('mirrorTextInput');
   const text = input.value;
   if (!text) return;
-  const ok = await sendCommand({ type: 'input', inputType: 'text', text, append: false, submit: Boolean(submitEnter) });
-  if (ok && input.value === text) input.value = '';
+  const token = {};
+  const session = generation;
+  textSubmission = token;
+  refreshControls();
+  try {
+    const ok = await sendCommand({ type: 'input', inputType: 'text', text, append: false, submit: Boolean(submitEnter) });
+    if (ok && active && session === generation && textSubmission === token && input.value === text) input.value = '';
+  } finally {
+    if (textSubmission === token) { textSubmission = null; refreshControls(); }
+  }
 }
 
 function sendNav(target) {

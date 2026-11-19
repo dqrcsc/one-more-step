@@ -1,15 +1,16 @@
 ---
 name: one-more-step
-description: 青简·咫尺 (OneMoreStep / oms) —— macOS 本地 AI Agent 与小米 Android 手机（HyperOS / MIUI）的全场景双向互操作与跨端协同工具。当用户提到“设置闹钟”、“在手机上设置闹钟”、“定闹钟/设个闹钟/叫我起床”、“让手机提醒我”、“手机提醒我/发提醒到手机/任务完成后手机提醒我”、“让手机说话”、“让手机说/让手机喊一声/手机语音播报”、“找手机/手机在哪”、“oms”、“OneMoreStep”、“青简”、“看看手机发来的图/文件/想法”、“拉取手机刚截的图/拍的照片”、“把这个发到我手机上/推送到手机时间流/通勤朗读”、“同步/读取/写入手机剪贴板或验证码”、“查手机日历/加日程”、“给手机发通知/强提醒”、“解锁手机/图案密码解锁”、“用手机打电话/拨号/挂断电话”、“远程截屏/调节手机音量/打开手机应用或链接”、“发远程审批卡片到手机”、或“观察/点击/自动化操作手机屏幕 App”时，必须触发本技能并通过 oms 服务操作手机。
+description: 青简 (OneMoreStep / oms · 咫尺 + 尺素合一) —— macOS 本地 AI Agent 与小米 Android 手机（HyperOS / MIUI）及手机微信 ClawBot 的全场景双向互操作与上下文收发总枢纽。当用户提到“设置闹钟”、“在手机上设置闹钟”、“定闹钟/设个闹钟/叫我起床”、“让手机提醒我”、“让手机说话/手机语音播报”、“找手机/手机在哪”、“oms”、“OneMoreStep”、“青简”、“尺素”、“wx-ctx”、“看看手机发来的图/文件/想法”、“拉取手机刚截的图/拍的照片”、“把这个发到我手机上/推送到手机时间流/通勤朗读”、“同步/读取/写入手机剪贴板或验证码”、“查手机日历/加日程”、“给手机发通知/强提醒”、“解锁手机/打电话/挂断电话”、“远程截屏/调节音量/打开应用”、“发远程审批卡片到手机”、“观察/点击/自动化操作手机屏幕 App”、或“看看我微信转的公众号/小红书/抖音/YouTube/网页文章”、“公众号收件箱”、“同步微信文章”、“深读刚转发的文章”、“查看微信转发的笔记/想法/定时任务”、“把这个发到我微信上”、“把这篇笔记/报告编译 MD/HTML/PDF 推送到微信”时，必须触发本技能并通过 oms 服务统一执行。
 ---
 
-# 青简·咫尺 · OneMoreStep (`oms`) 跨端双向互操作技能
+# 青简 · OneMoreStep (`oms` · 咫尺 + 尺素合一) 跨端双向互操作与微信上下文技能
 
 - **项目根目录**：`{{PROJECT_ROOT}}`
-- **全局 CLI 命令**：`oms <subcommand>`（默认安装于 `~/.local/bin/oms`，可在任意目录直接执行）
+- **全局统一 CLI**：`oms <subcommand>`（手机操控）与 `oms wx <subcommand>`（微信尺素；兼容别名 `wx-ctx`）
 - **备用 CLI 入口**：`bun run {{PROJECT_ROOT}}/mac-host/src/cli/index.ts <subcommand>`
 - **MCP Server 入口**：`oms mcp`（或 `bun run {{PROJECT_ROOT}}/mac-host/src/mcp/server.ts`）
-- **本地数据与收件箱目录**：`~/.one_more_step/`（可通过 `OMS_HOME` 覆盖）
+- **统一本地数据目录**：`~/.one_more_step/`（其中微信尺素 `.env` 与 `wechat_context.db` 统一位于 `~/.one_more_step/wechat/`，知识库原文与伴读笔记原位保留）
+- **微信尺素深度契约按需引用**：`references/wechat-context-rules.md`（涉及微信文章深读、重分析、采集质量核查或推送微信时必须按需加载）
 
 ---
 
@@ -426,3 +427,46 @@ oms daemon install-launchagent
 | **远程系统操控** | `phone_device_control` | `oms phone <find\|say\|voices\|stop-tts\|volume\|screenshot\|open\|launch\|unlock\|call\|hangup\|home\|back\|lock>` |
 | **GUI 语义树观察** | `phone_gui_observe` | `oms gui observe [--screenshot] [--som]` |
 | **GUI 自动化执行** | `phone_gui_action` | `oms gui act <click\|input_text\|...> [#id] --observation <id> [--confirm]` |
+
+---
+
+## 10. 💬 微信尺素 (`oms wx`) — 公众号/视频收件箱、深读与推送手机微信
+
+`omsd` 单例守护进程在后台统一托管 `wechat-context` 子进程（微信 ClawBot iLink 长轮询 + 本地归档流水线），并在 **Mac 原生悬浮窗 (`oms-mac-hud`)、右上角轻通知、本地 Web 看板 (`/inbox?module=wechat`) 与小米手机时间流** 中均提供独立的 **「💬 微信尺素」Tab**。
+
+> **⚠️ 渐进式披露强制规则（Progressive Disclosure）**：
+> - 当用户仅做简单的手机操控（闹钟、TTS 说话、截图、剪贴板、电话等）时，**无需读取**微信参考细则；
+> - **凡涉及查看/深读微信转发文章、执行 `sync` / `ingest` / `reanalyze`、核查采集与 ASR 转写质量 (`extractionQuality` / `asrEvidence`)、管理微信定时任务，或向手机微信推送文本/图片/多格式文档 (`oms wx push`) 时，必须先用 `read_file` 阅读本技能目录下的完整契约文件**：
+>   `~/.codex/skills/one-more-step/references/wechat-context-rules.md`
+
+### 高频 `oms wx` 速查命令
+
+```bash
+# 1. 查看本地微信转发文章列表与单篇详情（默认只读，严禁未经用户要求自动执行 sync！）
+oms wx list --json
+oms wx show <id> --json
+
+# 2. 查看非公众号链接的微信转发内容（速记、灵感想法、近期对话、定时任务、异步任务）
+oms wx recent --json
+oms wx inbox --json
+oms wx schedule list --json
+oms wx tasks --json
+
+# 3. 在 Mac 原生悬浮窗「💬 微信尺素」Tab 中直接打开查看伴读笔记，或同步至小米手机「💬 微信尺素」时间流供耳机通勤朗读
+oms wx peek [articleId]
+oms wx to-phone <articleId>
+
+# 4. 仅在用户明确要求时：触发微信同步 / 手动导入链接 / 补跑降级笔记初筛 / 本地自检
+oms wx sync --json
+oms wx ingest "<https://mp.weixin.qq.com/s/...>" --note "<关注点>" --json
+oms wx reanalyze <id> [--send] --json
+oms wx doctor --json
+
+# 5. 仅在用户明确要求推送到微信时：推送文本、图片或自动编译 MD/HTML/PDF 到手机微信（必须核对返回 JSON 的 ok/sentCount/failedCount/missingFormats）
+oms wx push --text "<文本>" --json
+cat <<'EOF' | oms wx push --stdin --json
+<多行总结内容>
+EOF
+oms wx push --file "<绝对路径>" [--formats md,html,pdf] [--text "<导读说明>"] --json
+oms wx push --article <id> [--with-file] [--formats md,html,pdf] --json
+```
