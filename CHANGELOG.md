@@ -1,5 +1,11 @@
 # Changelog · 更新日志
 
+## 3.4.0 - 2026-11-21 · 双速自动演化活记忆、全机原生超级工具集与内嵌 Web 应用舱（AI 伴读网页）
+
+- **双速持续自动演化记忆 (`CockpitAiServices.distillMemoryEvolution` & `SecretaryCore.evolveMemoryFromDialogue`)**：升级后台记忆蒸馏引擎为「快层近期焦点（Working Memory）+ 慢层长期画像自动提炼（Profile Evolution）+ 隐性待办捕获（Implicit Open Loops）」，每 3 轮非无痕对话静默演进一次；Mac 端 `SecretaryCore` 支持去重增强（`observations++`）、上限清理且**永不自动驱逐用户手动编辑的长期记忆**，透明可控。
+- **全机原生能力工具化 (`PhoneToolExecutor`、`AudioTranscribeAndTools` & `ChatWorkspaceView`)**：扩展随身秘书可调用的手机系统工具至 11 项——**读取真实手机日历**（`read_today_calendar` 自动读取未来 48 小时日程供 AI 精准作答）、**打开任意已安装 App**（`launch_app`）、**拨打电话**（`phone_call`，自动同步 Mac 常用联系人速查表，高风险操作强制内联确认）、**起草短信**（`send_sms`）、**内嵌应用舱打开网页**（`open_in_browser`）、**地图导航**（`navigate_map`）、**音量调节**（`set_volume`）、**写入剪贴板**（`clipboard_write`）、**直达系统设置面板**（`open_system_settings`）及原生日程/闹钟卡片。
+- **内嵌 Web 应用工作舱与 AI 伴读网页 (`WebAppHubOverlay` & `CockpitShell`)**：在侧边抽屉与首页新增「**青简·应用舱**」，内置 GitHub、Google AI Studio、Gmail、飞书文档、Notion、知乎、财经行情、Mac 咫尺总控台等高频网页版应用并支持自定义固定收藏、持久 Cookie 登录态与桌面/移动版切换；任意网页右上角一键 **`✦ 问秘书`** 即可提取正文带上下文总结追问，或一键 **`存入知识库`** 直推 Mac 归档，真正迈向「一个 App 完成绝大部分日常工作」。
+
 ## 3.3.2 - 2026-11-21 · 实时音色男/女声标注与按性别快筛、协同会话未发草稿自动持久化
 
 - **实时音频 / 视频音色选择增强 (`RealtimeVoiceCatalog` & `LiveVoicePickerDialog`)**：为全部 10 款 OpenAI Realtime 与 14 款 Gemini 3.8 Live 音色补齐明确的「女声 / 男声 / 中性」彩色徽章与顶部胶囊简标（如 `Marin·女` / `Puck·男`），并在选择弹窗新增 `全部 / 女声 / 男声` 一键快筛。

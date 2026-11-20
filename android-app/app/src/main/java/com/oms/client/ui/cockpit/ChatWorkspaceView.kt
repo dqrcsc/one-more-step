@@ -155,7 +155,8 @@ fun ChatWorkspaceView(
     onOpenLiveVoice: (glassCameraMode: Boolean) -> Unit,
     onEscalateToMacAgent: (promptSummary: String) -> Unit,
     onSwitchTab: (CockpitTab) -> Unit = {},
-    onOpenVaultDoc: (relPath: String) -> Unit = {}
+    onOpenVaultDoc: (relPath: String) -> Unit = {},
+    onOpenWebAppHub: (url: String?, title: String?) -> Unit = { _, _ -> }
 ) {
     val context = LocalContext.current
     val palette = OmsTheme.colors
@@ -486,7 +487,8 @@ fun ChatWorkspaceView(
                         },
                         onOpenBotanicalCamera = onOpenBotanicalCamera,
                         onOpenLiveVoice = { onOpenLiveVoice(false) },
-                        onOpenMacDrop = { showPlusSheet = true }
+                        onOpenMacDrop = { showPlusSheet = true },
+                        onOpenWebAppHub = { onOpenWebAppHub(null, null) }
                     )
                 } else {
                     val lastAssistantId = remember(messages) {
@@ -526,7 +528,8 @@ fun ChatWorkspaceView(
                                     onEscalateToMacAgent(
                                         "请基于我在手机咫尺讨论的以下方案直接推进实施并验证：\n\n$recentCtx"
                                     )
-                                }
+                                },
+                                onOpenWebAppHub = onOpenWebAppHub
                             )
                         }
 
@@ -1068,7 +1071,8 @@ private fun EmptyChatWelcomeHero(
     onQuickPrompt: (prompt: String, deep: Boolean, search: Boolean) -> Unit,
     onOpenBotanicalCamera: () -> Unit,
     onOpenLiveVoice: () -> Unit,
-    onOpenMacDrop: () -> Unit
+    onOpenMacDrop: () -> Unit,
+    onOpenWebAppHub: () -> Unit
 ) {
     val palette = OmsTheme.colors
     var showAddLoopDialog by remember { mutableStateOf(false) }
@@ -1304,28 +1308,26 @@ private fun EmptyChatWelcomeHero(
         ) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 WelcomeCompactActionTile(
+                    icon = OmsIcons.Globe,
+                    title = "应用舱",
+                    subtitle = "内置网页与AI伴读",
+                    onClick = onOpenWebAppHub,
+                    modifier = Modifier.weight(1f)
+                )
+                WelcomeCompactActionTile(
                     icon = OmsIcons.Waveform,
                     title = "散步语音",
                     subtitle = "全双工随行对谈",
                     onClick = onOpenLiveVoice,
                     modifier = Modifier.weight(1f)
                 )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 WelcomeCompactActionTile(
                     icon = OmsIcons.Leaf,
                     title = "博物镜头",
                     subtitle = "实景识物入图鉴",
                     onClick = onOpenBotanicalCamera,
-                    modifier = Modifier.weight(1f)
-                )
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                WelcomeCompactActionTile(
-                    icon = OmsIcons.Sparkles,
-                    title = "梳理今日主线",
-                    subtitle = "结合记忆定优先级",
-                    onClick = {
-                        onQuickPrompt("请作为我的随身秘书，结合我的个人偏好、未闭环事项和知识库近期主线，帮我梳理今天最值得优先推进的 3 件事。", true, false)
-                    },
                     modifier = Modifier.weight(1f)
                 )
                 WelcomeCompactActionTile(
@@ -1557,7 +1559,8 @@ private fun ChatMessageTurn(
     onPreviewImage: (String) -> Unit,
     onFollowUpSpecimen: (com.oms.core.ai.FieldGuideSpecimenCard) -> Unit,
     onRegenerate: () -> Unit,
-    onEscalateToMacAgent: () -> Unit
+    onEscalateToMacAgent: () -> Unit,
+    onOpenWebAppHub: (url: String?, title: String?) -> Unit = { _, _ -> }
 ) {
     val context = LocalContext.current
     val palette = OmsTheme.colors
@@ -1753,12 +1756,18 @@ private fun ChatMessageTurn(
                     }
                 }
 
-                // Inline Native Calendar & Alarm Confirmation Cards
+                // Inline Native Calendar, Alarm & Phone OS Super-Tool Action Cards
                 msg.calendarActions.forEach { cal ->
                     InlineCalendarActionCard(action = cal)
                 }
                 msg.alarmActions.forEach { alarm ->
                     InlineAlarmActionCard(action = alarm)
+                }
+                msg.phoneToolActions.forEach { toolAct ->
+                    InlinePhoneToolActionCard(
+                        action = toolAct,
+                        onOpenInWebAppHub = { url, title -> onOpenWebAppHub(url, title) }
+                    )
                 }
 
                 // Clean Minimalist Vector Action Toolbar (zero text clutter!)
@@ -1887,6 +1896,105 @@ private fun StreamingAssistantTurn(state: com.oms.client.cockpit.StreamingTurnSt
                 isStreaming = true
             )
         }
+    }
+}
+
+@Composable
+private fun InlinePhoneToolActionCard(
+    action: com.oms.core.ai.ProposedPhoneToolAction,
+    onOpenInWebAppHub: (url: String, title: String) -> Unit
+) {
+    val context = LocalContext.current
+    val palette = OmsTheme.colors
+    val scope = rememberCoroutineScope()
+    var executed by remember { mutableStateOf(false) }
+    var isRunning by remember { mutableStateOf(false) }
+    var resultHint by remember { mutableStateOf("") }
+
+    val icon = when (action.tool) {
+        "launch_app" -> OmsIcons.Bolt
+        "phone_call" -> OmsIcons.Volume
+        "send_sms" -> OmsIcons.Send
+        "open_in_browser" -> OmsIcons.Globe
+        "navigate_map" -> OmsIcons.Globe
+        "set_volume" -> OmsIcons.Volume
+        "clipboard_write" -> OmsIcons.Copy
+        "open_system_settings" -> OmsIcons.Sliders
+        else -> OmsIcons.Bolt
+    }
+    val actionBtnLabel = when {
+        isRunning -> "正在执行…"
+        executed -> "已执行"
+        action.tool == "open_in_browser" -> "应用舱内打开"
+        action.tool == "phone_call" -> "确认拨出"
+        action.tool == "send_sms" -> "打开短信草稿"
+        action.tool == "launch_app" -> "立即打开"
+        action.tool == "navigate_map" -> "开始导航"
+        action.tool == "clipboard_write" -> "一键复制"
+        else -> "立即执行"
+    }
+
+    OmsSurfaceCard(
+        containerColor = palette.subtleSurface,
+        borderColor = if (action.requiresConfirm) palette.warning.copy(alpha = 0.45f) else palette.hairline,
+        cornerRadius = 16.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(7.dp)
+            ) {
+                Icon(icon, contentDescription = null, tint = palette.accent, modifier = Modifier.size(16.dp))
+                Text(
+                    text = if (action.requiresConfirm) "手机操作 · 需确认" else "手机超级工具",
+                    color = if (action.requiresConfirm) palette.warning else palette.textSecondary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            if (executed) {
+                Text("已完成", color = palette.success, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(action.title, color = palette.textPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        if (action.detail.isNotBlank()) {
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(action.detail, color = palette.textSecondary, fontSize = 12.5.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        }
+        if (resultHint.isNotBlank()) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(resultHint, color = if (executed) palette.success else palette.warning, fontSize = 12.sp)
+        }
+        Spacer(modifier = Modifier.height(10.dp))
+        OmsPrimaryButton(
+            label = actionBtnLabel,
+            icon = if (executed) OmsIcons.Check else icon,
+            enabled = !isRunning,
+            height = 36.dp,
+            onClick = {
+                isRunning = true
+                scope.launch {
+                    val res = com.oms.client.capability.PhoneToolExecutor.execute(
+                        context = context,
+                        action = action,
+                        onOpenInWebAppHub = onOpenInWebAppHub
+                    )
+                    isRunning = false
+                    executed = res.ok
+                    resultHint = res.message
+                    OmsFeedbackController.show(
+                        res.message,
+                        if (res.ok) OmsToastKind.SUCCESS else OmsToastKind.WARNING
+                    )
+                }
+            }
+        )
     }
 }
 

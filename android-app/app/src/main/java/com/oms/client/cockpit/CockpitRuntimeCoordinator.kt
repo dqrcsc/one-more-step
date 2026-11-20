@@ -499,17 +499,28 @@ class CockpitRuntimeCoordinator(
             )
             val parsedFirst = CockpitAiServices.parseAssistantActions(firstPass.fullText)
 
-            // Check if model invoked on-demand `search_my_context`!
-            val finalCompletedAndActions = if (parsedFirst.contextSearchQuery != null) {
-                val query = parsedFirst.contextSearchQuery!!
-                _streamingFlow.value = _streamingFlow.value.copy(
-                    statusHint = "正在按需检索个人知识库：$query",
-                    markdownText = ""
-                )
-                val recallBlock = recallPersonalContext(query)
+            // Check if model invoked on-demand `search_my_context` or `read_today_calendar`!
+            val finalCompletedAndActions = if (parsedFirst.contextSearchQuery != null || parsedFirst.readCalendarRequested) {
+                val contextParts = ArrayList<String>()
+                if (parsedFirst.contextSearchQuery != null) {
+                    val query = parsedFirst.contextSearchQuery!!
+                    _streamingFlow.value = _streamingFlow.value.copy(
+                        statusHint = "正在按需检索个人知识库：$query",
+                        markdownText = ""
+                    )
+                    contextParts.add(recallPersonalContext(query))
+                }
+                if (parsedFirst.readCalendarRequested) {
+                    _streamingFlow.value = _streamingFlow.value.copy(
+                        statusHint = "正在读取手机近期真实日历…",
+                        markdownText = ""
+                    )
+                    contextParts.add(com.oms.client.capability.PhoneToolExecutor.readUpcomingCalendarSummary(appContext))
+                }
+                val recallBlock = contextParts.joinToString("\n\n")
                 val augmentedTurns = turns + listOf(
                     LlmTurnMessage("assistant", firstPass.fullText),
-                    LlmTurnMessage("user", "$recallBlock\n\n请基于以上检索到的个人背景直接给出完整回答（无需再次调用 search_my_context）。")
+                    LlmTurnMessage("user", "$recallBlock\n\n请基于以上检索到的真实个人背景与日程直接给出完整回答（无需再次调用 search_my_context 或 read_today_calendar）。")
                 )
                 val secondPass = streamSinglePassWithRetry(
                     threadId = threadId,
@@ -543,6 +554,7 @@ class CockpitRuntimeCoordinator(
                     sources = completed.sources,
                     calendarActions = parsedActions.calendarActions,
                     alarmActions = parsedActions.alarmActions,
+                    phoneToolActions = parsedActions.phoneToolActions,
                     status = "DONE",
                     createdAtMs = System.currentTimeMillis()
                 ),
@@ -551,10 +563,10 @@ class CockpitRuntimeCoordinator(
             vibrateConfirm()
             _streamingFlow.value = StreamingTurnState()
 
-            // Background L0 mirror & periodic L1 distillation
+            // Background L0 mirror & slow continuous living-memory evolution (every 3 turns)
             flushPendingSyncToMac()
             val thread = chatRepo.getThreadById(threadId)
-            if (thread?.incognito == false && completedTurnsSinceDistill.incrementAndGet() >= 5) {
+            if (thread?.incognito == false && completedTurnsSinceDistill.incrementAndGet() >= 3) {
                 completedTurnsSinceDistill.set(0)
                 distillWorkingMemoryQuietly(threadId)
             }
@@ -698,11 +710,29 @@ class CockpitRuntimeCoordinator(
         scope.launch {
             runCatching {
                 val recent = chatRepo.loadMessagesForThread(threadId).takeLast(10)
-                val summary = recent.joinToString("\n") { "${it.role}: ${it.content.take(300)}" }
-                val existing = (edgeStore.loadContextCapsule().recentWorkingMemory + chatRepo.getLocalWorkingMemory()).distinct()
-                val updated = aiServices.distillWorkingMemory(summary, existing)
-                chatRepo.saveLocalWorkingMemory(updated)
+                if (recent.size < 2) return@runCatching
+                val summary = recent.joinToString("\n") { "${it.role}: ${it.content.take(360)}" }
+                val existingWm = (edgeStore.loadContextCapsule().recentWorkingMemory + chatRepo.getLocalWorkingMemory()).distinct()
+                val existingProfile = _secretaryBriefFlow.value?.profileItems.orEmpty()
+                val evolved = aiServices.distillMemoryEvolution(summary, existingWm, existingProfile)
+                chatRepo.saveLocalWorkingMemory(evolved.workingMemory)
                 flushPendingSyncToMac()
+
+                // Slowly evolve long-term Living Memory & implicit commitments on Mac SecretaryCore
+                if ((evolved.profileAdditions.isNotEmpty() || evolved.implicitCommitments.isNotEmpty()) &&
+                    transportClient.activeTierFlow.value != "DISCONNECTED"
+                ) {
+                    val req = JSONObject().apply {
+                        put("profileAdditions", JSONArray(evolved.profileAdditions))
+                        val cArr = JSONArray()
+                        evolved.implicitCommitments.forEach { (title, due) ->
+                            cArr.put(JSONObject().put("title", title).put("dueHint", due))
+                        }
+                        put("implicitCommitments", cArr)
+                    }
+                    transportClient.callHostRpc("secretary.memory.evolve", req, 8_000L)
+                    refreshSecretaryBrief()
+                }
             }
         }
     }

@@ -36,6 +36,7 @@ data class ChatMessageModel(
     val sources: List<GroundingSource> = emptyList(),
     val calendarActions: List<ProposedCalendarAction> = emptyList(),
     val alarmActions: List<ProposedAlarmAction> = emptyList(),
+    val phoneToolActions: List<com.oms.core.ai.ProposedPhoneToolAction> = emptyList(),
     val specimenCard: FieldGuideSpecimenCard? = null,
     val imageLocalPath: String? = null,
     val status: String = "DONE", // "STREAMING" | "DONE" | "ERROR"
@@ -243,7 +244,7 @@ class ChatMemoryRepository(context: Context) :
             put("reasoning", msg.reasoning)
             put("model_used", msg.modelUsed)
             put("sources_json", encodeSources(msg.sources))
-            put("actions_json", encodeActions(msg.calendarActions, msg.alarmActions))
+            put("actions_json", encodeActions(msg.calendarActions, msg.alarmActions, msg.phoneToolActions))
             put("specimen_json", msg.specimenCard?.let(::encodeSpecimen).orEmpty())
             put("image_local_path", msg.imageLocalPath)
             put("status", msg.status)
@@ -296,7 +297,7 @@ class ChatMemoryRepository(context: Context) :
             arrayOf(threadId)
         ).use { c ->
             while (c.moveToNext()) {
-                val (cals, alarms) = decodeActions(c.getString(7).orEmpty())
+                val (cals, alarms, phoneTools) = decodeActions(c.getString(7).orEmpty())
                 list.add(
                     ChatMessageModel(
                         messageId = c.getString(0),
@@ -308,6 +309,7 @@ class ChatMemoryRepository(context: Context) :
                         sources = decodeSources(c.getString(6).orEmpty()),
                         calendarActions = cals,
                         alarmActions = alarms,
+                        phoneToolActions = phoneTools,
                         specimenCard = decodeSpecimen(c.getString(8).orEmpty()),
                         imageLocalPath = c.getString(9),
                         status = c.getString(10).orEmpty().ifBlank { "DONE" },
@@ -635,7 +637,8 @@ class ChatMemoryRepository(context: Context) :
 
     private fun encodeActions(
         cals: List<ProposedCalendarAction>,
-        alarms: List<ProposedAlarmAction>
+        alarms: List<ProposedAlarmAction>,
+        phoneTools: List<com.oms.core.ai.ProposedPhoneToolAction> = emptyList()
     ): String {
         val calArr = JSONArray()
         for (c in cals) {
@@ -658,11 +661,27 @@ class ChatMemoryRepository(context: Context) :
                     .put("days", JSONArray(a.daysOfWeek))
             )
         }
-        return JSONObject().put("calendars", calArr).put("alarms", alArr).toString()
+        val toolArr = JSONArray()
+        for (t in phoneTools) {
+            toolArr.put(
+                JSONObject()
+                    .put("tool", t.tool)
+                    .put("title", t.title)
+                    .put("target", t.target)
+                    .put("extra", t.extra)
+                    .put("detail", t.detail)
+                    .put("requiresConfirm", t.requiresConfirm)
+            )
+        }
+        return JSONObject()
+            .put("calendars", calArr)
+            .put("alarms", alArr)
+            .put("phoneTools", toolArr)
+            .toString()
     }
 
-    private fun decodeActions(raw: String): Pair<List<ProposedCalendarAction>, List<ProposedAlarmAction>> = runCatching {
-        if (raw.isBlank()) return emptyList<ProposedCalendarAction>() to emptyList()
+    private fun decodeActions(raw: String): Triple<List<ProposedCalendarAction>, List<ProposedAlarmAction>, List<com.oms.core.ai.ProposedPhoneToolAction>> = runCatching {
+        if (raw.isBlank()) return Triple(emptyList(), emptyList(), emptyList())
         val root = JSONObject(raw)
         val cals = ArrayList<ProposedCalendarAction>()
         root.optJSONArray("calendars")?.let { arr ->
@@ -697,8 +716,27 @@ class ChatMemoryRepository(context: Context) :
                 )
             }
         }
-        cals to alarms
-    }.getOrDefault(emptyList<ProposedCalendarAction>() to emptyList())
+        val phoneTools = ArrayList<com.oms.core.ai.ProposedPhoneToolAction>()
+        root.optJSONArray("phoneTools")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val tool = o.optString("tool", "").trim()
+                if (tool.isNotEmpty()) {
+                    phoneTools.add(
+                        com.oms.core.ai.ProposedPhoneToolAction(
+                            tool = tool,
+                            title = o.optString("title", tool),
+                            target = o.optString("target", ""),
+                            extra = o.optString("extra", ""),
+                            detail = o.optString("detail", ""),
+                            requiresConfirm = o.optBoolean("requiresConfirm", false)
+                        )
+                    )
+                }
+            }
+        }
+        Triple(cals, alarms, phoneTools)
+    }.getOrDefault(Triple(emptyList(), emptyList(), emptyList()))
 
     private fun encodeSpecimen(card: FieldGuideSpecimenCard): String = JSONObject().apply {
         put("specimenId", card.specimenId)

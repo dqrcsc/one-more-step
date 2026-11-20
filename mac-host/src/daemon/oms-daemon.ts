@@ -1338,6 +1338,16 @@ export class OmsDaemon {
             const p = (req.params || {}) as { items?: string[] };
             const items = this.secretary.saveProfileItems(Array.isArray(p.items) ? p.items : []);
             reply({ result: { ok: true, items } });
+          } else if (req.method === "secretary.memory.evolve") {
+            const p = (req.params || {}) as {
+              profileAdditions?: string[];
+              implicitCommitments?: Array<{ title: string; dueHint?: string }>;
+            };
+            const evolved = this.secretary.evolveMemoryFromDialogue({
+              profileAdditions: Array.isArray(p.profileAdditions) ? p.profileAdditions : [],
+              implicitCommitments: Array.isArray(p.implicitCommitments) ? p.implicitCommitments : [],
+            });
+            reply({ result: { ok: true, ...evolved } });
           } else if (req.method === "secretary.nudge.dismiss") {
             const p = (req.params || {}) as { id?: string };
             this.secretary.dismissNudge(String(p.id || ""));
@@ -1933,8 +1943,12 @@ export class OmsDaemon {
     }
 
     if (this.session.getActiveTier() !== "DISCONNECTED") {
+      const edgePayload: Record<string, unknown> = {
+        ...(edgeCfg as unknown as Record<string, unknown>),
+        contacts: this.config.contacts || {},
+      };
       await this.session
-        .callPhone("edge.config.sync", edgeCfg as unknown as Record<string, unknown>, 8000)
+        .callPhone("edge.config.sync", edgePayload, 8000)
         .catch(() => {});
     }
 

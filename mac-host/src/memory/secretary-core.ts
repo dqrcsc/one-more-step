@@ -10,8 +10,17 @@ import type {
 } from "@oms/shared-protocol";
 import { listImportedBooks } from "../knowledge/epub-importer.js";
 
+export interface ProfileMemoryEntry {
+  text: string;
+  source: "manual" | "auto";
+  observations: number;
+  createdAtMs: number;
+  lastSeenAtMs: number;
+}
+
 interface PersistedSecretaryState {
   profileItems: string[];
+  profileEntries?: ProfileMemoryEntry[];
   commitments: SecretaryCommitmentItem[];
   dismissedNudges: Record<string, number>;
   updatedAtIso: string;
@@ -42,10 +51,29 @@ export class SecretaryCore {
     try {
       if (fs.existsSync(this.statePath)) {
         const parsed = JSON.parse(fs.readFileSync(this.statePath, "utf8"));
+        const rawItems: string[] = Array.isArray(parsed?.profileItems)
+          ? parsed.profileItems.map((x: unknown) => String(x || "").trim()).filter(Boolean).slice(0, 24)
+          : [];
+        const rawEntries: ProfileMemoryEntry[] = Array.isArray(parsed?.profileEntries)
+          ? parsed.profileEntries
+              .filter((e: any) => e && typeof e.text === "string" && e.text.trim())
+              .map((e: any) => ({
+                text: String(e.text).trim(),
+                source: e.source === "auto" ? "auto" : "manual",
+                observations: Math.max(1, Number(e.observations) || 1),
+                createdAtMs: Number(e.createdAtMs) || Date.now(),
+                lastSeenAtMs: Number(e.lastSeenAtMs) || Date.now(),
+              }))
+          : rawItems.map((text) => ({
+              text,
+              source: "manual" as const,
+              observations: 1,
+              createdAtMs: Date.now(),
+              lastSeenAtMs: Date.now(),
+            }));
         return {
-          profileItems: Array.isArray(parsed?.profileItems)
-            ? parsed.profileItems.map((x: unknown) => String(x || "").trim()).filter(Boolean).slice(0, 24)
-            : [],
+          profileItems: rawEntries.map((e) => e.text).slice(0, 24),
+          profileEntries: rawEntries.slice(0, 24),
           commitments: Array.isArray(parsed?.commitments) ? parsed.commitments.slice(0, 80) : [],
           dismissedNudges:
             parsed?.dismissedNudges && typeof parsed.dismissedNudges === "object"
@@ -57,6 +85,7 @@ export class SecretaryCore {
     } catch {}
     return {
       profileItems: [],
+      profileEntries: [],
       commitments: [],
       dismissedNudges: {},
       updatedAtIso: "",
@@ -65,6 +94,9 @@ export class SecretaryCore {
 
   private saveState(state: PersistedSecretaryState): void {
     state.updatedAtIso = new Date().toISOString();
+    if (state.profileEntries) {
+      state.profileItems = state.profileEntries.map((e) => e.text).slice(0, 24);
+    }
     const tmp = `${this.statePath}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8");
     fs.renameSync(tmp, this.statePath);
@@ -74,13 +106,112 @@ export class SecretaryCore {
     return this.loadState().profileItems;
   }
 
+  public getProfileEntries(): ProfileMemoryEntry[] {
+    return this.loadState().profileEntries || [];
+  }
+
   public saveProfileItems(items: string[]): string[] {
     const state = this.loadState();
-    state.profileItems = Array.from(
+    const prevByText = new Map((state.profileEntries || []).map((e) => [e.text, e]));
+    const now = Date.now();
+    const cleaned = Array.from(
       new Set(items.map((x) => String(x || "").trim()).filter(Boolean))
     ).slice(0, 24);
+    state.profileEntries = cleaned.map((text) => {
+      const existing = prevByText.get(text);
+      return existing
+        ? { ...existing, lastSeenAtMs: now }
+        : { text, source: "manual", observations: 1, createdAtMs: now, lastSeenAtMs: now };
+    });
+    state.profileItems = cleaned;
     this.saveState(state);
     return state.profileItems;
+  }
+
+  /**
+   * Slow, conservative living-memory evolution from everyday conversations:
+   * - Deduplicates & reinforces matching memories (`observations += 1`)
+   * - Appends only high-signal new traits (`source: "auto"`), capping total at 24
+   *   while NEVER auto-evicting user-edited manual memories.
+   * - Also records implicit commitments into Open Loops cleanly.
+   */
+  public evolveMemoryFromDialogue(params: {
+    profileAdditions?: string[];
+    implicitCommitments?: Array<{ title: string; dueHint?: string }>;
+  }): { addedProfile: number; reinforcedProfile: number; addedCommitments: number; profileItems: string[] } {
+    const state = this.loadState();
+    const entries = [...(state.profileEntries || [])];
+    const now = Date.now();
+    let addedProfile = 0;
+    let reinforcedProfile = 0;
+
+    const normalize = (s: string) =>
+      s.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "").trim();
+
+    for (const raw of (params.profileAdditions || []).slice(0, 3)) {
+      const text = String(raw || "").trim().slice(0, 80);
+      if (text.length < 4) continue;
+      const norm = normalize(text);
+      if (!norm) continue;
+      const matchIdx = entries.findIndex((e) => {
+        const en = normalize(e.text);
+        return en === norm || (norm.length >= 6 && (en.includes(norm) || norm.includes(en)));
+      });
+      if (matchIdx >= 0) {
+        entries[matchIdx] = {
+          ...entries[matchIdx],
+          observations: entries[matchIdx].observations + 1,
+          lastSeenAtMs: now,
+        };
+        reinforcedProfile += 1;
+      } else {
+        entries.push({
+          text,
+          source: "auto",
+          observations: 1,
+          createdAtMs: now,
+          lastSeenAtMs: now,
+        });
+        addedProfile += 1;
+      }
+    }
+
+    // Cap at 24: preserve all manual entries first, then highest-observation / most recent auto entries
+    if (entries.length > 24) {
+      const manual = entries.filter((e) => e.source === "manual");
+      const auto = entries
+        .filter((e) => e.source === "auto")
+        .sort((a, b) => b.observations - a.observations || b.lastSeenAtMs - a.lastSeenAtMs);
+      const keepAuto = Math.max(0, 24 - manual.length);
+      state.profileEntries = [...manual, ...auto.slice(0, keepAuto)].slice(0, 24);
+    } else {
+      state.profileEntries = entries;
+    }
+    this.saveState(state);
+
+    let addedCommitments = 0;
+    for (const c of (params.implicitCommitments || []).slice(0, 2)) {
+      const title = String(c?.title || "").trim();
+      if (title.length < 3) continue;
+      const alreadyOpen = this.listCommitments(false).some(
+        (o) => normalize(o.title) === normalize(title)
+      );
+      if (!alreadyOpen) {
+        this.upsertCommitment({
+          title,
+          dueHint: c.dueHint,
+          source: "auto_distill",
+        });
+        addedCommitments += 1;
+      }
+    }
+
+    return {
+      addedProfile,
+      reinforcedProfile,
+      addedCommitments,
+      profileItems: this.getProfileItems(),
+    };
   }
 
   public listCommitments(includeDone = true): SecretaryCommitmentItem[] {

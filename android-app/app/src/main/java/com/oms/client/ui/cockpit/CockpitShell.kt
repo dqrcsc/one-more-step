@@ -169,6 +169,9 @@ fun OmsCockpitRootScreen() {
     var initialSettingsTab by remember { mutableStateOf(SettingsStudioTab.APPEARANCE) }
     var showQuickThemeSheet by remember { mutableStateOf(false) }
     var showSpecimenGallery by remember { mutableStateOf(false) }
+    var showWebAppHub by remember { mutableStateOf(false) }
+    var webAppInitialUrl by remember { mutableStateOf<String?>(null) }
+    var webAppInitialTitle by remember { mutableStateOf<String?>(null) }
 
     var searchQuery by remember { mutableStateOf("") }
     var pendingSearchJump by remember { mutableStateOf<SearchJumpRequest?>(null) }
@@ -289,14 +292,34 @@ fun OmsCockpitRootScreen() {
                             )
                         }
 
-                        // 2. Quick Curated Library & Instant Theme Bar
+                        // 2. Quick Curated Library (应用舱 + 博物图鉴 + 日夜模式)
                         Row(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            horizontalArrangement = Arrangement.spacedBy(7.dp)
                         ) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(7.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(38.dp)
+                                    .omsBounceClick(scaleDown = 0.96f, shape = RoundedCornerShape(12.dp)) {
+                                        scope.launch { drawerState.close() }
+                                        webAppInitialUrl = null
+                                        webAppInitialTitle = null
+                                        showWebAppHub = true
+                                    }
+                                    .background(palette.accentSoft, RoundedCornerShape(12.dp))
+                                    .border(0.6.dp, palette.accent.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+                                    .padding(horizontal = 10.dp)
+                            ) {
+                                Icon(OmsIcons.Globe, contentDescription = null, tint = palette.accent, modifier = Modifier.size(15.5.dp))
+                                Text("应用舱", color = palette.textPrimary, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                            }
+
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 modifier = Modifier
                                     .weight(1f)
                                     .height(38.dp)
@@ -306,16 +329,16 @@ fun OmsCockpitRootScreen() {
                                     }
                                     .background(palette.cardSurface, RoundedCornerShape(12.dp))
                                     .border(0.6.dp, palette.hairline, RoundedCornerShape(12.dp))
-                                    .padding(horizontal = 11.dp)
+                                    .padding(horizontal = 10.dp)
                             ) {
-                                Icon(OmsIcons.Leaf, contentDescription = null, tint = palette.accent, modifier = Modifier.size(16.dp))
-                                Text("博物图鉴册", color = palette.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                                Icon(OmsIcons.Leaf, contentDescription = null, tint = palette.accent, modifier = Modifier.size(15.5.dp))
+                                Text("图鉴册", color = palette.textPrimary, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, maxLines = 1)
                             }
 
                             // 1-Tap Appearance Mode Cycle (`跟随 / 素昼 / 玄夜`)
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
                                 modifier = Modifier
                                     .height(38.dp)
                                     .omsBounceClick(scaleDown = 0.95f, shape = RoundedCornerShape(12.dp)) {
@@ -324,15 +347,15 @@ fun OmsCockpitRootScreen() {
                                     }
                                     .background(palette.cardSurface, RoundedCornerShape(12.dp))
                                     .border(0.6.dp, palette.hairline, RoundedCornerShape(12.dp))
-                                    .padding(horizontal = 11.dp)
+                                    .padding(horizontal = 10.dp)
                             ) {
                                 Icon(
                                     imageVector = if (palette.isDark) OmsIcons.Moon else OmsIcons.Sun,
                                     contentDescription = "切换日夜模式",
                                     tint = palette.accent,
-                                    modifier = Modifier.size(15.5.dp)
+                                    modifier = Modifier.size(15.dp)
                                 )
-                                Text(themeSettings.mode.label, color = palette.textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                                Text(themeSettings.mode.label, color = palette.textSecondary, fontSize = 11.5.sp, fontWeight = FontWeight.Medium)
                             }
                         }
 
@@ -741,7 +764,12 @@ fun OmsCockpitRootScreen() {
                                     currentTab = CockpitTab.MISSION_HUB
                                 },
                                 onSwitchTab = { targetTab -> currentTab = targetTab },
-                                onOpenVaultDoc = { relPath -> coordinator.openVaultDoc(relPath) }
+                                onOpenVaultDoc = { relPath -> coordinator.openVaultDoc(relPath) },
+                                onOpenWebAppHub = { url, title ->
+                                    webAppInitialUrl = url
+                                    webAppInitialTitle = title
+                                    showWebAppHub = true
+                                }
                             )
 
                             CockpitTab.CHISU -> ChisuWorkspaceView(
@@ -902,6 +930,46 @@ fun OmsCockpitRootScreen() {
                 }
             }
         }
+    }
+
+    // In-App Embedded Web App Workspace (应用舱)
+    if (showWebAppHub) {
+        WebAppHubModal(
+            initialUrl = webAppInitialUrl,
+            initialTitle = webAppInitialTitle,
+            onDismiss = { showWebAppHub = false },
+            onAskSecretaryWithPage = { pageTitle, pageUrl, body ->
+                showWebAppHub = false
+                chatPrefillDraft = buildString {
+                    appendLine("请作为我的随身秘书，帮我提炼这篇网页的核心要点并结合我的知识库给出建议：")
+                    appendLine("- 标题：$pageTitle")
+                    appendLine("- 链接：$pageUrl")
+                    if (body.isNotBlank()) {
+                        appendLine()
+                        append(body.take(2600))
+                    }
+                }
+                currentTab = CockpitTab.CHAT
+            },
+            onSavePageToVault = { pageTitle, pageUrl, body ->
+                val md = buildString {
+                    appendLine("# $pageTitle")
+                    appendLine()
+                    appendLine("- **来源链接**：$pageUrl")
+                    appendLine()
+                    append(body.ifBlank { pageUrl })
+                }
+                app.transportClient.submitItemToMacOrQueue(
+                    intentTag = "pkb_vault",
+                    itemType = "TEXT",
+                    title = pageTitle.take(60),
+                    textContent = md,
+                    voiceTranscript = null,
+                    fileUri = null
+                )
+                OmsFeedbackController.show("已推送网页内容至 Mac 知识库收件箱", OmsToastKind.SUCCESS)
+            }
+        )
     }
 
     // Rename Thread Dialog

@@ -217,6 +217,17 @@ describe("EPUB Importer, Full-Vault Chinese FTS5 Search & Executive Secretary Co
         agentSessions: [],
       });
       expect(brief2.openLoops).toHaveLength(0);
+
+      // Verify slow continuous living-memory evolution: deduplicates, reinforces, and records implicit commitments
+      const ev1 = sec.evolveMemoryFromDialogue({
+        profileAdditions: ["偏好直接给可执行方案", "习惯在手机端完成网页阅读与待办闭环"],
+        implicitCommitments: [{ title: "下周二前完成 Agent 权限设计", dueHint: "下周二前" }],
+      });
+      expect(ev1.reinforcedProfile).toBe(1);
+      expect(ev1.addedProfile).toBe(1);
+      expect(ev1.addedCommitments).toBe(1);
+      expect(sec.getProfileItems()).toContain("习惯在手机端完成网页阅读与待办闭环");
+      expect(sec.listCommitments(false).some((c) => c.title === "下周二前完成 Agent 权限设计")).toBe(true);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

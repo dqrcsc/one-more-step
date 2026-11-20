@@ -587,4 +587,66 @@ class EdgeSecureStore(context: Context) {
         }
         prefs.edit().putString("agent_session_drafts_v1", MiniJson.stringify(map)).apply()
     }
+
+    /**
+     * Resolves a synced contact name (e.g. "老婆") or raw number from the synced Mac `edge.config.sync` snapshot.
+     * Returns Pair(phoneNumber, preferredSimSlot) if matched.
+     */
+    fun resolveContact(nameOrNumber: String): Pair<String, String>? {
+        val raw = nameOrNumber.trim()
+        if (raw.isEmpty()) return null
+        val cfgRaw = prefs.getString("synced_edge_config_v1", null)
+        if (!cfgRaw.isNullOrBlank()) {
+            runCatching {
+                val root = MiniJson.parseObject(cfgRaw)
+                val contacts = root["contacts"] as? Map<*, *>
+                if (contacts != null) {
+                    for ((k, v) in contacts) {
+                        val name = k?.toString()?.trim().orEmpty()
+                        val entry = v as? Map<*, *> ?: continue
+                        val num = entry["number"]?.toString()?.trim().orEmpty()
+                        val sim = entry["sim"]?.toString()?.trim().orEmpty()
+                        if (num.isNotEmpty() && (name.equals(raw, ignoreCase = true) || raw.contains(name))) {
+                            return num to sim
+                        }
+                    }
+                }
+            }
+        }
+        val digits = raw.replace(Regex("""[^\d+*#]"""), "")
+        return if (digits.length >= 3) digits to "" else null
+    }
+
+    fun loadPinnedWebApps(): List<com.oms.client.ui.cockpit.PinnedWebAppItem> {
+        val raw = prefs.getString("pinned_web_apps_v1", null) ?: return emptyList()
+        return runCatching {
+            val arr = org.json.JSONArray(raw)
+            (0 until arr.length()).mapNotNull { i ->
+                val o = arr.optJSONObject(i) ?: return@mapNotNull null
+                val url = o.optString("url", "").trim()
+                if (url.isBlank()) return@mapNotNull null
+                com.oms.client.ui.cockpit.PinnedWebAppItem(
+                    id = o.optString("id", "web_$i"),
+                    name = o.optString("name", url),
+                    url = url,
+                    tag = o.optString("tag", "自定义应用"),
+                    isBuiltin = false
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    fun savePinnedWebApps(items: List<com.oms.client.ui.cockpit.PinnedWebAppItem>) {
+        val arr = org.json.JSONArray()
+        items.filterNot { it.isBuiltin }.take(30).forEach { item ->
+            arr.put(
+                org.json.JSONObject()
+                    .put("id", item.id)
+                    .put("name", item.name)
+                    .put("url", item.url)
+                    .put("tag", item.tag)
+            )
+        }
+        prefs.edit().putString("pinned_web_apps_v1", arr.toString()).apply()
+    }
 }
