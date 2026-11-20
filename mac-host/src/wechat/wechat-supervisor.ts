@@ -3,6 +3,14 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { spawn, type ChildProcess } from "node:child_process";
+import type {
+  WeChatArticleAssetParams,
+  WeChatArticleAssetResult,
+  WeChatArticleDetailParams,
+  WeChatArticleDetailResult,
+  WeChatArticleListItem,
+  WeChatArticlesListResult,
+} from "@oms/shared-protocol";
 
 export interface ManagedWeChatEvent {
   eventType: "article" | "idea" | "plan" | "schedule";
@@ -350,6 +358,153 @@ export class WeChatBridgeSupervisor extends EventEmitter {
       throw new Error(data?.error || `Handoff failed with HTTP ${res.status}`);
     }
     return data;
+  }
+
+  private mapRawArticleSummary(raw: Record<string, any>): WeChatArticleListItem {
+    const notePath = typeof raw.note_md_path === "string" ? raw.note_md_path.trim() : "";
+    const sourcePath = typeof raw.source_md_path === "string" ? raw.source_md_path.trim() : "";
+    return {
+      id: Number(raw.id || 0),
+      title: String(raw.title || "").trim(),
+      author: String(raw.author || "").trim(),
+      url: String(raw.url || "").trim(),
+      publishDate: String(raw.publish_date || "").trim(),
+      createdAt: String(raw.created_at || "").trim(),
+      status: String(raw.status || "").trim(),
+      processLevel: String(raw.process_level || "").trim(),
+      triage: String(raw.triage || "").trim(),
+      userNotes: String(raw.user_notes || "").trim(),
+      shortSummary: String(raw.short_summary || "").trim(),
+      digest: String(raw.digest || "").trim(),
+      hasNote: Boolean(notePath && fs.existsSync(notePath)),
+      hasSource: Boolean(sourcePath && fs.existsSync(sourcePath)),
+      isFallbackNote: Boolean(raw.isFallbackNote),
+    };
+  }
+
+  private normalizeMatchTitle(raw: string): string {
+    return String(raw || "")
+      .replace(/^💬\s*/, "")
+      .replace(/[（(]初筛伴读笔记[)）]\s*$/, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+
+  public async fetchArticlesOverview(limit = 80): Promise<WeChatArticlesListResult> {
+    if (!this.isRunning()) {
+      return { ok: false, articles: [], error: "WeChat Context worker is not running" };
+    }
+    const clampedLimit = Math.min(200, Math.max(1, Math.floor(Number(limit) || 80)));
+    try {
+      const res = await fetch(`http://127.0.0.1:${this.internalPort}/api/overview?limit=${clampedLimit}`, {
+        headers: { Host: `127.0.0.1:${this.internalPort}` },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) {
+        return { ok: false, articles: [], error: `WeChat overview HTTP ${res.status}` };
+      }
+      const data = (await res.json()) as Record<string, any>;
+      const rawList = Array.isArray(data.articles) ? data.articles : [];
+      return {
+        ok: true,
+        articles: rawList
+          .map((item: Record<string, any>) => this.mapRawArticleSummary(item))
+          .filter((item: WeChatArticleListItem) => item.id > 0),
+      };
+    } catch (err: any) {
+      return { ok: false, articles: [], error: err?.message || String(err) };
+    }
+  }
+
+  public async fetchArticleDetail(params: WeChatArticleDetailParams): Promise<WeChatArticleDetailResult> {
+    if (!this.isRunning()) {
+      return { ok: false, error: "WeChat Context worker is not running" };
+    }
+    let targetId = Number(params.articleId || 0);
+    if (!Number.isFinite(targetId) || targetId <= 0) {
+      const overview = await this.fetchArticlesOverview(200);
+      if (overview.ok) {
+        const wantUrl = String(params.sourceUrl || "").trim();
+        const wantTitle = this.normalizeMatchTitle(params.title || "");
+        const matched = overview.articles.find((a) => {
+          if (wantUrl && a.url && a.url.trim() === wantUrl) return true;
+          if (wantTitle && this.normalizeMatchTitle(a.title) === wantTitle) return true;
+          return false;
+        });
+        if (matched) targetId = matched.id;
+      }
+    }
+    if (!Number.isFinite(targetId) || targetId <= 0) {
+      return { ok: false, error: "Article not found" };
+    }
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${this.internalPort}/api/article?id=${targetId}`, {
+        headers: { Host: `127.0.0.1:${this.internalPort}` },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) {
+        return { ok: false, error: `Article fetch HTTP ${res.status}` };
+      }
+      const data = (await res.json()) as Record<string, any>;
+      if (!data.ok || !data.article) {
+        return { ok: false, error: String(data.error || "Article not found") };
+      }
+      const mapped = this.mapRawArticleSummary(data.article);
+      mapped.hasNote = Boolean(data.noteMarkdown) || mapped.hasNote;
+      mapped.hasSource = Boolean(data.sourceMarkdown) || mapped.hasSource;
+      const summaryMarkdown = String(data.article.short_summary || data.article.digest || "").trim() || null;
+      return {
+        ok: true,
+        article: mapped,
+        noteMarkdown: typeof data.noteMarkdown === "string" ? data.noteMarkdown : null,
+        sourceMarkdown: typeof data.sourceMarkdown === "string" ? data.sourceMarkdown : null,
+        summaryMarkdown,
+        noteTruncated: Boolean(data.noteTruncated),
+        sourceTruncated: Boolean(data.sourceTruncated),
+      };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  }
+
+  public async fetchArticleAsset(params: WeChatArticleAssetParams): Promise<WeChatArticleAssetResult> {
+    if (!this.isRunning()) {
+      return { ok: false, error: "WeChat Context worker is not running" };
+    }
+    const articleId = Number(params.articleId || 0);
+    const relPath = String(params.path || "").trim();
+    const doc = params.doc === "note" ? "note" : "source";
+    if (!Number.isFinite(articleId) || articleId <= 0 || !relPath) {
+      return { ok: false, error: "Valid articleId and path required" };
+    }
+    try {
+      const qs = new URLSearchParams({
+        articleId: String(articleId),
+        doc,
+        path: relPath,
+      });
+      const res = await fetch(`http://127.0.0.1:${this.internalPort}/api/asset?${qs.toString()}`, {
+        headers: { Host: `127.0.0.1:${this.internalPort}` },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) {
+        return { ok: false, error: `Asset fetch HTTP ${res.status}` };
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.byteLength === 0 || buf.byteLength > 3 * 1024 * 1024) {
+        return { ok: false, error: "Asset empty or exceeds 3 MiB mobile cap" };
+      }
+      const mimeType = res.headers.get("content-type") || "image/jpeg";
+      return {
+        ok: true,
+        mimeType,
+        dataBase64: buf.toString("base64"),
+      };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err) };
+    }
   }
 
   public async stop(): Promise<void> {

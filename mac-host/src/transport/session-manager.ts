@@ -1888,6 +1888,8 @@ export class PhoneSessionManager extends EventEmitter {
     title?: string;
     intentTag?: IntentTag;
     enableCommuteTts?: boolean;
+    wechatArticleId?: number;
+    metadata?: Record<string, unknown>;
     timeoutMs?: number;
   }): Promise<{ streamId: string; sha256: string }> {
     const pipe = this.pipes.get(this.activeTier);
@@ -1909,6 +1911,8 @@ export class PhoneSessionManager extends EventEmitter {
       intentTag: opts.intentTag,
       title: opts.title,
       enableCommuteTts: opts.enableCommuteTts,
+      wechatArticleId: opts.wechatArticleId,
+      metadata: opts.metadata,
     };
 
     const effectiveTimeoutMs =

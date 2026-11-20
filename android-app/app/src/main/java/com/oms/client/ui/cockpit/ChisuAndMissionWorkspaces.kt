@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -25,9 +26,11 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -85,6 +88,9 @@ import com.oms.client.OmsApplication
 import com.oms.client.capability.NotificationExecutor
 import com.oms.client.capability.SpeechAudioPolicy
 import com.oms.client.capability.VoiceRecorderHelper
+import com.oms.client.cockpit.ChisuArticleDetailUi
+import com.oms.client.cockpit.ChisuArticleItemUi
+import com.oms.client.cockpit.ChisuDocumentParser
 import com.oms.client.cockpit.CockpitRuntimeCoordinator
 import com.oms.client.cockpit.RemoteAgentBackendQuotaUi
 import com.oms.client.cockpit.RemoteAgentQuotasUi
@@ -118,61 +124,102 @@ import java.util.Date
 import java.util.Locale
 
 // =============================================================================
-// Workspace 2 (`尺素`): Magazine Digest Stream + Immersive Paper Reader
+// Workspace 2 (`尺素`): Magazine Digest Stream + Mac-Parity Dual-Doc Paper Reader
 // =============================================================================
+private enum class ChisuReaderDocMode {
+    REPORT,
+    SUMMARY,
+    SOURCE
+}
+
 @Composable
 fun ChisuWorkspaceView(
+    coordinator: CockpitRuntimeCoordinator,
+    macConnected: Boolean,
     streamItems: List<StreamItemModel>,
-    onDiscussArticleInChat: (StreamItemModel) -> Unit,
-    onSendArticleToMacAgent: (StreamItemModel) -> Unit
+    onDiscussArticleInChat: (title: String, cleanBody: String) -> Unit,
+    onSendArticleToMacAgent: (title: String, cleanBody: String) -> Unit
 ) {
     val context = LocalContext.current
     val palette = OmsTheme.colors
     val app = OmsApplication.instance ?: return
     val isSpeaking by NotificationExecutor.isSpeakingFlow.collectAsState()
+    val macArticles by coordinator.chisuArticlesFlow.collectAsState()
+    val isRefreshing by coordinator.isRefreshingChisuFlow.collectAsState()
+    val activeDetail by coordinator.activeChisuDetailFlow.collectAsState()
+    val isLoadingDetail by coordinator.isLoadingChisuDetailFlow.collectAsState()
+    val detailError by coordinator.chisuDetailErrorFlow.collectAsState()
+
     var filterKey by remember { mutableStateOf("ALL") }
-    var activeReaderItemId by remember { mutableStateOf<String?>(null) }
+    var searchVisible by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+    var activeOpenedItem by remember { mutableStateOf<ChisuArticleItemUi?>(null) }
 
-    val chisuItems = remember(streamItems) {
-        streamItems.filter {
-            it.intentTag.contains("wechat", ignoreCase = true) ||
-                it.intentTag == "pkb_vault" ||
-                it.title?.contains("《") == true ||
-                it.textContent?.contains("脱水干货") == true ||
-                (it.direction == "MAC_TO_PHONE" && !it.textContent.isNullOrBlank() && it.itemType != "APPROVAL")
+    LaunchedEffect(Unit, macConnected) {
+        if (macConnected) coordinator.refreshChisuArticles()
+    }
+
+    val mergedArticles = remember(macArticles, streamItems) {
+        ChisuDocumentParser.mergeChisuLibrary(macArticles, streamItems)
+    }
+
+    val edgeCount = remember(mergedArticles) { mergedArticles.count { it.isEdgeNightStandby } }
+    val withSourceCount = remember(mergedArticles) { mergedArticles.count { it.hasSource } }
+
+    val filteredItems = remember(mergedArticles, filterKey, searchQuery) {
+        val q = searchQuery.trim().lowercase(Locale.ROOT)
+        mergedArticles.filter { item ->
+            val matchFilter = when (filterKey) {
+                "WITH_SOURCE" -> item.hasSource
+                "EDGE_NIGHT" -> item.isEdgeNightStandby
+                else -> true
+            }
+            if (!matchFilter) return@filter false
+            if (q.isEmpty()) return@filter true
+            item.title.lowercase(Locale.ROOT).contains(q) ||
+                item.author.lowercase(Locale.ROOT).contains(q) ||
+                item.previewExcerpt.lowercase(Locale.ROOT).contains(q) ||
+                item.userNotes.lowercase(Locale.ROOT).contains(q)
         }
     }
 
-    val filteredItems = remember(chisuItems, filterKey) {
-        when (filterKey) {
-            "EDGE_NIGHT" -> chisuItems.filter { it.intentTag == "wechat_edge_standby" }
-            else -> chisuItems
+    if (activeDetail != null) {
+        BackHandler {
+            activeOpenedItem = null
+            coordinator.closeChisuArticle()
         }
-    }
-
-    val activeReaderItem = remember(streamItems, activeReaderItemId) {
-        activeReaderItemId?.let { id -> streamItems.firstOrNull { it.itemId == id } }
-    }
-
-    if (activeReaderItem != null) {
-        BackHandler { activeReaderItemId = null }
         ChisuImmersiveReaderScreen(
-            item = activeReaderItem,
-            onBack = { activeReaderItemId = null },
-            onDiscussInChat = {
-                activeReaderItemId = null
-                onDiscussArticleInChat(activeReaderItem)
+            detail = activeDetail!!,
+            isLoadingRemote = isLoadingDetail,
+            loadError = detailError,
+            macConnected = macConnected,
+            isSpeaking = isSpeaking,
+            onBack = {
+                activeOpenedItem = null
+                coordinator.closeChisuArticle()
             },
-            onSendToAgent = {
-                activeReaderItemId = null
-                onSendArticleToMacAgent(activeReaderItem)
+            onRefreshFromMac = {
+                activeOpenedItem?.let { coordinator.openChisuArticle(it, forceRefresh = true) }
+            },
+            onLoadImageBytes = { docKind, src ->
+                coordinator.loadChisuInlineImageBytes(activeDetail?.articleId, docKind, src)
+            },
+            onDiscussInChat = { title, cleanBody ->
+                activeOpenedItem = null
+                coordinator.closeChisuArticle()
+                onDiscussArticleInChat(title, cleanBody)
+            },
+            onSendToAgent = { title, cleanBody ->
+                activeOpenedItem = null
+                coordinator.closeChisuArticle()
+                onSendArticleToMacAgent(title, cleanBody)
             }
         )
         return
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // Minimalist Filter & Commute Radio Header
+        // Minimalist Filter, Search, Sync & Commute Radio Header
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -182,53 +229,143 @@ fun ChisuWorkspaceView(
         ) {
             Row(
                 modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 OmsTogglePill(
-                    label = "全部精读 (${chisuItems.size})",
+                    label = "全部 (${mergedArticles.size})",
                     active = filterKey == "ALL",
                     icon = OmsIcons.BookOpen,
                     onClick = { filterKey = "ALL" }
                 )
-                OmsTogglePill(
-                    label = "手机休眠抢答",
-                    active = filterKey == "EDGE_NIGHT",
-                    icon = OmsIcons.Moon,
-                    onClick = { filterKey = "EDGE_NIGHT" }
-                )
+                if (withSourceCount > 0) {
+                    OmsTogglePill(
+                        label = "含原文 ($withSourceCount)",
+                        active = filterKey == "WITH_SOURCE",
+                        icon = OmsIcons.FileText,
+                        onClick = { filterKey = "WITH_SOURCE" }
+                    )
+                }
+                if (edgeCount > 0) {
+                    OmsTogglePill(
+                        label = "夜间抢答",
+                        active = filterKey == "EDGE_NIGHT",
+                        icon = OmsIcons.Moon,
+                        onClick = { filterKey = "EDGE_NIGHT" }
+                    )
+                }
             }
 
-            Spacer(modifier = Modifier.width(8.dp))
+            Spacer(modifier = Modifier.width(6.dp))
 
-            OmsPrimaryButton(
-                label = if (isSpeaking) "停止联播" else "通勤联播",
-                icon = if (isSpeaking) OmsIcons.StopSquare else OmsIcons.Waveform,
-                height = 33.dp,
-                containerColor = if (isSpeaking) palette.danger else palette.sendButtonBg,
-                contentColor = if (isSpeaking) Color.White else palette.sendButtonFg,
-                onClick = {
-                    if (isSpeaking) {
-                        NotificationExecutor.stopSpeaking(context)
-                    } else {
-                        val playlist = filteredItems
-                            .filter { !it.textContent.isNullOrBlank() }
-                            .take(5)
-                            .joinToString("\n\n下一篇：\n") {
-                                "${it.title ?: "尺素简报"}。${it.textContent.orEmpty().take(750)}"
-                            }
-                        if (playlist.isNotBlank()) {
-                            app.transportClient.speakTextSmart(
-                                playlist,
-                                useAlarmStream = false,
-                                audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE
-                            )
-                            OmsFeedbackController.show("已开启尺素通勤语音联播", OmsToastKind.INFO)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                OmsCircleIconButton(
+                    icon = OmsIcons.Search,
+                    contentDescription = "搜索文章",
+                    size = 33.dp,
+                    iconSize = 16.dp,
+                    containerColor = if (searchVisible) palette.accentSoft else palette.subtleSurface,
+                    contentColor = if (searchVisible) palette.accent else palette.textSecondary,
+                    borderColor = if (searchVisible) palette.accent.copy(alpha = 0.45f) else palette.hairline,
+                    onClick = {
+                        searchVisible = !searchVisible
+                        if (!searchVisible) searchQuery = ""
+                    }
+                )
+                if (macConnected) {
+                    OmsCircleIconButton(
+                        icon = OmsIcons.Refresh,
+                        contentDescription = "同步 Mac 尺素库",
+                        size = 33.dp,
+                        iconSize = 16.dp,
+                        containerColor = palette.subtleSurface,
+                        contentColor = if (isRefreshing) palette.accent else palette.textSecondary,
+                        borderColor = palette.hairline,
+                        onClick = {
+                            coordinator.vibrateTick()
+                            coordinator.refreshChisuArticles()
+                        }
+                    )
+                }
+                OmsPrimaryButton(
+                    label = if (isSpeaking) "停止" else "联播",
+                    icon = if (isSpeaking) OmsIcons.StopSquare else OmsIcons.Waveform,
+                    height = 33.dp,
+                    containerColor = if (isSpeaking) palette.danger else palette.sendButtonBg,
+                    contentColor = if (isSpeaking) Color.White else palette.sendButtonFg,
+                    onClick = {
+                        if (isSpeaking) {
+                            NotificationExecutor.stopSpeaking(context)
                         } else {
-                            OmsFeedbackController.show("暂无可朗读的伴读文章", OmsToastKind.WARNING)
+                            val playlist = filteredItems
+                                .mapNotNull { item ->
+                                    val raw = item.localNoteMarkdown ?: item.shortSummary
+                                    val clean = ChisuDocumentParser.cleanForTts(raw, item.title)
+                                    clean.takeIf { it.isNotBlank() }?.take(750)
+                                }
+                                .take(5)
+                                .joinToString("\n\n下一篇：\n")
+                            if (playlist.isNotBlank()) {
+                                app.transportClient.speakTextSmart(
+                                    playlist,
+                                    useAlarmStream = false,
+                                    audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE
+                                )
+                                OmsFeedbackController.show("已开启尺素通勤语音联播", OmsToastKind.INFO)
+                            } else {
+                                OmsFeedbackController.show("暂无可朗读的伴读文章", OmsToastKind.WARNING)
+                            }
                         }
                     }
+                )
+            }
+        }
+
+        AnimatedVisibility(
+            visible = searchVisible,
+            enter = expandVertically(tween(180)) + fadeIn(tween(150)),
+            exit = shrinkVertically(tween(150)) + fadeOut(tween(120))
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 16.dp, end = 16.dp, bottom = 8.dp)
+                    .height(38.dp)
+                    .clip(RoundedCornerShape(19.dp))
+                    .background(palette.subtleSurface)
+                    .border(0.6.dp, palette.hairline, RoundedCornerShape(19.dp))
+                    .padding(horizontal = 12.dp)
+            ) {
+                Icon(OmsIcons.Search, contentDescription = null, tint = palette.textTertiary, modifier = Modifier.size(15.dp))
+                Box(modifier = Modifier.weight(1f)) {
+                    if (searchQuery.isEmpty()) {
+                        Text("搜索标题、公众号、批注或正文摘要…", color = palette.textTertiary, fontSize = 13.sp)
+                    }
+                    BasicTextField(
+                        value = searchQuery,
+                        onValueChange = { searchQuery = it },
+                        singleLine = true,
+                        textStyle = TextStyle(color = palette.textPrimary, fontSize = 13.5.sp),
+                        cursorBrush = SolidColor(palette.accent),
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
-            )
+                if (searchQuery.isNotEmpty()) {
+                    OmsCircleIconButton(
+                        icon = OmsIcons.Close,
+                        contentDescription = "清空搜索",
+                        size = 24.dp,
+                        iconSize = 13.dp,
+                        contentColor = palette.textTertiary,
+                        onClick = { searchQuery = "" }
+                    )
+                }
+            }
         }
 
         if (filteredItems.isEmpty()) {
@@ -247,10 +384,19 @@ fun ChisuWorkspaceView(
                     Icon(OmsIcons.BookOpen, contentDescription = null, tint = palette.textTertiary, modifier = Modifier.size(24.dp))
                 }
                 Spacer(modifier = Modifier.height(14.dp))
-                Text("暂无尺素伴读笔记", color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                Text(
+                    text = if (searchQuery.isNotBlank()) "未找到匹配的文章" else "暂无尺素伴读笔记",
+                    color = palette.textPrimary,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    "在微信将公众号文章转发给「尺素」即可自动精析入库\nMac 休眠时将由手机咫尺自动无缝接管",
+                    text = if (searchQuery.isNotBlank()) {
+                        "尝试换个关键词，或清空筛选查看全部归档"
+                    } else {
+                        "在微信将公众号文章转发给「尺素」即可自动精析入库\n连通 Mac 后可同步查看全部伴读报告与保存原文"
+                    },
                     color = palette.textTertiary,
                     fontSize = 13.sp,
                     lineHeight = 20.sp
@@ -260,12 +406,15 @@ fun ChisuWorkspaceView(
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 32.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(11.dp)
             ) {
-                items(items = filteredItems, key = { it.itemId }) { item ->
+                items(items = filteredItems, key = { it.stableKey }) { item ->
                     ChisuMagazineDigestCard(
                         item = item,
-                        onClick = { activeReaderItemId = item.itemId }
+                        onClick = {
+                            activeOpenedItem = item
+                            coordinator.openChisuArticle(item)
+                        }
                     )
                 }
             }
@@ -275,21 +424,27 @@ fun ChisuWorkspaceView(
 
 @Composable
 private fun ChisuMagazineDigestCard(
-    item: StreamItemModel,
+    item: ChisuArticleItemUi,
     onClick: () -> Unit
 ) {
     val palette = OmsTheme.colors
     val timeLabel = remember(item.createdAtMs) {
         SimpleDateFormat("MM月dd日 HH:mm", Locale.CHINA).format(Date(item.createdAtMs))
     }
-    val isNightEdge = item.intentTag == "wechat_edge_standby"
-    val body = remember(item.textContent, item.voiceTranscript) {
-        (item.textContent ?: item.voiceTranscript ?: "")
-            .replace(Regex("[#*>`\\-]+"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
+    val triageLabel = remember(item.triage, item.processLevel) {
+        ChisuDocumentParser.triageDisplayLabel(item.triage, item.processLevel)
     }
-    val estReadMin = remember(body) { (body.length / 360).coerceAtLeast(1) }
+    val sourceLabel = remember(item.author, item.isEdgeNightStandby) {
+        when {
+            item.author.isNotBlank() -> item.author
+            item.isEdgeNightStandby -> "手机夜间初筛"
+            else -> "尺素伴读"
+        }
+    }
+    val estReadMin = remember(item.localNoteMarkdown, item.previewExcerpt) {
+        val len = item.localNoteMarkdown?.length ?: item.previewExcerpt.length
+        (len / 360).coerceAtLeast(1)
+    }
 
     OmsSurfaceCard(
         cornerRadius = 18.dp,
@@ -297,6 +452,7 @@ private fun ChisuMagazineDigestCard(
         onClick = onClick,
         modifier = Modifier.fillMaxWidth()
     ) {
+        // Top clean editorial meta line: Author/Source + Date
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -304,33 +460,45 @@ private fun ChisuMagazineDigestCard(
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.weight(1f)
             ) {
                 Icon(
-                    imageVector = if (isNightEdge) OmsIcons.Moon else OmsIcons.BookOpen,
+                    imageVector = if (item.isEdgeNightStandby) OmsIcons.Moon else OmsIcons.BookOpen,
                     contentDescription = null,
                     tint = palette.accent,
                     modifier = Modifier.size(13.5.dp)
                 )
                 Text(
-                    text = if (isNightEdge) "手机夜间直连初筛" else "尺素伴读",
+                    text = sourceLabel,
                     color = palette.accent,
-                    fontSize = 11.5.sp,
-                    fontWeight = FontWeight.SemiBold
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.widthIn(max = 140.dp)
                 )
-                Text(
-                    text = "· 约 $estReadMin 分钟",
-                    color = palette.textTertiary,
-                    fontSize = 11.5.sp
-                )
+                if (triageLabel.isNotBlank()) {
+                    Text(
+                        text = triageLabel,
+                        color = palette.textSecondary,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(palette.subtleSurface)
+                            .padding(horizontal = 6.dp, vertical = 1.5.dp)
+                    )
+                }
             }
+            Spacer(modifier = Modifier.width(8.dp))
             Text(timeLabel, color = palette.textTertiary, fontSize = 11.5.sp)
         }
 
         Spacer(modifier = Modifier.height(8.dp))
 
         Text(
-            text = item.title?.takeIf { it.isNotBlank() } ?: "未命名伴读笔记",
+            text = item.title.ifBlank { "未命名伴读笔记" },
             color = palette.textPrimary,
             fontSize = 16.5.sp,
             fontWeight = FontWeight.SemiBold,
@@ -339,10 +507,32 @@ private fun ChisuMagazineDigestCard(
             overflow = TextOverflow.Ellipsis
         )
 
-        if (body.isNotBlank()) {
+        if (item.userNotes.isNotBlank()) {
             Spacer(modifier = Modifier.height(6.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(palette.accentSoft)
+                    .padding(horizontal = 9.dp, vertical = 5.dp)
+            ) {
+                Text(
+                    text = "批注：${item.userNotes}",
+                    color = palette.textSecondary,
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+
+        if (item.previewExcerpt.isNotBlank()) {
+            Spacer(modifier = Modifier.height(7.dp))
             Text(
-                text = body.take(180),
+                text = item.previewExcerpt,
                 color = palette.textSecondary,
                 fontSize = 14.sp,
                 lineHeight = 21.sp,
@@ -350,21 +540,150 @@ private fun ChisuMagazineDigestCard(
                 overflow = TextOverflow.Ellipsis
             )
         }
+
+        Spacer(modifier = Modifier.height(9.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "约 $estReadMin 分钟阅读",
+                color = palette.textTertiary,
+                fontSize = 11.5.sp
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (item.hasSource) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(3.dp),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(7.dp))
+                            .background(palette.subtleSurface)
+                            .padding(horizontal = 7.dp, vertical = 2.5.dp)
+                    ) {
+                        Icon(OmsIcons.FileText, contentDescription = null, tint = palette.textSecondary, modifier = Modifier.size(11.dp))
+                        Text("含原文", color = palette.textSecondary, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                    }
+                }
+            }
+        }
     }
 }
 
 @Composable
 private fun ChisuImmersiveReaderScreen(
-    item: StreamItemModel,
+    detail: ChisuArticleDetailUi,
+    isLoadingRemote: Boolean,
+    loadError: String?,
+    macConnected: Boolean,
+    isSpeaking: Boolean,
     onBack: () -> Unit,
-    onDiscussInChat: () -> Unit,
-    onSendToAgent: () -> Unit
+    onRefreshFromMac: () -> Unit,
+    onLoadImageBytes: suspend (docKind: String, src: String) -> ByteArray?,
+    onDiscussInChat: (title: String, cleanBody: String) -> Unit,
+    onSendToAgent: (title: String, cleanBody: String) -> Unit
 ) {
     val context = LocalContext.current
     val palette = OmsTheme.colors
-    val body = item.textContent ?: item.voiceTranscript ?: ""
-    val timeLabel = remember(item.createdAtMs) {
-        SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(Date(item.createdAtMs))
+    val scrollState = rememberScrollState()
+
+    val parsedNote = remember(detail.noteMarkdown, detail.title) {
+        detail.noteMarkdown?.takeIf { it.isNotBlank() }?.let {
+            ChisuDocumentParser.parse(it, fallbackTitle = detail.title, stripHeaderBlock = true)
+        }
+    }
+    val parsedSource = remember(detail.sourceMarkdown, detail.title) {
+        detail.sourceMarkdown?.takeIf { it.isNotBlank() }?.let {
+            ChisuDocumentParser.parse(it, fallbackTitle = detail.title, stripHeaderBlock = true)
+        }
+    }
+    val parsedSummary = remember(detail.summaryMarkdown, detail.title) {
+        detail.summaryMarkdown?.takeIf { it.isNotBlank() }?.let {
+            ChisuDocumentParser.parse(it, fallbackTitle = detail.title, stripHeaderBlock = false)
+        }
+    }
+
+    val hasDistinctSummary = remember(parsedSummary, parsedNote) {
+        val sum = parsedSummary?.bodyMarkdown.orEmpty().trim()
+        val note = parsedNote?.bodyMarkdown.orEmpty().trim()
+        sum.isNotBlank() && sum != note
+    }
+
+    var docMode by remember(detail.stableKey) {
+        mutableStateOf(
+            if (parsedNote != null || parsedSummary != null) ChisuReaderDocMode.REPORT else ChisuReaderDocMode.SOURCE
+        )
+    }
+
+    // Reset scroll cleanly when user toggles between Report / Summary / Original Source
+    LaunchedEffect(docMode, detail.stableKey) {
+        scrollState.scrollTo(0)
+    }
+
+    val displayTitle = remember(detail.title, parsedNote, parsedSource) {
+        ChisuDocumentParser.cleanTitle(detail.title)
+            .ifBlank { parsedNote?.cleanTitle.orEmpty() }
+            .ifBlank { parsedSource?.cleanTitle.orEmpty() }
+            .ifBlank { "尺素伴读" }
+    }
+    val author = remember(detail.author, parsedNote, parsedSource) {
+        detail.author.ifBlank { parsedNote?.author.orEmpty() }.ifBlank { parsedSource?.author.orEmpty() }
+    }
+    val sourceUrl = remember(detail.sourceUrl, parsedNote, parsedSource) {
+        detail.sourceUrl.ifBlank { parsedNote?.sourceUrl.orEmpty() }.ifBlank { parsedSource?.sourceUrl.orEmpty() }
+    }
+    val publishDate = remember(detail.publishDate, parsedNote, parsedSource) {
+        detail.publishDate.ifBlank { parsedSource?.publishDate.orEmpty() }.ifBlank { parsedNote?.publishDate.orEmpty() }
+    }
+    val userNotes = remember(detail.userNotes, parsedNote, parsedSource) {
+        detail.userNotes.ifBlank { parsedSource?.userNotes.orEmpty() }.ifBlank { parsedNote?.userNotes.orEmpty() }
+    }
+    val triageLabel = remember(detail.triage, detail.processLevel, parsedNote, parsedSource) {
+        ChisuDocumentParser.triageDisplayLabel(
+            triage = detail.triage.ifBlank { parsedNote?.triage.orEmpty() }.ifBlank { parsedSource?.triage.orEmpty() },
+            processLevel = detail.processLevel.ifBlank { parsedNote?.processLevel.orEmpty() }
+        )
+    }
+    val timeLabel = remember(detail.createdAtMs, publishDate, parsedNote, parsedSource) {
+        when {
+            publishDate.isNotBlank() -> publishDate
+            !parsedSource?.capturedDate.isNullOrBlank() -> parsedSource!!.capturedDate
+            !parsedNote?.capturedDate.isNullOrBlank() -> parsedNote!!.capturedDate
+            detail.createdAtMs > 0L -> SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(Date(detail.createdAtMs))
+            else -> ""
+        }
+    }
+
+    val activeBodyMarkdown = when (docMode) {
+        ChisuReaderDocMode.REPORT -> parsedNote?.bodyMarkdown ?: parsedSummary?.bodyMarkdown ?: ""
+        ChisuReaderDocMode.SUMMARY -> parsedSummary?.bodyMarkdown ?: parsedNote?.bodyMarkdown ?: ""
+        ChisuReaderDocMode.SOURCE -> parsedSource?.bodyMarkdown ?: ""
+    }
+    val activeDocKind = if (docMode == ChisuReaderDocMode.SOURCE) "source" else "note"
+    val activeDocLabel = when (docMode) {
+        ChisuReaderDocMode.REPORT -> "分析报告"
+        ChisuReaderDocMode.SUMMARY -> "初筛摘要"
+        ChisuReaderDocMode.SOURCE -> "保存原文"
+    }
+    val estReadMin = remember(activeBodyMarkdown) {
+        (activeBodyMarkdown.length / 360).coerceAtLeast(1)
+    }
+
+    val segmentItems = remember(hasDistinctSummary) {
+        if (hasDistinctSummary) {
+            listOf(
+                OmsSegmentItem(ChisuReaderDocMode.REPORT, "分析报告"),
+                OmsSegmentItem(ChisuReaderDocMode.SUMMARY, "初筛摘要"),
+                OmsSegmentItem(ChisuReaderDocMode.SOURCE, "保存原文")
+            )
+        } else {
+            listOf(
+                OmsSegmentItem(ChisuReaderDocMode.REPORT, "分析报告"),
+                OmsSegmentItem(ChisuReaderDocMode.SOURCE, "保存原文")
+            )
+        }
     }
 
     Box(modifier = Modifier.fillMaxSize().background(palette.canvas)) {
@@ -384,39 +703,86 @@ private fun ChisuImmersiveReaderScreen(
                     onClick = onBack
                 )
 
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (macConnected) {
+                        OmsCircleIconButton(
+                            icon = OmsIcons.Refresh,
+                            contentDescription = "从 Mac 重新同步",
+                            size = 34.dp,
+                            iconSize = 16.5.dp,
+                            contentColor = if (isLoadingRemote) palette.accent else palette.textSecondary,
+                            onClick = onRefreshFromMac
+                        )
+                    }
                     OmsMorphIconAction(
                         icon = OmsIcons.Copy,
-                        contentDescription = "复制全文",
+                        contentDescription = "复制当前内容",
                         tint = palette.textPrimary,
                         iconSize = 18.dp,
                         onClick = {
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                            cm?.setPrimaryClip(ClipData.newPlainText("chisu", body))
-                            OmsFeedbackController.show("已复制伴读笔记全文", OmsToastKind.SUCCESS)
+                            if (activeBodyMarkdown.isNotBlank()) {
+                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                cm?.setPrimaryClip(ClipData.newPlainText("chisu", "$displayTitle\n\n$activeBodyMarkdown"))
+                                OmsFeedbackController.show("已复制${activeDocLabel}", OmsToastKind.SUCCESS)
+                            } else {
+                                OmsFeedbackController.show("当前视图暂无可复制正文", OmsToastKind.WARNING)
+                            }
                         }
                     )
                     OmsCircleIconButton(
-                        icon = OmsIcons.Volume,
-                        contentDescription = "朗读本篇",
+                        icon = if (isSpeaking) OmsIcons.StopSquare else OmsIcons.Volume,
+                        contentDescription = if (isSpeaking) "停止朗读" else "朗读本篇",
+                        contentColor = if (isSpeaking) palette.danger else palette.textPrimary,
                         onClick = {
-                            if (body.isNotBlank()) {
-                                val speakStr = "${item.title.orEmpty()}。$body"
+                            if (isSpeaking) {
+                                NotificationExecutor.stopSpeaking(context)
+                            } else if (activeBodyMarkdown.isNotBlank()) {
+                                val speakStr = ChisuDocumentParser.cleanForTts(activeBodyMarkdown, displayTitle)
                                 val tc = OmsApplication.instance?.transportClient
                                 if (tc != null) {
                                     tc.speakTextSmart(speakStr, useAlarmStream = false, audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE)
                                 } else {
                                     NotificationExecutor.speakText(context, speakStr, useAlarmStream = false, audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE)
                                 }
+                            } else {
+                                OmsFeedbackController.show("当前视图暂无可朗读正文", OmsToastKind.WARNING)
                             }
                         }
                     )
                     OmsCircleIconButton(
                         icon = OmsIcons.Laptop,
                         contentDescription = "派发至 Mac 验证",
-                        onClick = onSendToAgent
+                        onClick = {
+                            val bestBody = activeBodyMarkdown.ifBlank {
+                                parsedNote?.bodyMarkdown ?: parsedSource?.bodyMarkdown ?: ""
+                            }
+                            onSendToAgent(displayTitle, bestBody)
+                        }
                     )
                 }
+            }
+
+            // Mac-Parity Document Mode Switcher: 分析报告 | (初筛摘要) | 保存原文
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(palette.topBar)
+                    .padding(start = 16.dp, end = 16.dp, bottom = 10.dp)
+            ) {
+                OmsSlidingSegmentedBar(
+                    items = segmentItems,
+                    selected = if (!hasDistinctSummary && docMode == ChisuReaderDocMode.SUMMARY) {
+                        ChisuReaderDocMode.REPORT
+                    } else {
+                        docMode
+                    },
+                    onSelect = { docMode = it },
+                    height = 34.dp,
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
 
             Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
@@ -426,32 +792,228 @@ private fun ChisuImmersiveReaderScreen(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .verticalScroll(rememberScrollState())
-                    .padding(start = 22.dp, end = 22.dp, top = 20.dp, bottom = 96.dp)
+                    .verticalScroll(scrollState)
+                    .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 96.dp)
             ) {
-                if (!item.title.isNullOrBlank()) {
-                    Text(
-                        text = item.title,
-                        color = palette.textPrimary,
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.Bold,
-                        lineHeight = 31.sp,
-                        letterSpacing = (-0.3).sp
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                }
                 Text(
-                    text = "$timeLabel · 青简尺素归档",
-                    color = palette.textTertiary,
-                    fontSize = 12.5.sp
+                    text = displayTitle,
+                    color = palette.textPrimary,
+                    fontSize = 21.5.sp,
+                    fontWeight = FontWeight.Bold,
+                    lineHeight = 30.sp,
+                    letterSpacing = (-0.3).sp
                 )
-                Spacer(modifier = Modifier.height(20.dp))
 
-                IncrementalMarkdownView(
-                    markdown = body,
-                    bodyFontSize = 16.sp,
-                    bodyLineHeight = 27.5.sp
-                )
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Compact, clean editorial metadata strip (replaces verbose YAML & raw URLs)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(7.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (author.isNotBlank()) {
+                        ChisuMetaChip(label = author, emphasized = true)
+                    }
+                    if (timeLabel.isNotBlank()) {
+                        ChisuMetaChip(label = timeLabel)
+                    }
+                    if (triageLabel.isNotBlank()) {
+                        ChisuMetaChip(label = triageLabel)
+                    }
+                    if (activeBodyMarkdown.isNotBlank()) {
+                        ChisuMetaChip(label = "约 $estReadMin 分钟")
+                    }
+                    if (sourceUrl.isNotBlank()) {
+                        val chipShape = RoundedCornerShape(10.dp)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier
+                                .omsBounceClick(scaleDown = 0.94f, shape = chipShape) {
+                                    runCatching {
+                                        context.startActivity(
+                                            Intent(Intent.ACTION_VIEW, Uri.parse(sourceUrl))
+                                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        )
+                                    }
+                                }
+                                .background(palette.accentSoft, chipShape)
+                                .border(0.6.dp, palette.accent.copy(alpha = 0.35f), chipShape)
+                                .padding(horizontal = 9.dp, vertical = 4.dp)
+                        ) {
+                            Icon(OmsIcons.Globe, contentDescription = null, tint = palette.accent, modifier = Modifier.size(12.dp))
+                            Text("原网页", color = palette.accent, fontSize = 11.5.sp, fontWeight = FontWeight.Medium)
+                        }
+                    }
+                }
+
+                // Subtle User Annotation Callout (matches Mac HUD / Web Dashboard)
+                if (userNotes.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(IntrinsicSize.Min)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(palette.accentSoft)
+                            .padding(horizontal = 12.dp, vertical = 9.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .width(3.dp)
+                                .fillMaxHeight()
+                                .clip(RoundedCornerShape(1.5.dp))
+                                .background(palette.accent)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "你的转发批注",
+                                color = palette.accent,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = userNotes,
+                                color = palette.textPrimary,
+                                fontSize = 13.5.sp,
+                                lineHeight = 20.sp
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
+                Spacer(modifier = Modifier.height(16.dp))
+
+                when {
+                    activeBodyMarkdown.isNotBlank() -> {
+                        if (isLoadingRemote && docMode == ChisuReaderDocMode.SOURCE) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.padding(bottom = 12.dp)
+                            ) {
+                                CircularProgressIndicator(
+                                    strokeWidth = 2.dp,
+                                    color = palette.accent,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text("正在与 Mac 校验最新版本…", color = palette.textTertiary, fontSize = 12.sp)
+                            }
+                        }
+
+                        val imgLoader = remember(detail.articleId, activeDocKind) {
+                            val fn: suspend (String) -> ByteArray? = { src ->
+                                onLoadImageBytes(activeDocKind, src)
+                            }
+                            fn
+                        }
+                        IncrementalMarkdownView(
+                            markdown = activeBodyMarkdown,
+                            bodyFontSize = 16.sp,
+                            bodyLineHeight = 27.5.sp,
+                            imageBytesLoader = imgLoader
+                        )
+
+                        if ((docMode == ChisuReaderDocMode.SOURCE && detail.sourceTruncated) ||
+                            (docMode == ChisuReaderDocMode.REPORT && detail.noteTruncated)
+                        ) {
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = "（内容较长，移动端已按阅读上限安全截断；完整文件可在 Mac 知识库查看）",
+                                color = palette.textTertiary,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+
+                    isLoadingRemote -> {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 48.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            CircularProgressIndicator(strokeWidth = 2.4.dp, color = palette.accent, modifier = Modifier.size(26.dp))
+                            Text(
+                                text = if (docMode == ChisuReaderDocMode.SOURCE) "正在从 Mac 拉取保存的原文…" else "正在从 Mac 加载伴读内容…",
+                                color = palette.textSecondary,
+                                fontSize = 13.5.sp
+                            )
+                        }
+                    }
+
+                    else -> {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(palette.subtleSurface)
+                                .border(0.6.dp, palette.hairline, RoundedCornerShape(16.dp))
+                                .padding(horizontal = 20.dp, vertical = 26.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (docMode == ChisuReaderDocMode.SOURCE) OmsIcons.FileText else OmsIcons.BookOpen,
+                                contentDescription = null,
+                                tint = palette.textTertiary,
+                                modifier = Modifier.size(26.dp)
+                            )
+                            Text(
+                                text = when {
+                                    docMode == ChisuReaderDocMode.SOURCE && !macConnected -> "尚未在本地缓存此篇原文"
+                                    docMode == ChisuReaderDocMode.SOURCE -> "暂未找到本地归档原文"
+                                    else -> "暂无该视图内容"
+                                },
+                                color = palette.textPrimary,
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = when {
+                                    !loadError.isNullOrBlank() -> loadError
+                                    docMode == ChisuReaderDocMode.SOURCE && !macConnected ->
+                                        "连接 Mac 后会自动拉取归档原文并缓存到手机，之后离线也可随时阅读"
+                                    docMode == ChisuReaderDocMode.SOURCE ->
+                                        "这篇记录可能是早报/纯笔记，或 Mac 端尚未保存对应的 _source.md 原文文件"
+                                    else -> "可切换到其他标签查看已保存内容"
+                                },
+                                color = palette.textTertiary,
+                                fontSize = 12.5.sp,
+                                lineHeight = 19.sp
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                if (macConnected) {
+                                    OmsSecondaryButton(
+                                        label = "重新拉取",
+                                        icon = OmsIcons.Refresh,
+                                        onClick = onRefreshFromMac
+                                    )
+                                }
+                                if (sourceUrl.isNotBlank()) {
+                                    OmsPrimaryButton(
+                                        label = "打开原网页",
+                                        icon = OmsIcons.Globe,
+                                        onClick = {
+                                            runCatching {
+                                                context.startActivity(
+                                                    Intent(Intent.ACTION_VIEW, Uri.parse(sourceUrl))
+                                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                )
+                                            }
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -465,7 +1027,12 @@ private fun ChisuImmersiveReaderScreen(
                 .navigationBarsPadding()
                 .padding(horizontal = 20.dp, vertical = 14.dp)
                 .shadow(elevation = 8.dp, shape = askShape, clip = false)
-                .omsBounceClick(scaleDown = 0.96f, shape = askShape, onClick = onDiscussInChat)
+                .omsBounceClick(scaleDown = 0.96f, shape = askShape) {
+                    val bestBody = activeBodyMarkdown.ifBlank {
+                        parsedNote?.bodyMarkdown ?: parsedSource?.bodyMarkdown ?: ""
+                    }
+                    onDiscussInChat(displayTitle, bestBody)
+                }
                 .background(palette.composer, askShape)
                 .border(0.7.dp, palette.strongBorder, askShape)
                 .padding(horizontal = 18.dp, vertical = 11.dp)
@@ -490,6 +1057,26 @@ private fun ChisuImmersiveReaderScreen(
             )
         }
     }
+}
+
+@Composable
+private fun ChisuMetaChip(
+    label: String,
+    emphasized: Boolean = false
+) {
+    val palette = OmsTheme.colors
+    Text(
+        text = label,
+        color = if (emphasized) palette.textPrimary else palette.textSecondary,
+        fontSize = 11.5.sp,
+        fontWeight = if (emphasized) FontWeight.Medium else FontWeight.Normal,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = Modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(palette.subtleSurface)
+            .padding(horizontal = 9.dp, vertical = 4.dp)
+    )
 }
 
 // =============================================================================

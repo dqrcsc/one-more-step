@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
@@ -18,8 +19,11 @@ import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -28,8 +32,10 @@ import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -44,15 +50,21 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -63,6 +75,8 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.oms.client.ui.theme.OmsColorPalette
 import com.oms.client.ui.theme.OmsFeedbackController
 import com.oms.client.ui.theme.OmsIcons
@@ -70,7 +84,9 @@ import com.oms.client.ui.theme.OmsTheme
 import com.oms.client.ui.theme.OmsToastKind
 import com.oms.client.ui.theme.omsBounceClick
 import com.oms.core.ai.GroundingSource
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
 @Composable
 fun IncrementalMarkdownView(
@@ -80,6 +96,7 @@ fun IncrementalMarkdownView(
     isStreaming: Boolean = false,
     bodyFontSize: TextUnit = 15.5.sp,
     bodyLineHeight: TextUnit = 25.5.sp,
+    imageBytesLoader: (suspend (src: String) -> ByteArray?)? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -185,7 +202,8 @@ fun IncrementalMarkdownView(
                                     context = context,
                                     palette = palette,
                                     bodyFontSize = bodyFontSize,
-                                    bodyLineHeight = bodyLineHeight
+                                    bodyLineHeight = bodyLineHeight,
+                                    imageBytesLoader = imageBytesLoader
                                 )
                             }
                         }
@@ -248,7 +266,8 @@ private fun RenderMdBlock(
     context: Context,
     palette: OmsColorPalette,
     bodyFontSize: TextUnit,
-    bodyLineHeight: TextUnit
+    bodyLineHeight: TextUnit,
+    imageBytesLoader: (suspend (src: String) -> ByteArray?)? = null
 ) {
     when (block) {
         is MdBlock.Heading -> {
@@ -398,15 +417,207 @@ private fun RenderMdBlock(
             )
         }
 
+        is MdBlock.Image -> {
+            MarkdownImageBlockView(
+                alt = block.alt,
+                src = block.src,
+                context = context,
+                palette = palette,
+                imageBytesLoader = imageBytesLoader
+            )
+        }
+
         is MdBlock.Paragraph -> {
-            Text(
-                text = formatInlineMarkdown(block.text, palette),
+            LinkableMarkdownText(
+                annotated = formatInlineMarkdown(block.text, palette),
+                context = context,
                 color = palette.textPrimary,
                 fontSize = bodyFontSize,
                 lineHeight = bodyLineHeight
             )
         }
     }
+}
+
+@Composable
+private fun LinkableMarkdownText(
+    annotated: AnnotatedString,
+    context: Context,
+    color: Color,
+    fontSize: TextUnit,
+    lineHeight: TextUnit,
+    modifier: Modifier = Modifier
+) {
+    val hasLinks = remember(annotated) {
+        annotated.getStringAnnotations(tag = "URL", start = 0, end = annotated.length).isNotEmpty()
+    }
+    if (!hasLinks) {
+        Text(
+            text = annotated,
+            color = color,
+            fontSize = fontSize,
+            lineHeight = lineHeight,
+            modifier = modifier
+        )
+        return
+    }
+    var layoutResult by remember { mutableStateOf<TextLayoutResult?>(null) }
+    Text(
+        text = annotated,
+        color = color,
+        fontSize = fontSize,
+        lineHeight = lineHeight,
+        onTextLayout = { layoutResult = it },
+        modifier = modifier.pointerInput(annotated) {
+            detectTapGestures { offset ->
+                val lr = layoutResult ?: return@detectTapGestures
+                val idx = lr.getOffsetForPosition(offset)
+                val url = annotated.getStringAnnotations(tag = "URL", start = idx, end = idx)
+                    .firstOrNull()?.item ?: return@detectTapGestures
+                runCatching {
+                    context.startActivity(
+                        Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }
+            }
+        }
+    )
+}
+
+@Composable
+private fun MarkdownImageBlockView(
+    alt: String,
+    src: String,
+    context: Context,
+    palette: OmsColorPalette,
+    imageBytesLoader: (suspend (src: String) -> ByteArray?)?
+) {
+    val cleanAlt = remember(alt) {
+        val t = alt.trim()
+        if (t.isBlank() || Regex("""^(image|img|pic|photo|截图|图片|\d+)$""", RegexOption.IGNORE_CASE).matches(t)) "" else t
+    }
+    val loadedBitmap by produceState<ImageBitmap?>(initialValue = null, key1 = src, key2 = imageBytesLoader) {
+        if (imageBytesLoader == null) {
+            value = null
+            return@produceState
+        }
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                val bytes = imageBytesLoader.invoke(src) ?: return@runCatching null
+                decodeBoundedImageBitmap(bytes, maxDimPx = 1600)
+            }.getOrNull()
+        }
+    }
+    var showLightbox by remember { mutableStateOf(false) }
+
+    if (loadedBitmap != null) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            val imgShape = RoundedCornerShape(12.dp)
+            Image(
+                bitmap = loadedBitmap!!,
+                contentDescription = cleanAlt.ifBlank { "文章配图" },
+                contentScale = ContentScale.FillWidth,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 420.dp)
+                    .clip(imgShape)
+                    .border(0.6.dp, palette.hairline, imgShape)
+                    .clickable { showLightbox = true }
+            )
+            if (cleanAlt.isNotBlank()) {
+                Text(
+                    text = cleanAlt,
+                    color = palette.textTertiary,
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp,
+                    modifier = Modifier.padding(horizontal = 2.dp)
+                )
+            }
+        }
+        if (showLightbox) {
+            Dialog(
+                onDismissRequest = { showLightbox = false },
+                properties = DialogProperties(usePlatformDefaultWidth = false)
+            ) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.92f))
+                        .clickable { showLightbox = false }
+                        .padding(16.dp)
+                ) {
+                    Image(
+                        bitmap = loadedBitmap!!,
+                        contentDescription = cleanAlt.ifBlank { "高清配图" },
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+            }
+        }
+    } else if (src.startsWith("http://", ignoreCase = true) || src.startsWith("https://", ignoreCase = true)) {
+        val pillShape = RoundedCornerShape(10.dp)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier
+                .omsBounceClick(scaleDown = 0.96f, shape = pillShape) {
+                    runCatching {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse(src))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    }
+                }
+                .background(palette.subtleSurface, pillShape)
+                .border(0.6.dp, palette.hairline, pillShape)
+                .padding(horizontal = 11.dp, vertical = 7.dp)
+        ) {
+            Icon(OmsIcons.Image, contentDescription = null, tint = palette.accent, modifier = Modifier.size(14.dp))
+            Text(
+                text = if (cleanAlt.isNotBlank()) "查看原图：$cleanAlt" else "查看外部配图",
+                color = palette.textSecondary,
+                fontSize = 12.5.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    } else if (cleanAlt.isNotBlank()) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier
+                .clip(RoundedCornerShape(10.dp))
+                .background(palette.subtleSurface)
+                .padding(horizontal = 10.dp, vertical = 6.dp)
+        ) {
+            Icon(OmsIcons.Image, contentDescription = null, tint = palette.textTertiary, modifier = Modifier.size(13.5.dp))
+            Text(
+                text = cleanAlt,
+                color = palette.textTertiary,
+                fontSize = 12.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+private fun decodeBoundedImageBitmap(bytes: ByteArray, maxDimPx: Int): ImageBitmap? {
+    val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOpts)
+    val maxSide = maxOf(boundsOpts.outWidth, boundsOpts.outHeight)
+    var sample = 1
+    while (maxSide / sample > maxDimPx) {
+        sample *= 2
+    }
+    val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
+    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts)?.asImageBitmap()
 }
 
 @Composable
@@ -498,7 +709,7 @@ private fun CodeFenceBlockView(
 }
 
 private val INLINE_TOKEN_RE = Regex(
-    """(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\[[^\]]+\]\([^)]+\)|\$[^$\n]+\$)"""
+    """(`[^`\n]+`|!\[[^\]]*\]\([^)\n]+\)|\[\[[^\]\n]+\]\]|\*\*[^*\n]+\*\*|~~[^~\n]+~~|\*[^*\n]+\*|\[[^\]]+\]\([^)]+\)|\$[^$\n]+\$)"""
 )
 
 private fun formatInlineMarkdown(text: String, palette: OmsColorPalette): AnnotatedString = buildAnnotatedString {
@@ -522,8 +733,40 @@ private fun formatInlineMarkdown(text: String, palette: OmsColorPalette): Annota
                     append(" ${tok.substring(1, tok.length - 1)} ")
                 }
             }
+            tok.startsWith("![") -> {
+                val closeBr = tok.indexOf("](")
+                val alt = if (closeBr > 2) tok.substring(2, closeBr).trim() else ""
+                if (alt.isNotBlank() && !Regex("""^(image|img|pic|photo|截图|图片|\d+)$""", RegexOption.IGNORE_CASE).matches(alt)) {
+                    withStyle(SpanStyle(color = palette.textTertiary, fontStyle = FontStyle.Italic, fontSize = 13.sp)) {
+                        append("[图: $alt]")
+                    }
+                }
+            }
+            tok.startsWith("[[") && tok.endsWith("]]") -> {
+                val inner = tok.substring(2, tok.length - 2)
+                val label = inner.substringAfter('|', inner).trim()
+                withStyle(
+                    SpanStyle(
+                        color = palette.accent,
+                        background = palette.accentSoft,
+                        fontWeight = FontWeight.Medium
+                    )
+                ) {
+                    append(" $label ")
+                }
+            }
             tok.startsWith("**") && tok.endsWith("**") -> {
                 withStyle(SpanStyle(color = palette.textPrimary, fontWeight = FontWeight.SemiBold)) {
+                    append(tok.substring(2, tok.length - 2))
+                }
+            }
+            tok.startsWith("~~") && tok.endsWith("~~") -> {
+                withStyle(
+                    SpanStyle(
+                        color = palette.textTertiary,
+                        textDecoration = TextDecoration.LineThrough
+                    )
+                ) {
                     append(tok.substring(2, tok.length - 2))
                 }
             }
@@ -547,6 +790,10 @@ private fun formatInlineMarkdown(text: String, palette: OmsColorPalette): Annota
                 val closeBr = tok.indexOf("](")
                 if (closeBr > 0) {
                     val label = tok.substring(1, closeBr)
+                    val rawHref = tok.substring(closeBr + 2, tok.length - 1).trim()
+                    val isHttp = rawHref.startsWith("http://", ignoreCase = true) ||
+                        rawHref.startsWith("https://", ignoreCase = true)
+                    if (isHttp) pushStringAnnotation(tag = "URL", annotation = rawHref)
                     withStyle(
                         SpanStyle(
                             color = palette.accent,
@@ -556,6 +803,7 @@ private fun formatInlineMarkdown(text: String, palette: OmsColorPalette): Annota
                     ) {
                         append(label)
                     }
+                    if (isHttp) pop()
                 } else {
                     append(tok)
                 }

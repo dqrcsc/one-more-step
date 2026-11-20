@@ -2917,11 +2917,27 @@ class OmsTransportClient(
                 val preview = if (fileName.endsWith(".md") || fileName.endsWith(".txt")) {
                     readPreviewFromFile(savedFile, 256 * 1024)
                 } else "收到 Mac 推送文件：$fileName (${transfer.validated.totalBytes / 1024} KB)"
+                val metaObj = JSONObject()
+                    .put("enableCommuteTts", enableTts)
+                    .put("sha256", transfer.validated.sha256)
+                    .put("totalBytes", transfer.validated.totalBytes)
+                val headerArticleId = transfer.header.optInt("wechatArticleId", 0)
+                if (headerArticleId > 0) {
+                    metaObj.put("wechatArticleId", headerArticleId)
+                }
+                transfer.header.optJSONObject("metadata")?.let { extra ->
+                    val keys = extra.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        if (!extra.isNull(k)) {
+                            metaObj.put(k, extra.get(k))
+                        }
+                    }
+                }
                 repo.upsertStreamItem(StreamItemModel(streamId, "MAC_TO_PHONE", if (enableTts) "COMMUTE_READER" else "FILE",
                     intentTag, transfer.header.optString("title", fileName), preview, null,
                     Uri.fromFile(savedFile).toString(), null, "DELIVERED",
-                    JSONObject().put("enableCommuteTts", enableTts).put("sha256", transfer.validated.sha256)
-                        .put("totalBytes", transfer.validated.totalBytes).toString(), System.currentTimeMillis()))
+                    metaObj.toString(), System.currentTimeMillis()))
             } finally {
                 transfer.cleanup()
             }

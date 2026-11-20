@@ -520,4 +520,11 @@ class EdgeSecureStore(context: Context) {
 
     fun loadCachedWorkspaceCatalogJson(): String? =
         prefs.getString("agent_workspace_catalog_cache", null)
+
+    fun saveCachedChisuCatalogJson(rawJson: String) {
+        prefs.edit().putString("chisu_articles_catalog_cache_v1", rawJson).apply()
+    }
+
+    fun loadCachedChisuCatalogJson(): String? =
+        prefs.getString("chisu_articles_catalog_cache_v1", null)
 }

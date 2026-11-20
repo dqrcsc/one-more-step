@@ -1250,6 +1250,32 @@ export class OmsDaemon {
                 });
               }
             })();
+          } else if (req.method === "wechat.articles.list") {
+            const p = (req.params || {}) as { limit?: number };
+            void this.wechat
+              .fetchArticlesOverview(p.limit ?? 80)
+              .then((res) => reply({ result: res }))
+              .catch((err: any) => reply({ result: { ok: false, articles: [], error: err?.message || String(err) } }));
+          } else if (req.method === "wechat.article.detail") {
+            const p = (req.params || {}) as { articleId?: number; sourceUrl?: string; title?: string };
+            void this.wechat
+              .fetchArticleDetail({
+                articleId: p.articleId,
+                sourceUrl: p.sourceUrl,
+                title: p.title,
+              })
+              .then((res) => reply({ result: res }))
+              .catch((err: any) => reply({ result: { ok: false, error: err?.message || String(err) } }));
+          } else if (req.method === "wechat.article.asset") {
+            const p = (req.params || {}) as { articleId?: number; doc?: "note" | "source"; path?: string };
+            void this.wechat
+              .fetchArticleAsset({
+                articleId: Number(p.articleId || 0),
+                doc: p.doc === "note" ? "note" : "source",
+                path: String(p.path || ""),
+              })
+              .then((res) => reply({ result: res }))
+              .catch((err: any) => reply({ result: { ok: false, error: err?.message || String(err) } }));
           } else if (req.method === "edge.requestSync") {
             void this.syncEdgeConfigAndCapsuleToPhone(true)
               .then((summary) => reply({ result: { ok: true, ...summary } }))
@@ -1582,12 +1608,21 @@ export class OmsDaemon {
 
   private enqueuePendingWeChatPhoneItem(entry: {
     key: string;
+    articleId?: number;
     title: string;
     markdown: string;
+    metadata?: Record<string, unknown>;
     createdAtMs: number;
   }): void {
     try {
-      let queue: Array<{ key: string; title: string; markdown: string; createdAtMs: number }> = [];
+      let queue: Array<{
+        key: string;
+        articleId?: number;
+        title: string;
+        markdown: string;
+        metadata?: Record<string, unknown>;
+        createdAtMs: number;
+      }> = [];
       if (fs.existsSync(this.wechatPendingPhoneQueuePath)) {
         queue = JSON.parse(fs.readFileSync(this.wechatPendingPhoneQueuePath, "utf8"));
         if (!Array.isArray(queue)) queue = [];
@@ -1612,8 +1647,9 @@ export class OmsDaemon {
     let title = (opts.title || "").trim();
     let markdown = (opts.markdown || "").trim();
     const articleId = Number(opts.articleId || 0);
+    let articleMeta: Record<string, unknown> | undefined;
 
-    if ((!markdown || !title) && articleId > 0 && this.wechat.isRunning()) {
+    if (articleId > 0 && this.wechat.isRunning()) {
       try {
         const res = await fetch(`http://127.0.0.1:${this.wechat.internalPort}/api/article?id=${articleId}`, {
           headers: { Host: `127.0.0.1:${this.wechat.internalPort}` },
@@ -1626,6 +1662,17 @@ export class OmsDaemon {
           markdown =
             markdown ||
             String(data.noteMarkdown || art.short_summary || art.digest || "").trim();
+          articleMeta = {
+            wechatArticleId: articleId,
+            author: String(art.author || "").trim(),
+            sourceUrl: String(art.url || "").trim(),
+            publishDate: String(art.publish_date || "").trim(),
+            triage: String(art.triage || "").trim(),
+            processLevel: String(art.process_level || "").trim(),
+            userNotes: String(art.user_notes || "").trim(),
+            shortSummary: String(art.short_summary || art.digest || "").trim().slice(0, 2000),
+            hasSource: Boolean(data.sourceMarkdown || (art.source_md_path && fs.existsSync(art.source_md_path))),
+          };
         }
       } catch {
         // fallback to provided fields
@@ -1643,8 +1690,10 @@ export class OmsDaemon {
       if (opts.queueIfOffline !== false) {
         this.enqueuePendingWeChatPhoneItem({
           key: articleId > 0 ? `article_${articleId}` : `wx_${Date.now()}`,
+          articleId: articleId > 0 ? articleId : undefined,
           title: finalTitle,
           markdown,
+          metadata: articleMeta,
           createdAtMs: Date.now(),
         });
         return { ok: true, queuedOffline: true, title: finalTitle };
@@ -1661,14 +1710,18 @@ export class OmsDaemon {
         title: finalTitle,
         intentTag: "wechat_context",
         enableCommuteTts: true,
+        wechatArticleId: articleId > 0 ? articleId : undefined,
+        metadata: articleMeta,
       });
       return { ok: true, streamId: pushed.streamId, title: finalTitle };
     } catch (err: any) {
       if (opts.queueIfOffline !== false) {
         this.enqueuePendingWeChatPhoneItem({
           key: articleId > 0 ? `article_${articleId}` : `wx_${Date.now()}`,
+          articleId: articleId > 0 ? articleId : undefined,
           title: finalTitle,
           markdown,
+          metadata: articleMeta,
           createdAtMs: Date.now(),
         });
         return { ok: true, queuedOffline: true, title: finalTitle };
@@ -1680,7 +1733,14 @@ export class OmsDaemon {
   private async flushPendingWeChatPhoneQueue(): Promise<void> {
     if (this.session.getActiveTier() === "DISCONNECTED") return;
     if (!fs.existsSync(this.wechatPendingPhoneQueuePath)) return;
-    let queue: Array<{ key: string; title: string; markdown: string; createdAtMs: number }> = [];
+    let queue: Array<{
+      key: string;
+      articleId?: number;
+      title: string;
+      markdown: string;
+      metadata?: Record<string, unknown>;
+      createdAtMs: number;
+    }> = [];
     try {
       queue = JSON.parse(fs.readFileSync(this.wechatPendingPhoneQueuePath, "utf8"));
       if (!Array.isArray(queue) || queue.length === 0) return;
@@ -1704,6 +1764,8 @@ export class OmsDaemon {
           title: item.title,
           intentTag: "wechat_context",
           enableCommuteTts: true,
+          wechatArticleId: item.articleId,
+          metadata: item.metadata,
         });
       } catch {
         remaining.push(item);

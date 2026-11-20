@@ -8,6 +8,7 @@ sealed class MdBlock {
     data class Quote(val text: String) : MdBlock()
     data class BulletList(val ordered: Boolean, val items: List<String>) : MdBlock()
     data class Divider(val raw: String = "---") : MdBlock()
+    data class Image(val alt: String, val src: String) : MdBlock()
     data class Paragraph(val text: String) : MdBlock()
 }
 
@@ -27,6 +28,7 @@ object MarkdownBlockParser {
     private val BULLET_ITEM_RE = Regex("""^[-*+•]\s+(.+)$""")
     private val DIVIDER_RE = Regex("""^(?:---+|\*\*\*+|___+)\s*$""")
     private val TABLE_SEP_RE = Regex("""^\|?\s*:?-{2,}:?(?:\s*\|\s*:?-{2,}:?)+\s*\|?\s*$""")
+    private val STANDALONE_IMAGE_RE = Regex("""^!\[([^\]]*)\]\(([^)\n]+)\)$""")
 
     fun parse(markdown: String, isStreaming: Boolean = false): IncrementalMarkdownDocument {
         if (markdown.isBlank()) {
@@ -90,7 +92,15 @@ object MarkdownBlockParser {
                 continue
             }
 
-            // 3. Horizontal rule
+            // 3. Standalone image ![alt](src)
+            val imgMatch = STANDALONE_IMAGE_RE.matchEntire(trimmed)
+            if (imgMatch != null) {
+                blocks.add(MdBlock.Image(imgMatch.groupValues[1].trim(), imgMatch.groupValues[2].trim()))
+                i++
+                continue
+            }
+
+            // 4. Horizontal rule
             if (DIVIDER_RE.matches(trimmed)) {
                 blocks.add(MdBlock.Divider())
                 i++
@@ -161,6 +171,7 @@ object MarkdownBlockParser {
                     curTrim.startsWith("$$") ||
                     curTrim.startsWith("#") ||
                     curTrim.startsWith(">") ||
+                    STANDALONE_IMAGE_RE.matches(curTrim) ||
                     DIVIDER_RE.matches(curTrim) ||
                     BULLET_ITEM_RE.matches(curTrim) ||
                     ORDERED_ITEM_RE.matches(curTrim) ||

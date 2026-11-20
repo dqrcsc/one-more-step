@@ -133,6 +133,8 @@ export interface StreamStartHeader {
   intentTag?: IntentTag;
   title?: string;
   enableCommuteTts?: boolean;
+  wechatArticleId?: number;
+  metadata?: Record<string, unknown>;
 }
 
 export interface StreamAckResumeHeader {
@@ -506,6 +508,60 @@ export interface WeChatStandbyHandoffResult {
   importedArticlesCount: number;
   queuedDeferredCount: number;
   cursorUpdated: boolean;
+}
+
+export interface WeChatArticleListItem {
+  id: number;
+  title: string;
+  author: string;
+  url: string;
+  publishDate: string;
+  createdAt: string;
+  status: string;
+  processLevel: string;
+  triage: string;
+  userNotes: string;
+  shortSummary: string;
+  digest: string;
+  hasNote: boolean;
+  hasSource: boolean;
+  isFallbackNote: boolean;
+}
+
+export interface WeChatArticlesListResult {
+  ok: boolean;
+  articles: WeChatArticleListItem[];
+  error?: string;
+}
+
+export interface WeChatArticleDetailParams {
+  articleId?: number;
+  sourceUrl?: string;
+  title?: string;
+}
+
+export interface WeChatArticleDetailResult {
+  ok: boolean;
+  article?: WeChatArticleListItem;
+  noteMarkdown?: string | null;
+  sourceMarkdown?: string | null;
+  summaryMarkdown?: string | null;
+  noteTruncated?: boolean;
+  sourceTruncated?: boolean;
+  error?: string;
+}
+
+export interface WeChatArticleAssetParams {
+  articleId: number;
+  doc?: "note" | "source";
+  path: string;
+}
+
+export interface WeChatArticleAssetResult {
+  ok: boolean;
+  mimeType?: string;
+  dataBase64?: string;
+  error?: string;
 }
 
 /**

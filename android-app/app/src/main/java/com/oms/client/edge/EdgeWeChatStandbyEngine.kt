@@ -468,10 +468,20 @@ class EdgeWeChatStandbyEngine(
                     )
                 )
 
-                // Immediately surface in 咫尺 App's local 💬 微信尺素 stream for headphone TTS!
+                // Immediately surface in 咫尺 App's local 💬 微信尺素 stream for headphone TTS & original text viewing!
+                val localItemId = "edge_wx_${OmsFrameProtocol.generateUuidV7()}"
+                val savedSourcePath = if (extracted.markdownBody.isNotBlank()) {
+                    runCatching {
+                        val cacheDir = java.io.File(context.filesDir, "chisu_cache").apply { mkdirs() }
+                        val sourceFile = java.io.File(cacheDir, "${localItemId}_source.md")
+                        sourceFile.writeText(extracted.markdownBody, Charsets.UTF_8)
+                        sourceFile.absolutePath
+                    }.getOrNull()
+                } else null
+
                 streamRepo.upsertStreamItem(
                     StreamItemModel(
-                        itemId = "edge_wx_${OmsFrameProtocol.generateUuidV7()}",
+                        itemId = localItemId,
                         direction = "MAC_TO_PHONE",
                         itemType = "TEXT",
                         intentTag = "wechat_context",
@@ -481,12 +491,21 @@ class EdgeWeChatStandbyEngine(
                         localFileUri = null,
                         macSavedPath = null,
                         syncStatus = "DELIVERED",
-                        metadataJson = JSONObject()
-                            .put("enableCommuteTts", true)
-                            .put("edgeAnalyzed", true)
-                            .put("modelUsed", analysis.modelUsed)
-                            .put("sourceUrl", extracted.url)
-                            .toString(),
+                        metadataJson = JSONObject().apply {
+                            put("enableCommuteTts", true)
+                            put("edgeAnalyzed", true)
+                            put("modelUsed", analysis.modelUsed)
+                            put("sourceUrl", extracted.url)
+                            put("author", extracted.author)
+                            put("publishDate", extracted.publishDate)
+                            put("triage", analysis.triage)
+                            put("userNotes", inlineNotes)
+                            put("shortSummary", analysis.wechatReply)
+                            if (!savedSourcePath.isNullOrBlank()) {
+                                put("sourceFilePath", savedSourcePath)
+                                put("hasSource", true)
+                            }
+                        }.toString(),
                         createdAtMs = System.currentTimeMillis()
                     )
                 )

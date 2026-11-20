@@ -1,5 +1,11 @@
 # Changelog · 更新日志
 
+## 3.2.1 - 2026-11-20 · 尺素移动端双文档杂志阅读器、Mac 归档库双向同步与图文/链接渲染升级
+
+- **Mac 尺素归档库与手机端双向 RPC 同步 (`WeChatBridgeSupervisor`、`OmsDaemon` & `shared-protocol`)**：新增 `wechat.articles.list`、`wechat.article.detail` 与 `wechat.article.asset` 加密 RPC 协议，支持手机端实时拉取 Mac 微信尺素归档列表、按文章 ID/链接/标题按需获取完整「分析报告 / 初筛摘要 / 保存原文」Markdown 内容以及原文档内嵌图片资源（Base64 安全传输，单图上限 `3 MiB`）；同步在推送队列与 `StreamStartHeader` 中透传 `wechatArticleId` 与完整元数据。
+- **尺素工作区升级为 Mac 同源双文档纸感阅读器 (`ChisuAndMissionWorkspaces`、`ChisuDocumentParser` & `CockpitRuntimeCoordinator`)**：重构手机端「尺素」为杂志摘要流 + 沉浸式双文档阅读页，支持「分析报告 / 初筛摘要 / 保存原文」一键切换、YAML Frontmatter 自动剥离与标题/摘要清洗、作者/日期/预计阅读时长等精简编目信息条、用户转发批注高亮卡片，以及本地磁盘离线缓存（目录与文章详情/图片资源分级缓存）；离家待机模式（`EdgeWeChatStandbyEngine`）初筛完成后亦同步保存原文至本地缓存供离线切换对照阅读。
+- **增量 Markdown 引擎新增内嵌图片灯箱与可点击外链 (`MarkdownBlockParser` & `IncrementalMarkdownView`)**：补齐 `MdBlock.Image` 块级解析与异步图文加载渲染（同时支持网络图经内置代理拉取及 Mac 知识库相对路径图片通过 RPC 按需加载与点击放大查看），并升级正文段落为可点击外链渲染（`LinkableMarkdownText`）。
+
 ## 3.2.0 - 2026-11-20 · 实时视频快速故障转移、Live 语音联网查询、双脑桌面双向同步与接续自愈、AI 写歌/视频修复、模型去噪、检索消息精准定位与博物图鉴详情升级
 
 - **实时视频与 Live 语音握手稳定性升级 (`ProxyTunnels`、`SmartRegionRouter`、`OmsProxyManager` & `RealtimeVoiceProtocol`)**：将代理节点首包握手超时从 `65s` 收敛至 `6s`（首包连通后再放宽至 `660s` 流式长超时），修复个别节点出站黑洞导致 OkHttp 客户端超时早于代理换线的问题；修复 `OmsProxyManager` 单例客户端吞掉自定义 `readTimeout`（WebSocket 现采用 `0s` 无空闲读超时 + `15s` Ping）；补齐 `WebSocketListener.onClosing` 关闭帧回执、`9s` `setupComplete` 看门狗及握手失败自动驱逐坏节点重连机制。

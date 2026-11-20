@@ -156,6 +156,22 @@ class CockpitRuntimeCoordinator(
     private val _isLoadingAgentDetailFlow = MutableStateFlow(false)
     val isLoadingAgentDetailFlow: StateFlow<Boolean> = _isLoadingAgentDetailFlow
 
+    // Chisu (尺素) Mac-Synced Article Library + Dual-Doc (Report / Summary / Original Source) Cache
+    private val _chisuArticlesFlow = MutableStateFlow<List<ChisuArticleItemUi>>(emptyList())
+    val chisuArticlesFlow: StateFlow<List<ChisuArticleItemUi>> = _chisuArticlesFlow
+
+    private val _isRefreshingChisuFlow = MutableStateFlow(false)
+    val isRefreshingChisuFlow: StateFlow<Boolean> = _isRefreshingChisuFlow
+
+    private val _activeChisuDetailFlow = MutableStateFlow<ChisuArticleDetailUi?>(null)
+    val activeChisuDetailFlow: StateFlow<ChisuArticleDetailUi?> = _activeChisuDetailFlow
+
+    private val _isLoadingChisuDetailFlow = MutableStateFlow(false)
+    val isLoadingChisuDetailFlow: StateFlow<Boolean> = _isLoadingChisuDetailFlow
+
+    private val _chisuDetailErrorFlow = MutableStateFlow<String?>(null)
+    val chisuDetailErrorFlow: StateFlow<String?> = _chisuDetailErrorFlow
+
     // Proxy & Model Studio Reactive Flows
     private val _proxyNodesFlow = MutableStateFlow<List<ProxyNodeStatusView>>(emptyList())
     val proxyNodesFlow: StateFlow<List<ProxyNodeStatusView>> = _proxyNodesFlow
@@ -235,12 +251,16 @@ class CockpitRuntimeCoordinator(
         edgeStore.loadCachedWorkspaceCatalogJson()?.let { raw ->
             runCatching { applyWorkspaceCatalogJson(JSONObject(raw)) }
         }
+        edgeStore.loadCachedChisuCatalogJson()?.let { raw ->
+            runCatching { applyChisuArticlesCatalogJson(JSONObject(raw)) }
+        }
 
         scope.launch {
             transportClient.activeTierFlow.collect { tier ->
                 if (tier != "DISCONNECTED") {
                     flushPendingSyncToMac()
                     refreshAgentSessions()
+                    refreshChisuArticles()
                 }
             }
         }
@@ -252,6 +272,7 @@ class CockpitRuntimeCoordinator(
             scope.launch {
                 flushPendingSyncToMac()
                 refreshAgentSessions()
+                refreshChisuArticles()
             }
         }
     }
@@ -739,6 +760,262 @@ class CockpitRuntimeCoordinator(
                 }
             }
         }
+    }
+
+    // =========================================================================
+    // Chisu (尺素) Mac Library Sync, Dual-Doc Detail Cache & Inline Image Loader
+    // =========================================================================
+
+    private fun chisuCacheDir(): File = File(appContext.filesDir, "chisu_cache").apply { mkdirs() }
+    private fun chisuAssetCacheDir(): File = File(appContext.cacheDir, "chisu_assets").apply { mkdirs() }
+
+    fun refreshChisuArticles(limit: Int = 80) {
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") return
+        scope.launch {
+            _isRefreshingChisuFlow.value = true
+            try {
+                val resp = transportClient.callHostRpc(
+                    "wechat.articles.list",
+                    JSONObject().put("limit", limit),
+                    10_000L
+                ) ?: return@launch
+                if (resp.optBoolean("ok", false)) {
+                    edgeStore.saveCachedChisuCatalogJson(resp.toString())
+                    applyChisuArticlesCatalogJson(resp)
+                }
+            } catch (_: Throwable) {
+            } finally {
+                _isRefreshingChisuFlow.value = false
+            }
+        }
+    }
+
+    private fun applyChisuArticlesCatalogJson(resp: JSONObject) {
+        val arr = resp.optJSONArray("articles") ?: return
+        val out = ArrayList<ChisuArticleItemUi>(arr.length())
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val id = o.optInt("id", 0)
+            if (id <= 0) continue
+            val rawTitle = o.optString("title", "")
+            val summary = o.optString("shortSummary", "").trim()
+            val digest = o.optString("digest", "").trim()
+            val createdMs = ChisuDocumentParser.parseIsoToEpochMs(o.optString("createdAt", ""))
+                .takeIf { it > 0L } ?: System.currentTimeMillis()
+            val preview = ChisuDocumentParser.buildPlainExcerpt(summary.ifBlank { digest }, 220)
+            out.add(
+                ChisuArticleItemUi(
+                    stableKey = "wx_$id",
+                    articleId = id,
+                    title = ChisuDocumentParser.cleanTitle(rawTitle).ifBlank { "微信文章 #$id" },
+                    author = o.optString("author", "").trim(),
+                    sourceUrl = o.optString("url", "").trim(),
+                    publishDate = o.optString("publishDate", "").trim(),
+                    createdAtMs = createdMs,
+                    status = o.optString("status", "").trim(),
+                    processLevel = o.optString("processLevel", "").trim(),
+                    triage = o.optString("triage", "").trim(),
+                    userNotes = o.optString("userNotes", "").trim(),
+                    shortSummary = summary.ifBlank { digest },
+                    previewExcerpt = preview,
+                    hasNote = o.optBoolean("hasNote", false) || summary.isNotBlank(),
+                    hasSource = o.optBoolean("hasSource", false),
+                    isFallbackNote = o.optBoolean("isFallbackNote", false)
+                )
+            )
+        }
+        _chisuArticlesFlow.value = out
+    }
+
+    fun openChisuArticle(item: ChisuArticleItemUi, forceRefresh: Boolean = false) {
+        _chisuDetailErrorFlow.value = null
+        val localSource = item.localSourceFilePath?.let { p ->
+            runCatching { File(p).takeIf { it.exists() }?.readText(Charsets.UTF_8) }.getOrNull()
+        }
+        val cached = loadCachedChisuDetail(item.articleId)
+        val initial = ChisuArticleDetailUi(
+            stableKey = item.stableKey,
+            articleId = item.articleId ?: cached?.articleId,
+            title = cached?.title?.ifBlank { item.title } ?: item.title,
+            author = item.author.ifBlank { cached?.author.orEmpty() },
+            sourceUrl = item.sourceUrl.ifBlank { cached?.sourceUrl.orEmpty() },
+            publishDate = item.publishDate.ifBlank { cached?.publishDate.orEmpty() },
+            createdAtMs = item.createdAtMs,
+            status = item.status.ifBlank { cached?.status.orEmpty() },
+            processLevel = item.processLevel.ifBlank { cached?.processLevel.orEmpty() },
+            triage = item.triage.ifBlank { cached?.triage.orEmpty() },
+            userNotes = item.userNotes.ifBlank { cached?.userNotes.orEmpty() },
+            noteMarkdown = cached?.noteMarkdown?.takeIf { it.isNotBlank() } ?: item.localNoteMarkdown,
+            sourceMarkdown = cached?.sourceMarkdown?.takeIf { it.isNotBlank() } ?: localSource,
+            summaryMarkdown = cached?.summaryMarkdown?.takeIf { it.isNotBlank() }
+                ?: item.shortSummary.takeIf { it.isNotBlank() },
+            noteTruncated = cached?.noteTruncated == true,
+            sourceTruncated = cached?.sourceTruncated == true,
+            fromCache = cached != null
+        )
+        _activeChisuDetailFlow.value = initial
+
+        val canQueryMac = transportClient.activeTierFlow.value != "DISCONNECTED" &&
+            (item.articleId != null || item.sourceUrl.isNotBlank() || item.title.isNotBlank())
+        val needsRemote = forceRefresh || initial.sourceMarkdown.isNullOrBlank() || initial.noteMarkdown.isNullOrBlank()
+        if (!canQueryMac || !needsRemote) {
+            _isLoadingChisuDetailFlow.value = false
+            return
+        }
+
+        _isLoadingChisuDetailFlow.value = true
+        scope.launch {
+            try {
+                val req = JSONObject().apply {
+                    item.articleId?.let { put("articleId", it) }
+                    if (item.sourceUrl.isNotBlank()) put("sourceUrl", item.sourceUrl)
+                    if (item.title.isNotBlank()) put("title", item.title)
+                }
+                val resp = transportClient.callHostRpc("wechat.article.detail", req, 15_000L)
+                if (resp != null && resp.optBoolean("ok", false)) {
+                    val artObj = resp.optJSONObject("article")
+                    val resolvedId = artObj?.optInt("id", 0)?.takeIf { it > 0 } ?: item.articleId
+                    val noteMd = resp.optString("noteMarkdown", "").takeIf { it.isNotBlank() && it != "null" }
+                    val sourceMd = resp.optString("sourceMarkdown", "").takeIf { it.isNotBlank() && it != "null" }
+                    val summaryMd = resp.optString("summaryMarkdown", "").takeIf { it.isNotBlank() && it != "null" }
+                    val remoteDetail = ChisuArticleDetailUi(
+                        stableKey = item.stableKey,
+                        articleId = resolvedId,
+                        title = ChisuDocumentParser.cleanTitle(artObj?.optString("title", "")).ifBlank { item.title },
+                        author = artObj?.optString("author", "").orEmpty().ifBlank { initial.author },
+                        sourceUrl = artObj?.optString("url", "").orEmpty().ifBlank { initial.sourceUrl },
+                        publishDate = artObj?.optString("publishDate", "").orEmpty().ifBlank { initial.publishDate },
+                        createdAtMs = item.createdAtMs,
+                        status = artObj?.optString("status", "").orEmpty().ifBlank { initial.status },
+                        processLevel = artObj?.optString("processLevel", "").orEmpty().ifBlank { initial.processLevel },
+                        triage = artObj?.optString("triage", "").orEmpty().ifBlank { initial.triage },
+                        userNotes = artObj?.optString("userNotes", "").orEmpty().ifBlank { initial.userNotes },
+                        noteMarkdown = noteMd ?: initial.noteMarkdown,
+                        sourceMarkdown = sourceMd ?: initial.sourceMarkdown,
+                        summaryMarkdown = summaryMd ?: initial.summaryMarkdown,
+                        noteTruncated = resp.optBoolean("noteTruncated", false),
+                        sourceTruncated = resp.optBoolean("sourceTruncated", false),
+                        fromCache = false
+                    )
+                    if (resolvedId != null) {
+                        saveCachedChisuDetail(resolvedId, remoteDetail)
+                    }
+                    if (_activeChisuDetailFlow.value?.stableKey == item.stableKey) {
+                        _activeChisuDetailFlow.value = remoteDetail
+                    }
+                } else if (initial.sourceMarkdown.isNullOrBlank() && initial.noteMarkdown.isNullOrBlank()) {
+                    _chisuDetailErrorFlow.value = resp?.optString("error", "").orEmpty().ifBlank { "未能从 Mac 读取该文章详情" }
+                }
+            } catch (e: Throwable) {
+                if (initial.sourceMarkdown.isNullOrBlank() && initial.noteMarkdown.isNullOrBlank()) {
+                    _chisuDetailErrorFlow.value = e.message ?: "同步失败"
+                }
+            } finally {
+                _isLoadingChisuDetailFlow.value = false
+            }
+        }
+    }
+
+    fun closeChisuArticle() {
+        _activeChisuDetailFlow.value = null
+        _isLoadingChisuDetailFlow.value = false
+        _chisuDetailErrorFlow.value = null
+    }
+
+    suspend fun loadChisuInlineImageBytes(
+        articleId: Int?,
+        docKind: String,
+        src: String
+    ): ByteArray? = withContext(Dispatchers.IO) {
+        val trimmed = src.trim()
+        if (trimmed.isEmpty()) return@withContext null
+        val cacheKey = "${articleId ?: 0}_${docKind}_${trimmed.hashCode().toUInt()}"
+        val cacheFile = File(chisuAssetCacheDir(), "$cacheKey.img")
+        if (cacheFile.exists() && cacheFile.length() > 0L) {
+            return@withContext runCatching { cacheFile.readBytes() }.getOrNull()
+        }
+
+        val bytes: ByteArray? = if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) {
+            runCatching {
+                val client = proxyManager.getOrCreateOkHttpClient(connectTimeoutSec = 8, readTimeoutSec = 12)
+                val req = okhttp3.Request.Builder().url(trimmed).build()
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) null
+                    else resp.body?.bytes()?.takeIf { it.isNotEmpty() && it.size <= 4 * 1024 * 1024 }
+                }
+            }.getOrNull()
+        } else if (articleId != null && articleId > 0 && transportClient.activeTierFlow.value != "DISCONNECTED") {
+            runCatching {
+                val resp = transportClient.callHostRpc(
+                    "wechat.article.asset",
+                    JSONObject()
+                        .put("articleId", articleId)
+                        .put("doc", if (docKind == "note") "note" else "source")
+                        .put("path", trimmed),
+                    10_000L
+                )
+                val b64 = resp?.takeIf { it.optBoolean("ok", false) }?.optString("dataBase64", "").orEmpty()
+                if (b64.isNotBlank()) Base64.decode(b64, Base64.DEFAULT) else null
+            }.getOrNull()
+        } else {
+            null
+        }
+
+        if (bytes != null && bytes.isNotEmpty()) {
+            runCatching { cacheFile.writeBytes(bytes) }
+        }
+        bytes
+    }
+
+    private fun saveCachedChisuDetail(articleId: Int, detail: ChisuArticleDetailUi) {
+        runCatching {
+            val file = File(chisuCacheDir(), "article_$articleId.json")
+            val obj = JSONObject().apply {
+                put("articleId", articleId)
+                put("title", detail.title)
+                put("author", detail.author)
+                put("sourceUrl", detail.sourceUrl)
+                put("publishDate", detail.publishDate)
+                put("status", detail.status)
+                put("processLevel", detail.processLevel)
+                put("triage", detail.triage)
+                put("userNotes", detail.userNotes)
+                if (!detail.noteMarkdown.isNullOrBlank()) put("noteMarkdown", detail.noteMarkdown)
+                if (!detail.sourceMarkdown.isNullOrBlank()) put("sourceMarkdown", detail.sourceMarkdown)
+                if (!detail.summaryMarkdown.isNullOrBlank()) put("summaryMarkdown", detail.summaryMarkdown)
+                put("noteTruncated", detail.noteTruncated)
+                put("sourceTruncated", detail.sourceTruncated)
+                put("cachedAtMs", System.currentTimeMillis())
+            }
+            file.writeText(obj.toString(), Charsets.UTF_8)
+        }
+    }
+
+    private fun loadCachedChisuDetail(articleId: Int?): ChisuArticleDetailUi? {
+        if (articleId == null || articleId <= 0) return null
+        return runCatching {
+            val file = File(chisuCacheDir(), "article_$articleId.json")
+            if (!file.exists()) return null
+            val o = JSONObject(file.readText(Charsets.UTF_8))
+            ChisuArticleDetailUi(
+                stableKey = "wx_$articleId",
+                articleId = articleId,
+                title = o.optString("title", ""),
+                author = o.optString("author", ""),
+                sourceUrl = o.optString("sourceUrl", ""),
+                publishDate = o.optString("publishDate", ""),
+                status = o.optString("status", ""),
+                processLevel = o.optString("processLevel", ""),
+                triage = o.optString("triage", ""),
+                userNotes = o.optString("userNotes", ""),
+                noteMarkdown = o.optString("noteMarkdown", "").takeIf { it.isNotBlank() },
+                sourceMarkdown = o.optString("sourceMarkdown", "").takeIf { it.isNotBlank() },
+                summaryMarkdown = o.optString("summaryMarkdown", "").takeIf { it.isNotBlank() },
+                noteTruncated = o.optBoolean("noteTruncated", false),
+                sourceTruncated = o.optBoolean("sourceTruncated", false),
+                fromCache = true
+            )
+        }.getOrNull()
     }
 
     // =========================================================================

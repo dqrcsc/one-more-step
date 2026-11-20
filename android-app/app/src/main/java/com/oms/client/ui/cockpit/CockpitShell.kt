@@ -630,13 +630,15 @@ fun OmsCockpitRootScreen() {
                             )
 
                             CockpitTab.CHISU -> ChisuWorkspaceView(
+                                coordinator = coordinator,
+                                macConnected = activeTier != "DISCONNECTED",
                                 streamItems = streamItems,
-                                onDiscussArticleInChat = { item ->
-                                    chatPrefillDraft = "请结合这篇尺素文章《${item.title ?: "文章"}》帮我进一步深入分析：\n${item.textContent.orEmpty().take(1500)}"
+                                onDiscussArticleInChat = { title, cleanBody ->
+                                    chatPrefillDraft = "请结合这篇尺素文章《${title.ifBlank { "文章" }}》帮我进一步深入分析：\n${cleanBody.take(1800)}"
                                     currentTab = CockpitTab.CHAT
                                 },
-                                onSendArticleToMacAgent = { item ->
-                                    agentPrefillDraft = "请根据尺素文章《${item.title ?: "文章"}》中的核心启发，在对应项目中设计原型或写入知识库深读笔记：\n${item.textContent.orEmpty().take(2000)}"
+                                onSendArticleToMacAgent = { title, cleanBody ->
+                                    agentPrefillDraft = "请根据尺素文章《${title.ifBlank { "文章" }}》中的核心启发，在对应项目中设计原型或写入知识库深读笔记：\n${cleanBody.take(2200)}"
                                     currentTab = CockpitTab.MISSION_HUB
                                 }
                             )
