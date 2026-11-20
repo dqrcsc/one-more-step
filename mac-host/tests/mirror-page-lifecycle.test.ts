@@ -13,7 +13,7 @@ async function page(hud = true) {
   const nodes = new Map<string, any>();
   const get = (name: string) => {
     if (!nodes.has(name)) nodes.set(name, {
-      style: {}, textContent: '', value: name === 'presetSelect' ? '640,72,8' : '', width: 640, height: 1422,
+      style: { setProperty() {} }, textContent: '', value: name === 'presetSelect' ? '640,72,8' : '', width: 640, height: 1422,
       options: [{ value: '640,72,8' }], disabled: false, hidden: false,
       classList: { add() {}, remove() {} },
       getContext: () => ({ clearRect: () => clears++, drawImage: () => draws++ }),
@@ -185,4 +185,37 @@ test('a global stop while start is pending is not revived by connection timeout'
   expect([...p.timers.values()].some(t => t.delay === 10000)).toBe(false);
   expect(ws.sent).toHaveLength(1);
   p.run('hostDeactivate()');
+});
+
+test('text submit stays single-flight until ACK and preserves edits made while waiting', async () => {
+  const p = await page(), ws = await p.start();
+  p.get('mirrorTextInput').value = 'original';
+  const before = ws.sent.length;
+  const first = p.run('submitMirrorText(true)');
+  const reqId = ws.sent.at(-1).reqId;
+  p.get('mirrorTextInput').value = 'new draft';
+  const duplicate = p.run('submitMirrorText(true)');
+  expect(ws.sent.length).toBe(before + 1);
+  await duplicate;
+  ws.receive({ type: 'input_ack', reqId, ok: true, result: { ok: true } });
+  await first;
+  expect(p.get('mirrorTextInput').value).toBe('new draft');
+  const retry = p.run('submitMirrorText(false)');
+  expect(ws.sent.length).toBe(before + 2);
+  ws.receive({ type: 'input_ack', reqId: ws.sent.at(-1).reqId, ok: false, error: 'fixture rejection' });
+  await retry;
+  expect(p.get('mirrorTextInput').value).toBe('new draft');
+  p.run('hostDeactivate()');
+});
+
+test('an old text ACK cannot clear a draft after the viewer session has ended', async () => {
+  const p = await page(), ws = await p.start();
+  p.get('mirrorTextInput').value = 'keep this draft';
+  const submitted = p.run('submitMirrorText(false)');
+  ws.receive({ type: 'input_ack', reqId: ws.sent.at(-1).reqId, ok: true, result: { ok: true } });
+  // End the session before the awaiting submit continuation runs.
+  p.run('hostDeactivate()');
+  await submitted;
+  expect(p.get('mirrorTextInput').value).toBe('keep this draft');
+  expect(p.run('textSubmission')).toBeNull();
 });

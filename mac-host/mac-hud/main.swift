@@ -59,7 +59,7 @@ struct HudIncomingEnvelope: Codable {
     let toast: HudToastPayload?
     let status: HudStatusSnapshot?
     let itemId: String?
-    let wechatArticleId: Int?
+    var wechatArticleId: Int? = nil
 }
 
 struct HudWeChatArticleSummary: Codable, Equatable {
