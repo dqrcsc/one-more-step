@@ -1,5 +1,9 @@
 # Changelog · 更新日志
 
+## 3.3.1 - 2026-11-21 · 实时音频与 Glass 视频对话原生音色选择
+
+- **实时音频 / 视频对话音色自由切换 (`RealtimeVoiceCatalog`、`EdgeSecureStore` & `GlassAndLiveOverlay`)**：为 OpenAI Realtime 散步语音（10 款官方音色：`Marin`、`Cedar`、`Coral`、`Shimmer`、`Sage`、`Ballad`、`Verse`、`Ash`、`Alloy`、`Echo`）与 Gemini 3.8 Live 实时视频语音（14 款演播室音色：`Puck`、`Kore`、`Aoede`、`Zephyr`、`Charon`、`Fenrir`、`Leda`、`Orus`、`Sulafat`、`Vindemiatrix`、`Achird`、`Gacrux`、`Despina`、`Umbriel`）提供独立持久化的音色选择器；通话顶部新增毛玻璃音色胶囊，点开即可按中文风格标签一键切换并无感重连生效，且跨引擎严格隔离音色 ID 避免误传。
+
 ## 3.3.0 - 2026-11-21 · 随身秘书今日简报与活记忆、尺素全模态（图文/视频/灵感）双文档、全库中文 FTS5 统一检索、EPUB 拆章入库与 Antigravity 额度修复
 
 - **尺素支持图片笔记、视频与灵感的双文档查看 (`WeChatBridgeSupervisor`、`OmsDaemon` & `ChisuWorkspaceView`)**：打通 `wechat_context.db` 的 `conversation_turns`（`multimodal_ingest` / `capture_idea` / `capture_inbox`）与 `articles` 合并视图；扩展 `wechat.article.detail` / `wechat.article.asset` 支持 `turnId` 维度，自动将多媒体笔记中的相对路径图片附件提升为正文内嵌原图（支持灯箱缩放）；手机端新增 `图片 / 视频 / 灵感` 分类快筛，阅读器标签自动适配为「分析报告 / 原图与原文 / 转录与原文 / 原始灵感」。

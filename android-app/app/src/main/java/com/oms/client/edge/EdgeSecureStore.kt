@@ -527,4 +527,23 @@ class EdgeSecureStore(context: Context) {
 
     fun loadCachedChisuCatalogJson(): String? =
         prefs.getString("chisu_articles_catalog_cache_v1", null)
+
+    fun saveLiveVoiceName(mode: com.oms.core.ai.RealtimeBackendMode, voiceId: String) {
+        val key = if (mode == com.oms.core.ai.RealtimeBackendMode.OPENAI_WALK_TALK) {
+            "live_voice_openai_v1"
+        } else {
+            "live_voice_gemini_v1"
+        }
+        val valid = com.oms.core.ai.RealtimeVoiceCatalog.resolveVoice(mode, voiceId).id
+        prefs.edit().putString(key, valid).apply()
+    }
+
+    fun loadLiveVoiceName(mode: com.oms.core.ai.RealtimeBackendMode): String {
+        val key = if (mode == com.oms.core.ai.RealtimeBackendMode.OPENAI_WALK_TALK) {
+            "live_voice_openai_v1"
+        } else {
+            "live_voice_gemini_v1"
+        }
+        return com.oms.core.ai.RealtimeVoiceCatalog.resolveVoice(mode, prefs.getString(key, null)).id
+    }
 }

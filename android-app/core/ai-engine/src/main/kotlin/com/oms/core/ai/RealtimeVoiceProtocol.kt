@@ -23,6 +23,58 @@ enum class RealtimeBackendMode {
     GEMINI_GLASS_LIVE   // Google `gemini-3.8-live` BidiGenerateContent audio + 1fps camera + Search Grounding
 }
 
+data class RealtimeVoicePreset(
+    val id: String,
+    val displayName: String,
+    val toneTag: String,
+    val backend: RealtimeBackendMode
+)
+
+object RealtimeVoiceCatalog {
+    val OPENAI_VOICES: List<RealtimeVoicePreset> = listOf(
+        RealtimeVoicePreset("marin", "Marin", "清澈自然 · 默认", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("cedar", "Cedar", "温润沉稳", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("coral", "Coral", "温暖亲切", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("shimmer", "Shimmer", "明亮柔美", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("sage", "Sage", "知性冷静", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("ballad", "Ballad", "温柔抒情", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("verse", "Verse", "富有表现力", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("ash", "Ash", "低沉磁性", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("alloy", "Alloy", "均衡中性", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("echo", "Echo", "清晰男声", RealtimeBackendMode.OPENAI_WALK_TALK)
+    )
+
+    val GEMINI_VOICES: List<RealtimeVoicePreset> = listOf(
+        RealtimeVoicePreset("Puck", "Puck", "活泼明快 · 默认", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Kore", "Kore", "坚定知性", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Aoede", "Aoede", "轻盈自然", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Zephyr", "Zephyr", "清亮柔和", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Charon", "Charon", "沉稳博学", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Fenrir", "Fenrir", "热烈磁性", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Leda", "Leda", "青春灵动", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Orus", "Orus", "干练稳重", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Sulafat", "Sulafat", "温暖治愈", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Vindemiatrix", "Vindemiatrix", "温婉轻柔", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Achird", "Achird", "友好亲和", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Gacrux", "Gacrux", "成熟厚重", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Despina", "Despina", "丝滑悦耳", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Umbriel", "Umbriel", "随性松弛", RealtimeBackendMode.GEMINI_GLASS_LIVE)
+    )
+
+    fun voicesFor(mode: RealtimeBackendMode): List<RealtimeVoicePreset> =
+        if (mode == RealtimeBackendMode.OPENAI_WALK_TALK) OPENAI_VOICES else GEMINI_VOICES
+
+    fun defaultVoiceFor(mode: RealtimeBackendMode): String =
+        voicesFor(mode).first().id
+
+    fun resolveVoice(mode: RealtimeBackendMode, candidate: String?): RealtimeVoicePreset {
+        val list = voicesFor(mode)
+        val clean = candidate?.trim().orEmpty()
+        if (clean.isEmpty()) return list.first()
+        return list.firstOrNull { it.id.equals(clean, ignoreCase = true) } ?: list.first()
+    }
+}
+
 data class RealtimeSessionOptions(
     val mode: RealtimeBackendMode,
     val englishOnlyFluencyMode: Boolean = false,
@@ -159,7 +211,7 @@ class RealtimeVoiceSessionEngine(
                     myGen = myGen,
                     model = model,
                     instructions = instructions,
-                    voice = options.voiceName.ifBlank { "marin" },
+                    voice = RealtimeVoiceCatalog.resolveVoice(RealtimeBackendMode.OPENAI_WALK_TALK, options.voiceName).id,
                     listener = listener,
                     onRetryBeforeReady = if (attempt < maxAttempts) { _, isGeo ->
                         onNodeHandshakeFailed?.invoke(targetHost, isGeo)
@@ -184,7 +236,7 @@ class RealtimeVoiceSessionEngine(
                     myGen = myGen,
                     model = model,
                     instructions = instructions,
-                    voice = options.voiceName.ifBlank { "Puck" },
+                    voice = RealtimeVoiceCatalog.resolveVoice(RealtimeBackendMode.GEMINI_GLASS_LIVE, options.voiceName).id,
                     listener = listener,
                     onRetryBeforeReady = if (attempt < maxAttempts) { _, isGeo ->
                         onNodeHandshakeFailed?.invoke(targetHost, isGeo)

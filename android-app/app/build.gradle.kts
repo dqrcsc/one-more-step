@@ -11,8 +11,8 @@ android {
         applicationId = "com.oms.client"
         minSdk = 30
         targetSdk = 34
-        versionCode = 58
-        versionName = "3.3.0"
+        versionCode = 59
+        versionName = "3.3.1"
     }
 
     signingConfigs {

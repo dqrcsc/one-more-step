@@ -37,6 +37,7 @@ data class LiveVoiceUiState(
     val isConnecting: Boolean = false,
     val mode: RealtimeBackendMode = RealtimeBackendMode.OPENAI_WALK_TALK,
     val englishOnly: Boolean = false,
+    val voiceName: String = "",
     val modelLabel: String = "",
     val micMuted: Boolean = false,
     val speakerBoostEnabled: Boolean = true,
@@ -105,6 +106,7 @@ class LiveAudioDuplexController(
             isConnecting = true,
             mode = options.mode,
             englishOnly = options.englishOnlyFluencyMode,
+            voiceName = com.oms.core.ai.RealtimeVoiceCatalog.resolveVoice(options.mode, options.voiceName).id,
             speakerBoostEnabled = keepBoost,
             usingSpeakerphone = onSpeaker
         )

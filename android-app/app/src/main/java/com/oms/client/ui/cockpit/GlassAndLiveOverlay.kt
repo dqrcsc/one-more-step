@@ -114,6 +114,8 @@ import com.oms.client.ui.theme.omsBounceClick
 import com.oms.core.ai.FieldGuideSpecimenCard
 import com.oms.core.ai.RealtimeBackendMode
 import com.oms.core.ai.RealtimeSessionOptions
+import com.oms.core.ai.RealtimeVoiceCatalog
+import com.oms.core.ai.RealtimeVoicePreset
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -780,6 +782,24 @@ fun LiveVoiceAndGlassModal(
     }
     var englishOnly by remember { mutableStateOf(false) }
     var useFrontCamera by remember { mutableStateOf(false) }
+    var openAiVoiceId by remember {
+        mutableStateOf(
+            OmsApplication.instance?.edgeStore?.loadLiveVoiceName(RealtimeBackendMode.OPENAI_WALK_TALK)
+                ?: RealtimeVoiceCatalog.defaultVoiceFor(RealtimeBackendMode.OPENAI_WALK_TALK)
+        )
+    }
+    var geminiVoiceId by remember {
+        mutableStateOf(
+            OmsApplication.instance?.edgeStore?.loadLiveVoiceName(RealtimeBackendMode.GEMINI_GLASS_LIVE)
+                ?: RealtimeVoiceCatalog.defaultVoiceFor(RealtimeBackendMode.GEMINI_GLASS_LIVE)
+        )
+    }
+    var showVoicePicker by remember { mutableStateOf(false) }
+
+    val activeVoicePreset = remember(selectedMode, openAiVoiceId, geminiVoiceId) {
+        val raw = if (selectedMode == RealtimeBackendMode.OPENAI_WALK_TALK) openAiVoiceId else geminiVoiceId
+        RealtimeVoiceCatalog.resolveVoice(selectedMode, raw)
+    }
     var hasCameraPerm by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -787,6 +807,7 @@ fun LiveVoiceAndGlassModal(
     }
     val currentSelectedMode by rememberUpdatedState(selectedMode)
     val currentEnglishOnly by rememberUpdatedState(englishOnly)
+    val currentActiveVoiceId by rememberUpdatedState(activeVoicePreset.id)
 
     fun finishAndArchive() {
         val turns = liveState.transcriptTurns
@@ -826,13 +847,14 @@ fun LiveVoiceAndGlassModal(
                 RealtimeSessionOptions(
                     mode = currentSelectedMode,
                     englishOnlyFluencyMode = currentEnglishOnly,
+                    voiceName = currentActiveVoiceId,
                     extraContextSummary = capsule?.nowSummary.orEmpty()
                 )
             )
         }
     }
 
-    LaunchedEffect(selectedMode, englishOnly) {
+    LaunchedEffect(selectedMode, englishOnly, activeVoicePreset.id) {
         hasCameraPerm = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         val needed = mutableListOf(Manifest.permission.RECORD_AUDIO)
         if (selectedMode == RealtimeBackendMode.GEMINI_GLASS_LIVE) {
@@ -847,6 +869,7 @@ fun LiveVoiceAndGlassModal(
                 RealtimeSessionOptions(
                     mode = selectedMode,
                     englishOnlyFluencyMode = englishOnly,
+                    voiceName = activeVoicePreset.id,
                     extraContextSummary = capsule?.nowSummary.orEmpty()
                 )
             )
@@ -891,20 +914,45 @@ fun LiveVoiceAndGlassModal(
                     val pillShape = RoundedCornerShape(18.dp)
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        modifier = Modifier
-                            .omsBounceClick(scaleDown = 0.94f, shape = pillShape) { englishOnly = !englishOnly }
-                            .background(if (englishOnly) Color(0xFF2563EB) else Color(0x22FFFFFF), pillShape)
-                            .border(0.6.dp, Color(0x38FFFFFF), pillShape)
-                            .padding(horizontal = 12.dp, vertical = 7.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(OmsIcons.Globe, contentDescription = null, tint = Color.White, modifier = Modifier.size(14.dp))
-                        Text(
-                            text = if (englishOnly) "English Only · ON" else "English Only",
-                            color = Color.White,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
+                        // Voice / Timbre Selector Pill (Works for both OpenAI Walk&Talk & Gemini Glass Live!)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            modifier = Modifier
+                                .omsBounceClick(scaleDown = 0.94f, shape = pillShape) { showVoicePicker = true }
+                                .background(Color(0x26FFFFFF), pillShape)
+                                .border(0.6.dp, Color(0x40FFFFFF), pillShape)
+                                .padding(horizontal = 11.dp, vertical = 7.dp)
+                        ) {
+                            Icon(OmsIcons.Music, contentDescription = null, tint = Color(0xFF93C5FD), modifier = Modifier.size(13.5.dp))
+                            Text(
+                                text = activeVoicePreset.displayName,
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Icon(OmsIcons.ChevronDown, contentDescription = null, tint = Color(0xB3FFFFFF), modifier = Modifier.size(12.dp))
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            modifier = Modifier
+                                .omsBounceClick(scaleDown = 0.94f, shape = pillShape) { englishOnly = !englishOnly }
+                                .background(if (englishOnly) Color(0xFF2563EB) else Color(0x22FFFFFF), pillShape)
+                                .border(0.6.dp, Color(0x38FFFFFF), pillShape)
+                                .padding(horizontal = 11.dp, vertical = 7.dp)
+                        ) {
+                            Icon(OmsIcons.Globe, contentDescription = null, tint = Color.White, modifier = Modifier.size(13.5.dp))
+                            Text(
+                                text = if (englishOnly) "EN Only" else "双语",
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
                     }
                 }
 
@@ -1136,6 +1184,156 @@ fun LiveVoiceAndGlassModal(
                         )
                     }
                 )
+            }
+        }
+
+        if (showVoicePicker) {
+            LiveVoicePickerDialog(
+                mode = selectedMode,
+                selectedVoiceId = activeVoicePreset.id,
+                onDismiss = { showVoicePicker = false },
+                onSelectVoice = { preset ->
+                    OmsApplication.instance?.edgeStore?.saveLiveVoiceName(selectedMode, preset.id)
+                    if (selectedMode == RealtimeBackendMode.OPENAI_WALK_TALK) {
+                        openAiVoiceId = preset.id
+                    } else {
+                        geminiVoiceId = preset.id
+                    }
+                    showVoicePicker = false
+                    OmsFeedbackController.show(
+                        "已切换音色：${preset.displayName}（${preset.toneTag}）",
+                        OmsToastKind.SUCCESS
+                    )
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun LiveVoicePickerDialog(
+    mode: RealtimeBackendMode,
+    selectedVoiceId: String,
+    onDismiss: () -> Unit,
+    onSelectVoice: (RealtimeVoicePreset) -> Unit
+) {
+    val voices = remember(mode) { RealtimeVoiceCatalog.voicesFor(mode) }
+    val engineTitle = if (mode == RealtimeBackendMode.OPENAI_WALK_TALK) {
+        "散步实时语音 · 音色选择"
+    } else {
+        "Glass 实时视频语音 · 音色选择"
+    }
+    val engineSubtitle = if (mode == RealtimeBackendMode.OPENAI_WALK_TALK) {
+        "OpenAI Realtime 原生音色（切换后自动无感重连生效）"
+    } else {
+        "Gemini 3.8 Live 演播室音色（切换后自动无感重连生效）"
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .clip(RoundedCornerShape(24.dp))
+                .background(Color(0xF5111624))
+                .border(0.8.dp, Color(0x33FFFFFF), RoundedCornerShape(24.dp))
+                .padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(engineTitle, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(engineSubtitle, color = Color(0x99FFFFFF), fontSize = 11.5.sp)
+                }
+                OmsCircleIconButton(
+                    icon = OmsIcons.Close,
+                    contentDescription = "关闭",
+                    size = 32.dp,
+                    iconSize = 15.dp,
+                    containerColor = Color(0x22FFFFFF),
+                    contentColor = Color.White,
+                    onClick = onDismiss
+                )
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 390.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(7.dp)
+            ) {
+                voices.forEach { preset ->
+                    val isSelected = preset.id.equals(selectedVoiceId, ignoreCase = true)
+                    val rowShape = RoundedCornerShape(14.dp)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .omsBounceClick(scaleDown = 0.97f, shape = rowShape) { onSelectVoice(preset) }
+                            .background(
+                                if (isSelected) Color(0x3838BDF8) else Color(0x14FFFFFF),
+                                rowShape
+                            )
+                            .border(
+                                width = if (isSelected) 1.dp else 0.5.dp,
+                                color = if (isSelected) Color(0xAA38BDF8) else Color(0x22FFFFFF),
+                                shape = rowShape
+                            )
+                            .padding(horizontal = 13.dp, vertical = 11.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(30.dp)
+                                    .clip(CircleShape)
+                                    .background(if (isSelected) Color(0xFF38BDF8) else Color(0x22FFFFFF))
+                            ) {
+                                Icon(
+                                    imageVector = OmsIcons.Waveform,
+                                    contentDescription = null,
+                                    tint = if (isSelected) Color(0xFF07090F) else Color(0xCCFFFFFF),
+                                    modifier = Modifier.size(15.dp)
+                                )
+                            }
+                            Column {
+                                Text(
+                                    text = preset.displayName,
+                                    color = Color.White,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = preset.toneTag,
+                                    color = if (isSelected) Color(0xFFBAE6FD) else Color(0x99FFFFFF),
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+                        if (isSelected) {
+                            Icon(
+                                imageVector = OmsIcons.Check,
+                                contentDescription = "当前音色",
+                                tint = Color(0xFF38BDF8),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
             }
         }
     }
