@@ -928,7 +928,7 @@ fun LiveVoiceAndGlassModal(
                         ) {
                             Icon(OmsIcons.Music, contentDescription = null, tint = Color(0xFF93C5FD), modifier = Modifier.size(13.5.dp))
                             Text(
-                                text = activeVoicePreset.displayName,
+                                text = "${activeVoicePreset.displayName}·${activeVoicePreset.genderTag.take(1)}",
                                 color = Color.White,
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.SemiBold
@@ -1201,7 +1201,7 @@ fun LiveVoiceAndGlassModal(
                     }
                     showVoicePicker = false
                     OmsFeedbackController.show(
-                        "已切换音色：${preset.displayName}（${preset.toneTag}）",
+                        "已切换音色：${preset.displayName}（${preset.genderTag} · ${preset.toneTag}）",
                         OmsToastKind.SUCCESS
                     )
                 }
@@ -1217,7 +1217,15 @@ private fun LiveVoicePickerDialog(
     onDismiss: () -> Unit,
     onSelectVoice: (RealtimeVoicePreset) -> Unit
 ) {
-    val voices = remember(mode) { RealtimeVoiceCatalog.voicesFor(mode) }
+    val allVoices = remember(mode) { RealtimeVoiceCatalog.voicesFor(mode) }
+    var genderFilter by remember(mode) { mutableStateOf("ALL") }
+    val voices = remember(allVoices, genderFilter) {
+        when (genderFilter) {
+            "女声" -> allVoices.filter { it.genderTag == "女声" }
+            "男声" -> allVoices.filter { it.genderTag == "男声" }
+            else -> allVoices
+        }
+    }
     val engineTitle = if (mode == RealtimeBackendMode.OPENAI_WALK_TALK) {
         "散步实时语音 · 音色选择"
     } else {
@@ -1264,6 +1272,34 @@ private fun LiveVoicePickerDialog(
                 )
             }
 
+            // Quick Gender Filter Strip (`全部 / 女声 / 男声`)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val femaleCount = allVoices.count { it.genderTag == "女声" }
+                val maleCount = allVoices.count { it.genderTag == "男声" }
+                listOf(
+                    "ALL" to "全部 (${allVoices.size})",
+                    "女声" to "女声 ($femaleCount)",
+                    "男声" to "男声 ($maleCount)"
+                ).forEach { (key, label) ->
+                    val active = genderFilter == key
+                    val chipShape = RoundedCornerShape(14.dp)
+                    Box(
+                        modifier = Modifier
+                            .omsBounceClick(scaleDown = 0.94f, shape = chipShape) { genderFilter = key }
+                            .background(if (active) Color.White else Color(0x1FFFFFFF), chipShape)
+                            .border(0.5.dp, if (active) Color.White else Color(0x2EFFFFFF), chipShape)
+                            .padding(horizontal = 11.dp, vertical = 5.dp)
+                    ) {
+                        Text(
+                            text = label,
+                            color = if (active) Color(0xFF0A0F1A) else Color(0xCCFFFFFF),
+                            fontSize = 11.5.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1274,6 +1310,11 @@ private fun LiveVoicePickerDialog(
                 voices.forEach { preset ->
                     val isSelected = preset.id.equals(selectedVoiceId, ignoreCase = true)
                     val rowShape = RoundedCornerShape(14.dp)
+                    val (genderBg, genderFg) = when (preset.genderTag) {
+                        "女声" -> Color(0x33F472B6) to Color(0xFFFBCFE8)
+                        "男声" -> Color(0x3360A5FA) to Color(0xFFBFDBFE)
+                        else -> Color(0x2BFFFFFF) to Color(0xFFE2E8F0)
+                    }
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1311,12 +1352,27 @@ private fun LiveVoicePickerDialog(
                                 )
                             }
                             Column {
-                                Text(
-                                    text = preset.displayName,
-                                    color = Color.White,
-                                    fontSize = 14.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = preset.displayName,
+                                        color = Color.White,
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    Text(
+                                        text = preset.genderTag,
+                                        color = genderFg,
+                                        fontSize = 10.5.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(genderBg)
+                                            .padding(horizontal = 6.dp, vertical = 1.5.dp)
+                                    )
+                                }
                                 Text(
                                     text = preset.toneTag,
                                     color = if (isSelected) Color(0xFFBAE6FD) else Color(0x99FFFFFF),

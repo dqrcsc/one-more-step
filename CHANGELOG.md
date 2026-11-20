@@ -1,5 +1,10 @@
 # Changelog · 更新日志
 
+## 3.3.2 - 2026-11-21 · 实时音色男/女声标注与按性别快筛、协同会话未发草稿自动持久化
+
+- **实时音频 / 视频音色选择增强 (`RealtimeVoiceCatalog` & `LiveVoicePickerDialog`)**：为全部 10 款 OpenAI Realtime 与 14 款 Gemini 3.8 Live 音色补齐明确的「女声 / 男声 / 中性」彩色徽章与顶部胶囊简标（如 `Marin·女` / `Puck·男`），并在选择弹窗新增 `全部 / 女声 / 男声` 一键快筛。
+- **协同会话输入框草稿自动持久化 (`EdgeSecureStore` & `ChisuAndMissionWorkspaces`)**：在「协同」工作区的单个 Agent 会话追问框（按 `backend:sessionId` 独立存储）与远程派单抽屉中实时持久化未发送草稿——退出会话、切 Tab 或重启 App 后再次进入自动还原，列表卡片显示醒目「草稿」角标；仅在成功提交后自动清空，若发送失败则自动回填保留。
+
 ## 3.3.1 - 2026-11-21 · 实时音频与 Glass 视频对话原生音色选择
 
 - **实时音频 / 视频对话音色自由切换 (`RealtimeVoiceCatalog`、`EdgeSecureStore` & `GlassAndLiveOverlay`)**：为 OpenAI Realtime 散步语音（10 款官方音色：`Marin`、`Cedar`、`Coral`、`Shimmer`、`Sage`、`Ballad`、`Verse`、`Ash`、`Alloy`、`Echo`）与 Gemini 3.8 Live 实时视频语音（14 款演播室音色：`Puck`、`Kore`、`Aoede`、`Zephyr`、`Charon`、`Fenrir`、`Leda`、`Orus`、`Sulafat`、`Vindemiatrix`、`Achird`、`Gacrux`、`Despina`、`Umbriel`）提供独立持久化的音色选择器；通话顶部新增毛玻璃音色胶囊，点开即可按中文风格标签一键切换并无感重连生效，且跨引擎严格隔离音色 ID 避免误传。

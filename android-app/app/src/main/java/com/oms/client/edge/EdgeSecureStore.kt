@@ -546,4 +546,45 @@ class EdgeSecureStore(context: Context) {
         }
         return com.oms.core.ai.RealtimeVoiceCatalog.resolveVoice(mode, prefs.getString(key, null)).id
     }
+
+    private fun loadAllAgentDraftsMap(): LinkedHashMap<String, String> {
+        val raw = prefs.getString("agent_session_drafts_v1", null) ?: return LinkedHashMap()
+        val out = LinkedHashMap<String, String>()
+        runCatching {
+            val parsed = MiniJson.parseObject(raw)
+            for ((k, v) in parsed) {
+                val s = v?.toString().orEmpty()
+                if (k.isNotBlank() && s.isNotEmpty()) {
+                    out[k] = s
+                }
+            }
+        }
+        return out
+    }
+
+    fun loadAgentDraft(draftKey: String): String {
+        val k = draftKey.trim()
+        if (k.isEmpty()) return ""
+        return loadAllAgentDraftsMap()[k].orEmpty()
+    }
+
+    fun hasAgentDraft(draftKey: String): Boolean = loadAgentDraft(draftKey).isNotBlank()
+
+    fun saveAgentDraft(draftKey: String, text: String) {
+        val k = draftKey.trim()
+        if (k.isEmpty()) return
+        val map = loadAllAgentDraftsMap()
+        if (text.isEmpty()) {
+            map.remove(k)
+        } else {
+            // Re-insert so most recently edited draft stays at the end; cap at 40 entries
+            map.remove(k)
+            map[k] = text.take(8000)
+            while (map.size > 40) {
+                val oldestKey = map.keys.firstOrNull() ?: break
+                map.remove(oldestKey)
+            }
+        }
+        prefs.edit().putString("agent_session_drafts_v1", MiniJson.stringify(map)).apply()
+    }
 }

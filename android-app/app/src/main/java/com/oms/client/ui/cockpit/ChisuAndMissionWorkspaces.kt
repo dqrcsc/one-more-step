@@ -1218,16 +1218,19 @@ fun MissionHubWorkspaceView(
             onRefresh = { coordinator.selectAndLoadAgentSession(selectedSession!!) },
             onCancel = { coordinator.cancelRemoteAgentSession(selectedSession!!.backend, selectedSession!!.sessionId) },
             onContinuePrompt = { followUp ->
+                val curSession = selectedSession!!
+                val draftKey = "${curSession.backend}:${curSession.sessionId}"
                 scope.launch {
                     runCatching {
                         coordinator.continueRemoteAgentSession(
-                            backend = selectedSession!!.backend,
-                            sessionId = selectedSession!!.sessionId,
+                            backend = curSession.backend,
+                            sessionId = curSession.sessionId,
                             prompt = followUp,
-                            workspacePath = selectedSession!!.workspacePath
+                            workspacePath = curSession.workspacePath
                         )
                     }.onFailure {
-                        OmsFeedbackController.show("接续失败：${it.message}", OmsToastKind.WARNING)
+                        app.edgeStore.saveAgentDraft(draftKey, followUp)
+                        OmsFeedbackController.show("接续失败，已为你保留草稿：${it.message}", OmsToastKind.WARNING)
                     }
                 }
             }
@@ -1774,6 +1777,9 @@ private fun AgentSessionCard(session: RemoteAgentSessionUi, onClick: () -> Unit)
     val cleanSummary = remember(session.lastSummary) {
         cleanAgentPreviewSnippet(session.lastSummary)
     }
+    val hasSavedDraft = remember(session.backend, session.sessionId, session.updatedAtMs) {
+        OmsApplication.instance?.edgeStore?.hasAgentDraft("${session.backend}:${session.sessionId}") == true
+    }
     val (statusText, statusColor) = when (session.status) {
         "running" -> "运行中" to palette.success
         "completed" -> "已完成" to palette.accent
@@ -1803,6 +1809,18 @@ private fun AgentSessionCard(session: RemoteAgentSessionUi, onClick: () -> Unit)
                     tint = palette.accent,
                     modifier = Modifier.size(14.dp)
                 )
+                if (hasSavedDraft) {
+                    Text(
+                        text = "草稿",
+                        color = palette.warning,
+                        fontSize = 10.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(5.dp))
+                            .background(palette.warningSoft)
+                            .padding(horizontal = 5.dp, vertical = 1.dp)
+                    )
+                }
                 Text(
                     text = if (session.backend == "codex") "Codex" else "Antigravity",
                     color = palette.textSecondary,
@@ -1924,7 +1942,10 @@ private fun AgentSessionDetailScreen(
     onContinuePrompt: (String) -> Unit
 ) {
     val palette = OmsTheme.colors
-    var followUpText by remember { mutableStateOf("") }
+    val draftKey = remember(session.backend, session.sessionId) { "${session.backend}:${session.sessionId}" }
+    var followUpText by remember(draftKey) {
+        mutableStateOf(OmsApplication.instance?.edgeStore?.loadAgentDraft(draftKey).orEmpty())
+    }
     val groupedItems = remember(steps) { groupAgentTrajectorySteps(steps) }
     val listState = rememberLazyListState()
 
@@ -2139,7 +2160,10 @@ private fun AgentSessionDetailScreen(
                 }
                 BasicTextField(
                     value = followUpText,
-                    onValueChange = { followUpText = it },
+                    onValueChange = { next ->
+                        followUpText = next
+                        OmsApplication.instance?.edgeStore?.saveAgentDraft(draftKey, next)
+                    },
                     textStyle = TextStyle(color = palette.textPrimary, fontSize = 15.sp, lineHeight = 21.sp),
                     cursorBrush = SolidColor(palette.accent),
                     maxLines = 4,
@@ -2159,6 +2183,7 @@ private fun AgentSessionDetailScreen(
                 onClick = {
                     val prompt = followUpText.trim()
                     followUpText = ""
+                    OmsApplication.instance?.edgeStore?.saveAgentDraft(draftKey, "")
                     onContinuePrompt(prompt)
                 }
             )
@@ -2251,7 +2276,14 @@ private fun AgentDispatchSheetContent(
     var targetResumeSessionId by remember { mutableStateOf("") }
     var showSessionDropdown by remember { mutableStateOf(false) }
     var newBackend by remember { mutableStateOf("codex") }
-    var promptText by remember(initialPrompt) { mutableStateOf(initialPrompt) }
+    val dispatchDraftKey = "__new_dispatch__"
+    var promptText by remember(initialPrompt) {
+        mutableStateOf(
+            initialPrompt.ifBlank {
+                OmsApplication.instance?.edgeStore?.loadAgentDraft(dispatchDraftKey).orEmpty()
+            }
+        )
+    }
     var isDispatching by remember { mutableStateOf(false) }
 
     val projectSessions = remember(sessions, selectedWorkspacePath) {
@@ -2401,7 +2433,10 @@ private fun AgentDispatchSheetContent(
             }
             BasicTextField(
                 value = promptText,
-                onValueChange = { promptText = it },
+                onValueChange = { next ->
+                    promptText = next
+                    OmsApplication.instance?.edgeStore?.saveAgentDraft(dispatchDraftKey, next)
+                },
                 textStyle = TextStyle(color = palette.textPrimary, fontSize = 14.5.sp, lineHeight = 21.sp),
                 cursorBrush = SolidColor(palette.accent),
                 modifier = Modifier.fillMaxWidth()
@@ -2431,6 +2466,8 @@ private fun AgentDispatchSheetContent(
                                 workspacePath = selectedWorkspacePath.trim()
                             )
                         }
+                        OmsApplication.instance?.edgeStore?.saveAgentDraft(dispatchDraftKey, "")
+                        promptText = ""
                         onDispatched()
                     } catch (e: Throwable) {
                         OmsFeedbackController.show("派单失败：${e.message}", OmsToastKind.WARNING)

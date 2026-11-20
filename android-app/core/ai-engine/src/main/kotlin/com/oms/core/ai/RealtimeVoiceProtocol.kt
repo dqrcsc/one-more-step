@@ -26,39 +26,40 @@ enum class RealtimeBackendMode {
 data class RealtimeVoicePreset(
     val id: String,
     val displayName: String,
+    val genderTag: String,
     val toneTag: String,
     val backend: RealtimeBackendMode
 )
 
 object RealtimeVoiceCatalog {
     val OPENAI_VOICES: List<RealtimeVoicePreset> = listOf(
-        RealtimeVoicePreset("marin", "Marin", "清澈自然 · 默认", RealtimeBackendMode.OPENAI_WALK_TALK),
-        RealtimeVoicePreset("cedar", "Cedar", "温润沉稳", RealtimeBackendMode.OPENAI_WALK_TALK),
-        RealtimeVoicePreset("coral", "Coral", "温暖亲切", RealtimeBackendMode.OPENAI_WALK_TALK),
-        RealtimeVoicePreset("shimmer", "Shimmer", "明亮柔美", RealtimeBackendMode.OPENAI_WALK_TALK),
-        RealtimeVoicePreset("sage", "Sage", "知性冷静", RealtimeBackendMode.OPENAI_WALK_TALK),
-        RealtimeVoicePreset("ballad", "Ballad", "温柔抒情", RealtimeBackendMode.OPENAI_WALK_TALK),
-        RealtimeVoicePreset("verse", "Verse", "富有表现力", RealtimeBackendMode.OPENAI_WALK_TALK),
-        RealtimeVoicePreset("ash", "Ash", "低沉磁性", RealtimeBackendMode.OPENAI_WALK_TALK),
-        RealtimeVoicePreset("alloy", "Alloy", "均衡中性", RealtimeBackendMode.OPENAI_WALK_TALK),
-        RealtimeVoicePreset("echo", "Echo", "清晰男声", RealtimeBackendMode.OPENAI_WALK_TALK)
+        RealtimeVoicePreset("marin", "Marin", "女声", "清澈自然 · 默认", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("cedar", "Cedar", "男声", "温润沉稳", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("coral", "Coral", "女声", "温暖亲切", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("shimmer", "Shimmer", "女声", "明亮柔美", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("sage", "Sage", "女声", "知性冷静", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("ballad", "Ballad", "男声", "温柔抒情", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("verse", "Verse", "男声", "富有表现力", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("ash", "Ash", "男声", "低沉磁性", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("alloy", "Alloy", "中性", "均衡自然", RealtimeBackendMode.OPENAI_WALK_TALK),
+        RealtimeVoicePreset("echo", "Echo", "男声", "清晰稳重", RealtimeBackendMode.OPENAI_WALK_TALK)
     )
 
     val GEMINI_VOICES: List<RealtimeVoicePreset> = listOf(
-        RealtimeVoicePreset("Puck", "Puck", "活泼明快 · 默认", RealtimeBackendMode.GEMINI_GLASS_LIVE),
-        RealtimeVoicePreset("Kore", "Kore", "坚定知性", RealtimeBackendMode.GEMINI_GLASS_LIVE),
-        RealtimeVoicePreset("Aoede", "Aoede", "轻盈自然", RealtimeBackendMode.GEMINI_GLASS_LIVE),
-        RealtimeVoicePreset("Zephyr", "Zephyr", "清亮柔和", RealtimeBackendMode.GEMINI_GLASS_LIVE),
-        RealtimeVoicePreset("Charon", "Charon", "沉稳博学", RealtimeBackendMode.GEMINI_GLASS_LIVE),
-        RealtimeVoicePreset("Fenrir", "Fenrir", "热烈磁性", RealtimeBackendMode.GEMINI_GLASS_LIVE),
-        RealtimeVoicePreset("Leda", "Leda", "青春灵动", RealtimeBackendMode.GEMINI_GLASS_LIVE),
-        RealtimeVoicePreset("Orus", "Orus", "干练稳重", RealtimeBackendMode.GEMINI_GLASS_LIVE),
-        RealtimeVoicePreset("Sulafat", "Sulafat", "温暖治愈", RealtimeBackendMode.GEMINI_GLASS_LIVE),
-        RealtimeVoicePreset("Vindemiatrix", "Vindemiatrix", "温婉轻柔", RealtimeBackendMode.GEMINI_GLASS_LIVE),
-        RealtimeVoicePreset("Achird", "Achird", "友好亲和", RealtimeBackendMode.GEMINI_GLASS_LIVE),
-        RealtimeVoicePreset("Gacrux", "Gacrux", "成熟厚重", RealtimeBackendMode.GEMINI_GLASS_LIVE),
-        RealtimeVoicePreset("Despina", "Despina", "丝滑悦耳", RealtimeBackendMode.GEMINI_GLASS_LIVE),
-        RealtimeVoicePreset("Umbriel", "Umbriel", "随性松弛", RealtimeBackendMode.GEMINI_GLASS_LIVE)
+        RealtimeVoicePreset("Puck", "Puck", "男声", "活泼明快 · 默认", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Kore", "Kore", "女声", "坚定知性", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Aoede", "Aoede", "女声", "轻盈自然", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Zephyr", "Zephyr", "女声", "清亮柔和", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Charon", "Charon", "男声", "沉稳博学", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Fenrir", "Fenrir", "男声", "热烈磁性", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Leda", "Leda", "女声", "青春灵动", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Orus", "Orus", "男声", "干练稳重", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Sulafat", "Sulafat", "女声", "温暖治愈", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Vindemiatrix", "Vindemiatrix", "女声", "温婉轻柔", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Achird", "Achird", "男声", "友好亲和", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Gacrux", "Gacrux", "女声", "成熟沉稳", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Despina", "Despina", "女声", "丝滑悦耳", RealtimeBackendMode.GEMINI_GLASS_LIVE),
+        RealtimeVoicePreset("Umbriel", "Umbriel", "男声", "随性松弛", RealtimeBackendMode.GEMINI_GLASS_LIVE)
     )
 
     fun voicesFor(mode: RealtimeBackendMode): List<RealtimeVoicePreset> =
