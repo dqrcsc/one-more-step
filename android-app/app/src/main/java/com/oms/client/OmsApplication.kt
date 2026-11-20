@@ -92,6 +92,9 @@ class OmsApplication : Application() {
             llmEngine = llmEngine,
             sendHostRpc = { method, params, timeoutMs ->
                 transportClient.callHostRpc(method, params, timeoutMs)
+            },
+            isRelayConfirmedMacOffline = {
+                transportClient.isWanRelayConfirmedHostOffline()
             }
         )
 
@@ -117,6 +120,7 @@ class OmsApplication : Application() {
         }
         llmEngine.runtimeConfig = edgeStore.loadAiRuntimeConfig()
         llmEngine.roleOverrides = edgeStore.loadModelRoleSelections()
+        transportClient.onWanRelayConfigUpdated()
         cockpitCoordinator.refreshProxyUiState()
         wechatStandby.refreshState()
     }

@@ -32,6 +32,7 @@ import {
   StreamAckResumeHeader,
   StreamStartHeader,
   TransportTier,
+  WanRelayClientConfig,
   SecureHello,
   SecureStart,
   SecureSession,
@@ -130,6 +131,13 @@ export class PhoneSessionManager extends EventEmitter {
   private btBridge: BluetoothBridgeServer | null = null;
   private wanRelayWs: WebSocket | null = null;
   private wanRelayWssUrl: string | null = null;
+  private wanRelayConfig: WanRelayClientConfig | null = null;
+  private wanActivePipe: ActiveTransportPipe | null = null;
+  private wanBoundRoomId: string | null = null;
+  private wanPairId: string | null = null;
+  private wanStandbyConnected = false;
+  private wanLastConnectedAtMs = 0;
+  private wanLastError: string | null = null;
   private wanReconnectTimer: Timer | null = null;
   private wanReconnectAttempts = 0;
   private stopped = false;
@@ -169,6 +177,11 @@ export class PhoneSessionManager extends EventEmitter {
     clientIp: string
   ) => Promise<Response | null> | Response | null;
   private apkHashCache: { mtimeMs: number; size: number; sha256: string } | null = null;
+  private wanOtaDownloadUrl: string | null = null;
+
+  public setWanOtaDownloadUrl(url: string | null): void {
+    this.wanOtaDownloadUrl = url && url.trim() ? url.trim() : null;
+  }
 
   private connectionDiagnostics: ConnectionDiagnostics;
 
@@ -344,7 +357,9 @@ export class PhoneSessionManager extends EventEmitter {
       updatedAtMs: Math.floor(stat.mtimeMs),
       updatedAtIso: new Date(stat.mtimeMs).toISOString(),
       downloadUrl: "/OneMoreStep.apk",
-      githubDownloadUrl: `https://github.com/dqrcsc/one-more-step/releases/download/v${versionName}/OneMoreStep-v${versionName}.apk`,
+      githubDownloadUrl:
+        this.wanOtaDownloadUrl ||
+        `https://github.com/dqrcsc/one-more_step/releases/download/v${versionName}/OneMoreStep-v${versionName}.apk`.replace("one-more_step", "one-more-step"),
     };
   }
 
@@ -455,6 +470,7 @@ export class PhoneSessionManager extends EventEmitter {
     btSocketPath?: string;
     btBinaryPath?: string;
     wanRelayWssUrl?: string;
+    wanRelay?: WanRelayClientConfig | null;
   }): Promise<void> {
     const self = this;
 
@@ -763,7 +779,9 @@ export class PhoneSessionManager extends EventEmitter {
     }
 
     // 3. Optional Tier 3 Outbound WAN Signaling/Relay connection
-    if (opts?.wanRelayWssUrl) {
+    if (opts?.wanRelay?.enabled && opts.wanRelay.wssUrl && opts.wanRelay.authToken) {
+      this.configureWanRelay(opts.wanRelay);
+    } else if (opts?.wanRelayWssUrl) {
       this.connectWanRelay(opts.wanRelayWssUrl);
     }
 
@@ -865,6 +883,16 @@ export class PhoneSessionManager extends EventEmitter {
           }
         }
       }
+      if (
+        this.housekeepingTick % 5 === 0 &&
+        this.wanStandbyConnected &&
+        this.wanRelayWs &&
+        this.wanRelayWs.readyState === WebSocket.OPEN
+      ) {
+        try {
+          this.wanRelayWs.send(JSON.stringify({ type: "ping", ts: Date.now() }));
+        } catch {}
+      }
     }, 4000);
     if (typeof (this.housekeepingTimer as any)?.unref === "function") {
       (this.housekeepingTimer as any).unref();
@@ -934,17 +962,229 @@ export class PhoneSessionManager extends EventEmitter {
     }
   }
 
+  public getWanRelayStatus(): {
+    configured: boolean;
+    enabled: boolean;
+    standbyConnected: boolean;
+    peerPaired: boolean;
+    authenticated: boolean;
+    pairId: string | null;
+    wssUrl: string | null;
+    roomIdPrefix: string | null;
+    lastConnectedAtMs: number;
+    lastError: string | null;
+  } {
+    const roomId = this.wanBoundRoomId || this.resolvePrimaryWanRoomId();
+    return {
+      configured: Boolean(this.wanRelayConfig?.wssUrl && this.wanRelayConfig?.authToken),
+      enabled: Boolean(this.wanRelayConfig?.enabled),
+      standbyConnected: this.wanStandbyConnected,
+      peerPaired: Boolean(this.wanPairId),
+      authenticated: Boolean(this.wanActivePipe?.authenticated),
+      pairId: this.wanPairId,
+      wssUrl: this.wanRelayConfig?.wssUrl || this.wanRelayWssUrl,
+      roomIdPrefix: roomId ? roomId.slice(0, 12) : null,
+      lastConnectedAtMs: this.wanLastConnectedAtMs,
+      lastError: this.wanLastError,
+    };
+  }
+
+  private resolvePrimaryWanRoomId(): string | null {
+    for (const dev of this.trustedDevices.values()) {
+      if (dev.pairingVersion === 2 && dev.pairSecretHex) {
+        if (dev.wanRoomId) return dev.wanRoomId;
+        return deriveWanRoomId(this.hostIdentity.publicKeyBase64Url, dev.phoneId);
+      }
+    }
+    return null;
+  }
+
+  public configureWanRelay(cfg: WanRelayClientConfig | null): void {
+    this.wanRelayConfig = cfg;
+    this.wanReconnectAttempts = 0;
+    this.refreshWanRelayBinding(true);
+  }
+
+  public refreshWanRelayBinding(forceReconnect = false): void {
+    if (this.stopped) return;
+    if (!this.wanRelayConfig?.enabled || !this.wanRelayConfig.wssUrl || !this.wanRelayConfig.authToken) {
+      this.disconnectWanRelay();
+      return;
+    }
+    const roomId = this.resolvePrimaryWanRoomId();
+    if (!roomId) {
+      this.wanLastError = "No paired v2 phone device yet";
+      this.disconnectWanRelay(true);
+      return;
+    }
+    if (!forceReconnect && this.wanRelayWs && this.wanBoundRoomId === roomId) {
+      return;
+    }
+    this.disconnectWanRelay(true);
+    this.connectRendezvousWanRelay(this.wanRelayConfig, roomId);
+  }
+
+  private disconnectWanRelay(preserveConfig = false): void {
+    if (this.wanReconnectTimer) {
+      clearTimeout(this.wanReconnectTimer);
+      this.wanReconnectTimer = null;
+    }
+    if (!preserveConfig) {
+      this.wanRelayConfig = null;
+      this.wanRelayWssUrl = null;
+    }
+    this.wanStandbyConnected = false;
+    this.wanPairId = null;
+    this.wanBoundRoomId = null;
+    const prevPipe = this.wanActivePipe;
+    this.wanActivePipe = null;
+    if (prevPipe) {
+      this.onPipeClosed(prevPipe);
+    }
+    if (this.wanRelayWs) {
+      const ws = this.wanRelayWs;
+      this.wanRelayWs = null;
+      try {
+        ws.close();
+      } catch {}
+    }
+  }
+
   private scheduleWanRelayReconnect(): void {
-    if (this.stopped || !this.wanRelayWssUrl || this.wanReconnectTimer) return;
-    const delayMs = Math.min(60_000, 2_000 * Math.pow(2, Math.min(this.wanReconnectAttempts, 5)));
+    if (this.stopped || this.wanReconnectTimer) return;
+    const hasModern = Boolean(this.wanRelayConfig?.enabled && this.wanRelayConfig.wssUrl && this.wanRelayConfig.authToken);
+    if (!hasModern && !this.wanRelayWssUrl) return;
+    const delayMs = Math.min(30_000, 1_500 * Math.pow(2, Math.min(this.wanReconnectAttempts, 4)));
     this.wanReconnectAttempts++;
     this.wanReconnectTimer = setTimeout(() => {
       this.wanReconnectTimer = null;
-      if (!this.stopped && this.wanRelayWssUrl) {
+      if (this.stopped) return;
+      if (this.wanRelayConfig?.enabled && this.wanRelayConfig.wssUrl && this.wanRelayConfig.authToken) {
+        const roomId = this.resolvePrimaryWanRoomId();
+        if (roomId) {
+          this.connectRendezvousWanRelay(this.wanRelayConfig, roomId);
+        }
+      } else if (this.wanRelayWssUrl) {
         this.connectWanRelay(this.wanRelayWssUrl);
       }
     }, delayMs);
     (this.wanReconnectTimer as any)?.unref?.();
+  }
+
+  private connectRendezvousWanRelay(cfg: WanRelayClientConfig, roomId: string): void {
+    if (this.stopped) return;
+    try {
+      const url = new URL(cfg.wssUrl);
+      url.searchParams.set("room", roomId);
+      url.searchParams.set("role", "host");
+      const targetUrl = url.toString();
+      this.wanBoundRoomId = roomId;
+      const wsOptions: Record<string, any> = {
+        headers: {
+          Authorization: `Bearer ${cfg.authToken}`,
+        },
+      };
+      if (cfg.caCertPem && cfg.caCertPem.trim()) {
+        wsOptions.tls = { ca: cfg.caCertPem };
+      }
+      const ws = new WebSocket(targetUrl, wsOptions as any);
+      ws.binaryType = "arraybuffer";
+
+      const detachCurrentPairPipe = () => {
+        const prev = this.wanActivePipe;
+        this.wanActivePipe = null;
+        this.wanPairId = null;
+        if (prev) {
+          (prev as any)._detachedByRelay = true;
+          this.onPipeClosed(prev);
+        }
+      };
+
+      ws.onopen = () => {
+        if (this.wanRelayWs !== ws) return;
+        this.wanReconnectAttempts = 0;
+        this.wanStandbyConnected = true;
+        this.wanLastConnectedAtMs = Date.now();
+        this.wanLastError = null;
+      };
+
+      ws.onmessage = (ev) => {
+        if (this.wanRelayWs !== ws) return;
+        if (typeof ev.data === "string") {
+          try {
+            const ctrl = JSON.parse(ev.data);
+            if (ctrl?.omsRelay === 1) {
+              if (ctrl.event === "waiting_for_peer") {
+                detachCurrentPairPipe();
+              } else if (ctrl.event === "peer_paired") {
+                detachCurrentPairPipe();
+                const pairId = typeof ctrl.pairId === "string" ? ctrl.pairId : generateUuidV7();
+                this.wanPairId = pairId;
+                const pipe: ActiveTransportPipe = {
+                  tier: "WAN_WEBRTC",
+                  authenticated: false,
+                  decoder: new FrameStreamDecoder(),
+                  sendRaw: (bytes) => {
+                    if (ws.readyState !== WebSocket.OPEN || this.wanActivePipe !== pipe) {
+                      throw new Error("WAN socket is not paired");
+                    }
+                    ws.send(bytes);
+                    return true;
+                  },
+                  getBufferedAmount: () =>
+                    typeof (ws as any).bufferedAmount === "number" ? (ws as any).bufferedAmount : 0,
+                  close: () => {
+                    if ((pipe as any)._detachedByRelay) return;
+                    if (this.wanRelayWs === ws) {
+                      try {
+                        ws.close();
+                      } catch {}
+                    }
+                  },
+                };
+                this.wanActivePipe = pipe;
+                this.onPipeOpened(pipe);
+              } else if (ctrl.event === "peer_left") {
+                if (!ctrl.pairId || ctrl.pairId === this.wanPairId) {
+                  detachCurrentPairPipe();
+                }
+              }
+            }
+          } catch {
+            // Ignore malformed control text
+          }
+          return;
+        }
+
+        const activePipe = this.wanActivePipe;
+        if (!activePipe) return;
+        const bytes = new Uint8Array(ev.data as ArrayBuffer);
+        this.onRawBytesReceived(activePipe, bytes);
+      };
+
+      ws.onerror = (err: any) => {
+        if (this.wanRelayWs === ws) {
+          this.wanLastError = err?.message ? String(err.message) : "WAN relay connection error";
+        }
+      };
+
+      ws.onclose = (ev: any) => {
+        if (this.wanRelayWs === ws) {
+          this.wanRelayWs = null;
+          this.wanStandbyConnected = false;
+          if (ev?.code && ev.code !== 1000) {
+            this.wanLastError = `Closed (${ev.code}${ev.reason ? `: ${ev.reason}` : ""})`;
+          }
+        }
+        detachCurrentPairPipe();
+        this.scheduleWanRelayReconnect();
+      };
+
+      this.wanRelayWs = ws;
+    } catch (err: any) {
+      this.wanLastError = err?.message || "Failed to initiate WAN relay";
+      this.scheduleWanRelayReconnect();
+    }
   }
 
   private connectWanRelay(wssUrl: string): void {
@@ -1291,7 +1531,10 @@ export class PhoneSessionManager extends EventEmitter {
     if (pipe.tier === "LAN_WS") this.presence.onLanDirectActive(1);
     else if (pipe.tier === "BT_RFCOMM") this.presence.onBleRssiSample(this.presence.getSnapshot().rssiRaw ?? -58);
     this.recomputeActiveTier();
-    if (start.mode === "pair") this.emit("devicePaired", trusted);
+    if (start.mode === "pair") {
+      this.emit("devicePaired", trusted);
+      this.refreshWanRelayBinding();
+    }
     this.emit("phoneAuthenticated", { phoneId: start.phoneId, tier: pipe.tier, status: this.phoneStatus });
   }
 
@@ -1750,11 +1993,7 @@ export class PhoneSessionManager extends EventEmitter {
 
   public async stop(): Promise<void> {
     this.stopped = true;
-    if (this.wanReconnectTimer) {
-      clearTimeout(this.wanReconnectTimer);
-      this.wanReconnectTimer = null;
-    }
-    this.wanRelayWssUrl = null;
+    this.disconnectWanRelay();
     for (const pipe of [...this.openPipes]) this.onPipeClosed(pipe);
     this.emit("sessionRevoked");
     if (this.housekeepingTimer) {

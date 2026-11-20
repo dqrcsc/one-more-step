@@ -149,11 +149,199 @@ async function readStdinText(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+function getCliVersion(): string {
+  try {
+    const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+    return String(pkg.version || "2.2.0");
+  } catch {
+    return "2.2.0";
+  }
+}
+
+const HELP_SECTIONS: Record<string, string> = {
+  system: `【一、连接诊断、跨网中继与守护进程 (system)】
+  oms status [--live]                           全维状态总览（在场 AT_DESK/AWAY、三级通道、手机遥测、中继、防休眠、微信尺素）
+  oms wan [status|test|on|off|set]              跨网加密中继（Tier 3 WAN）状态、HTTPS 延迟探测、开关与配置下发
+    • oms wan status                              查看本机与跨网中继房间连接状态
+    • oms wan test                                实测本机到云端中继 HTTPS 健康度与 RTT 延迟
+    • oms wan on | off                            启用或停用跨网远程加密通道
+    • oms wan set --url <wss> --token <t> [--ca <pem>]  更新中继配置并自动加密同步至手机
+  oms stay-awake [status|on|off]                Mac 离家驻守防休眠（托管 caffeinate -i -s：允许息屏锁屏，防止断网睡眠）
+  oms pair [--json]                             生成 10 分钟有效的安全 v2 完整配对 URI 与本地无线安装页 (/install)
+  oms ota                                       校验 SHA-256 与签名，向手机推送最新 APK 覆盖升级
+  oms prefs [--auto-copy|--auto-preview|--auto-otp|--auto-wx-phone|--tts-voice|--unlock-pattern|--unlock-pin]
+                                                查看或更新宿主自动复制、预览、验证码、默认 TTS 音色与解锁凭据偏好
+  oms edge-sync                                 立即向手机加密同步代理节点快照、AI 配置、跨网中继凭据、上下文胶囊与微信游标
+  oms daemon [status|start|stop|restart|logs [--lines N] [--wx]|install-launchagent]
+                                                管理后台单例守护进程 omsd、查看主日志/微信子进程日志或注册开机自启
+  oms version                                   显示当前版本号`,
+
+  transfer: `【二、手机 ⇄ Mac 收件箱、媒体流转与剪贴板/验证码 (transfer)】
+  oms inbox [--tag <tag>] [--unprocessed] [--q <kw>] [--limit N] [--ack]
+                                                查询手机投递记录（tag: all|sms_otp|default_inbox|pkb_vault|voice_idea|ui_bug）
+    • oms inbox show <itemId>                     查看单条投递完整元数据与本地文件绝对路径
+    • oms inbox peek [itemId]                     在 Mac 原生无打扰 HUD 速览浮窗中内联预览图片/PDF/Office/音频
+    • oms inbox transcribe <itemId>               对语音附件触发本机 SenseVoiceSmall 离线转写
+    • oms inbox ack <itemId> [--unprocessed]      将记录标记为已处理（或恢复待处理）
+    • oms inbox clear-processed                   清理收件箱索引中已处理的记录（保留磁盘原始附件）
+  oms otp [--limit N] [--copy] [--ack]          查询手机锁屏实时同步的最新验证码（--copy 将纯数字写入 Mac 剪贴板）
+  oms media [--type screenshot|camera|all_images|video] [--limit N] [--since <min>]
+                                                主动列出手机近期截屏/相机照片/视频元数据
+  oms pull <latest-screenshot|latest-camera|remote-path> [-o <dir>] [--compress]
+                                                一键拉取手机最新截屏、最新照片或受权目录文件到 Mac 本地
+  oms push <file-or-text> | --file <p> | --text <md> | --stdin [--title <t>] [--tts]
+                                                向手机时间流推送文件或 Markdown（别名 oms send；--tts 开启通勤朗读）
+  oms clip [get [--otp] | set <text> [--stdin] | pull | push]
+                                                读写手机剪贴板，或与 Mac 系统剪贴板 (pbcopy/pbpaste) 一键互推互拉`,
+
+  device: `【三、手机硬件遥控、真人语音、解锁与通话 (device)】
+  oms phone <subcommand>                        手机全能系统级控制（别名 oms control）：
+    • oms phone status                            强制拉取手机最新电量、温度、前台应用、网络、存储与权限健康度
+    • oms phone find [text] [--voice <v>] [--repeat <N>] [--save]
+                                                  强制外放 + 闹钟声道突破静音真人语音寻机（手机支持按键/解锁/通知 5 种即停）
+    • oms phone say <text> [--force-speaker|--no-alarm] [--voice <v>] [--repeat <N>] [--save]
+                                                  9 款 Edge Neural TTS 真人语音播报（默认戴耳机私密走耳机，无耳机走闹钟声道）
+    • oms phone voices | stop-tts                 查看 9 款真人音色列表 / 立即停止手机正在播放的语音
+    • oms phone volume <up|down|mute|unmute|0..100> [--stream music|ring|alarm|notification]
+    • oms phone vibrate [ms]                      触发手机线性马达震动
+    • oms phone screenshot [--no-inbox]           远程静默抓取手机当前屏幕并落盘至 Mac
+    • oms phone open <url> | launch <wechat|lark|dingtalk|camera|settings|pkg>
+    • oms phone <home|back|recents|notifications|lock>
+  oms unlock [pattern] [--pin <p>] [--bounds l,t,r,b] [--save]
+                                                远程唤醒屏幕、上滑调出密码盘并绘制 3x3 九宫格图案（1~9）或 PIN 解锁
+  oms contacts [list | set <name> <number> [--sim 1|2] [--note <s>] | remove <name>]
+                                                管理本地常用联系人速查表（供 oms call 直接按姓名外呼）
+  oms call <name-or-number> [--sim 1|2|电信|联通|移动] [--speaker] [--mac-say <t>|--ai-call <t>|--say <t>] [--voice <v>] [--hangup-after]
+                                                自动解锁选卡拨号，支持接通后 Mac 扬声器喂麦或小米 AI 通话自动传话（oms dial 仅拨号盘）
+  oms hangup                                    远程挂断正在振铃或通话中的电话`,
+
+  assistant: `【四、主动式日程助理、分级强提醒与远程审批 (assistant)】
+  oms alarm <HH:MM> [--label <t>] [--days 1,2,3,4,5] [--vibrate false]
+                                                在小米原生系统时钟 App 中静默设定一次性或周期闹钟
+  oms calendar [list [--days N] [--start <iso>] [--end <iso>] | add --title <t> --start <iso> [--duration <m>] [--remind <m>] | delete <id>]
+                                                防冲突查询手机日历（自动展开重复例会），或新增/删除带响铃提醒的日程
+  oms notify <text> [--title <t>] [--level silent|normal|urgent] [--tts] [--voice <v>] [--repeat <N>]
+                                                L1~L3 在场感知分级通知（urgent + --tts 突破勿扰与锁屏强提醒播报）
+  oms approve --title <t> --summary <s> [--diff <d>] [--options "批准继续,拒绝并中止"] [--timeout 1800]
+                                                推送高风险操作远程审批卡至手机，阻塞等待用户点按决策后返回`,
+
+  gui: `【五、跨生态外设、实时投屏与无障碍 GUI 自动化 (gui)】
+  oms airpods [status [--live] | mac | phone | auto <on|off> | pause <on|off>]
+                                                AirPods 在 Mac 与小米手机间随音频焦点无感抢占切换与对端媒体自动暂停
+  oms mirror [open|start|stop|status] [--fps 12] [--width 720] [--quality 72] [--no-wake]
+                                                打开实时低延迟手机屏幕镜像与电脑鼠标触控工作台 (/mirror)
+  oms web                                       在 Mac 默认浏览器打开本地实时协同与微信尺素总控台 (/inbox)
+  oms gui observe [--screenshot] [--som]        提取当前屏幕紧凑无障碍语义控件树（#1, #2）及可选 Set-of-Mark 标注图
+  oms gui act <click|long_click|input_text|scroll_down|scroll_up|back|home|launch_app|open_url> [#id] --observation <obsId> [--text <t>] [--confirm]
+                                                受 observationId 时效校验、隐私页避让、顶部急停胶囊与 --confirm 保护的 App 自动化`,
+
+  wx: `【六、微信尺素：公众号/视频深读、知识库沉淀与推送微信 (wx)】
+  oms wx <subcommand>                           微信 ClawBot 上下文桥接总入口（兼容独立别名 wx-ctx）：
+    • oms wx list [--triage <t>] [--json]         查看微信转发文章收件箱与初筛状态（默认只读，不主动联网轮询）
+    • oms wx show <id> [--json]                   查看单篇文章详情、采集质量标签、原文路径与伴读笔记
+    • oms wx peek [id] | to-phone <id>            在 Mac 原生 HUD 浮窗打开阅读 / 同步至小米手机通勤 TTS 朗读
+    • oms wx recent | inbox | tasks [--json]      查看近期非文章消息、想法速记与异步任务记录
+    • oms wx sync | ingest <url> [--note <n>]     主动拉取微信新消息 / 手动导入单篇链接生成初筛伴读
+    • oms wx reanalyze <id> [--force] [--send]    重新运行模型初筛分析（可选回发微信）
+    • oms wx push [--text <t>|--stdin|--file <p>|--article <id>] [--formats md,html,pdf] [--with-file] [--json]
+                                                  将总结文本、图片或自动编译的 MD/HTML/PDF 多格式文档推送回手机微信
+    • oms wx schedule <list|add|run|done|cancel>  管理微信待办提醒与周期性信息收集定时任务
+    • oms wx status | doctor | login | web | config-web`,
+
+  agents: `【七、桌面重脑会话中枢与 MCP 接入 (agents)】
+  oms agents [list [--limit N] | projects]      列出本机活跃/历史 Codex 与 Antigravity 会话及可派单项目工作区目录
+  oms agents show <codex|agy> <sessionId>       查看指定桌面/远程 Agent 会话的步骤流与文件变更详情
+  oms agents start <prompt> [--backend codex|agy] [--cwd <dir>]
+                                                在指定工作区后台拉起新的 Codex 或 Antigravity 任务会话
+  oms agents resume <codex|agy> <sessionId> <prompt>
+                                                按原 session_id / conversation_id 跨端多轮接续追问已有会话
+  oms agents cancel <codex|agy> <sessionId>     中止正在运行的受管 Agent 会话
+  oms mcp                                       以标准 stdio 模式启动 MCP Server（暴露 13 个 Tools 与 3 个 Resources）`,
+};
+
+const CMD_TO_HELP_SECTION: Record<string, string> = {
+  system: "system",
+  status: "system",
+  doctor: "system",
+  wan: "system",
+  "stay-awake": "system",
+  awake: "system",
+  pair: "system",
+  ota: "system",
+  prefs: "system",
+  "edge-sync": "system",
+  daemon: "system",
+  version: "system",
+  transfer: "transfer",
+  inbox: "transfer",
+  otp: "transfer",
+  media: "transfer",
+  pull: "transfer",
+  push: "transfer",
+  send: "transfer",
+  clip: "transfer",
+  device: "device",
+  phone: "device",
+  control: "device",
+  unlock: "device",
+  contacts: "device",
+  contact: "device",
+  call: "device",
+  dial: "device",
+  hangup: "device",
+  assistant: "assistant",
+  alarm: "assistant",
+  calendar: "assistant",
+  notify: "assistant",
+  approve: "assistant",
+  gui: "gui",
+  airpods: "gui",
+  mirror: "gui",
+  web: "gui",
+  wx: "wx",
+  wechat: "wx",
+  agents: "agents",
+  agent: "agents",
+  mcp: "agents",
+};
+
+function printStructuredHelp(topic?: string): void {
+  const ver = getCliVersion();
+  const key = topic ? CMD_TO_HELP_SECTION[topic.toLowerCase()] : undefined;
+  console.log(`青简 · OneMoreStep CLI (oms v${ver}) — macOS 本地 AI ⇄ 小米 Android 认知座舱 & 微信尺素统一命令行\n`);
+  if (key && HELP_SECTIONS[key]) {
+    console.log(HELP_SECTIONS[key]);
+    console.log(`\n提示：运行 \`oms help\` 查看全部七大命令域总览。`);
+    return;
+  }
+  console.log(Object.values(HELP_SECTIONS).join("\n\n"));
+  console.log(`\n快速按域查询帮助：oms help <system | transfer | device | assistant | gui | wx | agents>`);
+}
+
 async function main() {
   const rawArgs = process.argv.slice(2);
-  const cmd = rawArgs[0] || "help";
+  const firstArg = rawArgs[0] || "help";
+
+  if (firstArg === "--version" || firstArg === "-v" || firstArg === "version") {
+    console.log(`one-more-step v${getCliVersion()}`);
+    return;
+  }
+
+  if (firstArg === "--help" || firstArg === "-h" || firstArg === "help") {
+    printStructuredHelp(rawArgs[1]);
+    return;
+  }
+
+  const cmd = firstArg;
   const sub = rawArgs[1];
   const { positional, flags } = parseFlags(rawArgs.slice(1));
+
+  if ((flags.help || flags.h) && cmd !== "wx" && cmd !== "wechat") {
+    printStructuredHelp(cmd);
+    return;
+  }
+
   const homeDir = process.env.OMS_HOME || path.join(os.homedir(), ".one_more_step");
   const ipc = new OmsIpcClient(homeDir);
 
@@ -687,6 +875,48 @@ async function main() {
       break;
     }
 
+    case "wan": {
+      const op = (positional[0] || "status").toLowerCase();
+      if (op === "test" || op === "probe") {
+        const res = await ipc.call("wan.probe", {}, 12000);
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "on" || op === "enable") {
+        const res = await ipc.call("wan.configure", { enabled: true });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "off" || op === "disable") {
+        const res = await ipc.call("wan.configure", { enabled: false });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "set" || op === "config") {
+        const res = await ipc.call("wan.configure", {
+          enabled: flags.enabled !== undefined ? flags.enabled !== "false" : true,
+          wssUrl: typeof flags.url === "string" ? flags.url : positional[1],
+          authToken: typeof flags.token === "string" ? flags.token : undefined,
+          caCertPath: typeof flags.ca === "string" ? flags.ca : undefined,
+        });
+        console.log(JSON.stringify(res, null, 2));
+      } else {
+        const res = await ipc.call("wan.status", {});
+        console.log(JSON.stringify(res, null, 2));
+      }
+      break;
+    }
+
+    case "stay-awake":
+    case "awake": {
+      const op = (positional[0] || "status").toLowerCase();
+      if (op === "on" || op === "enable" || op === "true") {
+        const res = await ipc.call("host.stay_awake", { enabled: true });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "off" || op === "disable" || op === "false") {
+        const res = await ipc.call("host.stay_awake", { enabled: false });
+        console.log(JSON.stringify(res, null, 2));
+      } else {
+        const res = await ipc.call("host.stay_awake", {});
+        console.log(JSON.stringify(res, null, 2));
+      }
+      break;
+    }
+
     case "unlock": {
       const pattern =
         (typeof flags.pattern === "string" ? flags.pattern : undefined) ||
@@ -924,9 +1154,60 @@ async function main() {
       break;
     }
 
-    case "agents": {
-      const res = await ipc.call("agent.sessions.list", { limit: Number(flags.limit || 20) }, 10000);
-      console.log(JSON.stringify(res, null, 2));
+    case "agents":
+    case "agent": {
+      const op = (positional[0] || "list").toLowerCase();
+      if (op === "projects") {
+        const res = await ipc.call("agent.sessions.list", { limit: Number(flags.limit || 20) }, 10000);
+        console.log(JSON.stringify({ projects: res.projects || [] }, null, 2));
+      } else if (op === "show" || op === "detail") {
+        const backend = (positional[1] || (flags.backend as string) || "codex").toLowerCase();
+        const sessionId = positional[2] || (flags.id as string) || positional[1];
+        if (!sessionId) throw new Error("Usage: oms agents show <codex|agy> <sessionId>");
+        const res = await ipc.call(
+          "agent.session.detail",
+          {
+            backend: backend === "agy" ? "agy" : "codex",
+            sessionId,
+          },
+          10000
+        );
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "start" || op === "run") {
+        const backend = ((flags.backend as string) || "codex").toLowerCase() === "agy" ? "agy" : "codex";
+        const cwd = typeof flags.cwd === "string" ? path.resolve(flags.cwd) : process.cwd();
+        const prompt = (typeof flags.prompt === "string" ? flags.prompt : "") || positional.slice(1).join(" ").trim();
+        if (!prompt) throw new Error("Usage: oms agents start [--backend codex|agy] [--cwd <dir>] <prompt>");
+        const res = await ipc.call("agent.session.start", { backend, cwd, prompt }, 15000);
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "resume" || op === "continue") {
+        const backend = (positional[1] || (flags.backend as string) || "codex").toLowerCase() === "agy" ? "agy" : "codex";
+        const sessionId = positional[2] || (flags.id as string);
+        const prompt = (typeof flags.prompt === "string" ? flags.prompt : "") || positional.slice(3).join(" ").trim();
+        if (!sessionId || !prompt) {
+          throw new Error("Usage: oms agents resume <codex|agy> <sessionId> <prompt>");
+        }
+        const res = await ipc.call(
+          "agent.session.continue",
+          {
+            backend,
+            sessionId,
+            prompt,
+            cwd: typeof flags.cwd === "string" ? path.resolve(flags.cwd) : undefined,
+          },
+          15000
+        );
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "cancel" || op === "stop") {
+        const backend = (positional[1] || (flags.backend as string) || "codex").toLowerCase() === "agy" ? "agy" : "codex";
+        const sessionId = positional[2] || (flags.id as string);
+        if (!sessionId) throw new Error("Usage: oms agents cancel <codex|agy> <sessionId>");
+        const res = await ipc.call("agent.session.cancel", { backend, sessionId }, 10000);
+        console.log(JSON.stringify(res, null, 2));
+      } else {
+        const res = await ipc.call("agent.sessions.list", { limit: Number(flags.limit || 20) }, 10000);
+        console.log(JSON.stringify(res, null, 2));
+      }
       break;
     }
 
@@ -996,47 +1277,7 @@ async function main() {
     }
 
     default:
-      console.log(`OneMoreStep CLI (oms) - Mac AI <-> Xiaomi Android & WeChat ClawBot Bridge
-Commands:
-  oms status [--live]                                  Inspect live presence, transport tier, WeChat worker, battery, temp, audio & permissions
-  oms wx <list|show|recent|inbox|schedule|tasks|sync|ingest|reanalyze|push|doctor|login|peek|to-phone>
-                                                       Unified WeChat-as-Context (青简·尺素) article inbox, deep-read, schedules & WeChat push
-  oms airpods [status|mac|phone|auto <on|off>|pause <on|off>]
-                                                       Seamless AirPods auto-switch between Mac & Android on audio output + media pause
-  oms phone <status|find|say|voices|stop-tts|volume|screenshot|open|launch|unlock|call|hangup|home|back|lock>
-                                                       Inspect rich phone telemetry or remotely control phone from Mac
-  oms phone find [text] [--voice <v>] [--repeat <N>] [--save]
-                                                       Ring/speak at max alarm volume with 9 Neural TTS human voices (e.g. xiaoyi, yunxia, hsiaochen)
-  oms phone say <text> [--force-speaker|--no-alarm] [--voice <v>] [--repeat <N>] [--save]
-                                                       Speak text on phone (respects AirPods/headset privately by default; --force-speaker forces built-in speaker)
-  oms phone voices                                     List all 9 Neural TTS human voices & current default voice
-  oms phone stop-tts                                   Stop active Find-My-Phone or TTS voice playback on phone
-  oms phone unlock [pattern] [--save] [--bounds l,t,r,b] Wake screen, swipe up bouncer & draw 3x3 pattern (1~9) to unlock phone
-  oms phone call <number> [--sim 1|2|电信|联通] [--say <text>] [--voice <v>] [--repeat <N>] [--hangup-after] [--speaker]
-                                                       Auto-unlock, place phone call, wait for answer & speak with Neural TTS voice
-  oms phone hangup                                     Hang up / end active or dialing phone call on Xiaomi phone
-  oms pair [--json]                                    Generate v2 pairing URI & local wireless install URL (/install)
-  oms web                                              Open Mac real-time Inbox & Stream Web Dashboard (/inbox)
-  oms mirror [open|start|stop|status] [--fps 12]       Open real-time Phone Screen Mirror & remote control studio (/mirror)
-  oms otp [--limit N] [--copy] [--ack]                 Query latest synced verification codes (OTP) from phone
-  oms prefs [--auto-otp] [--auto-copy] [--tts-voice <v>] [--unlock-pattern <1~9>]
-                                                       View or update Mac auto-OTP, clipboard, preview, default TTS voice & unlock pattern
-  oms inbox [latest] [--tag <tag>] [--unprocessed]     Query items sent from phone (--ack to mark read, --q <keyword>)
-  oms inbox show <id> | ack <id> | transcribe <id>     Inspect item, mark processed, or run SenseVoice offline ASR
-  oms media [recent] [--type screenshot|camera]        List recent screenshots/photos/videos on phone (--since <min>)
-  oms pull <remote-path | latest-screenshot> [-o dir]  Pull authorized file or latest screenshot/photo from phone to Mac
-  oms push <file-or-text> [--title <t>] [--tts]        Push file/Markdown/text to phone stream (--file, --text, --stdin)
-  oms clip [get [--otp] | set <text> | push | pull]    Bidirectional clipboard sync between Mac and Xiaomi phone
-  oms alarm [set] <HH:MM> [--label <t>] [--days 1,2]   Set native Xiaomi system clock alarm
-  oms calendar [list [--days N] | add --title <t>]     Query conflict-free schedule or insert phone calendar event
-  oms notify <text> [--level urgent] [--tts] [--voice <v>] [--repeat <N>]
-                                                       Send graded notification (L1-L3) or alarm-stream Neural TTS voice
-  oms approve --title <t> --summary <s> [--diff <d>]   Push blocking remote approval card to phone and wait for decision
-  oms gui observe [--screenshot] [--som]               Extract compact Accessibility semantic tree (#1, #2) & SoM screenshot
-  oms gui act <click|input_text|...> [#id] --observation <id> [--confirm] Perform GUI automation action on phone with safety guardrails
-  oms ota                                              Push latest APK update to phone over LAN
-  oms daemon [status|start|stop|restart|logs]          Manage background omsd daemon
-  oms mcp                                              Start stdio MCP server for Codex/Antigravity/OpenCode`);
+      printStructuredHelp(cmd);
       break;
   }
 }

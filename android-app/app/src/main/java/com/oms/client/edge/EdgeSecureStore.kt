@@ -31,6 +31,13 @@ data class ClawBotAuthConfig(
     val userId: String
 )
 
+data class WanRelayStoredConfig(
+    val enabled: Boolean,
+    val wssUrl: String,
+    val authToken: String,
+    val caCertPem: String = ""
+)
+
 data class WeChatCursorState(
     val updatesBuf: String = "",
     val recipientUserId: String = "",
@@ -194,6 +201,22 @@ class EdgeSecureStore(context: Context) {
             baseUrl = cm["baseUrl"]?.toString()?.ifBlank { "https://ilinkai.weixin.qq.com" } ?: "https://ilinkai.weixin.qq.com",
             botId = cm["botId"]?.toString().orEmpty(),
             userId = cm["userId"]?.toString().orEmpty()
+        )
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    fun loadWanRelayConfig(): WanRelayStoredConfig? = synchronized(lock) {
+        val m = readEncryptedJsonObj("edge_config") ?: return null
+        val wm = m["wanRelay"] as? Map<String, Any?> ?: return null
+        val wssUrl = wm["wssUrl"]?.toString()?.trim().orEmpty()
+        val authToken = wm["authToken"]?.toString()?.trim().orEmpty()
+        if (wssUrl.isEmpty() || authToken.isEmpty()) return null
+        val enabled = wm["enabled"] as? Boolean ?: true
+        WanRelayStoredConfig(
+            enabled = enabled,
+            wssUrl = wssUrl,
+            authToken = authToken,
+            caCertPem = wm["caCertPem"]?.toString()?.trim().orEmpty()
         )
     }
 

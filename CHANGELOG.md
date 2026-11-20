@@ -1,5 +1,12 @@
 # Changelog · 更新日志
 
+## 2.2.0 - 2026-11-20 · 腾讯云轻量零信任跨网中继 (`Tier 3 WAN`)、离家驻守防休眠与远程工作闭环
+
+- **零依赖跨网加密会合中继 (`wan-relay/server.mjs`)**：新增纯 Node 22 / Bun 兼容的 RFC 6455 WebSocket 房间配对中继服务（常驻内存约 `12 MiB`），采用恒定时间 `Bearer` 鉴权、双向二进制密文帧透传、`waiting_for_peer` / `peer_paired` / `peer_left` 状态同步与心跳超时回收，复用标准 `443` 端口独立两级 ECDSA P-256 证书链并完全隔离保留同机既有业务服务。
+- **Mac 与 Android 三级通道无感升降级 (`PhoneSessionManager` & `OmsTransportClient`)**：修复旧版 WAN 连接提前空发 `secure.hello` 握手超时的时序问题；Mac 常驻待命并在收到 `peer_paired` 时瞬间发起 v2 `P-256 ECDH + AES-256-GCM` 双向认证加密握手；手机端支持固定根证书（CA Pinning）、绕过第三方 VPN 直连国内中继、在同局域网 `LAN_WS` 就绪时自动释放云端连接，离席断连 `1.5s` 内自动切入 `🟣 跨网远程在线`，无缝承载 `🕹️ 任务舱`（Codex / Antigravity 远程派单、接续与审批）及文件/剪贴板协同。
+- **离家 5G 微信尺素状态确定化 (`StandbyLeasePolicy`)**：中继明确回传 `hostOnline: false` 时，手机在户外 5G 下也能 100% 确定性感知家里 Mac 已休眠并安全接管微信 iLink 轮询，消除离家模糊等待态。
+- **Mac 离家驻守防休眠与 CLI 扩展 (`oms wan` & `oms stay-awake`)**：新增 `oms stay-awake on|off|status`（受管 `caffeinate -i -s -w <pid>`，允许息屏锁屏但防止系统断网睡眠）及 `oms wan status|test|on|off|set` 实时跨网诊断命令。
+
 ## 2.1.1 - 2026-11-20 · 内置代理防 AI 锁区自动切换与带鉴权连通性探测
 
 - **AI 地域限制自动熔断与无感换线重试 (`AiGeoBlockFailoverInterceptor`)**：自动识别 Google Gemini (`User location is not supported`) 与 OpenAI 地域锁区响应，将触发锁区的代理节点（含香港节点及被送中的假美区节点）实时标记为 `🚫 AI锁区`、立即淘汰复用的 HTTP/2 长连接并自动切换至新/日/美纯净节点无感重试。

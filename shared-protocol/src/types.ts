@@ -420,6 +420,13 @@ export interface EdgeClawBotAuthPayload {
   userId: string;
 }
 
+export interface WanRelayClientConfig {
+  enabled: boolean;
+  wssUrl: string;
+  authToken: string;
+  caCertPem?: string;
+}
+
 export interface EdgeConfigSyncParams {
   subscriptionUrls: string[];
   bootstrapNodes: EdgeProxyNodePayload[];
@@ -430,6 +437,7 @@ export interface EdgeConfigSyncParams {
   domesticFallback?: EdgeProviderPayload;
   clawbotAuth?: EdgeClawBotAuthPayload;
   pairedLanSsidHint?: string;
+  wanRelay?: WanRelayClientConfig;
   syncedAtMs: number;
 }
 

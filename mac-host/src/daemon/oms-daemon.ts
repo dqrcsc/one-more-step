@@ -34,6 +34,7 @@ import {
   ScreenFrameCodec,
   ScreenFrameFlags,
   SpeechAudioPolicyName,
+  WanRelayClientConfig,
 } from "@oms/shared-protocol";
 import { PhoneSessionManager, TrustedPhoneDevice } from "../transport/session-manager.js";
 import { InboxManager, StoredInboxItem } from "../inbox/inbox-manager.js";
@@ -48,6 +49,9 @@ import { AgentSessionHub, type AgentSessionHubOptions } from "../agent/agent-ses
 export interface OmsHostConfig {
   lanPort: number;
   wanRelayWssUrl?: string;
+  wanRelay?: WanRelayClientConfig;
+  wanOtaDownloadUrl?: string;
+  stayAwakeEnabled?: boolean;
   enableBluetoothBridge: boolean;
   enableWeChatBridge?: boolean;
   wechatInternalPort?: number;
@@ -180,6 +184,7 @@ export class OmsDaemon {
   private lastSyncedUpdatesBuf = "";
   private lastKnownPhoneWifiSsid = "";
   private edgeCursorSyncTimer: Timer | null = null;
+  private stayAwakeProc: ReturnType<typeof spawn> | null = null;
 
   constructor(customHomeDir?: string) {
     this.homeDir = customHomeDir || path.join(os.homedir(), ".one_more_step");
@@ -249,6 +254,9 @@ export class OmsDaemon {
     });
 
     this.wireSessionEvents();
+    if (this.config.wanOtaDownloadUrl) {
+      this.session.setWanOtaDownloadUrl(this.config.wanOtaDownloadUrl);
+    }
     this.session.on("sessionRevoked", () => {
       for (const p of this.pendingApprovals.values()) { clearTimeout(p.timer); p.reject(new Error("Pairing session revoked")); }
       this.pendingApprovals.clear();
@@ -431,6 +439,132 @@ export class OmsDaemon {
     this.saveConfig();
     this.syncAirpodsConfigToBridgeAndPhone();
     return this.getHostPreferences();
+  }
+
+  public getStayAwakeStatus(): {
+    enabled: boolean;
+    running: boolean;
+    pid: number | null;
+    mode: string;
+  } {
+    const running = Boolean(this.stayAwakeProc && this.stayAwakeProc.exitCode === null && !this.stayAwakeProc.killed);
+    return {
+      enabled: Boolean(this.config.stayAwakeEnabled),
+      running,
+      pid: running ? this.stayAwakeProc?.pid ?? null : null,
+      mode: "caffeinate -i -s (允许锁屏息屏，防止系统与网络休眠)",
+    };
+  }
+
+  public setStayAwakeEnabled(enabled: boolean) {
+    this.config.stayAwakeEnabled = enabled;
+    this.saveConfig();
+    this.applyStayAwakeState();
+    return this.getStayAwakeStatus();
+  }
+
+  private applyStayAwakeState(): void {
+    if (!this.config.stayAwakeEnabled) {
+      this.stopStayAwakeProcess();
+      return;
+    }
+    if (this.stayAwakeProc && this.stayAwakeProc.exitCode === null && !this.stayAwakeProc.killed) {
+      return;
+    }
+    if (process.platform !== "darwin" || process.env.OMS_DISABLE_OSASCRIPT === "1") {
+      return;
+    }
+    try {
+      const child = spawn("/usr/bin/caffeinate", ["-i", "-s", "-w", String(process.pid)], {
+        stdio: "ignore",
+      });
+      child.on("error", () => {
+        if (this.stayAwakeProc === child) this.stayAwakeProc = null;
+      });
+      child.on("exit", () => {
+        if (this.stayAwakeProc === child) this.stayAwakeProc = null;
+      });
+      child.unref();
+      this.stayAwakeProc = child;
+    } catch {
+      this.stayAwakeProc = null;
+    }
+  }
+
+  private stopStayAwakeProcess(): void {
+    if (this.stayAwakeProc) {
+      const child = this.stayAwakeProc;
+      this.stayAwakeProc = null;
+      try {
+        child.kill("SIGTERM");
+      } catch {}
+    }
+  }
+
+  public configureWanRelayHost(params: {
+    enabled?: boolean;
+    wssUrl?: string;
+    authToken?: string;
+    caCertPem?: string;
+    caCertPath?: string;
+  }) {
+    const prev = this.config.wanRelay || { enabled: false, wssUrl: "", authToken: "" };
+    let caCertPem = typeof params.caCertPem === "string" ? params.caCertPem : prev.caCertPem;
+    if (typeof params.caCertPath === "string" && params.caCertPath.trim()) {
+      caCertPem = fs.readFileSync(params.caCertPath.trim(), "utf8");
+    }
+    const next: WanRelayClientConfig = {
+      enabled: typeof params.enabled === "boolean" ? params.enabled : prev.enabled !== false,
+      wssUrl: typeof params.wssUrl === "string" ? params.wssUrl.trim() : prev.wssUrl,
+      authToken: typeof params.authToken === "string" ? params.authToken.trim() : prev.authToken,
+      ...(caCertPem ? { caCertPem } : {}),
+    };
+    this.config.wanRelay = next;
+    this.saveConfig();
+    this.session.configureWanRelay(next);
+    void this.syncEdgeConfigAndCapsuleToPhone(false).catch(() => {});
+    return this.session.getWanRelayStatus();
+  }
+
+  public async probeWanRelayHealth(): Promise<Record<string, unknown>> {
+    const cfg = this.config.wanRelay;
+    if (!cfg?.wssUrl) {
+      return { ok: false, error: "WAN relay is not configured" };
+    }
+    try {
+      const u = new URL(cfg.wssUrl);
+      u.protocol = u.protocol === "wss:" ? "https:" : "http:";
+      u.pathname = u.pathname.replace(/\/v1\/?$/, "/health");
+      if (!u.pathname.endsWith("/health")) {
+        u.pathname = u.pathname.replace(/\/+$/, "") + "/health";
+      }
+      u.search = "";
+      const t0 = performance.now();
+      const fetchOpts: Record<string, any> = {
+        method: "GET",
+        signal: AbortSignal.timeout(6000),
+      };
+      if (cfg.caCertPem && u.protocol === "https:") {
+        fetchOpts.tls = { ca: cfg.caCertPem };
+      }
+      const res = await fetch(u.toString(), fetchOpts as any);
+      const rttMs = Math.round(performance.now() - t0);
+      const data = await res.json().catch(() => ({}));
+      return {
+        ok: res.ok,
+        status: res.status,
+        rttMs,
+        healthUrl: u.toString(),
+        relayHealth: data,
+        sessionStatus: this.session.getWanRelayStatus(),
+      };
+    } catch (err: any) {
+      return {
+        ok: false,
+        error: err?.message || String(err),
+        sessionStatus: this.session.getWanRelayStatus(),
+      };
+    }
   }
 
   public resolveNeuralTtsVoice(rawVoice?: string): { alias: string; voiceId: string; label: string } {
@@ -1682,6 +1816,14 @@ export class OmsDaemon {
     if (this.lastKnownPhoneWifiSsid) {
       edgeCfg.pairedLanSsidHint = this.lastKnownPhoneWifiSsid;
     }
+    if (this.config.wanRelay?.wssUrl && this.config.wanRelay?.authToken) {
+      edgeCfg.wanRelay = {
+        enabled: this.config.wanRelay.enabled !== false,
+        wssUrl: this.config.wanRelay.wssUrl,
+        authToken: this.config.wanRelay.authToken,
+        caCertPem: this.config.wanRelay.caCertPem,
+      };
+    }
 
     if (this.session.getActiveTier() !== "DISCONNECTED") {
       await this.session
@@ -2280,7 +2422,9 @@ export class OmsDaemon {
         btSocketPath: this.config.enableBluetoothBridge ? this.btSocketPath : undefined,
         btBinaryPath: fs.existsSync(btBin) ? btBin : undefined,
         wanRelayWssUrl: this.config.wanRelayWssUrl,
+        wanRelay: this.config.wanRelay,
       });
+      this.applyStayAwakeState();
       this.syncAirpodsConfigToBridgeAndPhone();
 
       if (process.platform === "darwin" && process.env.OMS_DISABLE_OSASCRIPT !== "1") {
@@ -2479,9 +2623,38 @@ export class OmsDaemon {
             lastSeenIso: new Date(d.lastSeenMs).toISOString(),
           })),
           airpodsStatus: this.getAirpodsStatusSnapshot(),
+          wanRelayStatus: this.session.getWanRelayStatus(),
+          stayAwakeStatus: this.getStayAwakeStatus(),
           phoneStatus: this.session.getPhoneStatus(),
           wechatStatus: await this.wechat.refreshHealth(Boolean(params.force)),
         };
+      }
+
+      case "wan.status": {
+        return {
+          wanRelay: this.session.getWanRelayStatus(),
+          stayAwake: this.getStayAwakeStatus(),
+        };
+      }
+
+      case "wan.configure": {
+        const wanRelay = this.configureWanRelayHost(params);
+        return {
+          ok: true,
+          wanRelay,
+          stayAwake: this.getStayAwakeStatus(),
+        };
+      }
+
+      case "wan.probe": {
+        return await this.probeWanRelayHealth();
+      }
+
+      case "host.stay_awake": {
+        if (typeof params.enabled === "boolean") {
+          return this.setStayAwakeEnabled(params.enabled);
+        }
+        return this.getStayAwakeStatus();
       }
 
       case "wechat.status": {
@@ -2508,6 +2681,26 @@ export class OmsDaemon {
 
       case "agent.sessions.list": {
         return this.agentHub.getWorkspaceCatalog(Number(params.limit) || 48);
+      }
+
+      case "agent.session.detail": {
+        const backend = params.backend === "agy" ? "agy" : "codex";
+        return this.agentHub.getSessionDetail(backend, String(params.sessionId || ""));
+      }
+
+      case "agent.session.start": {
+        const started = this.agentHub.startSession(params as unknown as AgentSessionStartParams);
+        return { ok: true, session: started };
+      }
+
+      case "agent.session.continue": {
+        const resumed = this.agentHub.continueSession(params as unknown as AgentSessionContinueParams);
+        return { ok: true, session: resumed };
+      }
+
+      case "agent.session.cancel": {
+        const backend = params.backend === "agy" ? "agy" : "codex";
+        return { ok: this.agentHub.cancelSession(backend, String(params.sessionId || "")) };
       }
 
       case "airpods.status": {
@@ -3577,6 +3770,7 @@ export class OmsDaemon {
       await this.hudServer.stop();
       this.hudServer = null;
     }
+    this.stopStayAwakeProcess();
     this.agentHub.stopAll();
     this.memoryMirror.close();
     await this.session.stop();

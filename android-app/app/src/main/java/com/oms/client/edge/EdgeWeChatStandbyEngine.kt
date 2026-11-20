@@ -56,7 +56,8 @@ object StandbyLeasePolicy {
         pairedLanSsidHint: String,
         currentWifiSsid: String,
         isScreenInteractive: Boolean,
-        msSinceScreenOff: Long
+        msSinceScreenOff: Long,
+        relayConfirmedMacOffline: Boolean = false
     ): StandbyLeaseState {
         if (!standbyFeatureEnabled || !hasClawBotAuth) return StandbyLeaseState.DISABLED
         if (isMacConnected) return StandbyLeaseState.MAC_CONNECTED_IDLE
@@ -69,8 +70,11 @@ object StandbyLeasePolicy {
                 cleanCurrentSsid.isNotEmpty() &&
                 cleanCurrentSsid.equals(cleanPairedSsid, ignoreCase = true)
 
+        val relayAwayConfirmedOffline =
+            relayConfirmedMacOffline && disconnectedDurationMs >= 15_000L
+
         val macConfirmedNotPolling =
-            macSleepingFlagFromHost || forceAwayStandbyEnabled || sameHomeLanConfirmedOffline
+            macSleepingFlagFromHost || forceAwayStandbyEnabled || sameHomeLanConfirmedOffline || relayAwayConfirmedOffline
 
         if (!macConfirmedNotPolling) {
             return StandbyLeaseState.BLOCKED_AWAY_UNCONFIRMED
@@ -223,7 +227,8 @@ class EdgeWeChatStandbyEngine(
     private val store: EdgeSecureStore,
     private val streamRepo: StreamRepository,
     private val llmEngine: DualLlmEngine,
-    private val sendHostRpc: suspend (method: String, params: JSONObject, timeoutMs: Long) -> JSONObject?
+    private val sendHostRpc: suspend (method: String, params: JSONObject, timeoutMs: Long) -> JSONObject?,
+    private val isRelayConfirmedMacOffline: () -> Boolean = { false }
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val directWeChatHttp = OkHttpClient.Builder()
@@ -335,7 +340,8 @@ class EdgeWeChatStandbyEngine(
             pairedLanSsidHint = store.getPairedLanSsidHint(),
             currentWifiSsid = currentWifiSsidSafe(),
             isScreenInteractive = interactive,
-            msSinceScreenOff = msSinceOff
+            msSinceScreenOff = msSinceOff,
+            relayConfirmedMacOffline = isRelayConfirmedMacOffline()
         )
     }
 

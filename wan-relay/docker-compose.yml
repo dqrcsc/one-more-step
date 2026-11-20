@@ -1,0 +1,20 @@
+services:
+  oms-wan-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: oms-wan-relay
+    env_file:
+      - ./.env
+    environment:
+      NODE_ENV: production
+      OMS_RELAY_PORT: 8788
+    restart: unless-stopped
+    mem_limit: 96m
+    networks:
+      - health-api-net
+
+networks:
+  health-api-net:
+    external: true
+    name: health-api-net

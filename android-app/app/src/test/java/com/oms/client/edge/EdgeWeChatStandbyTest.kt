@@ -91,6 +91,24 @@ class EdgeWeChatStandbyTest {
                 msSinceScreenOff = 30_000L
             )
         )
+
+        // 6. User is away on 5G, and Tencent Cloud WAN relay deterministically confirms Mac host is offline -> ACTIVE_POLLING!
+        assertEquals(
+            StandbyLeaseState.ACTIVE_POLLING,
+            StandbyLeasePolicy.evaluate(
+                standbyFeatureEnabled = true,
+                hasClawBotAuth = true,
+                isMacConnected = false,
+                macSleepingFlagFromHost = false,
+                forceAwayStandbyEnabled = false,
+                disconnectedDurationMs = 20_000L,
+                pairedLanSsidHint = "HomeWiFi",
+                currentWifiSsid = "",
+                isScreenInteractive = true,
+                msSinceScreenOff = 0L,
+                relayConfirmedMacOffline = true
+            )
+        )
     }
 
     @Test

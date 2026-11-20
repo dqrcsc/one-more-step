@@ -52,6 +52,7 @@ import com.oms.client.capability.SpeechAudioPolicy
 import com.oms.client.data.PairedMacConfig
 import com.oms.client.data.StreamItemModel
 import com.oms.client.data.StreamRepository
+import com.oms.client.edge.WanRelayStoredConfig
 import com.oms.client.otp.OtpExtractor
 import com.oms.client.otp.OtpMatch
 import com.oms.client.service.OmsCoreForegroundService
@@ -79,6 +80,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -88,6 +90,7 @@ import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
@@ -98,10 +101,15 @@ import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
+import java.net.Proxy
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.KeyStore
 import java.security.MessageDigest
+import java.security.SecureRandom
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
 import java.util.BitSet
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -110,6 +118,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManagerFactory
+import javax.net.ssl.X509TrustManager
 
 data class OtaCheckResult(
     val ok: Boolean,
@@ -193,6 +204,14 @@ class OmsTransportClient(
     private var cachedLanHttpClient: OkHttpClient? = null
     @Volatile
     private var preferDefaultSocketFactory = false
+    @Volatile
+    private var wanHostOnlineFromRelay: Boolean? = null
+    @Volatile
+    private var isConnectingWan = AtomicBoolean(false)
+    @Volatile
+    private var cachedWanClientKey: String = ""
+    @Volatile
+    private var cachedWanHttpClient: OkHttpClient? = null
 
     private val btDecoder = OmsFrameStreamDecoder()
     private val bleWriteQueue = java.util.concurrent.ConcurrentLinkedQueue<ByteArray>()
@@ -350,9 +369,11 @@ class OmsTransportClient(
                             startBleNearFieldScanner()
                         }
                         connectLanIfPossible(paired.lanIps, paired.lanPort)
-                        if (watchdogTickCount % 3L == 0L && wanWebSocket == null && !sourceAuthenticated(btSource)) {
-                            paired.wanRelayWssUrl?.takeIf { it.isNotBlank() }?.let { connectWanRelay(it) }
+                        if (wanWebSocket == null && !sourceAuthenticated(btSource)) {
+                            connectWanIfConfigured()
                         }
+                    } else if (wanWebSocket != null) {
+                        wanWebSocket?.let { closeSecureSource(FrameSource("WAN_WEBRTC", it, null), "Connection replaced") }
                     }
                 } catch (_: Throwable) {
                 }
@@ -857,8 +878,27 @@ class OmsTransportClient(
         val paired = repo.getPairedMac()?.takeIf { isV2Pairing(it) } ?: return
         startBleNearFieldScanner()
         connectLanIfPossible(paired.lanIps, paired.lanPort)
-        paired.wanRelayWssUrl?.takeIf { it.isNotBlank() }?.let { connectWanRelay(it) }
+        mainHandler.postDelayed({
+            if (_activeTierFlow.value == "DISCONNECTED") {
+                connectWanIfConfigured()
+            }
+        }, 1200L)
     }
+
+    fun onWanRelayConfigUpdated() {
+        val cfg = com.oms.client.OmsApplication.instance?.edgeStore?.loadWanRelayConfig()
+        if (cfg == null || !cfg.enabled) {
+            wanHostOnlineFromRelay = null
+            wanWebSocket?.let { closeSecureSource(FrameSource("WAN_WEBRTC", it, null), "WAN relay disabled") }
+            return
+        }
+        if (_activeTierFlow.value == "DISCONNECTED") {
+            connectWanIfConfigured(force = true)
+        }
+    }
+
+    fun isWanRelayConfirmedHostOffline(): Boolean =
+        wanHostOnlineFromRelay == false && _activeTierFlow.value == "DISCONNECTED"
 
     /**
      * Manual one-tap reconnect & LAN auto-discovery triggered from UI (strictly restricted to already-paired Mac)
@@ -893,14 +933,24 @@ class OmsTransportClient(
                 }
             } else {
                 connectLanIfPossible(paired.lanIps, port)
+                if (!isSourceAuthenticated("BT_RFCOMM", null)) {
+                    connectWanIfConfigured(force = true)
+                }
                 mainHandler.post {
-                    if (isSourceAuthenticated("BT_RFCOMM", null)) {
-                        onResult(
+                    when {
+                        isSourceAuthenticated("BT_RFCOMM", null) -> onResult(
                             true,
                             "🔵 局域网当前不可达，已通过近场蓝牙 (Tier 2) 保持加密连接"
                         )
-                    } else {
-                        onResult(
+                        wanWebSocket != null && isSourceAuthenticated("WAN_WEBRTC", wanWebSocket) -> onResult(
+                            true,
+                            "🟣 已通过跨网远程加密通道 (Tier 3) 在线连接 ${paired.macName}"
+                        )
+                        com.oms.client.OmsApplication.instance?.edgeStore?.loadWanRelayConfig()?.enabled == true -> onResult(
+                            true,
+                            "🟣 局域网不可达，正在通过腾讯云跨网远程加密通道连接 ${paired.macName}..."
+                        )
+                        else -> onResult(
                             false,
                             "⚠️ 局域网暂不可达 (${paired.macName})，已同时启动近场蓝牙扫描重连..."
                         )
@@ -1030,6 +1080,261 @@ class OmsTransportClient(
                 isConnectingLan.set(false)
                 scheduleLanReconnect(3500L)
             }
+        }
+    }
+
+    @Volatile
+    private var preferDefaultWanSocketFactory = false
+
+    @SuppressLint("MissingPermission")
+    private fun findNonVpnInternetNetwork(): Network? {
+        if (preferDefaultWanSocketFactory) return null
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return null
+        return runCatching {
+            val active = cm.activeNetwork
+            val activeCaps = active?.let { cm.getNetworkCapabilities(it) }
+            if (active != null && activeCaps != null &&
+                activeCaps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+                activeCaps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            ) {
+                return@runCatching active
+            }
+            cm.allNetworks.firstOrNull { net ->
+                val caps = cm.getNetworkCapabilities(net) ?: return@firstOrNull false
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
+            }
+        }.getOrNull()
+    }
+
+    private fun buildWanOkHttpClient(caCertPem: String): OkHttpClient {
+        val nonVpnNet = findNonVpnInternetNetwork()
+        val cacheKey = "${caCertPem.hashCode()}_${nonVpnNet?.hashCode() ?: 0}_$preferDefaultWanSocketFactory"
+        cachedWanHttpClient?.let { existing ->
+            if (cachedWanClientKey == cacheKey) return existing
+        }
+        val builder = baseHttpClient.newBuilder()
+            .proxy(Proxy.NO_PROXY)
+            .connectTimeout(6, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .pingInterval(20, TimeUnit.SECONDS)
+        if (nonVpnNet != null) {
+            runCatching { builder.socketFactory(nonVpnNet.socketFactory) }
+        }
+        if (caCertPem.isNotBlank()) {
+            val cf = CertificateFactory.getInstance("X.509")
+            val certs = cf.generateCertificates(ByteArrayInputStream(caCertPem.toByteArray(Charsets.UTF_8)))
+            require(certs.isNotEmpty()) { "Empty WAN relay CA certificate" }
+            val keyStore = KeyStore.getInstance(KeyStore.getDefaultType()).apply {
+                load(null, null)
+                certs.forEachIndexed { idx, cert ->
+                    setCertificateEntry("oms_wan_ca_$idx", cert)
+                }
+            }
+            val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply {
+                init(keyStore)
+            }
+            val trustManager = tmf.trustManagers.filterIsInstance<X509TrustManager>().first()
+            val sslContext = SSLContext.getInstance("TLS").apply {
+                init(null, arrayOf(trustManager), SecureRandom())
+            }
+            builder.sslSocketFactory(sslContext.socketFactory, trustManager)
+        }
+        val built = builder.build()
+        cachedWanClientKey = cacheKey
+        cachedWanHttpClient = built
+        return built
+    }
+
+    fun connectWanIfConfigured(force: Boolean = false) {
+        val paired = repo.getPairedMac()?.takeIf { isV2Pairing(it) } ?: return
+        if (!force && _activeTierFlow.value == "LAN_WS" && lanWebSocket != null && isSourceAuthenticated("LAN_WS", lanWebSocket)) {
+            return
+        }
+        val syncedRelay = com.oms.client.OmsApplication.instance?.edgeStore?.loadWanRelayConfig()
+        if (syncedRelay != null) {
+            if (!syncedRelay.enabled) return
+            connectRendezvousWanRelay(paired, syncedRelay, force)
+            return
+        }
+        paired.wanRelayWssUrl?.takeIf { it.isNotBlank() }?.let { connectWanRelay(it) }
+    }
+
+    private fun detachWanPeerSession(webSocket: WebSocket, reason: String) {
+        val source = FrameSource("WAN_WEBRTC", webSocket, null)
+        val link = synchronized(connectionLock) {
+            secureLinks.remove(source)
+        }
+        if (link != null) synchronized(link.lock) {
+            link.phase = SecurePhase.CLOSED
+            link.session?.destroy()
+            link.session = null
+            link.pskHex = ""
+            link.newPairSecret = ""
+            link.expectedMacProof = ""
+        }
+        for ((id, pending) in pendingReplies) {
+            if (pending.source == source && pendingReplies.remove(id, pending)) {
+                pending.result.completeExceptionally(IllegalStateException(reason))
+            }
+        }
+        val iter = incomingTransfers.entries.iterator()
+        while (iter.hasNext()) {
+            val entry = iter.next()
+            if (entry.value.source == source) {
+                entry.value.cleanup()
+                iter.remove()
+            }
+        }
+        OmsCoreForegroundService.setLowLatencyWifiNeeded("incoming_stream", incomingTransfers.isNotEmpty())
+        recomputeFallbackTier()
+        if (mirrorActive.get() && _activeTierFlow.value !in setOf("LAN_WS", "WAN_WEBRTC")) {
+            stopScreenMirror()
+        }
+    }
+
+    private fun connectRendezvousWanRelay(paired: PairedMacConfig, relayCfg: WanRelayStoredConfig, force: Boolean) {
+        val existingWs = wanWebSocket
+        if (!force && existingWs != null) {
+            if (isSourceAuthenticated("WAN_WEBRTC", existingWs) ||
+                hasPendingSecureHandshake(captureSource("WAN_WEBRTC", existingWs))
+            ) {
+                return
+            }
+            return
+        }
+        if (!isConnectingWan.compareAndSet(false, true)) return
+        val roomId = paired.wanRoomId.ifBlank {
+            if (paired.macPubKeyBase64Url.isNotBlank()) {
+                OmsFrameProtocol.deriveWanRoomId(paired.macPubKeyBase64Url, repo.getOrCreatePhoneId())
+            } else ""
+        }
+        if (roomId.isBlank()) {
+            isConnectingWan.set(false)
+            return
+        }
+        try {
+            val parsedHttpUrl = relayCfg.wssUrl
+                .replaceFirst(Regex("^wss://", RegexOption.IGNORE_CASE), "https://")
+                .replaceFirst(Regex("^ws://", RegexOption.IGNORE_CASE), "http://")
+                .toHttpUrlOrNull()
+            if (parsedHttpUrl == null) {
+                isConnectingWan.set(false)
+                return
+            }
+            val finalHttpUrl = parsedHttpUrl.newBuilder()
+                .setQueryParameter("room", roomId)
+                .setQueryParameter("role", "phone")
+                .build()
+            val finalWsUrl = finalHttpUrl.toString()
+                .replaceFirst(Regex("^https://"), "wss://")
+                .replaceFirst(Regex("^http://"), "ws://")
+
+            val client = buildWanOkHttpClient(relayCfg.caCertPem)
+            val generation = synchronized(connectionLock) { wanGeneration.incrementAndGet() }
+            existingWs?.let { closeSecureSource(FrameSource("WAN_WEBRTC", it, null), "Connection replaced") }
+            val req = Request.Builder()
+                .url(finalWsUrl)
+                .header("Authorization", "Bearer ${relayCfg.authToken}")
+                .build()
+
+            client.newWebSocket(req, object : WebSocketListener() {
+                private var decoder = OmsFrameStreamDecoder()
+                @Volatile private var didOpen = false
+
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    didOpen = true
+                    isConnectingWan.set(false)
+                    var replaced: FrameSource? = null
+                    val accepted = synchronized(connectionLock) {
+                        val currentCfg = repo.getPairedMac()
+                        if (generation != wanGeneration.get() || currentCfg == null || !isV2Pairing(currentCfg)) {
+                            false
+                        } else {
+                            replaced = wanWebSocket?.takeIf { it !== webSocket }?.let { FrameSource("WAN_WEBRTC", it, null) }
+                            wanWebSocket = webSocket
+                            true
+                        }
+                    }
+                    replaced?.let { closeSecureSource(it, "Connection replaced") }
+                    if (!accepted) {
+                        webSocket.close(4003, "Stale WAN connection")
+                    }
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    try {
+                        val ctrl = JSONObject(text)
+                        if (ctrl.optInt("omsRelay", 0) != 1) {
+                            closeSecureSource(FrameSource("WAN_WEBRTC", webSocket, null), "Text frames are not supported")
+                            return
+                        }
+                        if (ctrl.has("hostOnline")) {
+                            wanHostOnlineFromRelay = ctrl.optBoolean("hostOnline")
+                            com.oms.client.OmsApplication.instance?.wechatStandby?.refreshState()
+                        }
+                        when (ctrl.optString("event")) {
+                            "waiting_for_peer" -> {
+                                detachWanPeerSession(webSocket, "Waiting for Mac host")
+                            }
+                            "peer_paired" -> {
+                                detachWanPeerSession(webSocket, "Re-paired in relay room")
+                                decoder = OmsFrameStreamDecoder()
+                                val source = FrameSource("WAN_WEBRTC", webSocket, null)
+                                val currentCfg = repo.getPairedMac()
+                                val shouldBegin = synchronized(connectionLock) {
+                                    generation == wanGeneration.get() &&
+                                        wanWebSocket === webSocket &&
+                                        currentCfg != null &&
+                                        isV2Pairing(currentCfg)
+                                }
+                                if (shouldBegin && currentCfg != null) {
+                                    beginSecureSource(source, currentCfg, null)
+                                }
+                            }
+                            "peer_left" -> {
+                                detachWanPeerSession(webSocket, "Mac host left WAN room")
+                            }
+                        }
+                    } catch (_: Throwable) {
+                        closeSecureSource(FrameSource("WAN_WEBRTC", webSocket, null), "Invalid relay control message")
+                    }
+                }
+
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                    handleIncomingRawBytes("WAN_WEBRTC", decoder, bytes.toByteArray(), webSocket)
+                }
+
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    isConnectingWan.set(false)
+                    closeSecureSource(FrameSource("WAN_WEBRTC", webSocket, null), "Connection closing")
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    isConnectingWan.set(false)
+                    closeSecureSource(FrameSource("WAN_WEBRTC", webSocket, null), "Connection closed")
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    isConnectingWan.set(false)
+                    if (!didOpen && !preferDefaultWanSocketFactory && findNonVpnInternetNetwork() != null) {
+                        preferDefaultWanSocketFactory = true
+                        cachedWanHttpClient = null
+                    }
+                    wanHostOnlineFromRelay = null
+                    val source = FrameSource("WAN_WEBRTC", webSocket, null)
+                    val affectsCurrent = isSourceCurrent(source) || (!didOpen && generation == wanGeneration.get())
+                    closeSecureSource(source, "WAN connection failed")
+                    if (affectsCurrent) {
+                        traceConnection(ConnectionDiagnostics.networkFailure(t), "WAN_WEBRTC", generation)
+                    }
+                }
+            })
+        } catch (_: Throwable) {
+            isConnectingWan.set(false)
         }
     }
 
@@ -1588,6 +1893,7 @@ class OmsTransportClient(
             mainHandler.postDelayed({
                 if (_activeTierFlow.value == "DISCONNECTED" && !isSourceAuthenticated("BT_RFCOMM", null)) {
                     startBleNearFieldScanner()
+                    connectWanIfConfigured()
                 }
             }, 1500L)
         }
@@ -2685,11 +2991,21 @@ class OmsTransportClient(
                     } else {
                         val stored = repo.getPairedMac()
                         check(stored != null && isV2Pairing(stored) && stored.macId == link.config.macId && stored.pairSecretHex == link.newPairSecret)
+                        val returnedRoom = result.optString("wanRoomId", "")
+                        if (stored.wanRoomId.isBlank() && returnedRoom.isNotBlank()) {
+                            repo.savePairedMac(stored.copy(wanRoomId = returnedRoom))
+                        }
                     }
                     link.phase = SecurePhase.ACTIVE
                     if (link.mode == "pair") secureLinks.keys.filter { it != source } else emptyList()
                 }
                 for (old in revoked) closeSecureSource(old, "Re-pair completed")
+                if (source.tier == "LAN_WS" && wanWebSocket != null) {
+                    wanWebSocket?.let { closeSecureSource(FrameSource("WAN_WEBRTC", it, null), "Connection replaced") }
+                }
+                if (source.tier == "WAN_WEBRTC") {
+                    wanHostOnlineFromRelay = true
+                }
                 recomputeFallbackTier()
                 traceConnection(ConnectionDiagnostics.Event.CONNECTED, source.tier)
                 reportPairing(link.pairing, true)

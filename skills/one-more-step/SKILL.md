@@ -383,9 +383,30 @@ oms gui act click "#8" --confirm --observation "刚才返回的 observationId"
 
 ---
 
-## 8. 🔗 配对、实时 Web 看板与日常维护
+## 8. 🔗 跨网中继、离家防休眠、重脑会话中枢与日常维护
 
 ```bash
+# 查看跨网加密中继 (Tier 3 WAN) 状态、实测云端延迟、启停跨网通道
+oms wan status
+oms wan test
+oms wan on
+oms wan off
+
+# 开启 / 关闭 Mac 离家驻守防休眠（允许锁屏黑屏省电，防止系统断网睡眠）
+oms stay-awake status
+oms stay-awake on
+oms stay-awake off
+
+# 查看与跨端调度 Mac 上的 Codex / Antigravity 会话 (对应手机『🕹️ 任务舱』)
+oms agents list --limit 20
+oms agents projects
+oms agents show codex <sessionId>
+oms agents start --backend codex --cwd ~/x_project/one_more_step "检查构建状态"
+oms agents resume codex <sessionId> "继续补充单元测试"
+
+# 立即向手机加密同步最新代理节点快照、AI 配置、跨网中继凭据与上下文胶囊
+oms edge-sync
+
 # 在 Mac 默认浏览器打开实时收件箱与双向协同 Web 看板 (http://127.0.0.1:19527/inbox)
 oms web
 
@@ -398,14 +419,16 @@ oms prefs --auto-copy true --auto-preview true
 oms prefs --tts-voice xiaoyi
 oms prefs --unlock-pattern 123698745
 
-# 当重新编译 Android APK 后，通过局域网一键向手机推送 OTA 更新
+# 当重新编译 Android APK 后，一键向手机推送可验证 OTA 更新
 oms ota
 
-# 管理后台 omsd 守护进程与查看日志
+# 管理后台 omsd 守护进程、查看日志与按域查看结构化 CLI 帮助
 oms daemon status
 oms daemon restart
 oms daemon logs --lines 50
+oms daemon logs --wx --lines 50
 oms daemon install-launchagent
+oms help <system|transfer|device|assistant|gui|wx|agents>
 ```
 
 ---
