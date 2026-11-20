@@ -14,6 +14,7 @@ import {
 } from "./extractor/web.ts";
 import { isPlaceholderYouTubeTitle } from "./extractor/youtube.ts";
 import { analyzeArticleWithVault, isFallbackLightNote } from "./vault/analyzer.ts";
+import { formatAnalysisContext, loadAnalysisContext } from "./vault/analysis_context.ts";
 import { createIdeaSeedInVault, gatherVaultContext, saveCompanionLightNote, isUnmodifiedGeneratedLightNote } from "./vault/context.ts";
 import {
   ClawBotMessage,
@@ -68,6 +69,7 @@ export class WeChatContextPipeline {
   public clawbot: WeChatClawBotClient;
   public agent: WeChatAgentRuntime;
   public scheduler: TaskSchedulerEngine;
+  public standbyPaused = false;
   private lastEnvMtimeMs = 0;
   private isDrainingArticles = false;
   private isDrainingAgents = false;
@@ -1324,6 +1326,313 @@ export class WeChatContextPipeline {
         await this.flushReplies({ ignoreBusy: true });
       }
       return count;
+    });
+  }
+
+  /**
+   * Exports ClawBot credentials, current cursor checkpoint, LLM endpoints, and personal Vault Context Capsule
+   * for encrypted v2 synchronization to the paired Xiaomi phone (`EdgeWeChatStandbyEngine`).
+   */
+  public exportEdgeStandbySnapshot(): Record<string, any> {
+    this.refreshConfigFromDiskIfChanged();
+    const creds = this.clawbot.getCredentials();
+    const updatesBuf = this.db.getState("clawbot_updates_buf") ?? "";
+    const recipientUserId = this.clawbot.resolveDefaultRecipient() ?? undefined;
+    let contextToken: string | undefined;
+    let contextSourceTimeMs = 0;
+    if (recipientUserId) {
+      contextToken = this.clawbot.getContextToken(recipientUserId);
+      const metaRaw = this.db.getState(`clawbot_context_meta_${recipientUserId}`);
+      if (metaRaw) {
+        try {
+          const parsed = JSON.parse(metaRaw);
+          contextSourceTimeMs = Number(parsed?.sourceTime) || 0;
+        } catch {}
+      }
+    }
+
+    const vaultCtx =
+      this.config.vaultEnabled === false
+        ? { nowSummary: "", queueSummary: "", topicsOverview: "", matchedNotes: [] }
+        : gatherVaultContext(this.config.vaultRoot, "", this.config.vaultLayout);
+    const analysisBg = loadAnalysisContext(this.config.analysisContextFile);
+
+    const capsuleSource = JSON.stringify({
+      now: vaultCtx.nowSummary,
+      queue: vaultCtx.queueSummary,
+      topics: vaultCtx.topicsOverview,
+      bg: analysisBg.entries,
+    });
+    const capsuleRevision = createHash("sha256").update(capsuleSource).digest("hex").slice(0, 16);
+
+    return {
+      ok: true,
+      standbyPaused: this.standbyPaused,
+      clawbotAuth: creds
+        ? {
+            botToken: creds.botToken,
+            baseUrl: creds.baseUrl,
+            botId: creds.botId,
+            userId: creds.userId,
+          }
+        : undefined,
+      cursorCheckpoint: {
+        updatesBuf,
+        recipientUserId,
+        contextToken,
+        contextSourceTimeMs,
+        checkpointAtMs: Date.now(),
+      },
+      llmConfig: {
+        provider: this.config.llm.provider,
+        baseUrl: this.config.llm.baseUrl,
+        apiKey: this.config.llm.apiKey,
+        fastModel: this.config.llm.fastModel || this.config.llm.model,
+        proModel: this.config.llm.proModel,
+        fastProvider: this.config.llm.fastProvider,
+        proProvider: this.config.llm.proProvider,
+        providers: (this.config.llm.providers ?? []).map((p) => ({
+          id: p.id,
+          baseUrl: p.baseUrl,
+          apiKey: p.apiKey,
+          models: p.models,
+        })),
+      },
+      contextCapsule: {
+        revision: capsuleRevision,
+        generatedAtIso: new Date().toISOString(),
+        nowSummary: vaultCtx.nowSummary.slice(0, 6000),
+        queueSummary: vaultCtx.queueSummary.slice(0, 6000),
+        topicsOverview: vaultCtx.topicsOverview.slice(0, 8000),
+        analysisBackgroundFormatted: formatAnalysisContext(analysisBg).slice(0, 10000),
+        analysisWarnings: analysisBg.warnings,
+        matchedCandidates: vaultCtx.matchedNotes.slice(0, 12).map((n) => ({
+          title: n.wikiLink.replace(/^\[\[|\]\]$/g, ""),
+          wikiLink: n.wikiLink,
+          excerpt: n.excerpt.slice(0, 600),
+        })),
+        recentWorkingMemory: [],
+      },
+    };
+  }
+
+  /**
+   * Atomically commits articles analyzed by the phone while Mac was asleep + deferred video/agent messages
+   * + updated ClawBot cursor without re-running LLM calls or sending duplicate WeChat replies.
+   */
+  public async commitEdgeStandbyHandoff(params: {
+    handoffId: string;
+    latestUpdatesBuf: string;
+    recipientUserId?: string;
+    latestContextToken?: string;
+    contextSourceTimeMs?: number;
+    cursorAdvancedByPhone: boolean;
+    processedArticles: Array<{
+      messageKey: string;
+      senderId: string;
+      url: string;
+      title: string;
+      author: string;
+      publishDate: string;
+      digest: string;
+      userNotes: string;
+      englishSlug: string;
+      triage: "keep_raw" | "reference" | "process_later" | "process_now";
+      extractionQualityStatus: "complete" | "partial" | "metadata_only" | "unavailable";
+      rawMarkdownBody: string;
+      wechatReplyText: string;
+      companionNoteMarkdown: string;
+      replyDeliveredToWeChat: boolean;
+      modelUsed: string;
+      createdAtMs: number;
+    }>;
+    deferredMessages: Array<{
+      messageKey: string;
+      rawPayloadJson: string;
+    }>;
+  }): Promise<{
+    ok: boolean;
+    importedArticlesCount: number;
+    queuedDeferredCount: number;
+    cursorUpdated: boolean;
+  }> {
+    this.refreshConfigFromDiskIfChanged();
+    return this.db.withLock("sync", async () => {
+      let importedArticlesCount = 0;
+      let queuedDeferredCount = 0;
+      let cursorUpdated = false;
+
+      // 1. Persist pre-analyzed articles directly into Vault (localizing anti-hotlink images) & SQLite
+      for (const item of params.processedArticles ?? []) {
+        if (!item?.url || !item?.messageKey) continue;
+        const normalizedUrl = isWeChatArticleUrl(item.url)
+          ? normalizeWeChatUrl(item.url)
+          : normalizeExternalWebUrl(item.url);
+        const { record } = this.db.enqueueArticle({
+          msgid: item.messageKey,
+          url: normalizedUrl,
+          title: item.title,
+          author: item.author,
+          digest: item.digest,
+          user_notes: item.userNotes,
+          sender_id: item.senderId,
+          channel: "clawbot",
+          waitSeconds: 0,
+        });
+
+        // Respect authoritative existing work: never overwrite existing notes or deep articles
+        if (
+          record.process_level === "deep" ||
+          (record.note_md_path && existsSync(record.note_md_path))
+        ) {
+          this.db.db
+            .query("INSERT OR IGNORE INTO inbound_messages (message_key, payload, status) VALUES (?, ?, 'done')")
+            .run(item.messageKey, JSON.stringify({ handoffId: params.handoffId, url: normalizedUrl }));
+          continue;
+        }
+
+        const extractedObj = {
+          url: normalizedUrl,
+          title: item.title || record.title || "未命名文章",
+          author: item.author || record.author || "",
+          publishDate: item.publishDate || "",
+          digest: item.digest || record.digest || "",
+          markdownBody: item.rawMarkdownBody || "",
+          imageUrls: [],
+          extractorUsed: "native_http" as const,
+          extractionQuality: {
+            status: item.extractionQualityStatus || "complete",
+            reasons: [],
+          },
+        };
+
+        const isWeChat = isWeChatArticleUrl(normalizedUrl);
+        const targetExternalDir =
+          this.config.webArticlesDir ||
+          join(this.config.vaultRoot, "01_inputs", "articles", "web");
+
+        const sourceMdPath = isWeChat
+          ? await saveRawArticleToVault({
+              wechatArticlesDir: this.config.wechatArticlesDir,
+              article: extractedObj,
+              slug: item.englishSlug || "wechat_article",
+              userNotes: item.userNotes,
+              existingPath: record.source_md_path || undefined,
+            })
+          : await saveRawWebArticleToVault({
+              articlesDir: targetExternalDir,
+              article: extractedObj,
+              slug: item.englishSlug || "web_article",
+              userNotes: item.userNotes,
+              existingPath: record.source_md_path || undefined,
+            });
+
+        const validTriages = ["keep_raw", "reference", "process_later", "process_now"] as const;
+        const safeTriage = validTriages.includes(item.triage as any)
+          ? item.triage
+          : "process_later";
+
+        const vaultMatches =
+          this.config.vaultEnabled === false
+            ? []
+            : gatherVaultContext(
+                this.config.vaultRoot,
+                `${extractedObj.title}\n${extractedObj.digest}\n${item.userNotes}`,
+                {
+                  ...this.config.vaultLayout,
+                  excludePaths: [sourceMdPath],
+                  excludeSourceUrls: [normalizedUrl],
+                }
+              ).matchedNotes.map((m) => m.wikiLink);
+        const dedupedLinks = [...new Set(vaultMatches)];
+
+        const noteMdPath = saveCompanionLightNote({
+          sourceMdPath,
+          sourceUrl: normalizedUrl,
+          title: extractedObj.title,
+          author: extractedObj.author,
+          triage: safeTriage,
+          relatedVaultNodes: dedupedLinks,
+          noteMarkdownBody:
+            item.companionNoteMarkdown ||
+            `## 初筛摘要\n\n${item.wechatReplyText}`,
+        });
+
+        this.db.db.transaction(() => {
+          this.db.updateArticle(record.id, {
+            title: extractedObj.title,
+            author: extractedObj.author,
+            digest: extractedObj.digest,
+            source_md_path: sourceMdPath,
+            note_md_path: noteMdPath,
+            status: "light_done",
+            process_level: "light",
+            triage: safeTriage,
+            short_summary: item.wechatReplyText,
+            related_vault_nodes: JSON.stringify(dedupedLinks),
+            error_message: "",
+          });
+          this.db.db
+            .query("INSERT OR IGNORE INTO inbound_messages (message_key, payload, status) VALUES (?, ?, 'done')")
+            .run(item.messageKey, JSON.stringify({ handoffId: params.handoffId, url: normalizedUrl }));
+          if (!item.replyDeliveredToWeChat && item.senderId && item.wechatReplyText) {
+            this.db.queueReply(
+              `article_${record.id}_edge_handoff`,
+              item.senderId,
+              item.wechatReplyText
+            );
+          }
+        })();
+
+        emitOmsManagedEvent({
+          eventType: "article",
+          title: extractedObj.title,
+          summary: item.wechatReplyText,
+          articleId: record.id,
+          triage: safeTriage,
+          url: normalizedUrl,
+          notePath: noteMdPath,
+          sourcePath: sourceMdPath,
+        });
+        importedArticlesCount++;
+      }
+
+      // 2. Enqueue deferred messages (videos / complex agent tasks) + update cursor in one atomic transaction
+      this.db.db.transaction(() => {
+        for (const def of params.deferredMessages ?? []) {
+          if (!def?.messageKey || !def?.rawPayloadJson) continue;
+          const ins = this.db.db
+            .query("INSERT OR IGNORE INTO inbound_messages (message_key, payload, status) VALUES (?, ?, 'pending')")
+            .run(def.messageKey, def.rawPayloadJson);
+          if (ins.changes > 0) queuedDeferredCount++;
+        }
+
+        if (params.cursorAdvancedByPhone && params.latestUpdatesBuf) {
+          const curBuf = this.db.getState("clawbot_updates_buf") ?? "";
+          if (params.latestUpdatesBuf !== curBuf) {
+            this.db.setState("clawbot_updates_buf", params.latestUpdatesBuf);
+            cursorUpdated = true;
+          }
+        }
+        if (params.recipientUserId && params.latestContextToken) {
+          this.clawbot.setContextToken(
+            params.recipientUserId,
+            params.latestContextToken,
+            params.contextSourceTimeMs
+          );
+        }
+      })();
+
+      if (queuedDeferredCount > 0) {
+        this.processPendingMessages();
+      }
+
+      return {
+        ok: true,
+        importedArticlesCount,
+        queuedDeferredCount,
+        cursorUpdated,
+      };
     });
   }
 }

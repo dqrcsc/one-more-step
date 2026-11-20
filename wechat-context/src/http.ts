@@ -18,6 +18,10 @@ import {
   handleTestLlmConnection,
   renderConfigPageHtml,
 } from "./web_config.ts";
+import {
+  renderWeChatMarkdownReaderHtml,
+  resolveMarkdownRelativeAsset,
+} from "./reader_renderer.ts";
 
 export const LOCAL_HOST = "127.0.0.1";
 
@@ -290,6 +294,50 @@ export function createHttpHandler(db: ContextDatabase, pipeline: WeChatContextPi
         agentTasks,
       });
     }
+    if ((url.pathname === "/api/asset" || url.pathname === "/api/wechat/asset") && req.method === "GET") {
+      const relPath = url.searchParams.get("path") || "";
+      if (!relPath || relPath.includes("..") || relPath.startsWith("/") || relPath.startsWith("~") || relPath.includes("\\")) {
+        return Response.json({ ok: false, error: "Forbidden asset path" }, { status: 403 });
+      }
+      let docPath: string | null = null;
+      const turnIdParam = url.searchParams.get("turnId");
+      if (turnIdParam) {
+        const turnId = Number(turnIdParam);
+        const turn = Number.isFinite(turnId) && turnId > 0
+          ? (db.db.query("SELECT * FROM conversation_turns WHERE id = ?").get(turnId) as any)
+          : null;
+        if (!turn) return Response.json({ ok: false, error: "Turn not found" }, { status: 404 });
+        const artifactPaths = decodeArtifactPaths(turn.deposited_path || "");
+        docPath = artifactPaths.find((p) => /\.(md|markdown|txt)$/i.test(p)) || artifactPaths[0] || null;
+      } else {
+        const articleId = Number(url.searchParams.get("articleId"));
+        if (!Number.isFinite(articleId) || articleId <= 0) {
+          return Response.json({ ok: false, error: "Valid articleId required" }, { status: 400 });
+        }
+        const article = db.getArticleById(articleId);
+        if (!article) return Response.json({ ok: false, error: "Article not found" }, { status: 404 });
+        const docKind = url.searchParams.get("doc");
+        docPath = docKind === "note"
+          ? (article.note_md_path || article.source_md_path)
+          : (article.source_md_path || article.note_md_path);
+      }
+
+      const resolved = resolveMarkdownRelativeAsset(docPath, relPath);
+      if (!resolved) {
+        return Response.json({ ok: false, error: "Asset not found or outside document directory" }, { status: 404 });
+      }
+      const bytes = readFileSync(resolved.realAbsPath);
+      return new Response(bytes, {
+        status: 200,
+        headers: {
+          "Content-Type": resolved.mimeType,
+          "Cache-Control": "private, max-age=300",
+          "X-Content-Type-Options": "nosniff",
+          "Cross-Origin-Resource-Policy": "same-origin",
+          "Content-Security-Policy": "default-src 'none'; img-src 'self'",
+        },
+      });
+    }
     if (url.pathname === "/api/article" && req.method === "GET") {
       const readBoundedUtf8 = (filePath?: string | null, maxBytes = 250_000): { content: string; truncated: boolean } | null => {
         if (!filePath || !existsSync(filePath)) return null;
@@ -316,11 +364,21 @@ export function createHttpHandler(db: ContextDatabase, pipeline: WeChatContextPi
         const artifactPaths = decodeArtifactPaths(turn.deposited_path || "");
         const primaryMdPath = artifactPaths.find((p) => /\.(md|markdown|txt)$/i.test(p)) || artifactPaths[0] || "";
         const deposited = readBoundedUtf8(primaryMdPath);
+        const depositedRendered = deposited
+          ? renderWeChatMarkdownReaderHtml({
+              markdown: deposited.content,
+              docPath: primaryMdPath,
+              turnId,
+              docKind: "turn",
+            })
+          : null;
         return Response.json({
           ok: true,
           turn,
           artifactPaths,
           depositedMarkdown: deposited?.content ?? null,
+          depositedHtml: depositedRendered?.html ?? null,
+          resolvedImages: depositedRendered?.resolvedImages ?? {},
           depositedTruncated: Boolean(deposited?.truncated),
         });
       }
@@ -335,6 +393,32 @@ export function createHttpHandler(db: ContextDatabase, pipeline: WeChatContextPi
       }
       const noteDoc = readBoundedUtf8(article.note_md_path);
       const sourceDoc = readBoundedUtf8(article.source_md_path);
+      const noteRendered = noteDoc
+        ? renderWeChatMarkdownReaderHtml({
+            markdown: noteDoc.content,
+            docPath: article.note_md_path || article.source_md_path,
+            articleId: article.id,
+            docKind: "note",
+          })
+        : null;
+      const sourceRendered = sourceDoc
+        ? renderWeChatMarkdownReaderHtml({
+            markdown: sourceDoc.content,
+            docPath: article.source_md_path || article.note_md_path,
+            articleId: article.id,
+            docKind: "source",
+          })
+        : null;
+      const summaryText = article.short_summary || article.digest || "";
+      const summaryRendered = summaryText
+        ? renderWeChatMarkdownReaderHtml({
+            markdown: summaryText,
+            docPath: article.note_md_path || article.source_md_path,
+            articleId: article.id,
+            docKind: "summary",
+            stripHeaderBlock: false,
+          })
+        : null;
       return Response.json({
         ok: true,
         article: {
@@ -342,10 +426,52 @@ export function createHttpHandler(db: ContextDatabase, pipeline: WeChatContextPi
           isFallbackNote: isFallbackLightNote(noteDoc?.content || article.short_summary || ""),
         },
         noteMarkdown: noteDoc?.content ?? null,
+        noteHtml: noteRendered?.html ?? null,
         noteTruncated: Boolean(noteDoc?.truncated),
         sourceMarkdown: sourceDoc?.content ?? null,
+        sourceHtml: sourceRendered?.html ?? null,
         sourceTruncated: Boolean(sourceDoc?.truncated),
+        summaryHtml: summaryRendered?.html ?? null,
+        resolvedImages: {
+          ...(sourceRendered?.resolvedImages ?? {}),
+          ...(noteRendered?.resolvedImages ?? {}),
+          ...(summaryRendered?.resolvedImages ?? {}),
+        },
       });
+    }
+    if (url.pathname === "/internal/edge/snapshot" && req.method === "GET") {
+      return Response.json(pipeline.exportEdgeStandbySnapshot());
+    }
+    if (url.pathname === "/internal/edge/pause-poll" && req.method === "POST") {
+      try {
+        const body = (await req.json()) as { paused?: boolean };
+        pipeline.standbyPaused = Boolean(body?.paused);
+        return Response.json({ ok: true, standbyPaused: pipeline.standbyPaused });
+      } catch (err: any) {
+        return Response.json({ ok: false, error: err?.message || String(err) }, { status: 400 });
+      }
+    }
+    if (url.pathname === "/internal/edge/handoff" && req.method === "POST") {
+      try {
+        if (!req.headers.get("content-type")?.startsWith("application/json")) {
+          return new Response("Expected application/json", { status: 415 });
+        }
+        const body = (await req.json()) as any;
+        const result = await pipeline.commitEdgeStandbyHandoff(body);
+        pipeline.standbyPaused = false;
+        if (result.queuedDeferredCount > 0) {
+          void (async () => {
+            await pipeline.drainAgentQueue().catch(() => {});
+            await pipeline.drainReadyQueue().catch(() => {});
+            if (pipeline.clawbot.isConfigured()) {
+              await pipeline.flushReplies({ ignoreBusy: true }).catch(() => {});
+            }
+          })();
+        }
+        return Response.json(result);
+      } catch (err: any) {
+        return Response.json({ ok: false, error: err?.message || String(err) }, { status: 500 });
+      }
     }
     return new Response("Not found", { status: 404 });
   };

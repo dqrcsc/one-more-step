@@ -220,6 +220,7 @@ export async function callAgentLlm(params: {
       apiKey: effectiveApiKey,
       model: ep.model,
       retryHttpStatuses: !hasFastFallback,
+      reasoningEffort: usedTier === "deep" ? "high" : "low",
     });
     return { text, modelUsed: ep.model, tierUsed: usedTier };
   };
@@ -344,6 +345,31 @@ async function executeGeminiGroundedSearchCall(params: {
   };
 }
 
+export function isOpenAiResponsesModel(model: string, baseUrl = ""): boolean {
+  if (baseUrl.toLowerCase().includes("generativelanguage.googleapis.com")) {
+    return false;
+  }
+  return /^gpt-6/i.test(model.trim());
+}
+
+export function extractOpenAiResponsesText(data: any): string {
+  if (!data || typeof data !== "object") return "";
+  if (Array.isArray(data.output)) {
+    const chunks: string[] = [];
+    for (const item of data.output) {
+      if (item?.type === "message" && Array.isArray(item.content)) {
+        for (const c of item.content) {
+          if ((c?.type === "output_text" || c?.type === "text") && typeof c.text === "string") {
+            chunks.push(c.text);
+          }
+        }
+      }
+    }
+    if (chunks.length > 0) return chunks.join("");
+  }
+  return typeof data.output_text === "string" ? data.output_text : "";
+}
+
 async function executeOpenAICompatibleCall(params: {
   config: AppConfig;
   baseUrl?: string;
@@ -356,8 +382,59 @@ async function executeOpenAICompatibleCall(params: {
   temperature?: number;
   timeoutMs?: number;
   retryHttpStatuses?: boolean;
+  reasoningEffort?: "low" | "medium" | "high";
 }): Promise<string> {
-  const endpoint = `${(params.baseUrl || params.config.llm.baseUrl).replace(/\/+$/, "")}/chat/completions`;
+  const cleanBase = (params.baseUrl || params.config.llm.baseUrl).replace(/\/+$/, "");
+
+  if (isOpenAiResponsesModel(params.model, cleanBase)) {
+    const endpoint = `${cleanBase}/responses`;
+    const userInputContent: any =
+      params.images && params.images.length > 0
+        ? [
+            { type: "input_text", text: params.userPrompt },
+            ...params.images.map((img) => ({
+              type: "input_image",
+              image_url: `data:${img.mimeType};base64,${img.base64Data}`,
+            })),
+          ]
+        : params.userPrompt;
+    const inputItems: Array<{ role: string; content: any }> = [];
+    if (params.systemPrompt.trim()) {
+      inputItems.push({ role: "developer", content: params.systemPrompt });
+    }
+    inputItems.push({ role: "user", content: userInputContent });
+
+    const reqBody: Record<string, any> = {
+      model: params.model,
+      reasoning: { effort: params.reasoningEffort ?? "low" },
+      input: inputItems,
+      ...(params.jsonMode ? { text: { format: { type: "json_object" } } } : {}),
+    };
+    const resp = await fetchWithTransientRetry(
+      endpoint,
+      () => ({
+        method: "POST",
+        signal: AbortSignal.timeout(params.timeoutMs ?? 60_000),
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${params.apiKey || params.config.llm.apiKey}`,
+        },
+        body: JSON.stringify(reqBody),
+      }),
+      { retryHttpStatuses: params.retryHttpStatuses }
+    );
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`OpenAI Responses HTTP ${resp.status} (${params.model}): ${errText.slice(0, 300)}`);
+    }
+    const content = extractOpenAiResponsesText(await resp.json());
+    if (!content.trim()) {
+      throw new Error(`Empty response from OpenAI Responses (${params.model})`);
+    }
+    return content.trim();
+  }
+
+  const endpoint = `${cleanBase}/chat/completions`;
 
   const userContent: any =
     params.images && params.images.length > 0

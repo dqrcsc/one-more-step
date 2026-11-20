@@ -2054,22 +2054,239 @@ class OmsTransportClient(
     }
 
     private val otaInstaller = VerifiedOtaInstaller(context)
+    private val _otaStateFlow = MutableStateFlow<OtaUiState>(OtaUiState.Idle)
+    val otaStateFlow: StateFlow<OtaUiState> = _otaStateFlow
+    private val awaitingInstallPermissionResume = AtomicBoolean(false)
+    private val lastAutoOtaCheckElapsedMs = AtomicLong(0L)
+    private val autoOtaJobRunning = AtomicBoolean(false)
+
+    private fun isUnmeteredWifiOrLanConnected(): Boolean {
+        if (_activeTierFlow.value == "LAN_WS") return true
+        if (findNonVpnWifiNetwork() != null) return true
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val net = cm?.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(net) ?: return false
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ||
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun toVerifiedMetadata(ota: OtaCheckResult): VerifiedOtaPolicy.Metadata {
+        return VerifiedOtaPolicy.Metadata(
+            ota.downloadUrl,
+            ota.remoteSha256,
+            ota.remoteSizeBytes,
+            ota.remoteVersionName,
+            ota.remoteVersionCode.toLong(),
+            ota.integritySource
+        )
+    }
+
+    private suspend fun prepareAndOptionallyLaunchOta(
+        ota: OtaCheckResult,
+        launchWhenReady: Boolean
+    ): String {
+        check(ota.ok && ota.hasUpdate) { ota.message.ifBlank { "当前没有可安装的更新" } }
+        val metadata = toVerifiedMetadata(ota)
+        val initialClient = if (ota.downloadUrl.startsWith("http://", ignoreCase = true)) {
+            buildLanOkHttpClient()
+        } else {
+            baseHttpClient
+        }
+        _otaStateFlow.value = OtaUiState.Downloading(
+            ota = ota,
+            downloadedBytes = 0L,
+            totalBytes = ota.remoteSizeBytes,
+            percent = 0
+        )
+        val verifiedFile = try {
+            otaInstaller.prepareVerifiedApk(
+                metadata = metadata,
+                client = initialClient,
+                fallbackHttpsClient = baseHttpClient
+            ) { dl, total ->
+                val pct = if (total > 0L) ((dl * 100L) / total).toInt().coerceIn(0, 100) else 0
+                _otaStateFlow.value = OtaUiState.Downloading(
+                    ota = ota,
+                    downloadedBytes = dl,
+                    totalBytes = total,
+                    percent = pct
+                )
+            }
+        } catch (e: Exception) {
+            val errMsg = e.message ?: "下载或校验失败"
+            _otaStateFlow.value = OtaUiState.Error(errMsg, ota)
+            throw e
+        }
+
+        if (!launchWhenReady) {
+            _otaStateFlow.value = OtaUiState.ReadyToInstall(ota, verifiedFile)
+            return "新版本 v${ota.remoteVersionName} 已后台下载并验签就绪"
+        }
+
+        return if (otaInstaller.launchSystemInstaller(verifiedFile)) {
+            awaitingInstallPermissionResume.set(false)
+            _otaStateFlow.value = OtaUiState.InstallerLaunched(ota, verifiedFile)
+            "APK 校验通过，已打开系统安装器，请确认安装"
+        } else {
+            awaitingInstallPermissionResume.set(true)
+            _otaStateFlow.value = OtaUiState.NeedsInstallPermission(ota, verifiedFile)
+            runCatching { otaInstaller.openUnknownSourcesSettings() }
+            "安装包已验签就绪，请开启「安装未知应用」权限（返回后将自动安装）"
+        }
+    }
 
     private suspend fun installVerifiedOta(ota: OtaCheckResult) {
-        check(ota.ok && ota.hasUpdate) { ota.message.ifBlank { "当前没有可安装的更新" } }
-        val metadata = VerifiedOtaPolicy.Metadata(ota.downloadUrl, ota.remoteSha256, ota.remoteSizeBytes,
-            ota.remoteVersionName, ota.remoteVersionCode.toLong(), ota.integritySource)
-        val client = if (ota.downloadUrl.startsWith("http://")) buildLanOkHttpClient() else baseHttpClient
-        otaInstaller.install(metadata, client)
+        val msg = prepareAndOptionallyLaunchOta(ota, launchWhenReady = true)
+        check(_otaStateFlow.value is OtaUiState.InstallerLaunched) { msg }
     }
 
     fun installOtaUpdate(ota: OtaCheckResult, onResult: (String) -> Unit) {
         scope.launch {
             val message = try {
-                installVerifiedOta(ota)
-                "APK 校验通过，已打开系统安装器，请确认安装"
+                prepareAndOptionallyLaunchOta(ota, launchWhenReady = true)
             } catch (e: Exception) { "更新未安装：${e.message ?: "下载或校验失败"}" }
             mainHandler.post { onResult(message) }
+        }
+    }
+
+    fun startBackgroundPreDownload(ota: OtaCheckResult) {
+        scope.launch {
+            runCatching { prepareAndOptionallyLaunchOta(ota, launchWhenReady = false) }
+        }
+    }
+
+    fun installOrResumeReadyOta(onResult: ((String) -> Unit)? = null) {
+        scope.launch {
+            val cur = _otaStateFlow.value
+            val pair: Pair<OtaCheckResult, File>? = when (cur) {
+                is OtaUiState.ReadyToInstall -> cur.ota to cur.apkFile
+                is OtaUiState.NeedsInstallPermission -> cur.ota to cur.apkFile
+                is OtaUiState.InstallerLaunched -> cur.ota to cur.apkFile
+                else -> null
+            }
+            if (pair == null) {
+                val fallbackOta = when (cur) {
+                    is OtaUiState.UpdateAvailable -> cur.ota
+                    is OtaUiState.Error -> cur.ota
+                    else -> null
+                }
+                if (fallbackOta != null) {
+                    val msg = try {
+                        prepareAndOptionallyLaunchOta(fallbackOta, launchWhenReady = true)
+                    } catch (e: Exception) {
+                        "更新未安装：${e.message ?: "下载或校验失败"}"
+                    }
+                    if (onResult != null) mainHandler.post { onResult(msg) }
+                }
+                return@launch
+            }
+
+            val (ota, file) = pair
+            if (!file.exists()) {
+                val msg = try {
+                    prepareAndOptionallyLaunchOta(ota, launchWhenReady = true)
+                } catch (e: Exception) {
+                    "更新未安装：${e.message ?: "下载或校验失败"}"
+                }
+                if (onResult != null) mainHandler.post { onResult(msg) }
+                return@launch
+            }
+
+            val msg = if (otaInstaller.launchSystemInstaller(file)) {
+                awaitingInstallPermissionResume.set(false)
+                _otaStateFlow.value = OtaUiState.InstallerLaunched(ota, file)
+                "🚀 已拉起系统安装器，请点击确认完成升级"
+            } else {
+                awaitingInstallPermissionResume.set(true)
+                _otaStateFlow.value = OtaUiState.NeedsInstallPermission(ota, file)
+                runCatching { otaInstaller.openUnknownSourcesSettings() }
+                "🔓 请允许「安装未知应用」权限，返回本应用后将自动弹出安装"
+            }
+            if (onResult != null) mainHandler.post { onResult(msg) }
+        }
+    }
+
+    fun openInstallPermissionAndAwaitResume() {
+        val cur = _otaStateFlow.value
+        if (cur is OtaUiState.ReadyToInstall) {
+            _otaStateFlow.value = OtaUiState.NeedsInstallPermission(cur.ota, cur.apkFile)
+        }
+        awaitingInstallPermissionResume.set(true)
+        runCatching { otaInstaller.openUnknownSourcesSettings() }
+    }
+
+    fun onAppForegroundResume() {
+        scope.launch {
+            val (_, _, localSha) = getInstalledApkInfo(includeSha256 = true)
+            val cur = _otaStateFlow.value
+            val currentTargetOta = when (cur) {
+                is OtaUiState.ReadyToInstall -> cur.ota
+                is OtaUiState.NeedsInstallPermission -> cur.ota
+                is OtaUiState.InstallerLaunched -> cur.ota
+                is OtaUiState.UpdateAvailable -> cur.ota
+                is OtaUiState.Error -> cur.ota
+                else -> null
+            }
+            if (currentTargetOta != null && localSha.isNotEmpty() && localSha.equals(currentTargetOta.remoteSha256, ignoreCase = true)) {
+                awaitingInstallPermissionResume.set(false)
+                _otaStateFlow.value = OtaUiState.Idle
+                return@launch
+            }
+            if (awaitingInstallPermissionResume.get() && otaInstaller.canRequestPackageInstalls()) {
+                val readyFile = when (cur) {
+                    is OtaUiState.NeedsInstallPermission -> cur.apkFile
+                    is OtaUiState.ReadyToInstall -> cur.apkFile
+                    else -> null
+                }
+                if (readyFile != null && readyFile.exists() && currentTargetOta != null) {
+                    awaitingInstallPermissionResume.set(false)
+                    if (otaInstaller.launchSystemInstaller(readyFile)) {
+                        _otaStateFlow.value = OtaUiState.InstallerLaunched(currentTargetOta, readyFile)
+                    }
+                    return@launch
+                }
+            }
+            triggerAutoOtaCheckIfEligible(reason = "foreground_resume")
+        }
+    }
+
+    fun triggerAutoOtaCheckIfEligible(reason: String = "auto") {
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val connectedToMac = _activeTierFlow.value != "DISCONNECTED"
+        val minIntervalMs = if (reason == "session_connected") 60_000L else if (connectedToMac) 5 * 60_000L else 30 * 60_000L
+        val prev = lastAutoOtaCheckElapsedMs.get()
+        if (prev > 0L && nowElapsed - prev < minIntervalMs) return
+        if (_otaStateFlow.value is OtaUiState.Downloading) return
+        if (!autoOtaJobRunning.compareAndSet(false, true)) return
+        lastAutoOtaCheckElapsedMs.set(nowElapsed)
+
+        checkOtaUpdate { res ->
+            autoOtaJobRunning.set(false)
+            if (!res.ok || !res.hasUpdate) {
+                if (_otaStateFlow.value !is OtaUiState.Downloading) {
+                    _otaStateFlow.value = OtaUiState.Idle
+                }
+                return@checkOtaUpdate
+            }
+            val cur = _otaStateFlow.value
+            val alreadyReadySame = when (cur) {
+                is OtaUiState.ReadyToInstall -> cur.ota.remoteSha256.equals(res.remoteSha256, true) && cur.apkFile.exists()
+                is OtaUiState.InstallerLaunched -> cur.ota.remoteSha256.equals(res.remoteSha256, true) && cur.apkFile.exists()
+                is OtaUiState.NeedsInstallPermission -> cur.ota.remoteSha256.equals(res.remoteSha256, true) && cur.apkFile.exists()
+                else -> false
+            }
+            if (alreadyReadySame) return@checkOtaUpdate
+
+            if (repo.isAutoDownloadOtaEnabled() && isUnmeteredWifiOrLanConnected()) {
+                startBackgroundPreDownload(res)
+            } else {
+                _otaStateFlow.value = OtaUiState.UpdateAvailable(res)
+            }
         }
     }
 
@@ -2477,6 +2694,7 @@ class OmsTransportClient(
                 traceConnection(ConnectionDiagnostics.Event.CONNECTED, source.tier)
                 reportPairing(link.pairing, true)
                 flushOutboxQueue()
+                triggerAutoOtaCheckIfEligible(reason = "session_connected")
             } else {
                 check(sourceAuthenticated(source))
                 handleDecodedFrame(source.tier, decoded, source.socket, source.gatt)
@@ -2785,6 +3003,26 @@ class OmsTransportClient(
                         airpodsManager.updateSyncConfig(params)
                         JSONObject().put("ok", true)
                     }
+                    "edge.config.sync" -> {
+                        val app = com.oms.client.OmsApplication.instance
+                        app?.edgeStore?.saveSyncedEdgeConfig(params.toString())
+                        app?.reloadEdgeRuntimeFromStore()
+                        JSONObject().put("ok", true)
+                    }
+                    "edge.context_capsule.sync" -> {
+                        com.oms.client.OmsApplication.instance?.edgeStore?.saveContextCapsule(params.toString())
+                        JSONObject().put("ok", true)
+                    }
+                    "wechat.cursor.checkpoint" -> {
+                        val app = com.oms.client.OmsApplication.instance
+                        app?.edgeStore?.updateCursorFromMacCheckpoint(params.toString())
+                        app?.wechatStandby?.refreshState()
+                        JSONObject().put("ok", true)
+                    }
+                    "agent.session.event" -> {
+                        com.oms.client.OmsApplication.instance?.cockpitCoordinator?.onRemoteAgentSessionEvent(params)
+                        JSONObject().put("ok", true)
+                    }
                     else -> throw IllegalArgumentException("Unknown RPC method: $method")
                 }
 
@@ -2818,6 +3056,22 @@ class OmsTransportClient(
                 }
             }
         }
+    }
+
+    suspend fun callHostRpc(
+        method: String,
+        params: JSONObject,
+        timeoutMs: Long = 20_000L
+    ): JSONObject? {
+        val activeSrc = runCatching { activeSource() }.getOrNull() ?: return null
+        val rpcReq = JSONObject()
+            .put("jsonrpc", "2.0")
+            .put("id", "edge_${UUID.randomUUID()}")
+            .put("method", method)
+            .put("params", params)
+        val effectiveTimeout = if (activeSrc.tier == "BT_RFCOMM") maxOf(timeoutMs, 15_000L) else timeoutMs
+        val resp = runCatching { requestHost(rpcReq, activeSrc, effectiveTimeout) }.getOrNull() ?: return null
+        return resp.optJSONObject("result") ?: resp
     }
 
     fun speakTextSmart(

@@ -87,7 +87,11 @@ struct HudWeChatArticleDetailResponse: Codable {
     let ok: Bool
     let article: HudWeChatArticleSummary?
     let noteMarkdown: String?
+    let noteHtml: String?
     let sourceMarkdown: String?
+    let sourceHtml: String?
+    let summaryHtml: String?
+    let resolvedImages: [String: String]?
 }
 
 // MARK: - Helpers
@@ -221,6 +225,16 @@ final class MirrorWebView: WKWebView {
         let composing = (window?.firstResponder as? NSTextInputClient)?.hasMarkedText() ?? false
         if event.keyCode == 53 && !composing { onEscapePressed?(); return }
         super.keyDown(with: event)
+    }
+}
+
+final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var delegate: WKScriptMessageHandler?
+    init(_ delegate: WKScriptMessageHandler) {
+        self.delegate = delegate
+    }
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        delegate?.userContentController(userContentController, didReceive: message)
     }
 }
 
@@ -564,7 +578,7 @@ final class HudIpcClient {
 
 // MARK: - Main HUD Application Controller
 
-final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, AVAudioPlayerDelegate, WKNavigationDelegate, WKUIDelegate {
+final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, AVAudioPlayerDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     private let socketPath: String
     private let initialParentPid: pid_t
     private var ipc: HudIpcClient!
@@ -608,6 +622,9 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     private var selectedWxArticleId: Int?
     private var currentWxDetail: HudWeChatArticleDetailResponse?
     private var selectedWxDocSegment: Int = 0
+    private var isWxRawSourceMode: Bool = false
+    private var wxReaderWebView: MirrorWebView?
+    private var wxReaderBaseURL: URL?
     private var mirrorContent: NSView?
     private var mirrorWebView: MirrorWebView?
     private var mirrorLoadedURL: URL?
@@ -651,6 +668,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     private func cleanupAndExit() {
         destroyMirrorView()
+        destroyWxReaderView()
         if let token = sleepObserver { NSWorkspace.shared.notificationCenter.removeObserver(token) }
         closeActiveQLPreview()
         audioPlayer?.stop()
@@ -1116,6 +1134,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         guard let win = notification.object as? NSWindow, win === detailPanel else { return }
         closeImagePreview()
         destroyMirrorView()
+        destroyWxReaderView()
         closeActiveQLPreview()
         audioPlayer?.stop()
         audioPlayer = nil
@@ -1365,6 +1384,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         mirrorContent?.isHidden = selectedDetailTab != 1
         wechatContent?.isHidden = selectedDetailTab != 2
         if selectedDetailTab == 1 {
+            destroyWxReaderView()
             closeActiveQLPreview()
             audioPlayer?.stop()
             audioPlayer = nil
@@ -1379,6 +1399,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             fetchWeChatOverviewForHud(selectingArticleId: selectedWxArticleId)
         } else {
             destroyMirrorView()
+            destroyWxReaderView()
             rebuildSidebarAndInspector()
         }
         constrainDetailPanelToScreen(maximizeHeight: true)
@@ -1613,7 +1634,240 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         }
     }
 
+    private func destroyWxReaderView() {
+        guard let web = wxReaderWebView else { return }
+        wxReaderWebView = nil
+        wxReaderBaseURL = nil
+        web.onEscapePressed = nil
+        web.navigationDelegate = nil
+        web.uiDelegate = nil
+        web.configuration.userContentController.removeScriptMessageHandler(forName: "omsImagePreview")
+        web.removeFromSuperview()
+        web.loadHTMLString("", baseURL: nil)
+    }
+
+    private func validatedWxLoopbackOriginURL() -> URL {
+        let baseRaw = statusSnapshot.wechatApiBaseUrl ?? "http://127.0.0.1:19527/api/wechat"
+        if let valid = validatedLoopbackURL(baseRaw),
+           var comps = URLComponents(url: valid, resolvingAgainstBaseURL: false) {
+            comps.path = "/"
+            comps.query = nil
+            comps.fragment = nil
+            if let rootUrl = comps.url {
+                return rootUrl
+            }
+        }
+        return URL(string: "http://127.0.0.1:19527/")!
+    }
+
+    private func buildWeChatReaderDocumentHtml(fragmentHtml: String) -> String {
+        return """
+        <!DOCTYPE html>
+        <html lang="zh-CN">
+        <head>
+        <meta charset="utf-8"/>
+        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src http://127.0.0.1:* data:; style-src 'unsafe-inline'; script-src 'unsafe-inline';"/>
+        <style>
+          * { box-sizing: border-box; }
+          html, body {
+            margin: 0;
+            padding: 0;
+            background: transparent;
+            color: #E2E8F0;
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+            font-size: 14px;
+            line-height: 1.78;
+            word-break: break-word;
+            -webkit-font-smoothing: antialiased;
+          }
+          body { padding: 16px 20px 24px 20px; }
+          .wx-rich-reader > *:first-child { margin-top: 0; }
+          .wx-rich-reader > *:last-child { margin-bottom: 0; }
+          .wx-meta-strip {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 7px;
+            margin-bottom: 14px;
+            padding-bottom: 10px;
+            border-bottom: 1px dashed rgba(255,255,255,0.12);
+          }
+          .wx-meta-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.10);
+            color: #94A3B8;
+            text-decoration: none;
+          }
+          .wx-meta-link { color: #38BDF8; border-color: rgba(56,189,248,0.38); }
+          .wx-rich-reader h1, .wx-rich-reader h2, .wx-rich-reader h3, .wx-rich-reader h4 {
+            color: #F8FAFC;
+            font-weight: 700;
+            line-height: 1.38;
+            margin: 20px 0 9px 0;
+          }
+          .wx-rich-reader h1 { font-size: 18px; }
+          .wx-rich-reader h2 { font-size: 15.5px; padding-bottom: 5px; border-bottom: 1px solid rgba(255,255,255,0.10); color: #7DD3FC; }
+          .wx-rich-reader h3 { font-size: 14.5px; color: #BAE6FD; }
+          .wx-rich-reader .wx-p { margin: 0 0 12px 0; color: #E2E8F0; }
+          .wx-rich-reader strong { color: #FFFFFF; font-weight: 700; }
+          .wx-rich-reader .wx-sec-num {
+            display: inline-block;
+            margin: 16px 0 6px 0;
+            padding: 2px 9px;
+            border-radius: 6px;
+            background: rgba(56, 189, 248, 0.15);
+            border: 1px solid rgba(56, 189, 248, 0.35);
+            color: #38BDF8;
+            font-weight: 700;
+            font-size: 12px;
+          }
+          .wx-rich-reader .wx-list { margin: 0 0 13px 0; padding-left: 20px; }
+          .wx-rich-reader .wx-list li { margin-bottom: 5px; }
+          .wx-rich-reader .wx-quote {
+            margin: 12px 0;
+            padding: 9px 13px;
+            border-left: 3px solid #38BDF8;
+            background: rgba(255,255,255,0.04);
+            border-radius: 0 8px 8px 0;
+            color: #CBD5E1;
+          }
+          .wx-rich-reader .wx-quote p { margin: 0 0 5px 0; }
+          .wx-rich-reader .wx-quote p:last-child { margin-bottom: 0; }
+          .wx-rich-reader .wx-inline-code {
+            background: rgba(255,255,255,0.10);
+            color: #FDE68A;
+            padding: 1px 5px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          }
+          .wx-rich-reader .wx-code-wrap {
+            margin: 12px 0;
+            background: rgba(3, 6, 12, 0.85);
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: 8px;
+            overflow: hidden;
+          }
+          .wx-rich-reader .wx-code-lang {
+            padding: 3px 10px;
+            font-size: 10.5px;
+            color: #94A3B8;
+            background: rgba(255,255,255,0.05);
+            border-bottom: 1px solid rgba(255,255,255,0.08);
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          }
+          .wx-rich-reader .wx-code {
+            margin: 0;
+            padding: 10px 12px;
+            overflow-x: auto;
+            font-size: 12px;
+            line-height: 1.5;
+            color: #E2E8F0;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          }
+          .wx-rich-reader .wx-hr {
+            border: none;
+            border-top: 1px solid rgba(255,255,255,0.10);
+            margin: 16px 0;
+          }
+          .wx-rich-reader .wx-figure {
+            margin: 14px 0;
+            text-align: center;
+          }
+          .wx-rich-reader .wx-inline-img {
+            display: inline-block;
+            max-width: 100%;
+            max-height: 460px;
+            border-radius: 9px;
+            border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(0,0,0,0.35);
+            cursor: zoom-in;
+            transition: border-color 0.15s;
+          }
+          .wx-rich-reader .wx-inline-img:hover {
+            border-color: #38BDF8;
+          }
+          .wx-rich-reader .wx-figcaption {
+            margin-top: 5px;
+            font-size: 11.5px;
+            color: #94A3B8;
+          }
+          .wx-rich-reader .wx-link { color: #38BDF8; text-decoration: underline; text-underline-offset: 2px; }
+          .wx-rich-reader .wx-wikilink {
+            display: inline-block;
+            padding: 0 5px;
+            border-radius: 4px;
+            background: rgba(74, 222, 128, 0.14);
+            color: #86EFAC;
+            font-size: 12px;
+          }
+          .wx-rich-reader .wx-ext-img-pill, .wx-rich-reader .wx-missing-img {
+            display: inline-block;
+            margin: 4px 0;
+            padding: 3px 9px;
+            border-radius: 6px;
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.12);
+            color: #94A3B8;
+            font-size: 11.5px;
+            text-decoration: none;
+          }
+          .wx-rich-reader .wx-table-wrap { margin: 12px 0; overflow-x: auto; }
+          .wx-rich-reader .wx-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+          .wx-rich-reader .wx-table th, .wx-rich-reader .wx-table td {
+            border: 1px solid rgba(255,255,255,0.12);
+            padding: 6px 9px;
+            text-align: left;
+          }
+          .wx-rich-reader .wx-table th { background: rgba(255,255,255,0.06); color: #F8FAFC; font-weight: 600; }
+        </style>
+        </head>
+        <body>
+        \(fragmentHtml)
+        <script>
+        document.addEventListener('click', function(ev) {
+          var t = ev.target;
+          var img = t && t.closest ? t.closest('img.wx-inline-img') : null;
+          if (!img) return;
+          ev.preventDefault();
+          var key = img.getAttribute('data-img-key') || '';
+          var rel = img.getAttribute('data-rel-path') || '';
+          var alt = img.getAttribute('alt') || '文章配图';
+          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.omsImagePreview) {
+            window.webkit.messageHandlers.omsImagePreview.postMessage({ key: key, rel: rel, alt: alt });
+          }
+        });
+        </script>
+        </body>
+        </html>
+        """
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "omsImagePreview",
+              message.webView === wxReaderWebView,
+              let payload = message.body as? [String: String],
+              let map = currentWxDetail?.resolvedImages else { return }
+        let key = payload["key"] ?? ""
+        let rel = payload["rel"] ?? ""
+        guard let absPath = map[key] ?? map[rel],
+              !absPath.isEmpty,
+              FileManager.default.fileExists(atPath: absPath),
+              let nsImage = NSImage(contentsOfFile: absPath) else { return }
+        let rawAlt = (payload["alt"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let previewTitle = (!rawAlt.isEmpty && rawAlt != "文章配图" && rawAlt.lowercased() != "image")
+            ? rawAlt
+            : (absPath as NSString).lastPathComponent
+        openImagePreview(image: nsImage, title: previewTitle)
+    }
+
     private func renderWeChatEmptyInspector(_ text: String) {
+        destroyWxReaderView()
         guard let box = wxInspectorContainer else { return }
         box.subviews.forEach { $0.removeFromSuperview() }
         let lbl = NSTextField(wrappingLabelWithString: text)
@@ -1629,6 +1883,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     private func renderWeChatInspector() {
+        destroyWxReaderView()
         guard let box = wxInspectorContainer, let detail = currentWxDetail, let art = detail.article else {
             renderWeChatEmptyInspector("选择左侧微信文章查看伴读与原文")
             return
@@ -1656,7 +1911,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
         let actionRow = NSStackView()
         actionRow.orientation = .horizontal
-        actionRow.spacing = 8
+        actionRow.spacing = 7
         actionRow.translatesAutoresizingMaskIntoConstraints = false
         box.addSubview(actionRow)
 
@@ -1670,66 +1925,123 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             fg: .white,
             action: #selector(pushSelectedWeChatToPhoneClicked(_:))
         )
-        phoneBtn.widthAnchor.constraint(equalToConstant: 118).isActive = true
+        phoneBtn.widthAnchor.constraint(equalToConstant: 114).isActive = true
         phoneBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
         actionRow.addArrangedSubview(phoneBtn)
 
         let copyBtn = makePillButton(
-            title: "📋 复制内容",
+            title: "📋 复制",
             bg: NSColor(calibratedWhite: 1.0, alpha: 0.12),
             fg: .white,
             action: #selector(copySelectedWeChatContentClicked(_:))
         )
-        copyBtn.widthAnchor.constraint(equalToConstant: 92).isActive = true
+        copyBtn.widthAnchor.constraint(equalToConstant: 66).isActive = true
         copyBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
         actionRow.addArrangedSubview(copyBtn)
 
-        if !art.note_md_path.isEmpty {
+        let modeBtn = makePillButton(
+            title: isWxRawSourceMode ? "📖 阅读" : "</> 源码",
+            bg: isWxRawSourceMode
+                ? NSColor(calibratedRed: 0.01, green: 0.52, blue: 0.78, alpha: 0.75)
+                : NSColor(calibratedWhite: 1.0, alpha: 0.10),
+            fg: .white,
+            action: #selector(toggleWxRawSourceClicked)
+        )
+        modeBtn.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        modeBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        actionRow.addArrangedSubview(modeBtn)
+
+        let targetFinderPath = selectedWxDocSegment == 2
+            ? (!art.source_md_path.isEmpty ? art.source_md_path : art.note_md_path)
+            : (!art.note_md_path.isEmpty ? art.note_md_path : art.source_md_path)
+        if !targetFinderPath.isEmpty {
             let revealBtn = makePillButton(
                 title: "📂 Finder",
                 bg: NSColor(calibratedWhite: 1.0, alpha: 0.10),
                 fg: .white,
                 action: #selector(revealSelectedWeChatNoteInFinder)
             )
-            revealBtn.widthAnchor.constraint(equalToConstant: 78).isActive = true
+            revealBtn.widthAnchor.constraint(equalToConstant: 74).isActive = true
             revealBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
             actionRow.addArrangedSubview(revealBtn)
         }
 
-        let scroll = NSScrollView()
-        scroll.drawsBackground = true
-        scroll.backgroundColor = NSColor(calibratedRed: 0.05, green: 0.07, blue: 0.12, alpha: 0.88)
-        scroll.hasVerticalScroller = true
-        scroll.wantsLayer = true
-        scroll.layer?.cornerRadius = 10
-        scroll.layer?.borderWidth = 1
-        scroll.layer?.borderColor = NSColor(calibratedWhite: 1.0, alpha: 0.10).cgColor
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-
         let bodyContent: String
+        let richHtml: String?
         switch selectedWxDocSegment {
         case 1:
             bodyContent = art.short_summary.isEmpty ? "（暂无初筛摘要）" : art.short_summary
+            richHtml = detail.summaryHtml
         case 2:
             bodyContent = detail.sourceMarkdown ?? "（本地原文文件不存在或尚未抓取）"
+            richHtml = detail.sourceHtml
         default:
             bodyContent = detail.noteMarkdown ?? (art.short_summary.isEmpty ? "（暂无伴读笔记）" : art.short_summary)
+            richHtml = detail.noteHtml ?? detail.summaryHtml
         }
 
-        let textView = NSTextView()
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.drawsBackground = false
-        textView.textColor = NSColor(calibratedWhite: 0.94, alpha: 1.0)
-        textView.font = NSFont.systemFont(ofSize: 13)
-        textView.textContainerInset = NSSize(width: 12, height: 12)
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = false
-        textView.autoresizingMask = [.width]
-        textView.textContainer?.widthTracksTextView = true
-        textView.string = bodyContent
-        scroll.documentView = textView
-        box.addSubview(scroll)
+        let contentViewBox: NSView
+        if !isWxRawSourceMode, let htmlFrag = richHtml, !htmlFrag.isEmpty {
+            let readerHost = NSView()
+            readerHost.wantsLayer = true
+            readerHost.layer?.backgroundColor = NSColor(calibratedRed: 0.05, green: 0.07, blue: 0.12, alpha: 0.88).cgColor
+            readerHost.layer?.cornerRadius = 10
+            readerHost.layer?.borderWidth = 1
+            readerHost.layer?.borderColor = NSColor(calibratedWhite: 1.0, alpha: 0.10).cgColor
+            readerHost.layer?.masksToBounds = true
+            readerHost.translatesAutoresizingMaskIntoConstraints = false
+
+            let config = WKWebViewConfiguration()
+            config.websiteDataStore = .nonPersistent()
+            config.preferences.javaScriptCanOpenWindowsAutomatically = false
+            config.userContentController.add(WeakScriptMessageHandler(self), name: "omsImagePreview")
+
+            let web = MirrorWebView(frame: .zero, configuration: config)
+            web.setValue(false, forKey: "drawsBackground")
+            web.navigationDelegate = self
+            web.uiDelegate = self
+            web.onEscapePressed = { [weak self] in self?.closeDetailPanel() }
+            web.translatesAutoresizingMaskIntoConstraints = false
+            readerHost.addSubview(web)
+            NSLayoutConstraint.activate([
+                web.topAnchor.constraint(equalTo: readerHost.topAnchor),
+                web.bottomAnchor.constraint(equalTo: readerHost.bottomAnchor),
+                web.leadingAnchor.constraint(equalTo: readerHost.leadingAnchor),
+                web.trailingAnchor.constraint(equalTo: readerHost.trailingAnchor)
+            ])
+            let baseUrl = validatedWxLoopbackOriginURL()
+            self.wxReaderBaseURL = baseUrl
+            self.wxReaderWebView = web
+            web.loadHTMLString(buildWeChatReaderDocumentHtml(fragmentHtml: htmlFrag), baseURL: baseUrl)
+            box.addSubview(readerHost)
+            contentViewBox = readerHost
+        } else {
+            let scroll = NSScrollView()
+            scroll.drawsBackground = true
+            scroll.backgroundColor = NSColor(calibratedRed: 0.05, green: 0.07, blue: 0.12, alpha: 0.88)
+            scroll.hasVerticalScroller = true
+            scroll.wantsLayer = true
+            scroll.layer?.cornerRadius = 10
+            scroll.layer?.borderWidth = 1
+            scroll.layer?.borderColor = NSColor(calibratedWhite: 1.0, alpha: 0.10).cgColor
+            scroll.translatesAutoresizingMaskIntoConstraints = false
+
+            let textView = NSTextView()
+            textView.isEditable = false
+            textView.isSelectable = true
+            textView.drawsBackground = false
+            textView.textColor = NSColor(calibratedWhite: 0.94, alpha: 1.0)
+            textView.font = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
+            textView.textContainerInset = NSSize(width: 12, height: 12)
+            textView.isVerticallyResizable = true
+            textView.isHorizontallyResizable = false
+            textView.autoresizingMask = [.width]
+            textView.textContainer?.widthTracksTextView = true
+            textView.string = bodyContent
+            scroll.documentView = textView
+            box.addSubview(scroll)
+            contentViewBox = scroll
+        }
 
         NSLayoutConstraint.activate([
             titleField.topAnchor.constraint(equalTo: box.topAnchor, constant: 12),
@@ -1743,11 +2055,16 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             actionRow.topAnchor.constraint(equalTo: metaField.bottomAnchor, constant: 10),
             actionRow.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 14),
 
-            scroll.topAnchor.constraint(equalTo: actionRow.bottomAnchor, constant: 10),
-            scroll.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 14),
-            scroll.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -14),
-            scroll.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -14)
+            contentViewBox.topAnchor.constraint(equalTo: actionRow.bottomAnchor, constant: 10),
+            contentViewBox.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 14),
+            contentViewBox.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -14),
+            contentViewBox.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -14)
         ])
+    }
+
+    @objc private func toggleWxRawSourceClicked() {
+        isWxRawSourceMode.toggle()
+        renderWeChatInspector()
     }
 
     @objc private func wxDocSegmentChanged(_ sender: NSSegmentedControl) {
@@ -1780,7 +2097,11 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     @objc private func revealSelectedWeChatNoteInFinder() {
-        guard let path = currentWxDetail?.article?.note_md_path, !path.isEmpty else { return }
+        guard let art = currentWxDetail?.article else { return }
+        let path = selectedWxDocSegment == 2
+            ? (!art.source_md_path.isEmpty ? art.source_md_path : art.note_md_path)
+            : (!art.note_md_path.isEmpty ? art.note_md_path : art.source_md_path)
+        guard !path.isEmpty else { return }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 
@@ -1847,11 +2168,30 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        if webView === wxReaderWebView {
+            if navigationAction.navigationType == .linkActivated,
+               let url = navigationAction.request.url,
+               let scheme = url.scheme?.lowercased(),
+               (scheme == "https" || scheme == "http") {
+                NSWorkspace.shared.open(url)
+                decisionHandler(.cancel)
+                return
+            }
+            let isInitialLoad = navigationAction.navigationType == .other &&
+                navigationAction.targetFrame?.isMainFrame == true &&
+                (navigationAction.request.url == wxReaderBaseURL || navigationAction.request.url?.absoluteString == "about:blank")
+            decisionHandler(isInitialLoad ? .allow : .cancel)
+            return
+        }
         let allowed = webView === mirrorWebView && navigationAction.targetFrame?.isMainFrame == true && navigationAction.request.url == mirrorLoadedURL
         decisionHandler(allowed ? .allow : .cancel)
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        if webView === wxReaderWebView {
+            decisionHandler(.allow)
+            return
+        }
         let response = navigationResponse.response as? HTTPURLResponse
         let allowed = webView === mirrorWebView && response?.statusCode == 200 && response?.mimeType == "text/html"
         decisionHandler(allowed ? .allow : .cancel)

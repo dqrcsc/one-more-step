@@ -3,8 +3,10 @@ package com.oms.client.service
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -58,6 +60,7 @@ class OmsCoreForegroundService : Service() {
     private var smsObserver: SmsContentObserver? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private val wifiLockMutex = Any()
+    private var screenStateReceiver: BroadcastReceiver? = null
 
     private fun syncWifiLockState() {
         val shouldHold = lowLatencyReasons.isNotEmpty()
@@ -103,6 +106,8 @@ class OmsCoreForegroundService : Service() {
             it.startWatching()
         }
 
+        registerScreenInteractiveReceiver()
+
         val client = OmsApplication.instance?.transportClient
         client?.startAutoConnect()
 
@@ -129,7 +134,36 @@ class OmsCoreForegroundService : Service() {
         "LAN_WS" -> "🟢 Mac 已连接 (局域网高速直连)"
         "BT_RFCOMM" -> "🔵 Mac 已连接 (近场蓝牙直连)"
         "WAN_WEBRTC" -> "🟣 Mac 已连接 (远程跨网通道)"
-        else -> "⏳ 等待连接 Mac (支持离线暂存)"
+        else -> {
+            val hasClaw = OmsApplication.instance?.edgeStore?.loadClawBotAuth() != null
+            if (hasClaw) "🌙 Mac 休眠/离线 · 尺素随身守护已就绪" else "⏳ 等待连接 Mac (支持离线暂存)"
+        }
+    }
+
+    private fun registerScreenInteractiveReceiver() {
+        if (screenStateReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                val app = OmsApplication.instance ?: return
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_ON -> app.wechatStandby.onScreenInteractiveChanged(true)
+                    Intent.ACTION_SCREEN_OFF -> app.wechatStandby.onScreenInteractiveChanged(false)
+                    Intent.ACTION_USER_PRESENT -> {
+                        app.wechatStandby.onScreenInteractiveChanged(true)
+                        app.proxyManager.prewarmAiEndpointsIfDue()
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        runCatching {
+            registerReceiver(receiver, filter)
+            screenStateReceiver = receiver
+        }
     }
 
     private fun safeStartForeground(statusText: String) {
@@ -216,6 +250,8 @@ class OmsCoreForegroundService : Service() {
             wifiLock = null
         }
         serviceScope.cancel()
+        screenStateReceiver?.let { r -> runCatching { unregisterReceiver(r) } }
+        screenStateReceiver = null
         screenshotWatcher?.stopWatching()
         smsObserver?.stopWatching()
         super.onDestroy()

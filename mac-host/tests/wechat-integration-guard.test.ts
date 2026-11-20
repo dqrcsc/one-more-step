@@ -4,6 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { handleDashboardHttpRequest } from "../src/inbox/inbox-web-dashboard.js";
 import { WeChatBridgeSupervisor, type ManagedWeChatEvent } from "../src/wechat/wechat-supervisor.js";
+import {
+  renderWeChatMarkdownReaderHtml,
+  resolveMarkdownRelativeAsset,
+} from "../../wechat-context/src/reader_renderer.js";
 
 describe("Unified WeChat-as-Context (青简·尺素) Loopback Guard & Supervisor Integration", () => {
   test("strictly blocks non-loopback LAN clients from all /wechat and /api/wechat routes", async () => {
@@ -144,5 +148,85 @@ setTimeout(() => {}, 5000);
     } finally {
       await sup.stop();
     }
+  });
+
+  test("renders rich WeChat reader HTML, resolves inline local raster assets, and blocks path traversal / SVG XSS", () => {
+    const tmpVault = fs.mkdtempSync(path.join(os.tmpdir(), "oms-wx-reader-"));
+    const wxDir = path.join(tmpVault, "wechat");
+    const assetsDir = path.join(wxDir, "assets", "2026_11_19_demo");
+    fs.mkdirSync(assetsDir, { recursive: true });
+
+    const sourceMd = path.join(wxDir, "2026_11_19_demo.md");
+    const imgWebp = path.join(assetsDir, "img_01_demo.webp");
+    const evilSvg = path.join(assetsDir, "evil.svg");
+    const outsideSecret = path.join(tmpVault, "outside.png");
+    const escapedSymlink = path.join(assetsDir, "symlink_out.png");
+
+    fs.writeFileSync(imgWebp, Buffer.from("UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA", "base64"));
+    fs.writeFileSync(evilSvg, "<svg onload=alert(1)></svg>", "utf8");
+    fs.writeFileSync(outsideSecret, "secret", "utf8");
+    fs.symlinkSync(outsideSecret, escapedSymlink);
+
+    const sampleMarkdown = [
+      "---",
+      "type: source",
+      'title: "淘宝闪购本体平台"',
+      "---",
+      "",
+      "# 淘宝闪购本体平台",
+      "",
+      "- **公众号 / 作者**：阿里技术",
+      "- **发布时间**：2026-11-18",
+      "- **捕获时间**：2026-11-19",
+      "- **原始链接**：[原文链接](https://mp.weixin.qq.com/s?__biz=demo&mid=123456)",
+      "- **转发时批注**：[链接] 淘宝闪购本体平台",
+      "",
+      "---",
+      "",
+      "![image](assets/2026_11_19_demo/img_01_demo.webp)",
+      "",
+      "业务负责人脑子里记的却是另一种；**写下来的总是少数，多数口径还得靠人记。 **",
+      "",
+      "<script>alert('xss')</script>",
+      "",
+      "01",
+      "",
+      "## 平台架构",
+      "",
+      "| 层级 | 职责 |",
+      "| --- | --- |",
+      "| 元模型 | 统一语义 |",
+    ].join("\n");
+    fs.writeFileSync(sourceMd, sampleMarkdown, "utf8");
+
+    // Valid relative raster image resolves cleanly
+    const resolvedOk = resolveMarkdownRelativeAsset(sourceMd, "assets/2026_11_19_demo/img_01_demo.webp");
+    expect(resolvedOk).not.toBeNull();
+    expect(resolvedOk?.mimeType).toBe("image/webp");
+
+    // Traversal, absolute path, active SVG, and symlink escape must all be rejected
+    expect(resolveMarkdownRelativeAsset(sourceMd, "../outside.png")).toBeNull();
+    expect(resolveMarkdownRelativeAsset(sourceMd, "/etc/passwd")).toBeNull();
+    expect(resolveMarkdownRelativeAsset(sourceMd, "assets/2026_11_19_demo/evil.svg")).toBeNull();
+    expect(resolveMarkdownRelativeAsset(sourceMd, "assets/2026_11_19_demo/symlink_out.png")).toBeNull();
+
+    const rendered = renderWeChatMarkdownReaderHtml({
+      markdown: sampleMarkdown,
+      docPath: sourceMd,
+      articleId: 161,
+      docKind: "source",
+    });
+
+    expect(rendered.html).not.toContain("type: source");
+    expect(rendered.html).toContain("查看微信原网页");
+    expect(rendered.html).toContain("/api/wechat/asset?articleId=161&amp;doc=source&amp;path=assets%2F2026_11_19_demo%2Fimg_01_demo.webp");
+    expect(rendered.html).toContain("<strong>写下来的总是少数，多数口径还得靠人记。</strong>");
+    expect(rendered.html).toContain("&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;");
+    expect(rendered.html).not.toContain("<script>alert");
+    expect(rendered.html).toContain('<div class="wx-sec-num">01</div>');
+    expect(rendered.html).toContain('<table class="wx-table">');
+    expect(rendered.resolvedImages["source:assets/2026_11_19_demo/img_01_demo.webp"]).toBe(
+      fs.realpathSync(imgWebp)
+    );
   });
 });

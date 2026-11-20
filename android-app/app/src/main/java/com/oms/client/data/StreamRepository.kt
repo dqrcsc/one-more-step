@@ -110,6 +110,12 @@ class StreamRepository(context: Context) :
         return id
     }
 
+    fun isAutoDownloadOtaEnabled(): Boolean = prefs.getBoolean("auto_download_ota_wifi", true)
+
+    fun setAutoDownloadOtaEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("auto_download_ota_wifi", enabled).apply()
+    }
+
     private companion object {
         private const val DATABASE_VERSION = 2
         private const val KEYSTORE_PROVIDER = "AndroidKeyStore"

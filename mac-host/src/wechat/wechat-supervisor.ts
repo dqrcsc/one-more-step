@@ -283,6 +283,8 @@ export class WeChatBridgeSupervisor extends EventEmitter {
       const respHeaders = new Headers();
       const upCt = upstream.headers.get("content-type");
       if (upCt) respHeaders.set("Content-Type", upCt);
+      const upCsp = upstream.headers.get("content-security-policy");
+      if (upCsp) respHeaders.set("Content-Security-Policy", upCsp);
       respHeaders.set("Cache-Control", "no-store");
       respHeaders.set("X-Content-Type-Options", "nosniff");
       respHeaders.set("Cross-Origin-Resource-Policy", "same-origin");
@@ -296,6 +298,58 @@ export class WeChatBridgeSupervisor extends EventEmitter {
         { status: 502 }
       );
     }
+  }
+
+  public async fetchEdgeStandbySnapshot(): Promise<Record<string, any> | null> {
+    if (!this.isRunning()) return null;
+    try {
+      const res = await fetch(`http://127.0.0.1:${this.internalPort}/internal/edge/snapshot`, {
+        headers: { Host: `127.0.0.1:${this.internalPort}` },
+        signal: AbortSignal.timeout(4000),
+      });
+      if (!res.ok) return null;
+      return (await res.json()) as Record<string, any>;
+    } catch {
+      return null;
+    }
+  }
+
+  public async setStandbyPollPaused(paused: boolean): Promise<boolean> {
+    if (!this.isRunning()) return false;
+    try {
+      const res = await fetch(`http://127.0.0.1:${this.internalPort}/internal/edge/pause-poll`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Host: `127.0.0.1:${this.internalPort}`,
+        },
+        body: JSON.stringify({ paused }),
+        signal: AbortSignal.timeout(3000),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  public async submitStandbyHandoff(payload: unknown): Promise<Record<string, any>> {
+    if (!this.isRunning()) {
+      throw new Error("WeChat Context worker is not running");
+    }
+    const res = await fetch(`http://127.0.0.1:${this.internalPort}/internal/edge/handoff`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Host: `127.0.0.1:${this.internalPort}`,
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(45_000),
+    });
+    const data = (await res.json()) as Record<string, any>;
+    if (!res.ok || !data?.ok) {
+      throw new Error(data?.error || `Handoff failed with HTTP ${res.status}`);
+    }
+    return data;
   }
 
   public async stop(): Promise<void> {

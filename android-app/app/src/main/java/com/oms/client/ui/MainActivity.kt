@@ -47,11 +47,13 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -83,12 +85,14 @@ import com.oms.client.capability.NotificationExecutor
 import com.oms.client.capability.SpeechAudioPolicy
 import com.oms.client.capability.VoiceRecorderHelper
 import com.oms.client.data.StreamItemModel
+import com.oms.client.edge.StandbyLeaseState
 import com.oms.client.otp.OtpExtractor
 import com.oms.client.otp.OtpMatch
 import com.oms.client.service.OmsCoreForegroundService
 import com.oms.client.share.AttachmentBudget
 import com.oms.client.share.AttachmentResolver
 import com.oms.client.transport.OtaCheckResult
+import com.oms.client.transport.OtaUiState
 import com.oms.client.xiaomi.XiaomiAdaptationHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -136,9 +140,11 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
-                    color = Color(0xFF0F172A)
+                    color = Color(0xFF0B1120)
                 ) {
-                    OneMoreStepMainScreen()
+                    com.oms.client.ui.cockpit.OmsCockpitRootScreen(
+                        legacySystemConsoleContent = { OneMoreStepMainScreen() }
+                    )
                 }
             }
         }
@@ -164,6 +170,8 @@ class MainActivity : ComponentActivity() {
             intent?.removeExtra(NotificationExecutor.EXTRA_STOP_TTS)
         }
         OmsApplication.instance?.transportClient?.startAutoConnect()
+        OmsApplication.instance?.transportClient?.onAppForegroundResume()
+        OmsApplication.instance?.cockpitCoordinator?.onAppForeground()
     }
 
     override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
@@ -239,6 +247,9 @@ fun OneMoreStepMainScreen() {
     val streamItems by app.repository.itemsFlow.collectAsState()
     val isSpeakingTts by NotificationExecutor.isSpeakingFlow.collectAsState()
     val speakingTtsText by NotificationExecutor.speakingTextFlow.collectAsState()
+    val standbyLeaseState by app.wechatStandby.leaseStateFlow.collectAsState()
+    val standbyPendingCount by app.wechatStandby.standbyHandledCountFlow.collectAsState()
+    var forceAwayStandby by remember { mutableStateOf(app.edgeStore.isForceAwayStandbyEnabled()) }
 
     var showXiaomiWizard by remember { mutableStateOf(false) }
     var showPairSheet by remember { mutableStateOf(app.repository.getPairedMac()?.pairingVersion != 2) }
@@ -272,6 +283,8 @@ fun OneMoreStepMainScreen() {
     var searchQuery by remember { mutableStateOf("") }
     var checkingOta by remember { mutableStateOf(false) }
     var pendingOtaDialog by remember { mutableStateOf<OtaCheckResult?>(null) }
+    val otaState by app.transportClient.otaStateFlow.collectAsState()
+    var autoDownloadOta by remember { mutableStateOf(app.repository.isAutoDownloadOtaEnabled()) }
 
     var isRecordingVoice by remember { mutableStateOf(false) }
     var recordingSec by remember { mutableStateOf(0) }
@@ -420,6 +433,189 @@ fun OneMoreStepMainScreen() {
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
+        when (val st = otaState) {
+            is OtaUiState.Downloading -> {
+                val dlMb = String.format(Locale.US, "%.1f", st.downloadedBytes / 1048576.0)
+                val totalMb = if (st.totalBytes > 0L) String.format(Locale.US, "%.1f", st.totalBytes / 1048576.0) else "--"
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 10.dp)
+                        .border(1.dp, Color(0xFF0284C7), RoundedCornerShape(14.dp)),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF0C4A6E)),
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "⬇️ 正在后台预下载新版本 v${st.ota.remoteVersionName}",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
+                            )
+                            Text(
+                                "${st.percent}% · $dlMb / $totalMb MB",
+                                color = Color(0xFF7DD3FC),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        if (st.totalBytes > 0L) {
+                            LinearProgressIndicator(
+                                progress = { (st.percent / 100f).coerceIn(0f, 1f) },
+                                modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                                color = Color(0xFF38BDF8),
+                                trackColor = Color(0xFF082F49)
+                            )
+                        } else {
+                            LinearProgressIndicator(
+                                modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                                color = Color(0xFF38BDF8),
+                                trackColor = Color(0xFF082F49)
+                            )
+                        }
+                    }
+                }
+            }
+            is OtaUiState.ReadyToInstall, is OtaUiState.InstallerLaunched -> {
+                val ota = if (st is OtaUiState.ReadyToInstall) st.ota else (st as OtaUiState.InstallerLaunched).ota
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 10.dp)
+                        .border(1.dp, Color(0xFF10B981), RoundedCornerShape(14.dp)),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF064E3B)),
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                            Text(
+                                "🚀 新版本 v${ota.remoteVersionName} 已下载并验签就绪",
+                                color = Color(0xFFA7F3D0),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
+                            )
+                            Text(
+                                "SHA-256 与签名校验通过 · 无需等待，点击直接安装",
+                                color = Color(0xFFD1FAE5),
+                                fontSize = 11.sp
+                            )
+                        }
+                        Button(
+                            onClick = {
+                                app.transportClient.installOrResumeReadyOta { msg ->
+                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                        ) {
+                            Text("立即安装", color = Color(0xFF022C22), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+            is OtaUiState.NeedsInstallPermission -> {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 10.dp)
+                        .border(1.dp, Color(0xFFF59E0B), RoundedCornerShape(14.dp)),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF78350F)),
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                            Text(
+                                "🔓 新版本 v${st.ota.remoteVersionName} 已就绪，需开启安装权限",
+                                color = Color(0xFFFDE68A),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
+                            )
+                            Text(
+                                "允许「安装未知应用」后返回本页将自动弹出安装器",
+                                color = Color(0xFFFEF3C7),
+                                fontSize = 11.sp
+                            )
+                        }
+                        Button(
+                            onClick = { app.transportClient.openInstallPermissionAndAwaitResume() },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF59E0B)),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Text("去开启权限", color = Color(0xFF451A03), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+            is OtaUiState.UpdateAvailable -> {
+                val sizeMb = String.format(Locale.US, "%.1f MB", st.ota.remoteSizeBytes / 1048576.0)
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 10.dp)
+                        .border(1.dp, Color(0xFF38BDF8), RoundedCornerShape(14.dp)),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF0C4A6E)),
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                            Text(
+                                "🎉 发现新版本 v${st.ota.remoteVersionName}",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
+                            )
+                            Text(
+                                "安装包大小 $sizeMb · 点击下载并校验签名安装",
+                                color = Color(0xFFBAE6FD),
+                                fontSize = 11.sp
+                            )
+                        }
+                        Button(
+                            onClick = {
+                                app.transportClient.installOrResumeReadyOta { msg ->
+                                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Text("下载安装", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+            else -> {}
+        }
+
         if (isGuiEmergencyStopped) {
             Card(
                 modifier = Modifier
@@ -606,12 +802,22 @@ fun OneMoreStepMainScreen() {
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    val isReadyOta = otaState is OtaUiState.ReadyToInstall || otaState is OtaUiState.InstallerLaunched
+                    val isDownloadingOta = otaState is OtaUiState.Downloading
                     OutlinedButton(
-                        enabled = !checkingOta,
+                        enabled = !checkingOta && !isDownloadingOta,
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
                         modifier = Modifier.weight(1f).height(30.dp),
-                        colors = ButtonDefaults.outlinedButtonColors(containerColor = Color(0xFF0F172A)),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = if (isReadyOta) Color(0xFF065F46) else Color(0xFF0F172A)
+                        ),
                         onClick = {
+                            if (isReadyOta) {
+                                app.transportClient.installOrResumeReadyOta { msg ->
+                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                }
+                                return@OutlinedButton
+                            }
                             checkingOta = true
                             app.transportClient.checkOtaUpdate { res ->
                                 checkingOta = false
@@ -630,7 +836,12 @@ fun OneMoreStepMainScreen() {
                         }
                     ) {
                         Text(
-                            if (checkingOta) "⏳ 检查中" else "🔄 检查更新",
+                            when {
+                                isDownloadingOta -> "⬇️ 下载中"
+                                isReadyOta -> "🚀 立即安装"
+                                checkingOta -> "⏳ 检查中"
+                                else -> "🔄 检查更新"
+                            },
                             color = Color(0xFF4ADE80),
                             fontSize = 11.sp,
                             maxLines = 1,
@@ -676,6 +887,58 @@ fun OneMoreStepMainScreen() {
                         )
                     }
                 }
+
+                // Milestone 1 (v2.0): Built-in Proxy Tunnel & WeChat Standby Status Pill Row
+                val bestProxyNode = app.proxyManager.router.bestNode
+                val proxyStatusLabel = if (bestProxyNode != null) {
+                    val latTxt = if (bestProxyNode.latencyMs.isFinite()) "${bestProxyNode.latencyMs.toLong()}ms" else "就绪"
+                    "✈️ ${bestProxyNode.name.take(10)} ($latTxt)"
+                } else {
+                    "✈️ 隧道待同步"
+                }
+                val standbyDesc = when (standbyLeaseState) {
+                    StandbyLeaseState.ACTIVE_POLLING -> "🌙 尺素手机抢答中"
+                    StandbyLeaseState.STANDBY_SCREEN_OFF_POWERSAVE -> "🌙 尺素息屏省电待命"
+                    StandbyLeaseState.MAC_CONNECTED_IDLE -> "💻 尺素由Mac主控"
+                    StandbyLeaseState.BLOCKED_AWAY_UNCONFIRMED -> "🛡️ 离家防双活保护"
+                    StandbyLeaseState.DISABLED -> "⏳ 尺素待Mac下发"
+                }
+                val pendingSuffix = if (standbyPendingCount > 0) " · 待移交($standbyPendingCount)" else ""
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF0F172A), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "$proxyStatusLabel  |  $standbyDesc$pendingSuffix",
+                        color = if (standbyLeaseState == StandbyLeaseState.ACTIVE_POLLING) Color(0xFF34D399) else Color(0xFF94A3B8),
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (forceAwayStandby) "离家接管:开" else "离家接管:关",
+                        color = if (forceAwayStandby) Color(0xFF38BDF8) else Color(0xFF64748B),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clickable {
+                            val next = !forceAwayStandby
+                            forceAwayStandby = next
+                            app.edgeStore.setForceAwayStandbyEnabled(next)
+                            app.wechatStandby.refreshState()
+                            Toast.makeText(
+                                context,
+                                if (next) "🌙 已开启离家强制接管尺素（请确认家里Mac已休眠）" else "🛡️ 已恢复智能同网休眠检测模式",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    )
+                }
             }
         }
 
@@ -684,7 +947,7 @@ fun OneMoreStepMainScreen() {
             val currentPaired = app.repository.getPairedMac()
             Spacer(modifier = Modifier.height(6.dp))
             Card(
-                modifier = Modifier.fillMaxWidth().heightIn(max = 210.dp),
+                modifier = Modifier.fillMaxWidth().heightIn(max = 260.dp),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
                 shape = RoundedCornerShape(12.dp)
             ) {
@@ -766,6 +1029,29 @@ fun OneMoreStepMainScreen() {
                         ) {
                             Text("🔐 验证并绑定", fontSize = 11.sp)
                         }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "⚡ Wi-Fi / 局域网下自动后台预下载更新",
+                            color = Color(0xFFCBD5E1),
+                            fontSize = 11.5.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Switch(
+                            checked = autoDownloadOta,
+                            onCheckedChange = { enabled ->
+                                autoDownloadOta = enabled
+                                app.repository.setAutoDownloadOtaEnabled(enabled)
+                                if (enabled) {
+                                    app.transportClient.triggerAutoOtaCheckIfEligible("toggle_on")
+                                }
+                            }
+                        )
                     }
                 }
             }

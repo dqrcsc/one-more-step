@@ -918,6 +918,18 @@ async function main() {
       break;
     }
 
+    case "edge-sync": {
+      const res = await ipc.call("edge.sync_now", {}, 20000);
+      console.log(JSON.stringify(res, null, 2));
+      break;
+    }
+
+    case "agents": {
+      const res = await ipc.call("agent.sessions.list", { limit: Number(flags.limit || 20) }, 10000);
+      console.log(JSON.stringify(res, null, 2));
+      break;
+    }
+
     case "wx":
     case "wechat": {
       const wxSub = (sub || "list").toLowerCase();

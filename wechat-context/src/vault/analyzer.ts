@@ -1,7 +1,12 @@
 import { preservesReplyConditions, mergeCompactSections, INITIAL_REPLY_LIMIT, LONG_REPLY_NOTICE, replyLength, omitEmptyAnnotation, hasSubstantiveAnnotation } from "./initial_reply.ts";
 import { extractionNotice } from "../extractor/quality.ts";
 import { AppConfig } from "../config.ts";
-import { fetchWithTransientRetry, resolveModelEndpoint } from "../agent/llm.ts";
+import {
+  extractOpenAiResponsesText,
+  fetchWithTransientRetry,
+  isOpenAiResponsesModel,
+  resolveModelEndpoint,
+} from "../agent/llm.ts";
 import { TriageLevel } from "../db.ts";
 import { ExtractedWeChatArticle } from "../extractor/wechat.ts";
 import { VaultContextSnapshot } from "./context.ts";
@@ -136,8 +141,12 @@ douyin_seo_excerpt是可能截断的网页简介片段，不能当完整作品�
   }, null, 2);
 
   const resolvedEp = resolveModelEndpoint(config, "fast");
-  const endpoint = `${(resolvedEp.baseUrl || config.llm.baseUrl).replace(/\/+$/, "")}/chat/completions`;
+  const cleanBase = (resolvedEp.baseUrl || config.llm.baseUrl).replace(/\/+$/, "");
   const targetModel = resolvedEp.model || config.llm.fastModel || config.llm.model;
+  const useResponsesApi = isOpenAiResponsesModel(targetModel, cleanBase);
+  const endpoint = useResponsesApi
+    ? `${cleanBase}/responses`
+    : `${cleanBase}/chat/completions`;
   const authKey = resolvedEp.apiKey || config.llm.apiKey;
   const messages: Array<{ role: string; content: string }> = [
     { role: "system", content: systemPrompt },
@@ -156,13 +165,30 @@ douyin_seo_excerpt是可能截断的网页简介片段，不能当完整作品�
         "Content-Type": "application/json",
         Authorization: `Bearer ${authKey}`,
       },
-      body: JSON.stringify({
-        model: targetModel,
-        temperature: 0.2,
-        ...(useJsonObjectFormat ? { response_format: { type: "json_object" } } : {}),
-        messages: chatMessages,
-      }),
+      body: JSON.stringify(
+        useResponsesApi
+          ? {
+              model: targetModel,
+              reasoning: { effort: "medium" },
+              input: chatMessages.map((m) => ({
+                role: m.role === "system" ? "developer" : m.role,
+                content: m.content,
+              })),
+              ...(useJsonObjectFormat ? { text: { format: { type: "json_object" } } } : {}),
+            }
+          : {
+              model: targetModel,
+              temperature: 0.2,
+              ...(useJsonObjectFormat ? { response_format: { type: "json_object" } } : {}),
+              messages: chatMessages,
+            }
+      ),
     }));
+
+  const extractResponseContent = (data: any): string =>
+    useResponsesApi
+      ? extractOpenAiResponsesText(data)
+      : data?.choices?.[0]?.message?.content || "";
 
   const requestParsedOutput = async (
     chatMessages: Array<{ role: string; content: string }>
@@ -178,10 +204,8 @@ douyin_seo_excerpt是可能截断的网页简介片段，不能当完整作品�
       throw new Error(`LLM HTTP ${resp.status}: ${errText.slice(0, 300)}`);
     }
 
-    const data = (await resp.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    const content = data.choices?.[0]?.message?.content;
+    const data = await resp.json();
+    const content = extractResponseContent(data);
     if (!content) {
       throw new Error("Empty LLM response content");
     }
@@ -237,7 +261,7 @@ douyin_seo_excerpt是可能截断的网页简介片段，不能当完整作品�
       ], preferJsonObjectFormat);
       if (!response.ok) throw new Error("compression_http");
       const data = await response.json() as any;
-      const candidate = parseJsonFromLlm(data.choices?.[0]?.message?.content || "");
+      const candidate = parseJsonFromLlm(extractResponseContent(data));
       if (("digest" in candidate || "collision" in candidate) && (!candidate.digest?.trim() || !candidate.collision?.trim())) throw new Error("compression_empty_section");
       const selected = typeof candidate.digest === "string" && typeof candidate.collision === "string"
         ? mergeCompactSections(parsed.wechat_reply, candidate.digest, candidate.collision) : candidate.wechat_reply;

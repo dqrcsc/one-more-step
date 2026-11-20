@@ -15,3 +15,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "OneMoreStep"
 include(":app")
+include(":core:net-proxy")
+include(":core:ai-engine")

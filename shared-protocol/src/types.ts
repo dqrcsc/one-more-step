@@ -382,3 +382,250 @@ export interface ApprovalRespondParams {
   userComment?: string;
   decidedAtMs: number;
 }
+
+/**
+ * Milestone 1 (v2.0): Edge Proxy, Dual-Engine AI, Context Capsule & Zero-Split-Brain WeChat Standby Contracts
+ */
+export interface EdgeProxyNodePayload {
+  name: string;
+  protocol: "ss" | "trojan" | "socks5" | "http";
+  server: string;
+  port: number;
+  cipher?: string;
+  password?: string;
+  username?: string;
+  plugin?: string | null;
+  pluginOpts?: Record<string, string>;
+  sni?: string;
+  skipCertVerify?: boolean;
+  udp?: boolean;
+  source?: string;
+}
+
+export interface EdgeProviderPayload {
+  providerId: "openai" | "gemini" | "fallback";
+  baseUrl: string;
+  apiKey: string;
+  fastModel: string;
+  flagshipModel: string;
+  reasoningModel?: string;
+  liveModel?: string;
+  transcribeModel?: string;
+}
+
+export interface EdgeClawBotAuthPayload {
+  botToken: string;
+  baseUrl: string;
+  botId: string;
+  userId: string;
+}
+
+export interface EdgeConfigSyncParams {
+  subscriptionUrls: string[];
+  bootstrapNodes: EdgeProxyNodePayload[];
+  preferRegions: string;
+  maxPreferredLatencyMs: number;
+  openai?: EdgeProviderPayload;
+  gemini?: EdgeProviderPayload;
+  domesticFallback?: EdgeProviderPayload;
+  clawbotAuth?: EdgeClawBotAuthPayload;
+  pairedLanSsidHint?: string;
+  syncedAtMs: number;
+}
+
+export interface EdgeContextCapsuleParams {
+  revision: string;
+  generatedAtIso: string;
+  nowSummary: string;
+  queueSummary: string;
+  topicsOverview: string;
+  analysisBackgroundFormatted: string;
+  analysisWarnings: string[];
+  matchedCandidates: Array<{
+    title: string;
+    wikiLink: string;
+    excerpt: string;
+  }>;
+  recentWorkingMemory: string[];
+}
+
+export interface WeChatCursorCheckpointParams {
+  updatesBuf: string;
+  recipientUserId?: string;
+  contextToken?: string;
+  contextSourceTimeMs?: number;
+  macSleeping?: boolean;
+  checkpointAtMs: number;
+}
+
+export interface WeChatStandbyProcessedArticle {
+  messageKey: string;
+  senderId: string;
+  url: string;
+  title: string;
+  author: string;
+  publishDate: string;
+  digest: string;
+  userNotes: string;
+  englishSlug: string;
+  triage: "keep_raw" | "reference" | "process_later" | "process_now";
+  extractionQualityStatus: "complete" | "partial" | "metadata_only" | "unavailable";
+  rawMarkdownBody: string;
+  wechatReplyText: string;
+  companionNoteMarkdown: string;
+  replyDeliveredToWeChat: boolean;
+  modelUsed: string;
+  createdAtMs: number;
+}
+
+export interface WeChatStandbyHandoffParams {
+  handoffId: string;
+  latestUpdatesBuf: string;
+  recipientUserId?: string;
+  latestContextToken?: string;
+  contextSourceTimeMs?: number;
+  cursorAdvancedByPhone: boolean;
+  processedArticles: WeChatStandbyProcessedArticle[];
+  deferredMessages: Array<{
+    messageKey: string;
+    rawPayloadJson: string;
+  }>;
+  handedOffAtMs: number;
+}
+
+export interface WeChatStandbyHandoffResult {
+  ok: boolean;
+  importedArticlesCount: number;
+  queuedDeferredCount: number;
+  cursorUpdated: boolean;
+}
+
+/**
+ * Milestone 2 (v2.0): 3-Tier Mobile Chat Memory Funnel & Vault Promotion Contracts
+ */
+export interface MobileChatThreadSnapshot {
+  threadId: string;
+  title: string;
+  pinned: boolean;
+  incognito: boolean;
+  updatedAtMs: number;
+  createdAtMs: number;
+}
+
+export interface MobileChatMessageSnapshot {
+  messageId: string;
+  threadId: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  reasoning?: string;
+  modelUsed?: string;
+  sourcesJson?: string;
+  createdAtMs: number;
+}
+
+export interface ChatSyncBatchParams {
+  threads: MobileChatThreadSnapshot[];
+  messages: MobileChatMessageSnapshot[];
+  workingMemoryItems?: string[];
+  syncedAtMs: number;
+}
+
+export interface MemoryPromoteVaultParams {
+  itemId: string;
+  kind: "chat_highlight" | "botanical_specimen";
+  title: string;
+  slugHint?: string;
+  markdownContent: string;
+  jpegBase64?: string;
+  imageFileName?: string;
+  createdAtMs: number;
+}
+
+export interface MemoryPromoteVaultResult {
+  ok: boolean;
+  savedNotePath: string;
+  savedImagePath?: string;
+}
+
+export interface MemorySearchVaultParams {
+  query: string;
+  limit?: number;
+}
+
+export interface MemorySearchVaultResult {
+  hits: Array<{
+    source: "vault" | "mobile_chat";
+    title: string;
+    pathOrRef: string;
+    snippet: string;
+  }>;
+}
+
+/**
+ * Milestone 3 (v2.0): Mac Heavy-Brain Hub (Codex & Antigravity Live Session Monitor + Dispatch + Resume)
+ */
+export type AgentBackendType = "codex" | "agy";
+
+export interface AgentSessionSummary {
+  sessionId: string;
+  backend: AgentBackendType;
+  origin: "desktop" | "mobile";
+  title: string;
+  workspacePath: string;
+  status: "running" | "idle" | "completed" | "failed";
+  lastSummary: string;
+  updatedAtMs: number;
+  canContinue: boolean;
+}
+
+export interface AgentProjectItem {
+  projectPath: string;
+  displayName: string;
+  group: string;
+  sessionCount: number;
+  runningCount: number;
+  lastActiveAtMs: number;
+}
+
+export interface AgentWorkspaceCatalogResult {
+  projects: AgentProjectItem[];
+  sessions: AgentSessionSummary[];
+}
+
+export interface AgentStepItem {
+  stepIndex: number;
+  kind: "user" | "thinking" | "tool" | "assistant" | "status";
+  title: string;
+  detail: string;
+  timestampMs: number;
+}
+
+export interface AgentSessionDetailResult {
+  session: AgentSessionSummary;
+  steps: AgentStepItem[];
+}
+
+export interface AgentSessionStartParams {
+  clientRequestId: string;
+  backend: AgentBackendType;
+  prompt: string;
+  workspacePath?: string;
+  titleHint?: string;
+}
+
+export interface AgentSessionContinueParams {
+  clientRequestId: string;
+  backend: AgentBackendType;
+  sessionId: string;
+  prompt: string;
+  workspacePath?: string;
+}
+
+export interface AgentSessionStreamEventParams {
+  backend: AgentBackendType;
+  sessionId: string;
+  status: "running" | "completed" | "failed";
+  step?: AgentStepItem;
+  finalSummary?: string;
+  updatedAtMs: number;
+}

@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <cache-path name="verified_apk" path="verified_ota/update.apk" />
+    <cache-path name="verified_ota_dir" path="verified_ota/" />
+    <files-path name="creative_media" path="creative_media/" />
 </paths>

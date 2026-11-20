@@ -8,7 +8,14 @@ import java.security.MessageDigest
 /** Expected digests are accepted only from authenticated RPC or the HTTPS GitHub release API. */
 object VerifiedOtaPolicy {
     const val MAX_APK_BYTES = 128L * 1024 * 1024
+    const val MAX_REDIRECT_HOPS = 5
     enum class Source { AUTHENTICATED_RPC, GITHUB_HTTPS }
+
+    fun isTrustedGithubDownloadHost(host: String?): Boolean {
+        val h = host?.lowercase() ?: return false
+        return h == "github.com" || h == "githubusercontent.com" || h.endsWith(".githubusercontent.com")
+    }
+
     data class Metadata(val url: String, val sha256: String, val size: Long,
                         val versionName: String, val versionCode: Long, val source: Source?) {
         fun validate() {
@@ -16,17 +23,42 @@ object VerifiedOtaPolicy {
             require(Regex("[0-9a-fA-F]{64}").matches(sha256)) { "更新缺少可信 SHA-256，不能安装" }
             val uri = URI(url)
             require(uri.scheme in setOf("http", "https") && !uri.host.isNullOrBlank() && uri.userInfo == null) { "无效的 APK 下载地址" }
-            if (source == Source.GITHUB_HTTPS) require(uri.scheme == "https" && uri.host == "github.com") { "GitHub 更新必须使用 HTTPS" }
+            if (source == Source.GITHUB_HTTPS) require(uri.scheme == "https" && isTrustedGithubDownloadHost(uri.host)) { "GitHub 更新必须使用可信 HTTPS 域名" }
             require(size in 0..MAX_APK_BYTES) { "APK 超过 128 MiB 上限" }
             require(OtaVersionPolicy.parseSemVer(versionName) != null) { "更新版本信息无效" }
         }
     }
 
-    fun copyAndVerify(input: InputStream, output: OutputStream, metadata: Metadata): Long {
+    fun validateRedirectTarget(metadata: Metadata, currentUrl: String, locationHeader: String): String {
+        metadata.validate()
+        require(locationHeader.isNotBlank()) { "重定向缺少目标地址" }
+        val currentUri = URI(currentUrl)
+        val targetUri = currentUri.resolve(locationHeader)
+        require(targetUri.scheme in setOf("http", "https") && !targetUri.host.isNullOrBlank() && targetUri.userInfo == null) {
+            "无效的 APK 重定向地址"
+        }
+        if (currentUri.scheme == "https") {
+            require(targetUri.scheme == "https") { "拒绝从 HTTPS 降级到明文 HTTP 下载更新" }
+        }
+        if (metadata.source == Source.GITHUB_HTTPS || targetUri.scheme == "https") {
+            require(targetUri.scheme == "https" && isTrustedGithubDownloadHost(targetUri.host)) {
+                "更新重定向仅允许可信 GitHub HTTPS 节点"
+            }
+        }
+        return targetUri.toString()
+    }
+
+    fun copyAndVerify(
+        input: InputStream,
+        output: OutputStream,
+        metadata: Metadata,
+        onProgress: ((downloadedBytes: Long, totalBytes: Long) -> Unit)? = null
+    ): Long {
         metadata.validate()
         val digest = MessageDigest.getInstance("SHA-256")
         val buffer = ByteArray(65536)
         var total = 0L
+        onProgress?.invoke(0L, metadata.size)
         while (true) {
             val n = input.read(buffer)
             if (n < 0) break
@@ -34,6 +66,7 @@ object VerifiedOtaPolicy {
             require(total <= MAX_APK_BYTES && (metadata.size == 0L || total <= metadata.size)) { "APK 下载大小超限" }
             digest.update(buffer, 0, n)
             output.write(buffer, 0, n)
+            onProgress?.invoke(total, metadata.size)
         }
         require(total > 0 && (metadata.size == 0L || total == metadata.size)) { "APK 下载不完整" }
         val actual = digest.digest().joinToString("") { "%02x".format(it) }

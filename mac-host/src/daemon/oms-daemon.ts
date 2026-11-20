@@ -8,9 +8,13 @@ import crypto from "node:crypto";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { synthesizeNeuralAudio, neuralTtsPython, type TtsFallbackReason } from "./neural-tts.js";
 import {
+  AgentSessionContinueParams,
+  AgentSessionStartParams,
+  AgentSessionStreamEventParams,
   AirPodsStatusSnapshot,
   ApprovalRespondParams,
   buildPairingUri,
+  ChatSyncBatchParams,
   DecodedScreenFrame,
   encodeScreenFrame,
   FRAME_HEADER_BYTES,
@@ -21,6 +25,7 @@ import {
   InboxSubmitItemParams,
   IntentTag,
   JsonRpcRequest,
+  MemoryPromoteVaultParams,
   MirrorStatusSnapshot,
   OMS_BLE_SERVICE_SHORT_UUID,
   OMS_DEFAULT_LAN_PORT,
@@ -36,6 +41,9 @@ import { handleDashboardHttpRequest } from "../inbox/inbox-web-dashboard.js";
 import { DingTalkConfig, DingTalkPlugin } from "../plugins/dingtalk.js";
 import { HudStatusPayload, MacHudServer } from "../hud/mac-hud-server.js";
 import { ManagedWeChatEvent, WeChatBridgeSupervisor } from "../wechat/wechat-supervisor.js";
+import { buildEdgeSyncPayloadFromHost } from "../wechat/edge-proxy-bootstrap.js";
+import { MobileMemoryMirror } from "../memory/mobile-memory-mirror.js";
+import { AgentSessionHub, type AgentSessionHubOptions } from "../agent/agent-session-hub.js";
 
 export interface OmsHostConfig {
   lanPort: number;
@@ -107,6 +115,8 @@ export class OmsDaemon {
   public readonly session: PhoneSessionManager;
   public readonly dingtalk: DingTalkPlugin;
   public readonly wechat: WeChatBridgeSupervisor;
+  public readonly memoryMirror: MobileMemoryMirror;
+  public readonly agentHub: AgentSessionHub;
 
   private readonly configPath: string;
   private readonly wechatPendingPhoneQueuePath: string;
@@ -165,6 +175,12 @@ export class OmsDaemon {
     pairedAirpods: [],
   };
 
+  // Milestone 1 (v2.0): Edge Standby Cursor & Capsule Sync State
+  private lastSyncedCapsuleRevision = "";
+  private lastSyncedUpdatesBuf = "";
+  private lastKnownPhoneWifiSsid = "";
+  private edgeCursorSyncTimer: Timer | null = null;
+
   constructor(customHomeDir?: string) {
     this.homeDir = customHomeDir || path.join(os.homedir(), ".one_more_step");
     this.ensureSecureDir(this.homeDir);
@@ -204,6 +220,22 @@ export class OmsDaemon {
     this.wechat.on("statusChanged", () => this.syncMacHudState());
     this.wechat.on("wechatEvent", (evt: ManagedWeChatEvent) => {
       void this.handleManagedWeChatEvent(evt);
+    });
+
+    this.memoryMirror = new MobileMemoryMirror({
+      omsHomeDir: this.homeDir,
+      wechatEnvPath: path.join(this.wechat.wechatHomeDir, ".env"),
+    });
+    this.agentHub = new AgentSessionHub({
+      omsHomeDir: this.homeDir,
+      defaultWorkspacePath: repoRoot,
+    });
+    this.agentHub.on("session_event", (evt: AgentSessionStreamEventParams) => {
+      if (this.session.getActiveTier() !== "DISCONNECTED") {
+        void this.session
+          .callPhone("agent.session.event", evt as unknown as Record<string, unknown>, 4000)
+          .catch(() => {});
+      }
     });
 
     this.session = new PhoneSessionManager({
@@ -698,10 +730,14 @@ export class OmsDaemon {
     this.session.on("phoneAuthenticated", (evt: any) => {
       if (evt?.status) {
         this.ingestPhoneAirpodsSnapshot(evt.status);
+        if (typeof evt.status.wifiSsid === "string" && evt.status.wifiSsid.trim()) {
+          this.lastKnownPhoneWifiSsid = evt.status.wifiSsid.trim().replace(/^"|"$/g, "");
+        }
       }
       this.syncAirpodsConfigToBridgeAndPhone();
       this.syncMacHudState();
       void this.flushPendingWeChatPhoneQueue();
+      void this.syncEdgeConfigAndCapsuleToPhone();
     });
 
     this.session.on("airpodsDiagnostics", (diagnostics) => {
@@ -1059,6 +1095,72 @@ export class OmsDaemon {
               .catch(() => {
                 reply({ result: { ok: false } });
               });
+          } else if (req.method === "wechat.standby.handoff") {
+            const handoffParams = (req.params || {}) as Record<string, any>;
+            void (async () => {
+              try {
+                await this.wechat.setStandbyPollPaused(true);
+                const result = await this.wechat.submitStandbyHandoff(handoffParams);
+                if (typeof handoffParams.latestUpdatesBuf === "string" && handoffParams.latestUpdatesBuf) {
+                  this.lastSyncedUpdatesBuf = handoffParams.latestUpdatesBuf;
+                }
+                this.syncMacHudState();
+                reply({ result });
+              } catch (err: any) {
+                await this.wechat.setStandbyPollPaused(false).catch(() => {});
+                reply({
+                  error: {
+                    code: -32000,
+                    message: err?.message || "Standby handoff failed",
+                  },
+                });
+              }
+            })();
+          } else if (req.method === "edge.requestSync") {
+            void this.syncEdgeConfigAndCapsuleToPhone(true)
+              .then((summary) => reply({ result: { ok: true, ...summary } }))
+              .catch((err: any) =>
+                reply({
+                  error: {
+                    code: -32000,
+                    message: err?.message || "Edge sync failed",
+                  },
+                })
+              );
+          } else if (req.method === "chat.sync.batch") {
+            const summary = this.memoryMirror.syncBatch((req.params || {}) as ChatSyncBatchParams);
+            reply({ result: { ok: true, ...summary } });
+          } else if (req.method === "memory.promote_vault") {
+            const promoted = this.memoryMirror.promoteToVault(
+              (req.params || {}) as MemoryPromoteVaultParams
+            );
+            reply({ result: promoted });
+          } else if (req.method === "memory.search_vault") {
+            const p = (req.params || {}) as { query?: string; limit?: number };
+            const found = this.memoryMirror.searchContext(String(p.query || ""), p.limit ?? 6);
+            reply({ result: found });
+          } else if (req.method === "agent.sessions.list") {
+            const p = (req.params || {}) as { limit?: number };
+            reply({ result: { sessions: this.agentHub.listSessions(p.limit ?? 48) } });
+          } else if (req.method === "agent.workspace_catalog" || req.method === "agent.projects.list") {
+            const p = (req.params || {}) as { limit?: number };
+            reply({ result: this.agentHub.getWorkspaceCatalog(p.limit ?? 48) });
+          } else if (req.method === "agent.session.detail") {
+            const p = (req.params || {}) as { backend: "codex" | "agy"; sessionId: string };
+            const detail = this.agentHub.getSessionDetail(p.backend || "codex", String(p.sessionId || ""));
+            reply({ result: detail });
+          } else if (req.method === "agent.session.start") {
+            const started = this.agentHub.startSession((req.params || {}) as AgentSessionStartParams);
+            reply({ result: { ok: true, session: started } });
+          } else if (req.method === "agent.session.continue") {
+            const resumed = this.agentHub.continueSession(
+              (req.params || {}) as AgentSessionContinueParams
+            );
+            reply({ result: { ok: true, session: resumed } });
+          } else if (req.method === "agent.session.cancel") {
+            const p = (req.params || {}) as { backend: "codex" | "agy"; sessionId: string };
+            const cancelled = this.agentHub.cancelSession(p.backend || "codex", String(p.sessionId || ""));
+            reply({ result: { ok: cancelled } });
           } else {
             reply({ result: { ack: true } });
           }
@@ -1486,6 +1588,7 @@ export class OmsDaemon {
   private async handleManagedWeChatEvent(evt: ManagedWeChatEvent): Promise<void> {
     await this.wechat.refreshHealth(true).catch(() => {});
     this.syncMacHudState();
+    void this.syncWeChatCursorCheckpointToPhone();
 
     const toastTitle =
       evt.eventType === "article"
@@ -1557,6 +1660,120 @@ export class OmsDaemon {
       return { ok: delivered, hudActive: true, itemId: targetItem?.itemId ?? itemId };
     }
     return { ok: false, hudActive: false, itemId: targetItem?.itemId ?? itemId };
+  }
+
+  public async syncEdgeConfigAndCapsuleToPhone(forceCapsule = false): Promise<{
+    proxyNodesCount: number;
+    hasOpenAi: boolean;
+    hasGemini: boolean;
+    hasClawbot: boolean;
+  }> {
+    if (this.session.getActiveTier() === "DISCONNECTED") {
+      return { proxyNodesCount: 0, hasOpenAi: false, hasGemini: false, hasClawbot: false };
+    }
+    const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
+    const wxSnap = await this.wechat.fetchEdgeStandbySnapshot();
+    const edgeCfg = await buildEdgeSyncPayloadFromHost({
+      omsHomeDir: this.homeDir,
+      wechatHomeDir: this.wechat.wechatHomeDir,
+      repoRootDir: repoRoot,
+      wechatWorkerSnapshot: wxSnap,
+    });
+    if (this.lastKnownPhoneWifiSsid) {
+      edgeCfg.pairedLanSsidHint = this.lastKnownPhoneWifiSsid;
+    }
+
+    if (this.session.getActiveTier() !== "DISCONNECTED") {
+      await this.session
+        .callPhone("edge.config.sync", edgeCfg as unknown as Record<string, unknown>, 8000)
+        .catch(() => {});
+    }
+
+    const workingMem = this.memoryMirror.loadWorkingMemory();
+    const rawCapsule = wxSnap?.contextCapsule as Record<string, any> | undefined;
+    const capsule: Record<string, unknown> | undefined = rawCapsule
+      ? {
+          ...rawCapsule,
+          recentWorkingMemory: Array.from(
+            new Set([
+              ...(Array.isArray(rawCapsule.recentWorkingMemory) ? rawCapsule.recentWorkingMemory : []),
+              ...workingMem,
+            ])
+          ).slice(0, 12),
+        }
+      : workingMem.length > 0
+        ? {
+            revision: `wm_${workingMem.length}_${workingMem[0]?.slice(0, 8) || ""}`,
+            generatedAtIso: new Date().toISOString(),
+            nowSummary: "",
+            queueSummary: "",
+            topicsOverview: "",
+            analysisBackgroundFormatted: "",
+            analysisWarnings: [],
+            matchedCandidates: [],
+            recentWorkingMemory: workingMem,
+          }
+        : undefined;
+    if (
+      capsule &&
+      this.session.getActiveTier() !== "DISCONNECTED" &&
+      (forceCapsule || capsule.revision !== this.lastSyncedCapsuleRevision)
+    ) {
+      const ack = await this.session.callPhone("edge.context_capsule.sync", capsule, 8000).catch(() => null);
+      if (ack) this.lastSyncedCapsuleRevision = String(capsule.revision || "");
+    }
+
+    const cp = wxSnap?.cursorCheckpoint;
+    if (cp && this.session.getActiveTier() !== "DISCONNECTED") {
+      await this.session.callPhone("wechat.cursor.checkpoint", cp, 5000).catch(() => {});
+      if (typeof cp.updatesBuf === "string") {
+        this.lastSyncedUpdatesBuf = cp.updatesBuf;
+      }
+    }
+
+    this.ensureEdgeCursorSyncLoop();
+
+    return {
+      proxyNodesCount: edgeCfg.bootstrapNodes.length,
+      hasOpenAi: Boolean(edgeCfg.openai?.apiKey),
+      hasGemini: Boolean(edgeCfg.gemini?.apiKey),
+      hasClawbot: Boolean(edgeCfg.clawbotAuth?.botToken),
+    };
+  }
+
+  public async syncWeChatCursorCheckpointToPhone(macSleeping = false): Promise<void> {
+    if (this.session.getActiveTier() === "DISCONNECTED") return;
+    const wxSnap = await this.wechat.fetchEdgeStandbySnapshot();
+    const cp = wxSnap?.cursorCheckpoint;
+    if (!cp) return;
+    if (!macSleeping && cp.updatesBuf === this.lastSyncedUpdatesBuf) return;
+    if (macSleeping) {
+      await this.wechat.setStandbyPollPaused(true).catch(() => {});
+    }
+    await this.session
+      .callPhone(
+        "wechat.cursor.checkpoint",
+        {
+          ...cp,
+          macSleeping,
+          checkpointAtMs: Date.now(),
+        },
+        3500
+      )
+      .catch(() => {});
+    if (typeof cp.updatesBuf === "string") {
+      this.lastSyncedUpdatesBuf = cp.updatesBuf;
+    }
+  }
+
+  private ensureEdgeCursorSyncLoop(): void {
+    if (this.edgeCursorSyncTimer) return;
+    this.edgeCursorSyncTimer = setInterval(() => {
+      if (this.session.getActiveTier() !== "DISCONNECTED") {
+        void this.syncWeChatCursorCheckpointToPhone(false);
+      }
+    }, 20_000);
+    (this.edgeCursorSyncTimer as any).unref?.();
   }
 
   private showMacDesktopNotification(
@@ -2283,6 +2500,14 @@ export class OmsDaemon {
           markdown: typeof params.markdown === "string" ? params.markdown : undefined,
           queueIfOffline: params.queueIfOffline !== false,
         });
+      }
+
+      case "edge.sync_now": {
+        return await this.syncEdgeConfigAndCapsuleToPhone(true);
+      }
+
+      case "agent.sessions.list": {
+        return this.agentHub.getWorkspaceCatalog(Number(params.limit) || 48);
       }
 
       case "airpods.status": {
@@ -3309,7 +3534,10 @@ export class OmsDaemon {
 
   public async stop(): Promise<void> {
     this.mirrorDisposed = true;
-    await this.wechat.stop().catch(() => {});
+    if (this.edgeCursorSyncTimer) {
+      clearInterval(this.edgeCursorSyncTimer);
+      this.edgeCursorSyncTimer = null;
+    }
     // Drain an outstanding start and send its compensating stop before closing transport.
     if (this.mirrorRunning || this.mirrorStartPending) {
       await this.stopMirror().catch(() => {});
@@ -3321,6 +3549,12 @@ export class OmsDaemon {
         this.mirrorIdleStopTimer = null;
       }
       await this.mirrorLifecycleQueue;
+    }
+    if (this.wechat.isRunning()) {
+      await this.syncWeChatCursorCheckpointToPhone(true).catch(() => {});
+      await this.wechat.stop().catch(() => {});
+    } else {
+      await this.wechat.stop().catch(() => {});
     }
     for (const [, w] of this.pendingApprovals) {
       clearTimeout(w.timer);
@@ -3343,6 +3577,8 @@ export class OmsDaemon {
       await this.hudServer.stop();
       this.hudServer = null;
     }
+    this.agentHub.stopAll();
+    this.memoryMirror.close();
     await this.session.stop();
   }
 }

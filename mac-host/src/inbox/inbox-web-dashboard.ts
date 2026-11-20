@@ -837,6 +837,162 @@ function renderDashboardHtml(): string {
     border-radius: 10px;
     box-shadow: 0 20px 60px rgba(0,0,0,0.6);
   }
+  .wx-reader-card {
+    background: #090D16;
+    border: 1px solid #1E293B;
+    border-radius: 12px;
+    padding: 20px 24px;
+    color: #E2E8F0;
+    font-size: 14.5px;
+    line-height: 1.8;
+    word-break: break-word;
+  }
+  .wx-rich-reader > *:first-child { margin-top: 0; }
+  .wx-rich-reader > *:last-child { margin-bottom: 0; }
+  .wx-meta-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px dashed #1E293B;
+  }
+  .wx-meta-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11.5px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: #111827;
+    border: 1px solid #1F2937;
+    color: #94A3B8;
+    text-decoration: none;
+  }
+  .wx-meta-link { color: #38BDF8; border-color: rgba(56,189,248,0.35); }
+  .wx-meta-link:hover { background: rgba(56,189,248,0.12); }
+  .wx-rich-reader h1, .wx-rich-reader h2, .wx-rich-reader h3, .wx-rich-reader h4 {
+    color: #F8FAFC;
+    font-weight: 700;
+    line-height: 1.4;
+    margin: 22px 0 10px 0;
+  }
+  .wx-rich-reader h1 { font-size: 19px; }
+  .wx-rich-reader h2 { font-size: 16.5px; padding-bottom: 6px; border-bottom: 1px solid #1E293B; color: #7DD3FC; }
+  .wx-rich-reader h3 { font-size: 15px; color: #BAE6FD; }
+  .wx-rich-reader .wx-p { margin: 0 0 13px 0; color: #E2E8F0; }
+  .wx-rich-reader strong { color: #FFFFFF; font-weight: 700; }
+  .wx-rich-reader .wx-sec-num {
+    display: inline-block;
+    margin: 18px 0 6px 0;
+    padding: 2px 10px;
+    border-radius: 6px;
+    background: rgba(56, 189, 248, 0.14);
+    border: 1px solid rgba(56, 189, 248, 0.35);
+    color: #38BDF8;
+    font-weight: 700;
+    font-size: 12.5px;
+    letter-spacing: 0.5px;
+  }
+  .wx-rich-reader .wx-list { margin: 0 0 14px 0; padding-left: 22px; }
+  .wx-rich-reader .wx-list li { margin-bottom: 6px; }
+  .wx-rich-reader .wx-quote {
+    margin: 14px 0;
+    padding: 10px 14px;
+    border-left: 3px solid #38BDF8;
+    background: rgba(15, 23, 42, 0.85);
+    border-radius: 0 8px 8px 0;
+    color: #CBD5E1;
+  }
+  .wx-rich-reader .wx-quote p { margin: 0 0 6px 0; }
+  .wx-rich-reader .wx-quote p:last-child { margin-bottom: 0; }
+  .wx-rich-reader .wx-inline-code {
+    background: #1E293B;
+    color: #FDE68A;
+    padding: 1px 6px;
+    border-radius: 5px;
+    font-size: 12.5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .wx-rich-reader .wx-code-wrap {
+    margin: 14px 0;
+    background: #05080F;
+    border: 1px solid #1E293B;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .wx-rich-reader .wx-code-lang {
+    padding: 4px 12px;
+    font-size: 11px;
+    color: #94A3B8;
+    background: #0F172A;
+    border-bottom: 1px solid #1E293B;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .wx-rich-reader .wx-code {
+    margin: 0;
+    padding: 12px 14px;
+    overflow-x: auto;
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: #E2E8F0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .wx-rich-reader .wx-hr {
+    border: none;
+    border-top: 1px solid #1E293B;
+    margin: 18px 0;
+  }
+  .wx-rich-reader .wx-figure {
+    margin: 16px 0;
+    text-align: center;
+  }
+  .wx-rich-reader .wx-inline-img {
+    display: inline-block;
+    max-width: 100%;
+    max-height: 540px;
+    border-radius: 10px;
+    border: 1px solid #1E293B;
+    background: #0F172A;
+    cursor: zoom-in;
+    transition: border-color 0.15s, transform 0.15s;
+  }
+  .wx-rich-reader .wx-inline-img:hover {
+    border-color: #38BDF8;
+  }
+  .wx-rich-reader .wx-figcaption {
+    margin-top: 6px;
+    font-size: 12px;
+    color: #94A3B8;
+  }
+  .wx-rich-reader .wx-link { color: #38BDF8; text-decoration: underline; text-underline-offset: 2px; }
+  .wx-rich-reader .wx-wikilink {
+    display: inline-block;
+    padding: 0 6px;
+    border-radius: 5px;
+    background: rgba(74, 222, 128, 0.12);
+    color: #86EFAC;
+    font-size: 12.5px;
+  }
+  .wx-rich-reader .wx-ext-img-pill, .wx-rich-reader .wx-missing-img {
+    display: inline-block;
+    margin: 6px 0;
+    padding: 4px 10px;
+    border-radius: 8px;
+    background: #111827;
+    border: 1px solid #334155;
+    color: #94A3B8;
+    font-size: 12px;
+    text-decoration: none;
+  }
+  .wx-rich-reader .wx-table-wrap { margin: 14px 0; overflow-x: auto; }
+  .wx-rich-reader .wx-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .wx-rich-reader .wx-table th, .wx-rich-reader .wx-table td {
+    border: 1px solid #1E293B;
+    padding: 8px 10px;
+    text-align: left;
+  }
+  .wx-rich-reader .wx-table th { background: #0F172A; color: #F8FAFC; font-weight: 600; }
   .toast {
     position: fixed;
     bottom: 24px;
@@ -1612,6 +1768,7 @@ let wxOverviewData = { articles: [], turns: [], schedules: [], agentTasks: [], s
 let selectedWxArticleId = null;
 let selectedWxTurnId = null;
 let selectedWxDocMode = 'note';
+let wxRawSourceMode = false;
 
 function switchTopModule(mod) {
   activeTopModule = mod;
@@ -1746,6 +1903,20 @@ function setWxDocMode(mode) {
   renderCurrentWxArticleDetail();
 }
 
+function toggleWxRawSourceMode() {
+  wxRawSourceMode = !wxRawSourceMode;
+  renderCurrentWxArticleDetail();
+}
+
+function bindWxInlineImageLightbox(container) {
+  if (!container) return;
+  container.querySelectorAll('img.wx-inline-img').forEach(img => {
+    img.addEventListener('click', () => {
+      if (img.src) openLightbox(img.src);
+    });
+  });
+}
+
 function renderCurrentWxArticleDetail() {
   const data = window.__currentWxArticleDetail;
   if (!data || !data.article) return;
@@ -1756,6 +1927,16 @@ function renderCurrentWxArticleDetail() {
     : selectedWxDocMode === 'summary'
       ? (a.short_summary || a.digest || '（暂无初筛摘要）')
       : (data.noteMarkdown || a.short_summary || '（暂无伴读笔记）');
+
+  const richHtml = selectedWxDocMode === 'source'
+    ? data.sourceHtml
+    : selectedWxDocMode === 'summary'
+      ? data.summaryHtml
+      : (data.noteHtml || data.summaryHtml);
+
+  const bodySectionHtml = (!wxRawSourceMode && richHtml)
+    ? ('<div class="wx-reader-card">' + richHtml + '</div>')
+    : ('<pre style="white-space:pre-wrap;word-break:break-word;background:#090D16;border:1px solid #1E293B;border-radius:10px;padding:14px;font-size:13px;line-height:1.65;color:#E2E8F0;margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">' + escapeHtml(bodyText) + '</pre>');
 
   detail.innerHTML =
     '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:12px;">' +
@@ -1773,12 +1954,19 @@ function renderCurrentWxArticleDetail() {
       '</div>' +
     '</div>' +
     (a.user_notes ? ('<div style="background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.35);border-radius:8px;padding:8px 12px;margin-bottom:12px;font-size:12.5px;color:#FDE68A;">💬 你的批注：' + escapeHtml(a.user_notes) + '</div>') : '') +
-    '<div style="display:flex;gap:6px;margin-bottom:12px;">' +
-      '<button class="tab ' + (selectedWxDocMode === 'note' ? 'active' : '') + '" onclick="setWxDocMode(\'note\')">📒 伴读笔记 (_note.md)</button>' +
-      '<button class="tab ' + (selectedWxDocMode === 'summary' ? 'active' : '') + '" onclick="setWxDocMode(\'summary\')">💡 微信初筛摘要</button>' +
-      '<button class="tab ' + (selectedWxDocMode === 'source' ? 'active' : '') + '" onclick="setWxDocMode(\'source\')">📄 归档原文 (_source.md)</button>' +
+    '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px;">' +
+      '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
+        '<button class="tab ' + (selectedWxDocMode === 'note' ? 'active' : '') + '" onclick="setWxDocMode(\'note\')">📒 伴读笔记 (_note.md)</button>' +
+        '<button class="tab ' + (selectedWxDocMode === 'summary' ? 'active' : '') + '" onclick="setWxDocMode(\'summary\')">💡 微信初筛摘要</button>' +
+        '<button class="tab ' + (selectedWxDocMode === 'source' ? 'active' : '') + '" onclick="setWxDocMode(\'source\')">📄 归档原文 (_source.md)</button>' +
+      '</div>' +
+      '<button class="tab ' + (wxRawSourceMode ? 'active' : '') + '" onclick="toggleWxRawSourceMode()" title="切换富文本阅读视图与原始 Markdown 源码">' +
+        (wxRawSourceMode ? '📖 返回阅读视图' : '&lt;/&gt; 查看源码') +
+      '</button>' +
     '</div>' +
-    '<pre style="white-space:pre-wrap;word-break:break-word;background:#090D16;border:1px solid #1E293B;border-radius:10px;padding:14px;font-size:13px;line-height:1.65;color:#E2E8F0;margin:0;font-family:-apple-system,BlinkMacSystemFont,\'PingFang SC\',sans-serif;">' + escapeHtml(bodyText) + '</pre>';
+    bodySectionHtml;
+
+  bindWxInlineImageLightbox(detail);
 }
 
 function copyCurrentWxDoc() {
@@ -1825,7 +2013,10 @@ async function selectWxTurn(turnId) {
       '<div style="font-size:12px;color:#94A3B8;margin-bottom:12px;">🕒 ' + escapeHtml(t.created_at || '') + (t.model_used ? (' · 🤖 ' + escapeHtml(t.model_used)) : '') + '</div>' +
       '<div style="background:#090D16;border:1px solid #1E293B;border-radius:10px;padding:12px;margin-bottom:12px;white-space:pre-wrap;font-size:13px;">👤 发送内容：\n' + escapeHtml(t.user_text || '') + '</div>' +
       (t.assistant_reply ? ('<div style="background:#0B1526;border:1px solid #1E3A5F;border-radius:10px;padding:12px;margin-bottom:12px;white-space:pre-wrap;font-size:13px;">🤖 尺素回复：\n' + escapeHtml(t.assistant_reply) + '</div>') : '') +
-      (data.depositedMarkdown ? ('<div style="font-size:12px;color:#4ADE80;margin-bottom:6px;">📂 归档文件内容：</div><pre style="white-space:pre-wrap;background:#090D16;border:1px solid #1E293B;border-radius:10px;padding:12px;font-size:12.5px;line-height:1.6;">' + escapeHtml(data.depositedMarkdown) + '</pre>') : '');
+      (data.depositedHtml
+        ? ('<div style="font-size:12px;color:#4ADE80;margin-bottom:6px;">📂 归档文件内容：</div><div class="wx-reader-card">' + data.depositedHtml + '</div>')
+        : (data.depositedMarkdown ? ('<div style="font-size:12px;color:#4ADE80;margin-bottom:6px;">📂 归档文件内容：</div><pre style="white-space:pre-wrap;background:#090D16;border:1px solid #1E293B;border-radius:10px;padding:12px;font-size:12.5px;line-height:1.6;">' + escapeHtml(data.depositedMarkdown) + '</pre>') : ''));
+    bindWxInlineImageLightbox(detail);
   } catch {}
 }
 

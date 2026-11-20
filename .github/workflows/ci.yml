@@ -43,4 +43,4 @@ jobs:
 
       - name: Run Android JVM unit tests
         working-directory: android-app
-        run: ./gradlew testDebugUnitTest
+        run: ./gradlew :core:net-proxy:test :core:ai-engine:test :app:testDebugUnitTest

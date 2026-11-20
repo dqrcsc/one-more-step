@@ -64,10 +64,10 @@ setInterval(async () => {
 (async function startClawBotLongPollLoop() {
   while (true) {
     try {
-      if (pipeline.clawbot.isConfigured()) {
+      if (!pipeline.standbyPaused && pipeline.clawbot.isConfigured()) {
         await pipeline.pollClawBotUpdates(30_000, { backgroundDrain: true });
       } else {
-        await Bun.sleep(3000);
+        await Bun.sleep(2000);
       }
     } catch (err: any) {
       if (!String(err?.message || "").includes("Operation busy")) {

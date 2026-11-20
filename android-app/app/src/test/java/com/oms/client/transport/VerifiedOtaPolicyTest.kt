@@ -71,4 +71,52 @@ class VerifiedOtaPolicyTest {
         assertThrows(IllegalArgumentException::class.java) { check(signer = setOf("installed-cert", "other-cert")) }
         check(meta = metadata().copy(versionCode = 0)) // GitHub does not invent a build number.
     }
+
+    @Test fun `redirect validation allows trusted GitHub CDN hops and forbids scheme downgrade or untrusted hosts`() {
+        val ghMeta = metadata().copy(
+            url = "https://github.com/dqrcsc/one-more-step/releases/download/v1.7.1/OneMoreStep-v1.7.1.apk",
+            versionName = "1.7.1",
+            source = VerifiedOtaPolicy.Source.GITHUB_HTTPS
+        )
+        val cdnUrl = VerifiedOtaPolicy.validateRedirectTarget(
+            ghMeta,
+            ghMeta.url,
+            "https://objects.githubusercontent.com/github-production-release-asset/12345?X-Amz-Signature=abc"
+        )
+        assertTrue(cdnUrl.startsWith("https://objects.githubusercontent.com/"))
+
+        // LAN HTTP redirect to GitHub HTTPS -> GitHub CDN HTTPS is allowed
+        val lanMeta = metadata()
+        val hop1 = VerifiedOtaPolicy.validateRedirectTarget(
+            lanMeta,
+            lanMeta.url,
+            "https://github.com/dqrcsc/one-more-step/releases/download/v1.6.4/OneMoreStep-v1.6.4.apk"
+        )
+        val hop2 = VerifiedOtaPolicy.validateRedirectTarget(
+            lanMeta,
+            hop1,
+            "https://release-assets.githubusercontent.com/asset.apk"
+        )
+        assertEquals("https://release-assets.githubusercontent.com/asset.apk", hop2)
+
+        // Scheme downgrade from HTTPS to HTTP is strictly rejected
+        assertThrows(IllegalArgumentException::class.java) {
+            VerifiedOtaPolicy.validateRedirectTarget(ghMeta, ghMeta.url, "http://objects.githubusercontent.com/asset.apk")
+        }
+        // Redirect to untrusted third-party host is strictly rejected
+        assertThrows(IllegalArgumentException::class.java) {
+            VerifiedOtaPolicy.validateRedirectTarget(ghMeta, ghMeta.url, "https://evil.example.com/asset.apk")
+        }
+    }
+
+    @Test fun `copyAndVerify emits monotonic byte progress through completion`() {
+        val progressSnapshots = mutableListOf<Pair<Long, Long>>()
+        val output = ByteArrayOutputStream()
+        val written = VerifiedOtaPolicy.copyAndVerify(bytes.inputStream(), output, metadata()) { dl, total ->
+            progressSnapshots.add(dl to total)
+        }
+        assertEquals(bytes.size.toLong(), written)
+        assertEquals(0L to bytes.size.toLong(), progressSnapshots.first())
+        assertEquals(bytes.size.toLong() to bytes.size.toLong(), progressSnapshots.last())
+    }
 }

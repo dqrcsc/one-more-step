@@ -11,8 +11,8 @@ android {
         applicationId = "com.oms.client"
         minSdk = 30
         targetSdk = 34
-        versionCode = 43
-        versionName = "1.7.0"
+        versionCode = 51
+        versionName = "2.1.0"
     }
 
     signingConfigs {
@@ -67,6 +67,8 @@ android {
 }
 
 dependencies {
+    implementation(project(":core:net-proxy"))
+    implementation(project(":core:ai-engine"))
     testImplementation("junit:junit:4.13.2")
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.0")
@@ -88,4 +90,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.lsposed.hiddenapibypass:hiddenapibypass:4.3")
+    implementation("androidx.camera:camera-core:1.3.4")
+    implementation("androidx.camera:camera-camera2:1.3.4")
+    implementation("androidx.camera:camera-lifecycle:1.3.4")
+    implementation("androidx.camera:camera-view:1.3.4")
 }
