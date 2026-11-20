@@ -11,9 +11,10 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.material3.MaterialTheme
 import com.oms.client.OmsApplication
 import com.oms.client.R
+import com.oms.client.ui.theme.OmsThemeController
+import com.oms.client.ui.theme.OmsThemeRoot
 
 /**
  * Module 03: System Share Sheet Receiver (`ACTION_SEND` / `ACTION_SEND_MULTIPLE`)
@@ -135,10 +136,11 @@ class ShareReceiverActivity : ComponentActivity() {
 
         // Launched by tapping the main "青简·咫尺" icon in Gallery / WPS / WeChat / File Manager:
         // show translucent Quick-Send bottom sheet so user can 1-tap send OR pick tag / add note.
+        OmsThemeController.ensureLoaded(this)
         setContent {
-            MaterialTheme {
+            OmsThemeRoot {
                 QuickSendSheetScreen(
-                    headerTitle = "📤 发送分享内容到 Mac",
+                    headerTitle = "发送分享内容至 Mac",
                     initialUris = extractedUris,
                     initialText = sharedText,
                     initialSubject = sharedSubject,

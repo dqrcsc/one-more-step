@@ -1,20 +1,37 @@
 package com.oms.client.ui.cockpit
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.net.Uri
-import android.widget.Toast
+import android.os.Build
+import android.provider.MediaStore
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Image
-import androidx.core.content.FileProvider
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
-import com.oms.core.ai.ModelRoleCategory
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -25,42 +42,67 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import com.oms.client.OmsApplication
 import com.oms.client.capability.AlarmExecutor
 import com.oms.client.capability.CalendarExecutor
 import com.oms.client.capability.NotificationExecutor
@@ -68,10 +110,26 @@ import com.oms.client.capability.SpeechAudioPolicy
 import com.oms.client.capability.VoiceRecorderHelper
 import com.oms.client.cockpit.ChatMessageModel
 import com.oms.client.cockpit.CockpitRuntimeCoordinator
+import com.oms.client.share.AttachmentResolver
 import com.oms.client.ui.markdown.IncrementalMarkdownView
+import com.oms.client.ui.theme.OmsCircleIconButton
+import com.oms.client.ui.theme.OmsFeedbackController
+import com.oms.client.ui.theme.OmsIcons
+import com.oms.client.ui.theme.OmsMorphIconAction
+import com.oms.client.ui.theme.OmsPrimaryButton
+import com.oms.client.ui.theme.OmsSecondaryButton
+import com.oms.client.ui.theme.OmsSurfaceCard
+import com.oms.client.ui.theme.OmsTheme
+import com.oms.client.ui.theme.OmsToastKind
+import com.oms.client.ui.theme.OmsTogglePill
+import com.oms.client.ui.theme.omsBounceClick
+import com.oms.client.ui.theme.omsCombinedBounce
+import com.oms.core.ai.ModelCatalogRegistry
+import com.oms.core.ai.ModelRoleCategory
 import com.oms.core.ai.ProposedAlarmAction
 import com.oms.core.ai.ProposedCalendarAction
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -79,9 +137,11 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatWorkspaceView(
     coordinator: CockpitRuntimeCoordinator,
@@ -92,11 +152,15 @@ fun ChatWorkspaceView(
     onEscalateToMacAgent: (promptSummary: String) -> Unit
 ) {
     val context = LocalContext.current
+    val palette = OmsTheme.colors
     val scope = rememberCoroutineScope()
     val messages by coordinator.chatRepo.activeMessagesFlow.collectAsState()
     val activeThreadId by coordinator.chatRepo.activeThreadIdFlow.collectAsState()
     val threads by coordinator.chatRepo.threadsFlow.collectAsState()
     val streaming by coordinator.streamingFlow.collectAsState()
+    val roleSelections by coordinator.roleSelectionsFlow.collectAsState()
+    val modelCatalog by coordinator.modelCatalogFlow.collectAsState()
+
     val activeThread = remember(threads, activeThreadId) {
         threads.firstOrNull { it.threadId == activeThreadId }
     }
@@ -107,13 +171,35 @@ fun ChatWorkspaceView(
     var creativeCategory by remember { mutableStateOf<ModelRoleCategory?>(null) }
     var attachedImageBytes by remember { mutableStateOf<ByteArray?>(null) }
     var attachedImagePath by remember { mutableStateOf<String?>(null) }
+    var attachedPreviewBitmap by remember { mutableStateOf<ImageBitmap?>(null) }
+
     var isDictating by remember { mutableStateOf(false) }
     var isTranscribing by remember { mutableStateOf(false) }
+    var dictationSec by remember { mutableStateOf(0) }
+    val waveformSamples = remember { mutableStateListOf<Float>().apply { repeat(20) { add(0.16f) } } }
+
+    var showPlusSheet by remember { mutableStateOf(false) }
+    var showModelQuickMenu by remember { mutableStateOf(false) }
+    var fullScreenPreviewPath by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(prefillDraft) {
         if (prefillDraft.isNotBlank()) {
             inputText = prefillDraft
             onConsumePrefillDraft()
+        }
+    }
+
+    // Live 60ms Audio Amplitude Sampler for In-Place Waveform Dictation
+    LaunchedEffect(isDictating) {
+        if (!isDictating) return@LaunchedEffect
+        val startedMs = System.currentTimeMillis()
+        while (isDictating && VoiceRecorderHelper.isRecording()) {
+            dictationSec = ((System.currentTimeMillis() - startedMs) / 1000L).toInt()
+            val rawAmp = VoiceRecorderHelper.getMaxAmplitude()
+            val normalized = (rawAmp / 16000f).coerceIn(0.12f, 1.0f)
+            if (waveformSamples.size >= 20) waveformSamples.removeAt(0)
+            waveformSamples.add(normalized)
+            delay(65L)
         }
     }
 
@@ -124,8 +210,13 @@ fun ChatWorkspaceView(
             val total = layoutInfo.totalItemsCount
             if (total == 0) true
             else {
-                val lastVisible = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-                lastVisible >= total - 2
+                val lastVisible = layoutInfo.visibleItemsInfo.lastOrNull()
+                if (lastVisible == null) true
+                else {
+                    val viewportEnd = layoutInfo.viewportEndOffset
+                    lastVisible.index >= total - 1 &&
+                        (lastVisible.offset + lastVisible.size - viewportEnd) <= 140
+                }
             }
         }
     }
@@ -139,79 +230,245 @@ fun ChatWorkspaceView(
         }
     }
 
-    // Physical-anchor smooth scroll on new message or streaming growth when pinned
-    LaunchedEffect(messages.size, streaming.markdownText.length) {
+    // Smooth scroll on new turn; gentle throttled follow during streaming without per-char jumpiness
+    LaunchedEffect(messages.size, streaming.isStreaming) {
         if (autoFollowPinned) {
             val count = messages.size + (if (streaming.isStreaming && streaming.threadId == activeThreadId) 1 else 0)
             if (count > 0) {
-                runCatching { listState.scrollToItem(count - 1) }
+                runCatching { listState.animateScrollToItem(count - 1) }
+            }
+        }
+    }
+
+    val streamBucket = streaming.markdownText.length / 96
+    LaunchedEffect(streamBucket) {
+        if (autoFollowPinned && streaming.isStreaming && streaming.threadId == activeThreadId && streamBucket > 0) {
+            val total = listState.layoutInfo.totalItemsCount
+            if (total > 0) {
+                runCatching { listState.scrollToItem(total - 1, scrollOffset = Int.MAX_VALUE / 4) }
+            }
+        }
+    }
+
+    fun attachUriAsChatImage(uri: Uri) {
+        scope.launch {
+            runCatching {
+                val (bytes, path, previewBmp) = withContext(Dispatchers.IO) {
+                    val raw = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?: error("读取图片失败")
+                    val bmp = BitmapFactory.decodeByteArray(raw, 0, raw.size) ?: error("图片解码失败")
+                    val maxDim = 1600
+                    val longest = maxOf(bmp.width, bmp.height)
+                    val scaled = if (longest > maxDim) {
+                        val r = maxDim.toFloat() / longest.toFloat()
+                        android.graphics.Bitmap.createScaledBitmap(
+                            bmp,
+                            (bmp.width * r).toInt().coerceAtLeast(1),
+                            (bmp.height * r).toInt().coerceAtLeast(1),
+                            true
+                        )
+                    } else bmp
+                    val bos = ByteArrayOutputStream()
+                    scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 86, bos)
+                    val out = bos.toByteArray()
+                    val f = File(File(context.filesDir, "chat_images").apply { mkdirs() }, "img_${System.currentTimeMillis()}.jpg")
+                    f.writeBytes(out)
+                    val thumb = android.graphics.Bitmap.createScaledBitmap(scaled, 180, 180, true).asImageBitmap()
+                    Triple(out, f.absolutePath, thumb)
+                }
+                attachedImageBytes = bytes
+                attachedImagePath = path
+                attachedPreviewBitmap = previewBmp
+            }.onFailure {
+                OmsFeedbackController.show("附加图片失败：${it.message}", OmsToastKind.WARNING)
             }
         }
     }
 
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri: Uri? ->
-        if (uri != null) {
-            scope.launch {
-                runCatching {
-                    val (bytes, path) = withContext(Dispatchers.IO) {
-                        val raw = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                            ?: error("读取图片失败")
-                        val bmp = BitmapFactory.decodeByteArray(raw, 0, raw.size) ?: error("图片解码失败")
-                        val bos = ByteArrayOutputStream()
-                        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, bos)
-                        val out = bos.toByteArray()
-                        val f = File(File(context.filesDir, "chat_images").apply { mkdirs() }, "img_${System.currentTimeMillis()}.jpg")
-                        f.writeBytes(out)
-                        out to f.absolutePath
+        if (uri != null) attachUriAsChatImage(uri)
+    }
+
+    // Direct Drop-to-Mac File/Photo Launchers (accessible directly from Chat `+` Sheet!)
+    val macDropPhotoPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(9)
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            val metas = uris.map { AttachmentResolver.describeUri(context, it) }
+            val first = metas.first()
+            val title = if (metas.size == 1) first.safeFileName else "${first.safeFileName} 等 ${metas.size} 张图片"
+            OmsApplication.instance?.transportClient?.submitItemToMacOrQueue(
+                intentTag = "default_inbox",
+                itemType = AttachmentResolver.inferItemType(metas.map { it.mimeType }),
+                title = title,
+                textContent = inputText.trim().ifEmpty { null },
+                voiceTranscript = null,
+                fileUri = uris.first(),
+                additionalFileUris = uris.drop(1)
+            )
+            inputText = ""
+            OmsFeedbackController.show("已投递 ${uris.size} 张图片至 Mac 收件箱", OmsToastKind.SUCCESS)
+        }
+    }
+
+    val macDropDocPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            val metas = uris.map { AttachmentResolver.describeUri(context, it) }
+            val first = metas.first()
+            val title = if (metas.size == 1) first.safeFileName else "${first.safeFileName} 等 ${metas.size} 个文件"
+            OmsApplication.instance?.transportClient?.submitItemToMacOrQueue(
+                intentTag = "default_inbox",
+                itemType = AttachmentResolver.inferItemType(metas.map { it.mimeType }),
+                title = title,
+                textContent = inputText.trim().ifEmpty { null },
+                voiceTranscript = null,
+                fileUri = uris.first(),
+                additionalFileUris = uris.drop(1)
+            )
+            inputText = ""
+            OmsFeedbackController.show("已投递 ${uris.size} 个文档至 Mac 收件箱", OmsToastKind.SUCCESS)
+        }
+    }
+
+    val micPermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) {
+            if (VoiceRecorderHelper.startRecording(context) != null) {
+                dictationSec = 0
+                isDictating = true
+                coordinator.vibrateTick()
+            }
+        } else {
+            OmsFeedbackController.show("需要麦克风权限以使用语音听写", OmsToastKind.WARNING)
+        }
+    }
+
+    fun dispatchCurrentTurn(overrideText: String? = null) {
+        val txt = (overrideText ?: inputText).trim()
+        val img = attachedImageBytes
+        val imgPath = attachedImagePath
+        if (txt.isEmpty() && img == null) return
+        val activeCreative = creativeCategory
+        inputText = ""
+        attachedImageBytes = null
+        attachedImagePath = null
+        attachedPreviewBitmap = null
+        autoFollowPinned = true
+        coordinator.vibrateTick()
+        if (activeCreative != null) {
+            creativeCategory = null
+            coordinator.sendCreativeTurn(activeCreative, txt)
+        } else {
+            coordinator.sendChatTurn(
+                userText = txt,
+                imageJpegBytes = img,
+                imageLocalPath = imgPath,
+                deepThinking = deepThinking,
+                forceWebSearch = forceWebSearch
+            )
+        }
+    }
+
+    fun finishDictation(sendImmediately: Boolean) {
+        isDictating = false
+        val recorded = VoiceRecorderHelper.stopRecording() ?: return
+        isTranscribing = true
+        scope.launch {
+            try {
+                val transcript = coordinator.transcribeVoiceNote(recorded.first)
+                if (transcript.isNotBlank()) {
+                    val merged = if (inputText.isBlank()) transcript else "$inputText $transcript"
+                    if (sendImmediately) {
+                        dispatchCurrentTurn(overrideText = merged)
+                    } else {
+                        inputText = merged
                     }
-                    attachedImageBytes = bytes
-                    attachedImagePath = path
-                }.onFailure {
-                    Toast.makeText(context, "附加图片失败：${it.message}", Toast.LENGTH_SHORT).show()
                 }
+            } catch (e: Throwable) {
+                OmsFeedbackController.show("转写未完成：${e.message}", OmsToastKind.WARNING)
+            } finally {
+                runCatching { recorded.first.delete() }
+                isTranscribing = false
             }
         }
     }
 
+    val activeRoleCategory = if (deepThinking) ModelRoleCategory.DEEP_REASONING else ModelRoleCategory.CHAT_PRIMARY
+    val currentModelKey = roleSelections[activeRoleCategory] ?: activeRoleCategory.defaultSelection
+    val shortModelTag = remember(currentModelKey) { prettifyModelShortName(currentModelKey) }
+
     Box(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
-            if (activeThread?.incognito == true) {
-                Box(
+            // Subtle Incognito Banner
+            AnimatedVisibility(visible = activeThread?.incognito == true) {
+                Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(Color(0xFF31102F))
-                        .padding(vertical = 5.dp),
-                    contentAlignment = Alignment.Center
+                        .background(palette.subtleSurface)
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("🕵️ 无痕对话模式：不写入全文索引、不同步至 Mac、不参与记忆蒸馏", color = Color(0xFFF5D0FE), fontSize = 11.sp)
+                    Icon(
+                        imageVector = OmsIcons.Incognito,
+                        contentDescription = null,
+                        tint = palette.textSecondary,
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "无痕对话 · 不落全文索引、不同步 Mac、不参与记忆蒸馏",
+                        color = palette.textSecondary,
+                        fontSize = 11.5.sp
+                    )
                 }
             }
 
-            // Main Chat Canvas
+            // Main Conversation Stage
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 if (messages.isEmpty() && !streaming.isStreaming) {
                     EmptyChatWelcomeHero(
+                        shortModelName = shortModelTag,
                         onQuickPrompt = { prompt, deep, search ->
                             deepThinking = deep
                             forceWebSearch = search
                             coordinator.sendChatTurn(prompt, deepThinking = deep, forceWebSearch = search)
                         },
                         onOpenBotanicalCamera = onOpenBotanicalCamera,
-                        onOpenLiveVoice = onOpenLiveVoice
+                        onOpenLiveVoice = { onOpenLiveVoice(false) },
+                        onOpenMacDrop = { showPlusSheet = true }
                     )
                 } else {
+                    val lastAssistantId = remember(messages) {
+                        messages.lastOrNull { it.role == "assistant" }?.messageId
+                    }
                     LazyColumn(
                         state = listState,
                         modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
-                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                        contentPadding = PaddingValues(
+                            start = 18.dp,
+                            end = 18.dp,
+                            top = 14.dp,
+                            bottom = 26.dp
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(22.dp)
                     ) {
-                        items(items = messages, key = { it.messageId }) { msg ->
-                            ChatMessageBubble(
+                        itemsIndexed(items = messages, key = { _, it -> it.messageId }) { _, msg ->
+                            ChatMessageTurn(
                                 msg = msg,
+                                isLatestAssistant = msg.messageId == lastAssistantId && !streaming.isStreaming,
                                 coordinator = coordinator,
+                                onEditUserPrompt = { oldText -> inputText = oldText },
+                                onPreviewImage = { path -> fullScreenPreviewPath = path },
                                 onFollowUpSpecimen = { card ->
                                     inputText = "关于刚才识别的《${card.chineseName}》，我想进一步请教："
+                                },
+                                onRegenerate = {
+                                    coordinator.regenerateLastAssistantTurn(
+                                        deepThinking = deepThinking,
+                                        forceWebSearch = forceWebSearch
+                                    )
                                 },
                                 onEscalateToMacAgent = {
                                     val recentCtx = messages.takeLast(6)
@@ -225,263 +482,556 @@ fun ChatWorkspaceView(
 
                         if (streaming.isStreaming && streaming.threadId == activeThreadId) {
                             item(key = "streaming_live_turn") {
-                                StreamingAssistantBubble(state = streaming)
+                                StreamingAssistantTurn(state = streaming)
                             }
                         }
                     }
                 }
 
-                // Floating `↓` Jump-to-Bottom Pill when user scrolled up
-                if (!isAtBottom && (messages.isNotEmpty() || streaming.isStreaming)) {
+                // Floating Circular Jump-to-Bottom Button (ChatGPT / Gemini style)
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = !isAtBottom && (messages.isNotEmpty() || streaming.isStreaming),
+                    enter = scaleIn(spring(stiffness = 550f)) + fadeIn(tween(140)),
+                    exit = scaleOut(tween(120)) + fadeOut(tween(120)),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 12.dp)
+                ) {
                     Box(
+                        contentAlignment = Alignment.Center,
                         modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(bottom = 10.dp)
-                            .clip(RoundedCornerShape(20.dp))
-                            .background(Color(0xEE1E293B))
-                            .border(1.dp, Color(0xFF38BDF8), RoundedCornerShape(20.dp))
-                            .clickable {
+                            .size(36.dp)
+                            .shadow(elevation = 6.dp, shape = CircleShape, clip = false)
+                            .omsBounceClick(scaleDown = 0.88f, shape = CircleShape) {
                                 autoFollowPinned = true
                                 scope.launch {
                                     val total = listState.layoutInfo.totalItemsCount
                                     if (total > 0) listState.animateScrollToItem(total - 1)
                                 }
                             }
-                            .padding(horizontal = 14.dp, vertical = 6.dp)
+                            .background(palette.composer, CircleShape)
+                            .border(0.7.dp, palette.strongBorder, CircleShape)
                     ) {
-                        Text("↓ 回到最新回复", color = Color(0xFF7DD3FC), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        Icon(
+                            imageVector = OmsIcons.ArrowDown,
+                            contentDescription = "回到最新回复",
+                            tint = palette.textPrimary,
+                            modifier = Modifier.size(17.dp)
+                        )
                     }
                 }
             }
 
-            // Omnibox Bottom Composer
+            // =====================================================================
+            // Sculptural Floating Pill Omnibox Composer (120Hz IME-Synchronized)
+            // =====================================================================
+            val pillShape = RoundedCornerShape(26.dp)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF0D1424))
-                    .border(0.5.dp, Color(0xFF1E293B))
-                    .padding(horizontal = 10.dp, vertical = 8.dp)
+                    .navigationBarsPadding()
+                    .imePadding()
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                    .shadow(
+                        elevation = if (palette.isDark) 3.dp else 7.dp,
+                        shape = pillShape,
+                        clip = false
+                    )
+                    .clip(pillShape)
+                    .background(palette.composer, pillShape)
+                    .border(0.65.dp, palette.strongBorder, pillShape)
+                    .padding(horizontal = 12.dp, vertical = 9.dp)
             ) {
-                // Mode & Attachment Strip
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState())
-                        .padding(bottom = 6.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                // Conditional Attachment Thumbnail & Creative Mode Strip
+                AnimatedVisibility(
+                    visible = attachedPreviewBitmap != null || creativeCategory != null,
+                    enter = expandVertically(tween(160)) + fadeIn(tween(140)),
+                    exit = shrinkVertically(tween(140)) + fadeOut(tween(110))
                 ) {
-                    ToggleChip(
-                        label = "💡 深度思考",
-                        active = deepThinking && creativeCategory == null,
-                        activeColor = Color(0xFF5B21B6),
-                        onClick = {
-                            creativeCategory = null
-                            deepThinking = !deepThinking
-                            coordinator.vibrateTick()
-                        }
-                    )
-                    ToggleChip(
-                        label = "🌐 联网核查",
-                        active = forceWebSearch && creativeCategory == null,
-                        activeColor = Color(0xFF0369A1),
-                        onClick = {
-                            creativeCategory = null
-                            forceWebSearch = !forceWebSearch
-                            coordinator.vibrateTick()
-                        }
-                    )
-                    ToggleChip(
-                        label = "🎨 生图",
-                        active = creativeCategory == ModelRoleCategory.IMAGE_GENERATION,
-                        activeColor = Color(0xFFBE185D),
-                        onClick = {
-                            creativeCategory = if (creativeCategory == ModelRoleCategory.IMAGE_GENERATION) null else ModelRoleCategory.IMAGE_GENERATION
-                            coordinator.vibrateTick()
-                        }
-                    )
-                    ToggleChip(
-                        label = "🎬 视频",
-                        active = creativeCategory == ModelRoleCategory.VIDEO_GENERATION,
-                        activeColor = Color(0xFFB45309),
-                        onClick = {
-                            creativeCategory = if (creativeCategory == ModelRoleCategory.VIDEO_GENERATION) null else ModelRoleCategory.VIDEO_GENERATION
-                            coordinator.vibrateTick()
-                        }
-                    )
-                    ToggleChip(
-                        label = "🎵 写歌",
-                        active = creativeCategory == ModelRoleCategory.MUSIC_GENERATION,
-                        activeColor = Color(0xFF0F766E),
-                        onClick = {
-                            creativeCategory = if (creativeCategory == ModelRoleCategory.MUSIC_GENERATION) null else ModelRoleCategory.MUSIC_GENERATION
-                            coordinator.vibrateTick()
-                        }
-                    )
-                    ToggleChip(
-                        label = if (attachedImageBytes != null) "🖼️ 已附图 (移除)" else "🖼️ 附图",
-                        active = attachedImageBytes != null,
-                        activeColor = Color(0xFF047857),
-                        onClick = {
-                            if (attachedImageBytes != null) {
-                                attachedImageBytes = null
-                                attachedImagePath = null
-                            } else {
-                                imagePicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 4.dp, end = 4.dp, bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        attachedPreviewBitmap?.let { bmp ->
+                            Box(modifier = Modifier.size(58.dp)) {
+                                Image(
+                                    bitmap = bmp,
+                                    contentDescription = "已附加图片",
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .border(0.6.dp, palette.hairline, RoundedCornerShape(12.dp))
+                                        .clickable { attachedImagePath?.let { fullScreenPreviewPath = it } }
+                                )
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(3.dp)
+                                        .size(18.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xCC000000))
+                                        .clickable {
+                                            attachedImageBytes = null
+                                            attachedImagePath = null
+                                            attachedPreviewBitmap = null
+                                        }
+                                ) {
+                                    Icon(
+                                        imageVector = OmsIcons.Close,
+                                        contentDescription = "移除图片",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(11.dp)
+                                    )
+                                }
                             }
                         }
-                    )
-                    ToggleChip(
-                        label = "👓 Glass 实时镜头",
-                        active = false,
-                        activeColor = Color(0xFF059669),
-                        onClick = { onOpenLiveVoice(true) }
-                    )
+
+                        creativeCategory?.let { cat ->
+                            val (catIcon, catLabel) = when (cat) {
+                                ModelRoleCategory.IMAGE_GENERATION -> OmsIcons.Palette to "视觉生图模式"
+                                ModelRoleCategory.VIDEO_GENERATION -> OmsIcons.Video to "视频生成模式"
+                                ModelRoleCategory.MUSIC_GENERATION -> OmsIcons.Music to "歌曲创作模式"
+                                else -> OmsIcons.Sparkles to cat.title
+                            }
+                            OmsTogglePill(
+                                label = "$catLabel  ×",
+                                active = true,
+                                icon = catIcon,
+                                onClick = { creativeCategory = null }
+                            )
+                        }
+                    }
                 }
 
-                // Input Row: 📷 Camera | Input Field | 🎙️ Dictation | 🎧 Live / ➤ Send
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    // Left Wing: CameraX Botanical Glass
+                // Borderless Multi-Line Editorial Text Field (hidden during full waveform dictation)
+                if (!isDictating) {
                     Box(
-                        contentAlignment = Alignment.Center,
                         modifier = Modifier
-                            .size(42.dp)
-                            .clip(CircleShape)
-                            .background(Color(0xFF132A26))
-                            .border(1.dp, Color(0xFF10B981), CircleShape)
-                            .clickable { onOpenBotanicalCamera() }
+                            .fillMaxWidth()
+                            .padding(horizontal = 6.dp, vertical = 4.dp)
                     ) {
-                        Text("📷", fontSize = 18.sp)
-                    }
-
-                    OutlinedTextField(
-                        value = inputText,
-                        onValueChange = { inputText = it },
-                        placeholder = {
+                        if (inputText.isEmpty()) {
                             Text(
                                 text = when {
-                                    isDictating -> "🎙️ 正在录音听写，再点麦克风立即上屏…"
-                                    isTranscribing -> "⚡ GPT Live Transcribe 极速转写中…"
-                                    else -> "随时提问、聊想法、定日程…"
+                                    isTranscribing -> "正在极速转写语音…"
+                                    creativeCategory == ModelRoleCategory.IMAGE_GENERATION -> "描述你想生成的画面构图与光影风格…"
+                                    creativeCategory == ModelRoleCategory.VIDEO_GENERATION -> "描述你想生成的镜头运动与动态场景…"
+                                    creativeCategory == ModelRoleCategory.MUSIC_GENERATION -> "描述曲风、情绪、乐器或歌词主题…"
+                                    else -> "发消息、推演想法，或安排日程…"
                                 },
-                                color = if (isDictating) Color(0xFFFCA5A5) else Color(0xFF64748B),
-                                fontSize = 13.5.sp
+                                color = palette.textTertiary,
+                                fontSize = 15.5.sp,
+                                lineHeight = 22.sp
                             )
-                        },
-                        maxLines = 5,
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = Color(0xFFF8FAFC),
-                            unfocusedTextColor = Color(0xFFF8FAFC),
-                            focusedBorderColor = Color(0xFF38BDF8),
-                            unfocusedBorderColor = Color(0xFF1E293B),
-                            focusedContainerColor = Color(0xFF131C31),
-                            unfocusedContainerColor = Color(0xFF131C31)
-                        ),
-                        shape = RoundedCornerShape(20.dp),
-                        modifier = Modifier.weight(1f)
-                    )
+                        }
+                        BasicTextField(
+                            value = inputText,
+                            onValueChange = { inputText = it },
+                            textStyle = TextStyle(
+                                color = palette.textPrimary,
+                                fontSize = 15.5.sp,
+                                lineHeight = 22.sp
+                            ),
+                            cursorBrush = SolidColor(palette.accent),
+                            maxLines = 6,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 24.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                }
 
-                    // Dictation Mic (`gpt-live-transcribe`)
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .size(42.dp)
-                            .clip(CircleShape)
-                            .background(if (isDictating) Color(0xFFDC2626) else Color(0xFF1E293B))
-                            .clickable(enabled = !isTranscribing) {
-                                if (!isDictating) {
-                                    val started = VoiceRecorderHelper.startRecording(context)
-                                    if (started != null) {
-                                        isDictating = true
-                                        coordinator.vibrateTick()
-                                    } else {
-                                        Toast.makeText(context, "请先授予麦克风权限", Toast.LENGTH_SHORT).show()
-                                    }
-                                } else {
+                // Bottom Tool & Action Row (Morphs smoothly into Live Waveform during dictation!)
+                AnimatedContent(
+                    targetState = isDictating,
+                    transitionSpec = {
+                        fadeIn(tween(160)) togetherWith fadeOut(tween(120))
+                    },
+                    label = "composerBottomMorph"
+                ) { dictating ->
+                    if (dictating) {
+                        // In-Place 60fps Live Audio Waveform Dictation Bar
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(38.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OmsCircleIconButton(
+                                icon = OmsIcons.Close,
+                                contentDescription = "取消录音",
+                                size = 34.dp,
+                                iconSize = 16.dp,
+                                containerColor = palette.subtleSurface,
+                                contentColor = palette.textSecondary,
+                                onClick = {
                                     isDictating = false
-                                    val recorded = VoiceRecorderHelper.stopRecording()
-                                    if (recorded != null) {
-                                        isTranscribing = true
-                                        scope.launch {
-                                            try {
-                                                val transcript = coordinator.transcribeVoiceNote(recorded.first)
-                                                if (transcript.isNotBlank()) {
-                                                    inputText = if (inputText.isBlank()) transcript else "$inputText $transcript"
-                                                }
-                                            } catch (e: Throwable) {
-                                                Toast.makeText(context, "语音转写失败：${e.message}", Toast.LENGTH_SHORT).show()
-                                            } finally {
-                                                runCatching { recorded.first.delete() }
-                                                isTranscribing = false
-                                            }
-                                        }
-                                    }
+                                    VoiceRecorderHelper.cancelRecording()
+                                    coordinator.vibrateTick()
+                                }
+                            )
+
+                            // Live Waveform Equalizer
+                            Row(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(28.dp)
+                                    .padding(horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(3.dp, Alignment.CenterHorizontally)
+                            ) {
+                                waveformSamples.forEach { sample ->
+                                    val barFrac by animateFloatAsState(
+                                        targetValue = sample,
+                                        animationSpec = tween(70),
+                                        label = "waveBar"
+                                    )
+                                    Box(
+                                        modifier = Modifier
+                                            .width(3.dp)
+                                            .fillMaxHeight(barFrac.coerceIn(0.14f, 1f))
+                                            .clip(CircleShape)
+                                            .background(palette.accent)
+                                    )
                                 }
                             }
-                    ) {
-                        Text(if (isDictating) "⏹" else "🎙️", fontSize = 17.sp)
-                    }
 
-                    // Right Wing: Stop / Send / 🎧 Live
-                    val canSend = inputText.isNotBlank() || attachedImageBytes != null
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .size(44.dp)
-                            .clip(CircleShape)
-                            .background(
-                                when {
-                                    streaming.isStreaming -> Color(0xFFB91C1C)
-                                    canSend -> Color(0xFF0284C7)
-                                    else -> Color(0xFF312E81)
-                                }
+                            Text(
+                                text = String.format(Locale.US, "%d:%02d", dictationSec / 60, dictationSec % 60),
+                                color = palette.textSecondary,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium
                             )
-                            .clickable {
-                                when {
-                                    streaming.isStreaming -> coordinator.cancelActiveTurn()
-                                    canSend -> {
-                                        val txt = inputText
-                                        val img = attachedImageBytes
-                                        val imgPath = attachedImagePath
-                                        val activeCreative = creativeCategory
-                                        inputText = ""
-                                        attachedImageBytes = null
-                                        attachedImagePath = null
-                                        autoFollowPinned = true
-                                        coordinator.vibrateTick()
-                                        if (activeCreative != null) {
-                                            creativeCategory = null
-                                            coordinator.sendCreativeTurn(activeCreative, txt)
-                                        } else {
-                                            coordinator.sendChatTurn(
-                                                userText = txt,
-                                                imageJpegBytes = img,
-                                                imageLocalPath = imgPath,
-                                                deepThinking = deepThinking,
-                                                forceWebSearch = forceWebSearch
+
+                            // Confirm -> Transcribe into Input
+                            OmsCircleIconButton(
+                                icon = OmsIcons.Check,
+                                contentDescription = "转写上屏",
+                                size = 34.dp,
+                                iconSize = 17.dp,
+                                containerColor = palette.subtleSurface,
+                                contentColor = palette.textPrimary,
+                                onClick = { finishDictation(sendImmediately = false) }
+                            )
+
+                            // Confirm & Send Immediately
+                            OmsCircleIconButton(
+                                icon = OmsIcons.ArrowUp,
+                                contentDescription = "转写并直接发送",
+                                size = 36.dp,
+                                iconSize = 18.dp,
+                                containerColor = palette.sendButtonBg,
+                                contentColor = palette.sendButtonFg,
+                                onClick = { finishDictation(sendImmediately = true) }
+                            )
+                        }
+                    } else {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            // Left Tool Cluster: (+) | 思考 | 联网 | Model Selector
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .horizontalScroll(rememberScrollState())
+                            ) {
+                                OmsCircleIconButton(
+                                    icon = OmsIcons.Plus,
+                                    contentDescription = "添加附件与多模态能力",
+                                    size = 33.dp,
+                                    iconSize = 17.5.dp,
+                                    containerColor = palette.subtleSurface,
+                                    borderColor = palette.hairline,
+                                    contentColor = palette.textPrimary,
+                                    onClick = { showPlusSheet = true }
+                                )
+
+                                OmsTogglePill(
+                                    label = "思考",
+                                    active = deepThinking && creativeCategory == null,
+                                    icon = OmsIcons.Lightbulb,
+                                    onClick = {
+                                        creativeCategory = null
+                                        deepThinking = !deepThinking
+                                    }
+                                )
+
+                                OmsTogglePill(
+                                    label = "联网",
+                                    active = forceWebSearch && creativeCategory == null,
+                                    icon = OmsIcons.Globe,
+                                    onClick = {
+                                        creativeCategory = null
+                                        forceWebSearch = !forceWebSearch
+                                    }
+                                )
+
+                                // Inline Quick Model Selector Chip
+                                Box {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(3.dp),
+                                        modifier = Modifier
+                                            .height(31.dp)
+                                            .omsBounceClick(scaleDown = 0.94f, shape = RoundedCornerShape(15.dp)) {
+                                                showModelQuickMenu = true
+                                            }
+                                            .padding(horizontal = 7.dp)
+                                    ) {
+                                        Text(
+                                            text = shortModelTag,
+                                            color = palette.textTertiary,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Medium,
+                                            maxLines = 1
+                                        )
+                                        Icon(
+                                            imageVector = OmsIcons.ChevronDown,
+                                            contentDescription = "切换模型",
+                                            tint = palette.textTertiary,
+                                            modifier = Modifier.size(12.dp)
+                                        )
+                                    }
+
+                                    DropdownMenu(
+                                        expanded = showModelQuickMenu,
+                                        onDismissRequest = { showModelQuickMenu = false },
+                                        modifier = Modifier
+                                            .background(palette.composer)
+                                            .width(265.dp)
+                                    ) {
+                                        val options = remember(modelCatalog, activeRoleCategory) {
+                                            ModelCatalogRegistry.optionsForCategory(activeRoleCategory, modelCatalog)
+                                        }
+                                        options.forEach { opt ->
+                                            val selected = opt.selectionKey == currentModelKey
+                                            DropdownMenuItem(
+                                                text = {
+                                                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                                        Row(
+                                                            verticalAlignment = Alignment.CenterVertically,
+                                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                                        ) {
+                                                            Text(
+                                                                text = opt.label,
+                                                                color = if (selected) palette.accent else palette.textPrimary,
+                                                                fontSize = 13.sp,
+                                                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium
+                                                            )
+                                                            if (selected) {
+                                                                Icon(
+                                                                    imageVector = OmsIcons.Check,
+                                                                    contentDescription = null,
+                                                                    tint = palette.accent,
+                                                                    modifier = Modifier.size(13.dp)
+                                                                )
+                                                            }
+                                                        }
+                                                        Text(
+                                                            text = opt.description,
+                                                            color = palette.textTertiary,
+                                                            fontSize = 11.sp,
+                                                            maxLines = 1,
+                                                            overflow = TextOverflow.Ellipsis
+                                                        )
+                                                    }
+                                                },
+                                                onClick = {
+                                                    showModelQuickMenu = false
+                                                    coordinator.setModelRoleSelection(activeRoleCategory, opt.selectionKey)
+                                                }
                                             )
                                         }
                                     }
-                                    else -> onOpenLiveVoice(false)
                                 }
                             }
-                    ) {
-                        Text(
-                            text = when {
-                                streaming.isStreaming -> "⏹"
-                                canSend -> "↑"
-                                else -> "🎧"
-                            },
-                            color = Color.White,
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Bold
-                        )
+
+                            Spacer(modifier = Modifier.width(6.dp))
+
+                            // Right Action Cluster: Mic + Morphing Send / Stop / Live Voice Orb
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                if (isTranscribing) {
+                                    Box(
+                                        contentAlignment = Alignment.Center,
+                                        modifier = Modifier.size(35.dp)
+                                    ) {
+                                        CircularProgressIndicator(
+                                            color = palette.accent,
+                                            strokeWidth = 2.dp,
+                                            modifier = Modifier.size(17.dp)
+                                        )
+                                    }
+                                } else {
+                                    OmsCircleIconButton(
+                                        icon = OmsIcons.Mic,
+                                        contentDescription = "语音听写",
+                                        size = 35.dp,
+                                        iconSize = 18.dp,
+                                        contentColor = palette.textSecondary,
+                                        onClick = {
+                                            val hasPerm = ContextCompat.checkSelfPermission(
+                                                context,
+                                                Manifest.permission.RECORD_AUDIO
+                                            ) == PackageManager.PERMISSION_GRANTED
+                                            if (hasPerm) {
+                                                if (VoiceRecorderHelper.startRecording(context) != null) {
+                                                    dictationSec = 0
+                                                    isDictating = true
+                                                    coordinator.vibrateTick()
+                                                }
+                                            } else {
+                                                micPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                            }
+                                        }
+                                    )
+                                }
+
+                                val canSend = inputText.isNotBlank() || attachedImageBytes != null
+                                val orbMode = when {
+                                    streaming.isStreaming -> "STOP"
+                                    canSend -> "SEND"
+                                    else -> "LIVE"
+                                }
+
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier
+                                        .size(37.dp)
+                                        .omsBounceClick(scaleDown = 0.88f, shape = CircleShape) {
+                                            when (orbMode) {
+                                                "STOP" -> coordinator.cancelActiveTurn()
+                                                "SEND" -> dispatchCurrentTurn()
+                                                else -> onOpenLiveVoice(false)
+                                            }
+                                        }
+                                        .background(palette.sendButtonBg, CircleShape)
+                                ) {
+                                    AnimatedContent(
+                                        targetState = orbMode,
+                                        transitionSpec = {
+                                            (scaleIn(spring(stiffness = 620f)) + fadeIn(tween(130))) togetherWith
+                                                (scaleOut(tween(100)) + fadeOut(tween(100)))
+                                        },
+                                        label = "primaryOrbMorph"
+                                    ) { mode ->
+                                        val icon = when (mode) {
+                                            "STOP" -> OmsIcons.StopSquare
+                                            "SEND" -> OmsIcons.ArrowUp
+                                            else -> OmsIcons.Waveform
+                                        }
+                                        Icon(
+                                            imageVector = icon,
+                                            contentDescription = mode,
+                                            tint = palette.sendButtonFg,
+                                            modifier = Modifier.size(18.5.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    // =========================================================================
+    // Multimodal & Mac Drop Half-Screen Action Sheet (`+` Button)
+    // =========================================================================
+    if (showPlusSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showPlusSheet = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = palette.composer,
+            contentColor = palette.textPrimary,
+            shape = RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp)
+        ) {
+            MultimodalPlusSheetContent(
+                onAttachPhotoUri = { uri ->
+                    showPlusSheet = false
+                    attachUriAsChatImage(uri)
+                },
+                onPickAlbumForChat = {
+                    showPlusSheet = false
+                    imagePicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                },
+                onOpenBotanicalCamera = {
+                    showPlusSheet = false
+                    onOpenBotanicalCamera()
+                },
+                onOpenGlassLive = {
+                    showPlusSheet = false
+                    onOpenLiveVoice(true)
+                },
+                onDropPhotosToMac = {
+                    showPlusSheet = false
+                    macDropPhotoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+                },
+                onDropDocsToMac = {
+                    showPlusSheet = false
+                    macDropDocPicker.launch(arrayOf("*/*"))
+                },
+                onSelectCreative = { cat ->
+                    showPlusSheet = false
+                    deepThinking = false
+                    forceWebSearch = false
+                    creativeCategory = cat
+                }
+            )
+        }
+    }
+
+    // Full-Screen Image Lightbox
+    fullScreenPreviewPath?.let { path ->
+        Dialog(
+            onDismissRequest = { fullScreenPreviewPath = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            val bmp = remember(path) {
+                runCatching { BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
+            }
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color(0xEE050507))
+                    .clickable { fullScreenPreviewPath = null }
+            ) {
+                if (bmp != null) {
+                    Image(
+                        bitmap = bmp,
+                        contentDescription = "图片预览",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                    )
+                }
+                OmsCircleIconButton(
+                    icon = OmsIcons.Close,
+                    contentDescription = "关闭预览",
+                    containerColor = Color(0x55FFFFFF),
+                    contentColor = Color.White,
+                    onClick = { fullScreenPreviewPath = null },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(24.dp)
+                )
             }
         }
     }
@@ -489,121 +1039,295 @@ fun ChatWorkspaceView(
 
 @Composable
 private fun EmptyChatWelcomeHero(
+    shortModelName: String,
     onQuickPrompt: (prompt: String, deep: Boolean, search: Boolean) -> Unit,
     onOpenBotanicalCamera: () -> Unit,
-    onOpenLiveVoice: (Boolean) -> Unit
+    onOpenLiveVoice: () -> Unit,
+    onOpenMacDrop: () -> Unit
 ) {
+    val palette = OmsTheme.colors
+    val greeting = remember {
+        val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        when {
+            hour < 6 -> "夜深了，有什么正在思考的事？"
+            hour < 12 -> "早上好，今天想探索什么？"
+            hour < 18 -> "下午好，随时开始推演或记录"
+            else -> "晚上好，有什么想一起梳理的？"
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 22.dp),
+            .padding(horizontal = 26.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text("✦ 青简 · 咫尺 v2.0", color = Color(0xFFF8FAFC), fontSize = 23.sp, fontWeight = FontWeight.Bold)
+        // Minimalist Breathing Brand Halo
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(54.dp)
+                .clip(CircleShape)
+                .background(palette.accentSoft)
+                .border(0.7.dp, palette.accent.copy(alpha = 0.3f), CircleShape)
+        ) {
+            Icon(
+                imageVector = OmsIcons.Sparkles,
+                contentDescription = null,
+                tint = palette.accent,
+                modifier = Modifier.size(25.dp)
+            )
+        }
+
+        Spacer(modifier = Modifier.height(18.dp))
+
+        Text(
+            text = greeting,
+            color = palette.textPrimary,
+            fontSize = 21.sp,
+            fontWeight = FontWeight.SemiBold,
+            letterSpacing = (-0.3).sp
+        )
         Spacer(modifier = Modifier.height(6.dp))
         Text(
-            "OpenAI GPT-6.2 & Gemini 4 双擎直连 · 个人知识库按需心有灵犀",
-            color = Color(0xFF94A3B8),
-            fontSize = 12.5.sp
+            text = "$shortModelName · 个人知识库按需共鸣",
+            color = palette.textTertiary,
+            fontSize = 13.sp
         )
-        Spacer(modifier = Modifier.height(22.dp))
 
-        Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            QuickHeroCard(
-                icon = "🌿",
-                title = "博物之眼 · 拍植物识万物",
-                subtitle = "Gemini 4 Argon + 联网权威学名与易混种一眼辨析",
-                borderColor = Color(0xFF10B981),
+        Spacer(modifier = Modifier.height(28.dp))
+
+        Column(
+            verticalArrangement = Arrangement.spacedBy(9.dp),
+            modifier = Modifier.widthIn(max = 360.dp).fillMaxWidth()
+        ) {
+            WelcomeSuggestionRow(
+                icon = OmsIcons.Leaf,
+                title = "博物识物镜头",
+                subtitle = "实景拍摄植物或展品，联网核验学名与辨识要点",
                 onClick = onOpenBotanicalCamera
             )
-            QuickHeroCard(
-                icon = "🎧",
-                title = "散步语音对谈 & English Only",
-                subtitle = "OpenAI Realtime 2.1 全双工打断 / Google Glass 实时镜头",
-                borderColor = Color(0xFF6366F1),
-                onClick = { onOpenLiveVoice(false) }
+            WelcomeSuggestionRow(
+                icon = OmsIcons.Waveform,
+                title = "散步全双工语音对谈",
+                subtitle = "支持自然开口打断与 English Only 口语实战",
+                onClick = onOpenLiveVoice
             )
-            QuickHeroCard(
-                icon = "🧠",
-                title = "结合我的知识库梳理近期关注重点",
-                subtitle = "自动触发 search_my_context 按需检索，绝不污染日常闲聊",
-                borderColor = Color(0xFF38BDF8),
+            WelcomeSuggestionRow(
+                icon = OmsIcons.Sparkles,
+                title = "结合我的知识库梳理近期主线",
+                subtitle = "按需检索近期工作记忆与笔记，提炼优先事项",
                 onClick = {
                     onQuickPrompt("请结合我的知识库与近期工作记忆，帮我梳理当前最值得优先推进的 3 件事。", true, false)
                 }
             )
+            WelcomeSuggestionRow(
+                icon = OmsIcons.Send,
+                title = "快传图片或文档至 Mac",
+                subtitle = "多选相册照片、PDF 或剪贴板，加密直达桌面收件箱",
+                onClick = onOpenMacDrop
+            )
         }
     }
 }
 
 @Composable
-private fun QuickHeroCard(
-    icon: String,
+private fun WelcomeSuggestionRow(
+    icon: ImageVector,
     title: String,
     subtitle: String,
-    borderColor: Color,
     onClick: () -> Unit
 ) {
+    val palette = OmsTheme.colors
+    val shape = RoundedCornerShape(16.dp)
     Row(
+        verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .background(Color(0xFF131C31))
-            .border(1.dp, borderColor.copy(alpha = 0.55f), RoundedCornerShape(14.dp))
-            .clickable { onClick() }
-            .padding(horizontal = 14.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically
+            .omsBounceClick(scaleDown = 0.975f, shape = shape, onClick = onClick)
+            .background(palette.cardSurface, shape)
+            .border(0.6.dp, palette.hairline, shape)
+            .padding(horizontal = 14.dp, vertical = 12.dp)
     ) {
-        Text(icon, fontSize = 24.sp)
-        Spacer(modifier = Modifier.width(12.dp))
-        Column {
-            Text(title, color = Color(0xFFF1F5F9), fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-            Text(subtitle, color = Color(0xFF94A3B8), fontSize = 11.5.sp)
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(36.dp)
+                .clip(RoundedCornerShape(11.dp))
+                .background(palette.subtleSurface)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = palette.accent,
+                modifier = Modifier.size(18.dp)
+            )
         }
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                color = palette.textPrimary,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Text(
+                text = subtitle,
+                color = palette.textTertiary,
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        Icon(
+            imageVector = OmsIcons.ChevronRight,
+            contentDescription = null,
+            tint = palette.textTertiary,
+            modifier = Modifier.size(16.dp)
+        )
     }
 }
 
 @Composable
-private fun ChatMessageBubble(
+private fun ChatMessageTurn(
     msg: ChatMessageModel,
+    isLatestAssistant: Boolean,
     coordinator: CockpitRuntimeCoordinator,
+    onEditUserPrompt: (String) -> Unit,
+    onPreviewImage: (String) -> Unit,
     onFollowUpSpecimen: (com.oms.core.ai.FieldGuideSpecimenCard) -> Unit,
+    onRegenerate: () -> Unit,
     onEscalateToMacAgent: () -> Unit
 ) {
     val context = LocalContext.current
+    val palette = OmsTheme.colors
     val scope = rememberCoroutineScope()
     val isUser = msg.role == "user"
+    var showUserMenu by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = if (isUser) Alignment.End else Alignment.Start
     ) {
         if (isUser) {
-            Box(
-                modifier = Modifier
-                    .widthIn(max = 310.dp)
-                    .clip(RoundedCornerShape(18.dp, 18.dp, 4.dp, 18.dp))
-                    .background(Color(0xFF0369A1))
-                    .padding(horizontal = 14.dp, vertical = 10.dp)
-            ) {
-                Text(msg.content, color = Color.White, fontSize = 14.5.sp, lineHeight = 21.sp)
+            // User Image Attachment Thumbnail (previously missing!)
+            msg.imageLocalPath?.let { path ->
+                val userBmp by produceState<ImageBitmap?>(initialValue = null, key1 = path) {
+                    value = withContext(Dispatchers.IO) {
+                        runCatching {
+                            val f = File(path)
+                            if (f.exists()) BitmapFactory.decodeFile(path)?.asImageBitmap() else null
+                        }.getOrNull()
+                    }
+                }
+                if (userBmp != null) {
+                    Image(
+                        bitmap = userBmp!!,
+                        contentDescription = "用户附图",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .padding(bottom = 6.dp)
+                            .widthIn(max = 220.dp)
+                            .heightIn(max = 200.dp)
+                            .clip(RoundedCornerShape(16.dp))
+                            .border(0.6.dp, palette.hairline, RoundedCornerShape(16.dp))
+                            .clickable { onPreviewImage(path) }
+                    )
+                }
+            }
+
+            Box {
+                val bubbleShape = RoundedCornerShape(
+                    topStart = 20.dp,
+                    topEnd = 20.dp,
+                    bottomEnd = 5.dp,
+                    bottomStart = 20.dp
+                )
+                Box(
+                    modifier = Modifier
+                        .widthIn(max = 305.dp)
+                        .omsCombinedBounce(
+                            scaleDown = 0.98f,
+                            shape = bubbleShape,
+                            onLongClick = { showUserMenu = true },
+                            onClick = {}
+                        )
+                        .background(palette.userBubble, bubbleShape)
+                        .padding(horizontal = 15.dp, vertical = 10.5.dp)
+                ) {
+                    Text(
+                        text = msg.content,
+                        color = palette.userBubbleText,
+                        fontSize = 15.5.sp,
+                        lineHeight = 23.sp
+                    )
+                }
+
+                DropdownMenu(
+                    expanded = showUserMenu,
+                    onDismissRequest = { showUserMenu = false },
+                    modifier = Modifier.background(palette.composer)
+                ) {
+                    DropdownMenuItem(
+                        leadingIcon = { Icon(OmsIcons.Copy, null, tint = palette.textSecondary, modifier = Modifier.size(16.dp)) },
+                        text = { Text("复制文本", color = palette.textPrimary, fontSize = 13.5.sp) },
+                        onClick = {
+                            showUserMenu = false
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("prompt", msg.content))
+                            OmsFeedbackController.show("已复制提问内容", OmsToastKind.SUCCESS)
+                        }
+                    )
+                    DropdownMenuItem(
+                        leadingIcon = { Icon(OmsIcons.NewChat, null, tint = palette.textSecondary, modifier = Modifier.size(16.dp)) },
+                        text = { Text("填入输入框重新编辑", color = palette.textPrimary, fontSize = 13.5.sp) },
+                        onClick = {
+                            showUserMenu = false
+                            onEditUserPrompt(msg.content)
+                        }
+                    )
+                    DropdownMenuItem(
+                        leadingIcon = { Icon(OmsIcons.Send, null, tint = palette.textSecondary, modifier = Modifier.size(16.dp)) },
+                        text = { Text("投递至 Mac 收件箱", color = palette.textPrimary, fontSize = 13.5.sp) },
+                        onClick = {
+                            showUserMenu = false
+                            OmsApplication.instance?.transportClient?.submitItemToMacOrQueue(
+                                intentTag = "default_inbox",
+                                itemType = "TEXT",
+                                title = msg.content.take(32),
+                                textContent = msg.content,
+                                voiceTranscript = null,
+                                fileUri = msg.imageLocalPath?.let { Uri.fromFile(File(it)) }
+                            )
+                            OmsFeedbackController.show("已发送至 Mac 收件箱", OmsToastKind.SUCCESS)
+                        }
+                    )
+                }
             }
         } else {
+            // =================================================================
+            // Borderless Editorial Assistant Turn (ChatGPT / Gemini Canvas)
+            // =================================================================
             Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(Color(0xFF131C31))
-                    .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(16.dp))
-                    .padding(14.dp),
+                modifier = Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                if (msg.modelUsed.isNotBlank()) {
+                // Subtle Author / Model Eyebrow
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = OmsIcons.Sparkles,
+                        contentDescription = null,
+                        tint = palette.accent,
+                        modifier = Modifier.size(13.5.dp)
+                    )
                     Text(
-                        text = "✦ ${msg.modelUsed}",
-                        color = Color(0xFF64748B),
-                        fontSize = 11.sp,
+                        text = prettifyModelShortName(msg.modelUsed.ifBlank { "AI" }),
+                        color = palette.textTertiary,
+                        fontSize = 12.sp,
                         fontWeight = FontWeight.Medium
                     )
                 }
@@ -614,11 +1338,10 @@ private fun ChatMessageBubble(
                         onSaveVault = {
                             scope.launch {
                                 val ok = coordinator.promoteSpecimenToVault(msg.specimenCard, msg.imageLocalPath)
-                                Toast.makeText(
-                                    context,
-                                    if (ok) "🌿 已归档至 Mac 知识库 FieldGuide" else "🌿 已排队，连上 Mac 自动归档",
-                                    Toast.LENGTH_SHORT
-                                ).show()
+                                OmsFeedbackController.show(
+                                    if (ok) "已归档至 Mac 知识库 FieldGuide" else "已加入同步队列，连上 Mac 自动归档",
+                                    OmsToastKind.SUCCESS
+                                )
                             }
                         },
                         onFollowUp = { onFollowUpSpecimen(msg.specimenCard) }
@@ -631,54 +1354,93 @@ private fun ChatMessageBubble(
                         isStreaming = false
                     )
                     msg.imageLocalPath?.let { mediaPath ->
-                        InlineGeneratedMediaPreview(mediaPath = mediaPath, messageId = msg.messageId)
+                        InlineGeneratedMediaPreview(
+                            mediaPath = mediaPath,
+                            messageId = msg.messageId,
+                            onPreviewImage = onPreviewImage
+                        )
                     }
                 }
 
-                // Inline Native Calendar Cards (with real-time Xiaomi Calendar conflict check!)
+                // Inline Native Calendar & Alarm Confirmation Cards
                 msg.calendarActions.forEach { cal ->
                     InlineCalendarActionCard(action = cal)
                 }
-
-                // Inline Native Alarm Cards
                 msg.alarmActions.forEach { alarm ->
                     InlineAlarmActionCard(action = alarm)
                 }
 
-                // Action Bar: Copy | TTS | Promote to Vault | Escalate to Mac Codex/AGY
+                // Clean Minimalist Vector Action Toolbar (zero text clutter!)
+                val iconTint = if (isLatestAssistant) palette.textSecondary else palette.textTertiary
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    modifier = Modifier.padding(top = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    ActionLink("📋 复制") {
-                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                        cm?.setPrimaryClip(ClipData.newPlainText("reply", msg.content))
-                        Toast.makeText(context, "已复制内容", Toast.LENGTH_SHORT).show()
-                    }
-                    ActionLink("🔊 朗读") {
-                        val tc = com.oms.client.OmsApplication.instance?.transportClient
-                        if (tc != null) {
-                            tc.speakTextSmart(msg.content, useAlarmStream = false, audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE)
-                        } else {
-                            NotificationExecutor.speakText(context, msg.content, useAlarmStream = false, audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE)
+                    OmsMorphIconAction(
+                        icon = OmsIcons.Copy,
+                        confirmedIcon = OmsIcons.Check,
+                        contentDescription = "复制回复",
+                        tint = iconTint,
+                        onClick = {
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("reply", msg.content))
                         }
-                    }
-                    ActionLink("📚 提炼入库") {
-                        scope.launch {
-                            val title = msg.content.lineSequence().firstOrNull()?.replace("#", "")?.trim()?.take(36)
-                                ?: "随身对话高光笔记"
-                            val ok = coordinator.promoteHighlightToVault(title, msg.content)
-                            Toast.makeText(
-                                context,
-                                if (ok) "📚 已存入 Mac 知识库 MobileHighlights" else "📚 已排队，连上 Mac 自动入库",
-                                Toast.LENGTH_SHORT
-                            ).show()
+                    )
+
+                    OmsCircleIconButton(
+                        icon = OmsIcons.Volume,
+                        contentDescription = "语音朗读",
+                        size = 32.dp,
+                        iconSize = 16.5.dp,
+                        contentColor = iconTint,
+                        onClick = {
+                            val tc = OmsApplication.instance?.transportClient
+                            if (tc != null) {
+                                tc.speakTextSmart(msg.content, useAlarmStream = false, audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE)
+                            } else {
+                                NotificationExecutor.speakText(context, msg.content, useAlarmStream = false, audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE)
+                            }
                         }
-                    }
-                    ActionLink("🚀 转交 Mac 执行") {
-                        onEscalateToMacAgent()
+                    )
+
+                    OmsMorphIconAction(
+                        icon = OmsIcons.Bookmark,
+                        confirmedIcon = OmsIcons.BookmarkFilled,
+                        confirmedTint = palette.accent,
+                        contentDescription = "提炼入知识库",
+                        tint = iconTint,
+                        onClick = {
+                            scope.launch {
+                                val title = msg.content.lineSequence().firstOrNull()?.replace("#", "")?.trim()?.take(36)
+                                    ?: "随身对话高光笔记"
+                                val ok = coordinator.promoteHighlightToVault(title, msg.content)
+                                OmsFeedbackController.show(
+                                    if (ok) "已提炼归档至个人知识库" else "已暂存，连上 Mac 后自动入库",
+                                    OmsToastKind.SUCCESS
+                                )
+                            }
+                        }
+                    )
+
+                    OmsCircleIconButton(
+                        icon = OmsIcons.Laptop,
+                        contentDescription = "转交 Mac Agent 推进",
+                        size = 32.dp,
+                        iconSize = 16.5.dp,
+                        contentColor = iconTint,
+                        onClick = onEscalateToMacAgent
+                    )
+
+                    if (isLatestAssistant) {
+                        OmsCircleIconButton(
+                            icon = OmsIcons.Refresh,
+                            contentDescription = "重新生成",
+                            size = 32.dp,
+                            iconSize = 16.dp,
+                            contentColor = iconTint,
+                            onClick = onRegenerate
+                        )
                     }
                 }
             }
@@ -687,31 +1449,60 @@ private fun ChatMessageBubble(
 }
 
 @Composable
-private fun StreamingAssistantBubble(state: com.oms.client.cockpit.StreamingTurnState) {
+private fun StreamingAssistantTurn(state: com.oms.client.cockpit.StreamingTurnState) {
+    val palette = OmsTheme.colors
+    val infinite = rememberInfiniteTransition(label = "streamPulse")
+    val pulse by infinite.animateFloat(
+        initialValue = 0.55f,
+        targetValue = 1.08f,
+        animationSpec = infiniteRepeatable(tween(750), RepeatMode.Reverse),
+        label = "dotScale"
+    )
+
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(Color(0xFF131C31))
-            .border(1.dp, Color(0xFF0284C7), RoundedCornerShape(16.dp))
-            .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        if (state.statusHint.isNotBlank()) {
-            Text(state.statusHint, color = Color(0xFF7DD3FC), fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(9.dp)
+                    .scale(pulse)
+                    .clip(CircleShape)
+                    .background(palette.accent)
+            )
+            val label = state.statusHint
+                .replace("💭 ", "")
+                .replace("✦ ", "")
+                .replace("🔍 ", "")
+                .replace("📡 ", "")
+                .ifBlank { prettifyModelShortName(state.modelLabel.ifBlank { "正在生成…" }) }
+            Text(
+                text = label,
+                color = palette.textSecondary,
+                fontSize = 12.5.sp,
+                fontWeight = FontWeight.Medium
+            )
         }
-        IncrementalMarkdownView(
-            markdown = state.markdownText,
-            reasoning = state.reasoningText,
-            sources = state.sources,
-            isStreaming = true
-        )
+
+        if (state.markdownText.isNotBlank() || state.reasoningText.isNotBlank()) {
+            IncrementalMarkdownView(
+                markdown = state.markdownText,
+                reasoning = state.reasoningText,
+                sources = state.sources,
+                isStreaming = true
+            )
+        }
     }
 }
 
 @Composable
 private fun InlineCalendarActionCard(action: ProposedCalendarAction) {
     val context = LocalContext.current
+    val palette = OmsTheme.colors
     var committed by remember { mutableStateOf(false) }
     val endMs = action.startEpochMs + action.durationMinutes * 60_000L
     val conflictTitle = remember(action.startEpochMs, action.durationMinutes) {
@@ -725,28 +1516,37 @@ private fun InlineCalendarActionCard(action: ProposedCalendarAction) {
         }.getOrNull()
     }
     val timeStr = remember(action.startEpochMs) {
-        SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(Date(action.startEpochMs))
+        SimpleDateFormat("MM月dd日 HH:mm", Locale.CHINA).format(Date(action.startEpochMs))
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(Color(0xFF0F2942))
-            .border(1.dp, Color(0xFF0284C7), RoundedCornerShape(12.dp))
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp)
+    OmsSurfaceCard(
+        containerColor = palette.subtleSurface,
+        borderColor = palette.hairline,
+        cornerRadius = 16.dp,
+        modifier = Modifier.fillMaxWidth()
     ) {
-        Text("📅 小米系统日历确认卡", color = Color(0xFF7DD3FC), fontSize = 12.sp, fontWeight = FontWeight.Bold)
-        Text("${action.title} · $timeStr (${action.durationMinutes} 分钟)", color = Color.White, fontSize = 13.5.sp)
-        if (!conflictTitle.isNullOrBlank()) {
-            Text("⚠️ 检测到时段已有日程：《$conflictTitle》", color = Color(0xFFFDE047), fontSize = 11.5.sp)
-        } else {
-            Text("✅ 已核验该时段无日程冲突", color = Color(0xFF6EE7B7), fontSize = 11.5.sp)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Icon(OmsIcons.Calendar, contentDescription = null, tint = palette.accent, modifier = Modifier.size(16.dp))
+            Text("系统日历确认", color = palette.textSecondary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
         }
-        Button(
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(action.title, color = palette.textPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        Text("$timeStr · ${action.durationMinutes} 分钟", color = palette.textSecondary, fontSize = 13.sp)
+        Spacer(modifier = Modifier.height(6.dp))
+        if (!conflictTitle.isNullOrBlank()) {
+            Text("时段存在已有日程：《$conflictTitle》", color = palette.warning, fontSize = 12.sp)
+        } else {
+            Text("已核验该时段无日程冲突", color = palette.success, fontSize = 12.sp)
+        }
+        Spacer(modifier = Modifier.height(10.dp))
+        OmsPrimaryButton(
+            label = if (committed) "已写入系统日历" else "写入小米日历",
+            icon = if (committed) OmsIcons.Check else OmsIcons.Calendar,
             enabled = !committed,
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+            height = 36.dp,
             onClick = {
                 runCatching {
                     CalendarExecutor.insertEvent(
@@ -759,88 +1559,84 @@ private fun InlineCalendarActionCard(action: ProposedCalendarAction) {
                             .put("description", action.description)
                     )
                     committed = true
-                    Toast.makeText(context, "✅ 已写入小米系统日历", Toast.LENGTH_SHORT).show()
+                    OmsFeedbackController.show("已写入小米系统日历", OmsToastKind.SUCCESS)
                 }.onFailure {
-                    Toast.makeText(context, "写入日历失败，请检查日历权限", Toast.LENGTH_SHORT).show()
+                    OmsFeedbackController.show("写入失败，请检查日历权限", OmsToastKind.WARNING)
                 }
             }
-        ) {
-            Text(if (committed) "✅ 已写入日历" else "写入小米日历", fontSize = 12.sp)
-        }
+        )
     }
 }
 
 @Composable
 private fun InlineAlarmActionCard(action: ProposedAlarmAction) {
     val context = LocalContext.current
+    val palette = OmsTheme.colors
     var committed by remember { mutableStateOf(false) }
     val timeLabel = String.format(Locale.US, "%02d:%02d", action.hour, action.minute)
 
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(Color(0xFF1F1638))
-            .border(1.dp, Color(0xFF7C3AED), RoundedCornerShape(12.dp))
-            .padding(12.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
+    OmsSurfaceCard(
+        containerColor = palette.subtleSurface,
+        borderColor = palette.hairline,
+        cornerRadius = 16.dp,
+        modifier = Modifier.fillMaxWidth()
     ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text("⏰ 系统闹钟 · $timeLabel", color = Color(0xFFDDD6FE), fontSize = 14.sp, fontWeight = FontWeight.Bold)
-            Text(action.label, color = Color(0xFF94A3B8), fontSize = 12.sp)
-        }
-        Button(
-            enabled = !committed,
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6D28D9)),
-            onClick = {
-                val res = AlarmExecutor.setSystemAlarm(
-                    context,
-                    JSONObject()
-                        .put("hour", action.hour)
-                        .put("minute", action.minute)
-                        .put("label", action.label)
-                        .put("days", JSONArray(action.daysOfWeek))
-                )
-                if (res.optBoolean("ok", false)) {
-                    committed = true
-                    Toast.makeText(context, "⏰ 已设定 $timeLabel 系统闹钟", Toast.LENGTH_SHORT).show()
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(38.dp)
+                        .clip(CircleShape)
+                        .background(palette.accentSoft)
+                ) {
+                    Icon(OmsIcons.Clock, contentDescription = null, tint = palette.accent, modifier = Modifier.size(18.dp))
+                }
+                Column {
+                    Text(timeLabel, color = palette.textPrimary, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                    Text(action.label.ifBlank { "系统闹钟" }, color = palette.textSecondary, fontSize = 12.5.sp)
                 }
             }
-        ) {
-            Text(if (committed) "已设定" else "一键定闹钟", fontSize = 12.sp)
+            OmsPrimaryButton(
+                label = if (committed) "已设定" else "设定闹钟",
+                icon = if (committed) OmsIcons.Check else null,
+                enabled = !committed,
+                height = 36.dp,
+                onClick = {
+                    val res = AlarmExecutor.setSystemAlarm(
+                        context,
+                        JSONObject()
+                            .put("hour", action.hour)
+                            .put("minute", action.minute)
+                            .put("label", action.label)
+                            .put("days", JSONArray(action.daysOfWeek))
+                    )
+                    if (res.optBoolean("ok", false)) {
+                        committed = true
+                        OmsFeedbackController.show("已设定 $timeLabel 闹钟", OmsToastKind.SUCCESS)
+                    }
+                }
+            )
         }
     }
 }
 
 @Composable
-private fun ToggleChip(label: String, active: Boolean, activeColor: Color, onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(14.dp))
-            .background(if (active) activeColor else Color(0xFF162032))
-            .border(1.dp, if (active) Color.White.copy(alpha = 0.5f) else Color(0xFF283548), RoundedCornerShape(14.dp))
-            .clickable { onClick() }
-            .padding(horizontal = 10.dp, vertical = 5.dp)
-    ) {
-        Text(label, color = if (active) Color.White else Color(0xFF94A3B8), fontSize = 11.sp, fontWeight = FontWeight.Medium)
-    }
-}
-
-@Composable
-private fun ActionLink(label: String, onClick: () -> Unit) {
-    Text(
-        text = label,
-        color = Color(0xFF94A3B8),
-        fontSize = 11.5.sp,
-        fontWeight = FontWeight.Medium,
-        modifier = Modifier.clickable { onClick() }
-    )
-}
-
-@Composable
-private fun InlineGeneratedMediaPreview(mediaPath: String, messageId: String) {
+private fun InlineGeneratedMediaPreview(
+    mediaPath: String,
+    messageId: String,
+    onPreviewImage: (String) -> Unit
+) {
     val context = LocalContext.current
+    val palette = OmsTheme.colors
     val file = remember(mediaPath) { File(mediaPath) }
     if (!file.exists()) return
     val low = file.name.lowercase()
@@ -852,18 +1648,22 @@ private fun InlineGeneratedMediaPreview(mediaPath: String, messageId: String) {
             if (bmp != null) {
                 Image(
                     bitmap = bmp,
-                    contentDescription = "Generated image",
+                    contentDescription = "生成的图片",
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(230.dp)
-                        .clip(RoundedCornerShape(12.dp))
+                        .height(240.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .border(0.6.dp, palette.hairline, RoundedCornerShape(16.dp))
+                        .clickable { onPreviewImage(mediaPath) }
                 )
             }
         }
         low.endsWith(".mp3") || low.endsWith(".wav") || low.endsWith(".m4a") -> {
             var isPlaying by remember { mutableStateOf(false) }
-            OutlinedButton(
+            OmsSecondaryButton(
+                label = if (isPlaying) "停止播放曲目" else "播放生成的音乐",
+                icon = if (isPlaying) OmsIcons.StopSquare else OmsIcons.Play,
                 onClick = {
                     if (isPlaying) {
                         VoiceRecorderHelper.stopPlayback()
@@ -874,12 +1674,12 @@ private fun InlineGeneratedMediaPreview(mediaPath: String, messageId: String) {
                         }
                     }
                 }
-            ) {
-                Text(if (isPlaying) "⏹ 停止播放生成曲目" else "🎵 播放生成的音乐曲目", color = Color(0xFF6EE7B7))
-            }
+            )
         }
         low.endsWith(".mp4") -> {
-            OutlinedButton(
+            OmsSecondaryButton(
+                label = "播放生成的视频 (${file.name})",
+                icon = OmsIcons.Video,
                 onClick = {
                     runCatching {
                         val uri = FileProvider.getUriForFile(context, "${context.packageName}.ota", file)
@@ -889,12 +1689,222 @@ private fun InlineGeneratedMediaPreview(mediaPath: String, messageId: String) {
                                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         )
                     }.onFailure {
-                        Toast.makeText(context, "视频已保存在: ${file.absolutePath}", Toast.LENGTH_LONG).show()
+                        OmsFeedbackController.show("视频保存在: ${file.absolutePath}", OmsToastKind.INFO)
                     }
                 }
-            ) {
-                Text("🎬 播放生成的视频 (${file.name})", color = Color(0xFFFBBF24))
+            )
+        }
+    }
+}
+
+@Composable
+private fun MultimodalPlusSheetContent(
+    onAttachPhotoUri: (Uri) -> Unit,
+    onPickAlbumForChat: () -> Unit,
+    onOpenBotanicalCamera: () -> Unit,
+    onOpenGlassLive: () -> Unit,
+    onDropPhotosToMac: () -> Unit,
+    onDropDocsToMac: () -> Unit,
+    onSelectCreative: (ModelRoleCategory) -> Unit
+) {
+    val context = LocalContext.current
+    val palette = OmsTheme.colors
+    var recentUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+
+    LaunchedEffect(Unit) {
+        recentUris = withContext(Dispatchers.IO) { queryRecentMediaUris(context, limit = 10) }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .padding(horizontal = 18.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        if (recentUris.isNotEmpty()) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "最近相册 · 点选直接附图提问",
+                    color = palette.textTertiary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(items = recentUris, key = { it.toString() }) { uri ->
+                        val thumb by produceState<ImageBitmap?>(initialValue = null, key1 = uri) {
+                            value = withContext(Dispatchers.IO) {
+                                runCatching {
+                                    val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
+                                    context.contentResolver.openInputStream(uri)?.use {
+                                        BitmapFactory.decodeStream(it, null, opts)?.asImageBitmap()
+                                    }
+                                }.getOrNull()
+                            }
+                        }
+                        Box(
+                            modifier = Modifier
+                                .size(68.dp)
+                                .omsBounceClick(scaleDown = 0.93f, shape = RoundedCornerShape(14.dp)) {
+                                    onAttachPhotoUri(uri)
+                                }
+                                .background(palette.subtleSurface, RoundedCornerShape(14.dp))
+                                .border(0.6.dp, palette.hairline, RoundedCornerShape(14.dp))
+                        ) {
+                            if (thumb != null) {
+                                Image(
+                                    bitmap = thumb!!,
+                                    contentDescription = null,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(14.dp))
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
+
+        // 2x4 Clean Action Tile Grid
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                SheetActionTile(
+                    icon = OmsIcons.Image,
+                    title = "相册附图",
+                    subtitle = "选图发给 AI",
+                    modifier = Modifier.weight(1f),
+                    onClick = onPickAlbumForChat
+                )
+                SheetActionTile(
+                    icon = OmsIcons.Camera,
+                    title = "博物镜头",
+                    subtitle = "识植物/展品",
+                    modifier = Modifier.weight(1f),
+                    onClick = onOpenBotanicalCamera
+                )
+                SheetActionTile(
+                    icon = OmsIcons.Sparkles,
+                    title = "Glass 实时",
+                    subtitle = "边看边聊",
+                    modifier = Modifier.weight(1f),
+                    onClick = onOpenGlassLive
+                )
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                SheetActionTile(
+                    icon = OmsIcons.Send,
+                    title = "图片传 Mac",
+                    subtitle = "多图直达桌面",
+                    modifier = Modifier.weight(1f),
+                    onClick = onDropPhotosToMac
+                )
+                SheetActionTile(
+                    icon = OmsIcons.FileText,
+                    title = "文档传 Mac",
+                    subtitle = "PDF / Office",
+                    modifier = Modifier.weight(1f),
+                    onClick = onDropDocsToMac
+                )
+                SheetActionTile(
+                    icon = OmsIcons.Palette,
+                    title = "视觉生图",
+                    subtitle = "AI 图像创作",
+                    modifier = Modifier.weight(1f),
+                    onClick = { onSelectCreative(ModelRoleCategory.IMAGE_GENERATION) }
+                )
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                SheetActionTile(
+                    icon = OmsIcons.Video,
+                    title = "视频生成",
+                    subtitle = "动态短片",
+                    modifier = Modifier.weight(1f),
+                    onClick = { onSelectCreative(ModelRoleCategory.VIDEO_GENERATION) }
+                )
+                SheetActionTile(
+                    icon = OmsIcons.Music,
+                    title = "AI 写歌",
+                    subtitle = "旋律与配乐",
+                    modifier = Modifier.weight(1f),
+                    onClick = { onSelectCreative(ModelRoleCategory.MUSIC_GENERATION) }
+                )
+                Spacer(modifier = Modifier.weight(1f))
+            }
+        }
+        Spacer(modifier = Modifier.height(6.dp))
+    }
+}
+
+@Composable
+private fun SheetActionTile(
+    icon: ImageVector,
+    title: String,
+    subtitle: String,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    val palette = OmsTheme.colors
+    val shape = RoundedCornerShape(16.dp)
+    Column(
+        horizontalAlignment = Alignment.Start,
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = modifier
+            .omsBounceClick(scaleDown = 0.95f, shape = shape, onClick = onClick)
+            .background(palette.subtleSurface, shape)
+            .border(0.6.dp, palette.hairline, shape)
+            .padding(horizontal = 12.dp, vertical = 12.dp)
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = title,
+            tint = palette.accent,
+            modifier = Modifier.size(20.dp)
+        )
+        Column {
+            Text(title, color = palette.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            Text(subtitle, color = palette.textTertiary, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+    }
+}
+
+private fun queryRecentMediaUris(context: Context, limit: Int): List<Uri> {
+    val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
+    } else {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+    }
+    if (!granted) return emptyList()
+    val out = ArrayList<Uri>()
+    runCatching {
+        context.contentResolver.query(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.IS_PENDING),
+            null,
+            null,
+            "${MediaStore.Images.Media.DATE_ADDED} DESC"
+        )?.use { c ->
+            while (c.moveToNext() && out.size < limit) {
+                if (c.getInt(1) != 0) continue
+                out.add(ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(0)))
+            }
+        }
+    }
+    return out
+}
+
+internal fun prettifyModelShortName(raw: String): String {
+    val clean = raw.substringAfter(':', raw).trim()
+    return when {
+        clean.equals("auto", ignoreCase = true) -> "Auto"
+        clean.contains("gpt-6.2-astra", ignoreCase = true) -> "GPT-6.2 Astra"
+        clean.contains("gpt-6.2-sol", ignoreCase = true) -> "GPT-6.2 Sol"
+        clean.contains("gpt-6.1-terra", ignoreCase = true) -> "GPT-6.1 Terra"
+        clean.contains("gemini-4-argon", ignoreCase = true) -> "Gemini 4 Argon"
+        clean.contains("gemini-3.8-flash", ignoreCase = true) -> "Gemini 3.8 Flash"
+        clean.contains("gemini-3.8-live", ignoreCase = true) -> "Gemini 3.8 Live"
+        clean.contains("gpt-realtime", ignoreCase = true) -> "GPT Realtime"
+        else -> clean.take(20)
     }
 }

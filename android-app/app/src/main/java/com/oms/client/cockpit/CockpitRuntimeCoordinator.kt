@@ -275,6 +275,27 @@ class CockpitRuntimeCoordinator(
         }
     }
 
+    fun regenerateLastAssistantTurn(deepThinking: Boolean = false, forceWebSearch: Boolean = false) {
+        val threadId = chatRepo.activeThreadIdFlow.value.takeIf { it.isNotBlank() } ?: return
+        val history = chatRepo.loadMessagesForThread(threadId)
+        val lastUser = history.lastOrNull { it.role == "user" } ?: return
+        val imgBytes = lastUser.imageLocalPath?.let { p ->
+            runCatching { File(p).takeIf { it.exists() }?.readBytes() }.getOrNull()
+        }
+        val assistantMsgId = "msg_${OmsFrameProtocol.generateUuidV7().takeLast(12)}"
+        vibrateTick()
+        activeTurnJob?.cancel()
+        activeTurnJob = scope.launch {
+            executeStreamingTurnWithResilience(
+                threadId = threadId,
+                assistantMsgId = assistantMsgId,
+                latestImageBytes = imgBytes,
+                deepThinking = deepThinking,
+                forceWebSearch = forceWebSearch
+            )
+        }
+    }
+
     private suspend fun executeStreamingTurnWithResilience(
         threadId: String,
         assistantMsgId: String,

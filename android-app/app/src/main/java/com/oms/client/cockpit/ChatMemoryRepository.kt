@@ -184,6 +184,19 @@ class ChatMemoryRepository(context: Context) :
     }
 
     @Synchronized
+    fun renameThread(threadId: String, newTitle: String) {
+        val cleaned = newTitle.trim().take(48)
+        if (cleaned.isEmpty()) return
+        val cur = _threadsFlow.value.firstOrNull { it.threadId == threadId } ?: return
+        val cv = ContentValues().apply {
+            put("title", cleaned)
+            put("synced_to_mac", if (cur.incognito) 1 else 0)
+        }
+        writableDatabase.update("chat_threads", cv, "thread_id = ?", arrayOf(threadId))
+        refreshThreads()
+    }
+
+    @Synchronized
     fun deleteThread(threadId: String) {
         val db = writableDatabase
         db.delete("chat_messages_fts", "thread_id = ?", arrayOf(threadId))
@@ -194,6 +207,26 @@ class ChatMemoryRepository(context: Context) :
             val next = _threadsFlow.value.firstOrNull()?.threadId
             if (next != null) selectThread(next) else createNewThread(incognito = false)
         }
+    }
+
+    fun loadRecentSpecimens(limit: Int = 60): List<Pair<FieldGuideSpecimenCard, String?>> {
+        val list = ArrayList<Pair<FieldGuideSpecimenCard, String?>>()
+        readableDatabase.rawQuery(
+            """
+            SELECT specimen_json, image_local_path
+            FROM chat_messages
+            WHERE specimen_json != ''
+            ORDER BY created_at_ms DESC
+            LIMIT ?
+            """.trimIndent(),
+            arrayOf(limit.toString())
+        ).use { c ->
+            while (c.moveToNext()) {
+                val card = decodeSpecimen(c.getString(0).orEmpty()) ?: continue
+                list.add(card to c.getString(1))
+            }
+        }
+        return list
     }
 
     @Synchronized

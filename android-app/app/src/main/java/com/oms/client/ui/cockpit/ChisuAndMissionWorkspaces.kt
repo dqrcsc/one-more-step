@@ -1,6 +1,23 @@
 package com.oms.client.ui.cockpit
 
-import android.widget.Toast
+import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
+import android.net.Uri
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -14,54 +31,91 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
-import androidx.compose.ui.window.Dialog
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.core.content.ContextCompat
 import com.oms.client.OmsApplication
 import com.oms.client.capability.NotificationExecutor
 import com.oms.client.capability.SpeechAudioPolicy
+import com.oms.client.capability.VoiceRecorderHelper
 import com.oms.client.cockpit.CockpitRuntimeCoordinator
 import com.oms.client.cockpit.RemoteAgentSessionUi
+import com.oms.client.cockpit.RemoteAgentStepUi
 import com.oms.client.data.StreamItemModel
+import com.oms.client.otp.OtpExtractor
+import com.oms.client.share.AttachmentBudget
+import com.oms.client.share.AttachmentResolver
 import com.oms.client.ui.markdown.IncrementalMarkdownView
+import com.oms.client.ui.theme.OmsCircleIconButton
+import com.oms.client.ui.theme.OmsFeedbackController
+import com.oms.client.ui.theme.OmsIcons
+import com.oms.client.ui.theme.OmsMorphIconAction
+import com.oms.client.ui.theme.OmsPrimaryButton
+import com.oms.client.ui.theme.OmsSecondaryButton
+import com.oms.client.ui.theme.OmsSegmentItem
+import com.oms.client.ui.theme.OmsSlidingSegmentedBar
+import com.oms.client.ui.theme.OmsSurfaceCard
+import com.oms.client.ui.theme.OmsTheme
+import com.oms.client.ui.theme.OmsToastKind
+import com.oms.client.ui.theme.OmsTogglePill
+import com.oms.client.ui.theme.omsBounceClick
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/**
- * Workspace 2 (`📖 尺素`): Segmented WeChat Article Digest Reader, Commute TTS Playlist & Remote Approval Stream.
- */
+// =============================================================================
+// Workspace 2 (`尺素`): Magazine Digest Stream + Immersive Paper Reader
+// =============================================================================
 @Composable
 fun ChisuWorkspaceView(
     streamItems: List<StreamItemModel>,
@@ -69,116 +123,145 @@ fun ChisuWorkspaceView(
     onSendArticleToMacAgent: (StreamItemModel) -> Unit
 ) {
     val context = LocalContext.current
+    val palette = OmsTheme.colors
     val app = OmsApplication.instance ?: return
     val isSpeaking by NotificationExecutor.isSpeakingFlow.collectAsState()
     var filterKey by remember { mutableStateOf("ALL") }
-    var expandedItemId by remember { mutableStateOf<String?>(null) }
+    var activeReaderItemId by remember { mutableStateOf<String?>(null) }
 
-    val filteredItems = remember(streamItems, filterKey) {
-        when (filterKey) {
-            "ARTICLE" -> streamItems.filter {
-                it.intentTag.contains("wechat", ignoreCase = true) ||
-                    it.intentTag == "pkb_vault" ||
-                    it.title?.contains("《") == true ||
-                    it.textContent?.contains("脱水干货") == true
-            }
-            "EDGE_NIGHT" -> streamItems.filter { it.intentTag == "wechat_edge_standby" }
-            "APPROVAL" -> streamItems.filter { it.itemType == "APPROVAL" }
-            else -> streamItems
+    val chisuItems = remember(streamItems) {
+        streamItems.filter {
+            it.intentTag.contains("wechat", ignoreCase = true) ||
+                it.intentTag == "pkb_vault" ||
+                it.title?.contains("《") == true ||
+                it.textContent?.contains("脱水干货") == true ||
+                (it.direction == "MAC_TO_PHONE" && !it.textContent.isNullOrBlank() && it.itemType != "APPROVAL")
         }
     }
 
+    val filteredItems = remember(chisuItems, filterKey) {
+        when (filterKey) {
+            "EDGE_NIGHT" -> chisuItems.filter { it.intentTag == "wechat_edge_standby" }
+            else -> chisuItems
+        }
+    }
+
+    val activeReaderItem = remember(streamItems, activeReaderItemId) {
+        activeReaderItemId?.let { id -> streamItems.firstOrNull { it.itemId == id } }
+    }
+
+    if (activeReaderItem != null) {
+        BackHandler { activeReaderItemId = null }
+        ChisuImmersiveReaderScreen(
+            item = activeReaderItem,
+            onBack = { activeReaderItemId = null },
+            onDiscussInChat = {
+                activeReaderItemId = null
+                onDiscussArticleInChat(activeReaderItem)
+            },
+            onSendToAgent = {
+                activeReaderItemId = null
+                onSendArticleToMacAgent(activeReaderItem)
+            }
+        )
+        return
+    }
+
     Column(modifier = Modifier.fillMaxSize()) {
-        // Filter & Commute Broadcast Bar
+        // Minimalist Filter & Commute Radio Header
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(Color(0xFF0D1424))
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                .padding(horizontal = 16.dp, vertical = 10.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
             Row(
-                modifier = Modifier
-                    .weight(1f)
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                FilterPill("全部 (${streamItems.size})", filterKey == "ALL") { filterKey = "ALL" }
-                FilterPill("📄 尺素精读", filterKey == "ARTICLE") { filterKey = "ARTICLE" }
-                FilterPill("🌙 手机抢答", filterKey == "EDGE_NIGHT") { filterKey = "EDGE_NIGHT" }
-                FilterPill("🛡️ 远程审批", filterKey == "APPROVAL") { filterKey = "APPROVAL" }
-            }
-            Spacer(modifier = Modifier.width(8.dp))
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(if (isSpeaking) Color(0xFFDC2626) else Color(0xFF0284C7))
-                    .clickable {
-                        if (isSpeaking) {
-                            NotificationExecutor.stopSpeaking(context)
-                        } else {
-                            val digestPlaylist = filteredItems
-                                .filter { !it.textContent.isNullOrBlank() }
-                                .take(5)
-                                .joinToString("\n\n下一篇：\n") {
-                                    "${it.title ?: "尺素简报"}。${it.textContent.orEmpty().take(700)}"
-                                }
-                            if (digestPlaylist.isNotBlank()) {
-                                app.transportClient.speakTextSmart(
-                                    digestPlaylist,
-                                    useAlarmStream = false,
-                                    audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE
-                                )
-                            } else {
-                                Toast.makeText(context, "暂无可朗读的尺素内容", Toast.LENGTH_SHORT).show()
-                            }
-                        }
-                    }
-                    .padding(horizontal = 10.dp, vertical = 6.dp)
-            ) {
-                Text(
-                    text = if (isSpeaking) "⏹ 停止联播" else "🎧 通勤联播",
-                    color = Color.White,
-                    fontSize = 11.5.sp,
-                    fontWeight = FontWeight.Bold
+                OmsTogglePill(
+                    label = "全部精读 (${chisuItems.size})",
+                    active = filterKey == "ALL",
+                    icon = OmsIcons.BookOpen,
+                    onClick = { filterKey = "ALL" }
+                )
+                OmsTogglePill(
+                    label = "手机休眠抢答",
+                    active = filterKey == "EDGE_NIGHT",
+                    icon = OmsIcons.Moon,
+                    onClick = { filterKey = "EDGE_NIGHT" }
                 )
             }
+
+            Spacer(modifier = Modifier.width(8.dp))
+
+            OmsPrimaryButton(
+                label = if (isSpeaking) "停止联播" else "通勤联播",
+                icon = if (isSpeaking) OmsIcons.StopSquare else OmsIcons.Waveform,
+                height = 33.dp,
+                containerColor = if (isSpeaking) palette.danger else palette.sendButtonBg,
+                contentColor = if (isSpeaking) Color.White else palette.sendButtonFg,
+                onClick = {
+                    if (isSpeaking) {
+                        NotificationExecutor.stopSpeaking(context)
+                    } else {
+                        val playlist = filteredItems
+                            .filter { !it.textContent.isNullOrBlank() }
+                            .take(5)
+                            .joinToString("\n\n下一篇：\n") {
+                                "${it.title ?: "尺素简报"}。${it.textContent.orEmpty().take(750)}"
+                            }
+                        if (playlist.isNotBlank()) {
+                            app.transportClient.speakTextSmart(
+                                playlist,
+                                useAlarmStream = false,
+                                audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE
+                            )
+                            OmsFeedbackController.show("已开启尺素通勤语音联播", OmsToastKind.INFO)
+                        } else {
+                            OmsFeedbackController.show("暂无可朗读的伴读文章", OmsToastKind.WARNING)
+                        }
+                    }
+                }
+            )
         }
 
         if (filteredItems.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Column(
+                modifier = Modifier.fillMaxSize().padding(32.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(52.dp)
+                        .clip(CircleShape)
+                        .background(palette.subtleSurface)
+                ) {
+                    Icon(OmsIcons.BookOpen, contentDescription = null, tint = palette.textTertiary, modifier = Modifier.size(24.dp))
+                }
+                Spacer(modifier = Modifier.height(14.dp))
+                Text("暂无尺素伴读笔记", color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    "📖 转发微信公众号文章给「尺素」即可自动精析入库\n（Mac 休眠时由手机咫尺自动抢答）",
-                    color = Color(0xFF64748B),
-                    fontSize = 13.sp
+                    "在微信将公众号文章转发给「尺素」即可自动精析入库\nMac 休眠时将由手机咫尺自动无缝接管",
+                    color = palette.textTertiary,
+                    fontSize = 13.sp,
+                    lineHeight = 20.sp
                 )
             }
         } else {
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(14.dp),
+                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 32.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 items(items = filteredItems, key = { it.itemId }) { item ->
-                    val isExpanded = expandedItemId == item.itemId
-                    ChisuDigestCard(
+                    ChisuMagazineDigestCard(
                         item = item,
-                        expanded = isExpanded,
-                        onToggleExpand = { expandedItemId = if (isExpanded) null else item.itemId },
-                        onApproveDecision = { approved, opt ->
-                            val meta = runCatching { JSONObject(item.metadataJson ?: "{}") }.getOrDefault(JSONObject())
-                            val approvalId = meta.optString("approvalId", item.itemId)
-                            app.transportClient.sendApprovalDecision(
-                                itemId = item.itemId,
-                                approvalId = approvalId,
-                                approved = approved,
-                                selectedOption = opt,
-                                userComment = null
-                            )
-                        },
-                        onDiscussInChat = { onDiscussArticleInChat(item) },
-                        onSendToAgent = { onSendArticleToMacAgent(item) }
+                        onClick = { activeReaderItemId = item.itemId }
                     )
                 }
             }
@@ -187,194 +270,272 @@ fun ChisuWorkspaceView(
 }
 
 @Composable
-private fun ChisuDigestCard(
+private fun ChisuMagazineDigestCard(
     item: StreamItemModel,
-    expanded: Boolean,
-    onToggleExpand: () -> Unit,
-    onApproveDecision: (Boolean, String) -> Unit,
-    onDiscussInChat: () -> Unit,
-    onSendToAgent: () -> Unit
+    onClick: () -> Unit
 ) {
-    val context = LocalContext.current
+    val palette = OmsTheme.colors
     val timeLabel = remember(item.createdAtMs) {
-        SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(Date(item.createdAtMs))
+        SimpleDateFormat("MM月dd日 HH:mm", Locale.CHINA).format(Date(item.createdAtMs))
     }
     val isNightEdge = item.intentTag == "wechat_edge_standby"
+    val body = remember(item.textContent, item.voiceTranscript) {
+        (item.textContent ?: item.voiceTranscript ?: "")
+            .replace(Regex("[#*>`\\-]+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+    val estReadMin = remember(body) { (body.length / 360).coerceAtLeast(1) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(Color(0xFF131C31))
-            .border(
-                1.dp,
-                if (item.itemType == "APPROVAL" && item.syncStatus == "PENDING_APPROVAL") Color(0xFFF59E0B)
-                else if (isNightEdge) Color(0xFF8B5CF6)
-                else Color(0xFF1E293B),
-                RoundedCornerShape(16.dp)
-            )
-            .clickable { onToggleExpand() }
-            .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+    OmsSurfaceCard(
+        cornerRadius = 18.dp,
+        contentPadding = PaddingValues(16.dp),
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth()
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = when {
-                    isNightEdge -> "🌙 手机夜间抢答 · $timeLabel"
-                    item.itemType == "APPROVAL" -> "🛡️ 远程审批请求 · $timeLabel"
-                    else -> "📖 ${item.intentTag} · $timeLabel"
-                },
-                color = if (isNightEdge) Color(0xFFC4B5FD) else Color(0xFF7DD3FC),
-                fontSize = 11.sp,
-                fontWeight = FontWeight.SemiBold
-            )
-            Text(
-                text = if (expanded) "收起 ▲" else "展开精读 ▼",
-                color = Color(0xFF64748B),
-                fontSize = 11.sp
-            )
-        }
-
-        if (!item.title.isNullOrBlank()) {
-            Text(
-                text = item.title,
-                color = Color(0xFFF8FAFC),
-                fontSize = 15.5.sp,
-                fontWeight = FontWeight.Bold
-            )
-        }
-
-        val body = item.textContent ?: item.voiceTranscript ?: ""
-        if (body.isNotBlank()) {
-            if (expanded) {
-                IncrementalMarkdownView(markdown = body)
-            } else {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Icon(
+                    imageVector = if (isNightEdge) OmsIcons.Moon else OmsIcons.BookOpen,
+                    contentDescription = null,
+                    tint = palette.accent,
+                    modifier = Modifier.size(13.5.dp)
+                )
                 Text(
-                    text = body.replace(Regex("\\s+"), " ").take(160),
-                    color = Color(0xFFCBD5E1),
-                    fontSize = 13.5.sp,
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis,
-                    lineHeight = 20.sp
+                    text = if (isNightEdge) "手机夜间直连初筛" else "尺素伴读",
+                    color = palette.accent,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "· 约 $estReadMin 分钟",
+                    color = palette.textTertiary,
+                    fontSize = 11.5.sp
                 )
             }
+            Text(timeLabel, color = palette.textTertiary, fontSize = 11.5.sp)
         }
 
-        // Remote Approval Buttons if pending
-        if (item.itemType == "APPROVAL" && item.syncStatus == "PENDING_APPROVAL") {
-            val meta = runCatching { JSONObject(item.metadataJson ?: "{}") }.getOrDefault(JSONObject())
-            val optsArr = meta.optJSONArray("options")
-            val allowLabel = optsArr?.optString(0)?.takeIf { it.isNotBlank() } ?: "批准执行"
-            val denyLabel = optsArr?.optString(1)?.takeIf { it.isNotBlank() } ?: "拒绝"
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Button(
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669)),
-                    onClick = { onApproveDecision(true, allowLabel) }
-                ) {
-                    Text("✅ $allowLabel", fontSize = 12.sp)
-                }
-                OutlinedButton(onClick = { onApproveDecision(false, denyLabel) }) {
-                    Text("✕ $denyLabel", color = Color(0xFFFCA5A5), fontSize = 12.sp)
-                }
-            }
-        }
+        Spacer(modifier = Modifier.height(8.dp))
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
+        Text(
+            text = item.title?.takeIf { it.isNotBlank() } ?: "未命名伴读笔记",
+            color = palette.textPrimary,
+            fontSize = 16.5.sp,
+            fontWeight = FontWeight.SemiBold,
+            lineHeight = 23.sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis
+        )
+
+        if (body.isNotBlank()) {
+            Spacer(modifier = Modifier.height(6.dp))
             Text(
-                text = "🔊 朗读本篇",
-                color = Color(0xFF94A3B8),
-                fontSize = 11.5.sp,
-                modifier = Modifier.clickable {
-                    if (body.isNotBlank()) {
-                        val speakStr = "${item.title.orEmpty()}。$body"
-                        val tc = OmsApplication.instance?.transportClient
-                        if (tc != null) {
-                            tc.speakTextSmart(speakStr, useAlarmStream = false, audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE)
-                        } else {
-                            NotificationExecutor.speakText(context, speakStr, useAlarmStream = false, audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE)
-                        }
-                    }
-                }
-            )
-            Text(
-                text = "💬 带着这篇问 AI",
-                color = Color(0xFF38BDF8),
-                fontSize = 11.5.sp,
-                fontWeight = FontWeight.Medium,
-                modifier = Modifier.clickable { onDiscussInChat() }
-            )
-            Text(
-                text = "🚀 派单落地验证",
-                color = Color(0xFF34D399),
-                fontSize = 11.5.sp,
-                fontWeight = FontWeight.Medium,
-                modifier = Modifier.clickable { onSendToAgent() }
+                text = body.take(180),
+                color = palette.textSecondary,
+                fontSize = 14.sp,
+                lineHeight = 21.sp,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis
             )
         }
     }
 }
 
-/**
- * Workspace 3 (`🕹️ 任务舱`): Mac Heavy-Brain Hub for OpenAI Codex & Google Antigravity (`agy`).
- * Supports real-time desktop/mobile session monitoring, new task dispatch, and cross-device `resume` continuation!
- */
+@Composable
+private fun ChisuImmersiveReaderScreen(
+    item: StreamItemModel,
+    onBack: () -> Unit,
+    onDiscussInChat: () -> Unit,
+    onSendToAgent: () -> Unit
+) {
+    val context = LocalContext.current
+    val palette = OmsTheme.colors
+    val body = item.textContent ?: item.voiceTranscript ?: ""
+    val timeLabel = remember(item.createdAtMs) {
+        SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(Date(item.createdAtMs))
+    }
+
+    Box(modifier = Modifier.fillMaxSize().background(palette.canvas)) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            // Sticky Minimalist Editorial Header
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(palette.topBar)
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OmsCircleIconButton(
+                    icon = OmsIcons.ArrowLeft,
+                    contentDescription = "返回列表",
+                    onClick = onBack
+                )
+
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OmsMorphIconAction(
+                        icon = OmsIcons.Copy,
+                        contentDescription = "复制全文",
+                        tint = palette.textPrimary,
+                        iconSize = 18.dp,
+                        onClick = {
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("chisu", body))
+                            OmsFeedbackController.show("已复制伴读笔记全文", OmsToastKind.SUCCESS)
+                        }
+                    )
+                    OmsCircleIconButton(
+                        icon = OmsIcons.Volume,
+                        contentDescription = "朗读本篇",
+                        onClick = {
+                            if (body.isNotBlank()) {
+                                val speakStr = "${item.title.orEmpty()}。$body"
+                                val tc = OmsApplication.instance?.transportClient
+                                if (tc != null) {
+                                    tc.speakTextSmart(speakStr, useAlarmStream = false, audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE)
+                                } else {
+                                    NotificationExecutor.speakText(context, speakStr, useAlarmStream = false, audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE)
+                                }
+                            }
+                        }
+                    )
+                    OmsCircleIconButton(
+                        icon = OmsIcons.Laptop,
+                        contentDescription = "派发至 Mac 验证",
+                        onClick = onSendToAgent
+                    )
+                }
+            }
+
+            Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
+
+            // Paper-Grade Long-Form Reading Scroll
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 22.dp, end = 22.dp, top = 20.dp, bottom = 96.dp)
+            ) {
+                if (!item.title.isNullOrBlank()) {
+                    Text(
+                        text = item.title,
+                        color = palette.textPrimary,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold,
+                        lineHeight = 31.sp,
+                        letterSpacing = (-0.3).sp
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+                Text(
+                    text = "$timeLabel · 青简尺素归档",
+                    color = palette.textTertiary,
+                    fontSize = 12.5.sp
+                )
+                Spacer(modifier = Modifier.height(20.dp))
+
+                IncrementalMarkdownView(
+                    markdown = body,
+                    bodyFontSize = 16.sp,
+                    bodyLineHeight = 27.5.sp
+                )
+            }
+        }
+
+        // Floating Contextual Ask Pill at Bottom
+        val askShape = RoundedCornerShape(24.dp)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .padding(horizontal = 20.dp, vertical = 14.dp)
+                .shadow(elevation = 8.dp, shape = askShape, clip = false)
+                .omsBounceClick(scaleDown = 0.96f, shape = askShape, onClick = onDiscussInChat)
+                .background(palette.composer, askShape)
+                .border(0.7.dp, palette.strongBorder, askShape)
+                .padding(horizontal = 18.dp, vertical = 11.dp)
+        ) {
+            Icon(
+                imageVector = OmsIcons.Sparkles,
+                contentDescription = null,
+                tint = palette.accent,
+                modifier = Modifier.size(16.dp)
+            )
+            Text(
+                text = "带着这篇文章继续向 AI 深度追问",
+                color = palette.textPrimary,
+                fontSize = 13.5.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Icon(
+                imageVector = OmsIcons.ChevronRight,
+                contentDescription = null,
+                tint = palette.textTertiary,
+                modifier = Modifier.size(15.dp)
+            )
+        }
+    }
+}
+
+// =============================================================================
+// Workspace 3 (`协同`): Unified Mac Heavy-Brain (Codex / AGY) + Cross-Device Dropzone
+// =============================================================================
+private enum class HubSubView {
+    AGENTS,
+    DROPZONE
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MissionHubWorkspaceView(
     coordinator: CockpitRuntimeCoordinator,
     macConnected: Boolean,
+    streamItems: List<StreamItemModel>,
     prefillAgentPrompt: String,
     onConsumePrefillAgentPrompt: () -> Unit
 ) {
     val context = LocalContext.current
+    val palette = OmsTheme.colors
     val scope = rememberCoroutineScope()
+    val app = OmsApplication.instance ?: return
+
     val sessions by coordinator.agentSessionsFlow.collectAsState()
     val projects by coordinator.agentProjectsFlow.collectAsState()
     val selectedSession by coordinator.selectedAgentSessionFlow.collectAsState()
     val selectedSteps by coordinator.selectedAgentStepsFlow.collectAsState()
 
+    var activeSubView by remember { mutableStateOf(HubSubView.AGENTS) }
     var backendFilter by remember { mutableStateOf("ALL") }
-    var projectFilterPath by remember { mutableStateOf("") }
-    var showNewTaskSheet by remember { mutableStateOf(false) }
-    var newBackend by remember { mutableStateOf("codex") }
-    var selectedWorkspacePath by remember { mutableStateOf("") }
-    var useCustomWorkspaceInput by remember { mutableStateOf(false) }
-    var showProjectPickerDialog by remember { mutableStateOf(false) }
-    var projectSearchText by remember { mutableStateOf("") }
-
-    // "" means "+ Create New Session in this project"; non-blank means "Continue this existing sessionId"
-    var targetResumeSessionId by remember { mutableStateOf("") }
-    var showSessionDropdown by remember { mutableStateOf(false) }
-
-    var newPrompt by remember { mutableStateOf("") }
-    var isDispatching by remember { mutableStateOf(false) }
+    var showDispatchSheet by remember { mutableStateOf(false) }
+    var showMacDropSheet by remember { mutableStateOf(false) }
+    var dispatchInitialPrompt by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit, macConnected) {
         if (macConnected) coordinator.refreshAgentSessions()
     }
 
-    // Auto-select first project once catalog arrives
-    LaunchedEffect(projects) {
-        if (selectedWorkspacePath.isBlank() && projects.isNotEmpty() && !useCustomWorkspaceInput) {
-            selectedWorkspacePath = projects.first().projectPath
-        }
-    }
-
     LaunchedEffect(prefillAgentPrompt) {
         if (prefillAgentPrompt.isNotBlank()) {
-            newPrompt = prefillAgentPrompt
-            showNewTaskSheet = true
+            dispatchInitialPrompt = prefillAgentPrompt
+            activeSubView = HubSubView.AGENTS
+            showDispatchSheet = true
             onConsumePrefillAgentPrompt()
         }
     }
 
     if (selectedSession != null) {
+        BackHandler { coordinator.closeSelectedAgentSession() }
         AgentSessionDetailScreen(
             session = selectedSession!!,
             steps = selectedSteps,
@@ -392,13 +553,645 @@ fun MissionHubWorkspaceView(
                             workspacePath = selectedSession!!.workspacePath
                         )
                     }.onFailure {
-                        Toast.makeText(context, "接续失败：${it.message}", Toast.LENGTH_SHORT).show()
+                        OmsFeedbackController.show("接续失败：${it.message}", OmsToastKind.WARNING)
                     }
                 }
             }
         )
         return
     }
+
+    val pendingApprovals = remember(streamItems) {
+        streamItems.filter { it.itemType == "APPROVAL" && it.syncStatus == "PENDING_APPROVAL" }
+    }
+
+    val filteredSessions = remember(sessions, backendFilter) {
+        sessions.filter { backendFilter == "ALL" || it.backend == backendFilter }
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        // Sub-Navigation Header: [ Agent 会话 | 跨端投递箱 ]  +  [刷新] [+ 派单 / + 投递]
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OmsSlidingSegmentedBar(
+                items = listOf(
+                    OmsSegmentItem(HubSubView.AGENTS, "Agent 会话"),
+                    OmsSegmentItem(HubSubView.DROPZONE, "跨端投递箱")
+                ),
+                selected = activeSubView,
+                onSelect = { activeSubView = it },
+                height = 34.dp,
+                modifier = Modifier.width(206.dp)
+            )
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                if (activeSubView == HubSubView.AGENTS) {
+                    OmsCircleIconButton(
+                        icon = OmsIcons.Refresh,
+                        contentDescription = "刷新会话",
+                        size = 34.dp,
+                        iconSize = 16.5.dp,
+                        containerColor = palette.subtleSurface,
+                        borderColor = palette.hairline,
+                        onClick = { coordinator.refreshAgentSessions() }
+                    )
+                    OmsPrimaryButton(
+                        label = "派发任务",
+                        icon = OmsIcons.Plus,
+                        height = 34.dp,
+                        onClick = { showDispatchSheet = true }
+                    )
+                } else {
+                    OmsPrimaryButton(
+                        label = "投递至 Mac",
+                        icon = OmsIcons.Send,
+                        height = 34.dp,
+                        onClick = { showMacDropSheet = true }
+                    )
+                }
+            }
+        }
+
+        // Pinned High-Priority Remote Approval Cards
+        if (pendingApprovals.isNotEmpty()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                pendingApprovals.forEach { appr ->
+                    PinnedRemoteApprovalCard(
+                        item = appr,
+                        onDecision = { approved, opt ->
+                            val meta = runCatching { JSONObject(appr.metadataJson ?: "{}") }.getOrDefault(JSONObject())
+                            app.transportClient.sendApprovalDecision(
+                                itemId = appr.itemId,
+                                approvalId = meta.optString("approvalId", appr.itemId),
+                                approved = approved,
+                                selectedOption = opt,
+                                userComment = null
+                            )
+                        }
+                    )
+                }
+            }
+        }
+
+        if (activeSubView == HubSubView.AGENTS) {
+            // Backend Filter Strip
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OmsTogglePill("全部 (${sessions.size})", backendFilter == "ALL", onClick = { backendFilter = "ALL" })
+                OmsTogglePill("Codex", backendFilter == "codex", icon = OmsIcons.Terminal, onClick = { backendFilter = "codex" })
+                OmsTogglePill("Antigravity", backendFilter == "agy", icon = OmsIcons.Sparkles, onClick = { backendFilter = "agy" })
+            }
+
+            if (!macConnected) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(palette.warningSoft)
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(OmsIcons.Laptop, contentDescription = null, tint = palette.warning, modifier = Modifier.size(15.dp))
+                    Text(
+                        text = "当前未连通 Mac，恢复连接后可实时查看桌面轨迹或派单接续",
+                        color = palette.textSecondary,
+                        fontSize = 12.sp
+                    )
+                }
+            }
+
+            if (filteredSessions.isEmpty()) {
+                Column(
+                    modifier = Modifier.fillMaxSize().padding(32.dp),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier.size(52.dp).clip(CircleShape).background(palette.subtleSurface)
+                    ) {
+                        Icon(OmsIcons.Terminal, contentDescription = null, tint = palette.textTertiary, modifier = Modifier.size(24.dp))
+                    }
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Text("暂无活跃 Agent 会话", color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        "点击右上角「派发任务」可在任意 Mac 仓库启动 Codex 或 Antigravity",
+                        color = palette.textTertiary,
+                        fontSize = 13.sp
+                    )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 32.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(items = filteredSessions, key = { "${it.backend}:${it.sessionId}" }) { session ->
+                        AgentSessionCard(
+                            session = session,
+                            onClick = { coordinator.selectAndLoadAgentSession(session) }
+                        )
+                    }
+                }
+            }
+        } else {
+            // Sub-view 2: Cross-Device Dropzone (Replaces Legacy MainActivity Timeline!)
+            CrossDeviceDropzoneList(streamItems = streamItems)
+        }
+    }
+
+    // Half-Screen Agent Task Dispatch Sheet
+    if (showDispatchSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showDispatchSheet = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = palette.composer,
+            contentColor = palette.textPrimary,
+            shape = RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp)
+        ) {
+            AgentDispatchSheetContent(
+                coordinator = coordinator,
+                macConnected = macConnected,
+                projects = projects,
+                sessions = sessions,
+                initialPrompt = dispatchInitialPrompt,
+                onDispatched = {
+                    dispatchInitialPrompt = ""
+                    showDispatchSheet = false
+                }
+            )
+        }
+    }
+
+    // Half-Screen Cross-Device Drop-to-Mac Sheet
+    if (showMacDropSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showMacDropSheet = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = palette.composer,
+            contentColor = palette.textPrimary,
+            shape = RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp)
+        ) {
+            DropToMacSheetContent(
+                onSubmitted = { showMacDropSheet = false }
+            )
+        }
+    }
+}
+
+@Composable
+private fun PinnedRemoteApprovalCard(
+    item: StreamItemModel,
+    onDecision: (Boolean, String) -> Unit
+) {
+    val palette = OmsTheme.colors
+    val meta = remember(item.metadataJson) { runCatching { JSONObject(item.metadataJson ?: "{}") }.getOrDefault(JSONObject()) }
+    val optsArr = meta.optJSONArray("options")
+    val allowLabel = optsArr?.optString(0)?.takeIf { it.isNotBlank() } ?: "批准执行"
+    val denyLabel = optsArr?.optString(1)?.takeIf { it.isNotBlank() } ?: "拒绝"
+
+    OmsSurfaceCard(
+        containerColor = palette.warningSoft,
+        borderColor = palette.warning.copy(alpha = 0.55f),
+        cornerRadius = 18.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+            Icon(OmsIcons.Shield, contentDescription = null, tint = palette.warning, modifier = Modifier.size(16.dp))
+            Text("远程敏感操作待确认", color = palette.warning, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold)
+        }
+        if (!item.title.isNullOrBlank()) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(item.title, color = palette.textPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        }
+        if (!item.textContent.isNullOrBlank()) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(item.textContent, color = palette.textSecondary, fontSize = 13.sp, maxLines = 4, overflow = TextOverflow.Ellipsis)
+        }
+        Spacer(modifier = Modifier.height(10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            OmsPrimaryButton(
+                label = allowLabel,
+                icon = OmsIcons.Check,
+                height = 36.dp,
+                containerColor = palette.success,
+                contentColor = Color.White,
+                onClick = { onDecision(true, allowLabel) }
+            )
+            OmsSecondaryButton(
+                label = denyLabel,
+                icon = OmsIcons.Close,
+                height = 36.dp,
+                contentColor = palette.danger,
+                onClick = { onDecision(false, denyLabel) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun AgentSessionCard(session: RemoteAgentSessionUi, onClick: () -> Unit) {
+    val palette = OmsTheme.colors
+    val timeStr = remember(session.updatedAtMs) {
+        SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(Date(session.updatedAtMs))
+    }
+    val (statusText, statusColor) = when (session.status) {
+        "running" -> "运行中" to palette.success
+        "completed" -> "已完成" to palette.accent
+        "failed" -> "异常中止" to palette.danger
+        else -> "可接续" to palette.textTertiary
+    }
+
+    OmsSurfaceCard(
+        cornerRadius = 18.dp,
+        borderColor = if (session.status == "running") palette.success.copy(alpha = 0.5f) else palette.hairline,
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Icon(
+                    imageVector = if (session.backend == "codex") OmsIcons.Terminal else OmsIcons.Sparkles,
+                    contentDescription = null,
+                    tint = palette.accent,
+                    modifier = Modifier.size(14.dp)
+                )
+                Text(
+                    text = (if (session.backend == "codex") "Codex" else "Antigravity") +
+                        (if (session.origin == "mobile") " · 手机派单" else " · 桌面会话"),
+                    color = palette.textSecondary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                Box(modifier = Modifier.size(6.dp).background(statusColor, CircleShape))
+                Text(statusText, color = statusColor, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(7.dp))
+        Text(
+            text = session.title,
+            color = palette.textPrimary,
+            fontSize = 15.5.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis
+        )
+
+        if (session.lastSummary.isNotBlank()) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = session.lastSummary,
+                color = palette.textSecondary,
+                fontSize = 13.sp,
+                lineHeight = 19.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = session.workspacePath.substringAfterLast('/').ifBlank { "工作区" },
+                color = palette.textTertiary,
+                fontSize = 11.5.sp
+            )
+            Text(
+                text = timeStr,
+                color = palette.textTertiary,
+                fontSize = 11.5.sp
+            )
+        }
+    }
+}
+
+private sealed class TrajectoryDisplayItem {
+    data class SingleTurn(val step: RemoteAgentStepUi) : TrajectoryDisplayItem()
+    data class ToolAccordionGroup(val groupKey: String, val steps: List<RemoteAgentStepUi>) : TrajectoryDisplayItem()
+}
+
+private fun groupAgentTrajectorySteps(steps: List<RemoteAgentStepUi>): List<TrajectoryDisplayItem> {
+    val result = ArrayList<TrajectoryDisplayItem>()
+    val pendingTools = ArrayList<RemoteAgentStepUi>()
+
+    fun flushTools() {
+        if (pendingTools.isEmpty()) return
+        val copy = pendingTools.toList()
+        result.add(
+            TrajectoryDisplayItem.ToolAccordionGroup(
+                groupKey = "grp_${copy.first().stepIndex}_${copy.last().stepIndex}",
+                steps = copy
+            )
+        )
+        pendingTools.clear()
+    }
+
+    for (st in steps) {
+        if (st.kind == "tool" || st.kind == "thinking") {
+            pendingTools.add(st)
+        } else {
+            flushTools()
+            result.add(TrajectoryDisplayItem.SingleTurn(st))
+        }
+    }
+    flushTools()
+    return result
+}
+
+@Composable
+private fun AgentSessionDetailScreen(
+    session: RemoteAgentSessionUi,
+    steps: List<RemoteAgentStepUi>,
+    macConnected: Boolean,
+    onBack: () -> Unit,
+    onRefresh: () -> Unit,
+    onCancel: () -> Unit,
+    onContinuePrompt: (String) -> Unit
+) {
+    val palette = OmsTheme.colors
+    var followUpText by remember { mutableStateOf("") }
+    val groupedItems = remember(steps) { groupAgentTrajectorySteps(steps) }
+
+    Column(modifier = Modifier.fillMaxSize().background(palette.canvas)) {
+        // Minimalist Header
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(palette.topBar)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                OmsCircleIconButton(
+                    icon = OmsIcons.ArrowLeft,
+                    contentDescription = "返回列表",
+                    onClick = onBack
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = session.title,
+                        color = palette.textPrimary,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "${if (session.backend == "codex") "Codex" else "Antigravity"} · ${session.workspacePath.substringAfterLast('/')}",
+                        color = palette.textTertiary,
+                        fontSize = 11.5.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (session.status == "running") {
+                    OmsSecondaryButton(
+                        label = "中止",
+                        icon = OmsIcons.StopSquare,
+                        height = 32.dp,
+                        contentColor = palette.danger,
+                        onClick = onCancel
+                    )
+                }
+                OmsCircleIconButton(
+                    icon = OmsIcons.Refresh,
+                    contentDescription = "刷新轨迹",
+                    size = 34.dp,
+                    iconSize = 17.dp,
+                    onClick = onRefresh
+                )
+            }
+        }
+
+        Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
+
+        // Grouped Trajectory Stream (User Bubble + Collapsible Tool Accordion + Editorial Summary)
+        LazyColumn(
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            items(
+                items = groupedItems,
+                key = {
+                    when (it) {
+                        is TrajectoryDisplayItem.SingleTurn -> "turn_${it.step.stepIndex}_${it.step.timestampMs}"
+                        is TrajectoryDisplayItem.ToolAccordionGroup -> it.groupKey
+                    }
+                }
+            ) { item ->
+                when (item) {
+                    is TrajectoryDisplayItem.SingleTurn -> {
+                        val st = item.step
+                        if (st.kind == "user") {
+                            Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+                                Box(
+                                    modifier = Modifier
+                                        .widthIn(max = 300.dp)
+                                        .clip(RoundedCornerShape(20.dp, 20.dp, 5.dp, 20.dp))
+                                        .background(palette.userBubble)
+                                        .padding(horizontal = 15.dp, vertical = 10.dp)
+                                ) {
+                                    Text(st.detail.ifBlank { st.title }, color = palette.userBubbleText, fontSize = 15.sp, lineHeight = 22.sp)
+                                }
+                            }
+                        } else {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                if (st.title.isNotBlank()) {
+                                    Text(st.title, color = palette.textTertiary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                                }
+                                IncrementalMarkdownView(markdown = st.detail)
+                            }
+                        }
+                    }
+
+                    is TrajectoryDisplayItem.ToolAccordionGroup -> {
+                        ToolStepAccordionView(steps = item.steps)
+                    }
+                }
+            }
+        }
+
+        // Sculptural Floating Pill Resume Composer
+        val pillShape = RoundedCornerShape(24.dp)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .imePadding()
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+                .shadow(elevation = if (palette.isDark) 2.dp else 6.dp, shape = pillShape, clip = false)
+                .clip(pillShape)
+                .background(palette.composer, pillShape)
+                .border(0.65.dp, palette.strongBorder, pillShape)
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Box(modifier = Modifier.weight(1f).padding(vertical = 4.dp)) {
+                if (followUpText.isEmpty()) {
+                    Text(
+                        text = if (session.status == "running") "任务执行中，完成后可直接追问接续…" else "接续当前会话追问或下达下一步指令…",
+                        color = palette.textTertiary,
+                        fontSize = 14.5.sp
+                    )
+                }
+                BasicTextField(
+                    value = followUpText,
+                    onValueChange = { followUpText = it },
+                    textStyle = TextStyle(color = palette.textPrimary, fontSize = 15.sp, lineHeight = 21.sp),
+                    cursorBrush = SolidColor(palette.accent),
+                    maxLines = 4,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+
+            val canResume = macConnected && followUpText.isNotBlank() && session.status != "running"
+            OmsCircleIconButton(
+                icon = OmsIcons.ArrowUp,
+                contentDescription = "发送接续指令",
+                enabled = canResume,
+                size = 36.dp,
+                iconSize = 18.dp,
+                containerColor = palette.sendButtonBg,
+                contentColor = palette.sendButtonFg,
+                onClick = {
+                    val prompt = followUpText.trim()
+                    followUpText = ""
+                    onContinuePrompt(prompt)
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun ToolStepAccordionView(steps: List<RemoteAgentStepUi>) {
+    val palette = OmsTheme.colors
+    var expanded by remember { mutableStateOf(false) }
+    val toolCount = steps.count { it.kind == "tool" }
+    val thinkCount = steps.count { it.kind == "thinking" }
+    val summary = buildString {
+        append("已执行 ${steps.size} 步过程")
+        if (toolCount > 0) append(" · $toolCount 次工具操作")
+        if (thinkCount > 0) append(" · $thinkCount 段推演")
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(palette.subtleSurface)
+            .border(0.6.dp, palette.hairline, RoundedCornerShape(14.dp))
+            .padding(horizontal = 13.dp, vertical = 10.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .omsBounceClick(scaleDown = 0.98f) { expanded = !expanded },
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                Icon(OmsIcons.Bolt, contentDescription = null, tint = palette.accent, modifier = Modifier.size(15.dp))
+                Text(summary, color = palette.textSecondary, fontSize = 12.5.sp, fontWeight = FontWeight.Medium)
+            }
+            Icon(
+                imageVector = if (expanded) OmsIcons.ChevronUp else OmsIcons.ChevronDown,
+                contentDescription = null,
+                tint = palette.textTertiary,
+                modifier = Modifier.size(15.dp)
+            )
+        }
+
+        AnimatedVisibility(
+            visible = expanded,
+            enter = expandVertically(tween(180)) + fadeIn(tween(140)),
+            exit = shrinkVertically(tween(150)) + fadeOut(tween(110))
+        ) {
+            Column(
+                modifier = Modifier.padding(top = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                steps.forEach { st ->
+                    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Text(st.title, color = palette.accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            text = st.detail.trim(),
+                            color = palette.textSecondary,
+                            fontSize = 12.5.sp,
+                            lineHeight = 18.5.sp,
+                            maxLines = 12,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AgentDispatchSheetContent(
+    coordinator: CockpitRuntimeCoordinator,
+    macConnected: Boolean,
+    projects: List<com.oms.client.cockpit.RemoteAgentProjectUi>,
+    sessions: List<RemoteAgentSessionUi>,
+    initialPrompt: String,
+    onDispatched: () -> Unit
+) {
+    val palette = OmsTheme.colors
+    val scope = rememberCoroutineScope()
+    var selectedWorkspacePath by remember(projects) {
+        mutableStateOf(projects.firstOrNull()?.projectPath.orEmpty())
+    }
+    var showProjectPickerDialog by remember { mutableStateOf(false) }
+    var projectSearchText by remember { mutableStateOf("") }
+    var targetResumeSessionId by remember { mutableStateOf("") }
+    var showSessionDropdown by remember { mutableStateOf(false) }
+    var newBackend by remember { mutableStateOf("codex") }
+    var promptText by remember(initialPrompt) { mutableStateOf(initialPrompt) }
+    var isDispatching by remember { mutableStateOf(false) }
 
     val projectSessions = remember(sessions, selectedWorkspacePath) {
         val norm = selectedWorkspacePath.trim().trimEnd('/')
@@ -409,435 +1202,330 @@ fun MissionHubWorkspaceView(
         projectSessions.firstOrNull { it.sessionId == targetResumeSessionId }
     }
 
-    val filtered = remember(sessions, backendFilter, projectFilterPath) {
-        sessions.filter { s ->
-            (backendFilter == "ALL" || s.backend == backendFilter) &&
-                (projectFilterPath.isBlank() || s.workspacePath.trimEnd('/') == projectFilterPath.trimEnd('/'))
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .imePadding()
+            .padding(horizontal = 18.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text("远程派单至 Mac 重脑", color = palette.textPrimary, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+
+        // 1. Target Project Selector
+        OmsSurfaceCard(
+            containerColor = palette.subtleSurface,
+            cornerRadius = 14.dp,
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+            onClick = { showProjectPickerDialog = true },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("目标工作区", color = palette.textTertiary, fontSize = 11.sp)
+                    Text(
+                        text = selectedWorkspacePath.substringAfterLast('/').ifBlank { "点击选择 Mac 仓库…" },
+                        color = palette.textPrimary,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("${projects.size} 个仓库", color = palette.accent, fontSize = 12.sp)
+                    Icon(OmsIcons.ChevronDown, null, tint = palette.textTertiary, modifier = Modifier.size(14.dp))
+                }
+            }
+        }
+
+        // 2. Session Mode Selector (New vs Resume)
+        Box(modifier = Modifier.fillMaxWidth()) {
+            OmsSurfaceCard(
+                containerColor = palette.subtleSurface,
+                cornerRadius = 14.dp,
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+                onClick = { showSessionDropdown = true },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("会话模式", color = palette.textTertiary, fontSize = 11.sp)
+                        Text(
+                            text = if (chosenResumeSession == null) "开启全新独立会话"
+                            else "接续：${chosenResumeSession.title}",
+                            color = palette.textPrimary,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Icon(OmsIcons.ChevronDown, null, tint = palette.textTertiary, modifier = Modifier.size(14.dp))
+                }
+            }
+
+            DropdownMenu(
+                expanded = showSessionDropdown,
+                onDismissRequest = { showSessionDropdown = false },
+                modifier = Modifier.background(palette.composer).width(310.dp)
+            ) {
+                DropdownMenuItem(
+                    text = { Text("开启全新独立会话", color = palette.accent, fontWeight = FontWeight.SemiBold) },
+                    onClick = {
+                        targetResumeSessionId = ""
+                        showSessionDropdown = false
+                    }
+                )
+                projectSessions.forEach { sess ->
+                    DropdownMenuItem(
+                        text = {
+                            Column {
+                                Text(
+                                    text = "${if (sess.backend == "codex") "Codex" else "AGY"} · ${sess.title}",
+                                    color = palette.textPrimary,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                if (sess.lastSummary.isNotBlank()) {
+                                    Text(sess.lastSummary, color = palette.textTertiary, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                            }
+                        },
+                        onClick = {
+                            targetResumeSessionId = sess.sessionId
+                            newBackend = sess.backend
+                            showSessionDropdown = false
+                        }
+                    )
+                }
+            }
+        }
+
+        if (chosenResumeSession == null) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OmsTogglePill("OpenAI Codex", newBackend == "codex", icon = OmsIcons.Terminal, onClick = { newBackend = "codex" })
+                OmsTogglePill("Google Antigravity", newBackend == "agy", icon = OmsIcons.Sparkles, onClick = { newBackend = "agy" })
+            }
+        }
+
+        // 3. Borderless Task Prompt Input
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 96.dp, max = 180.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(palette.subtleSurface)
+                .border(0.6.dp, palette.hairline, RoundedCornerShape(16.dp))
+                .padding(14.dp)
+        ) {
+            if (promptText.isEmpty()) {
+                Text(
+                    text = "描述要交由 Mac 自主完成的编码、排查或知识库治理任务…",
+                    color = palette.textTertiary,
+                    fontSize = 14.5.sp
+                )
+            }
+            BasicTextField(
+                value = promptText,
+                onValueChange = { promptText = it },
+                textStyle = TextStyle(color = palette.textPrimary, fontSize = 14.5.sp, lineHeight = 21.sp),
+                cursorBrush = SolidColor(palette.accent),
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+
+        OmsPrimaryButton(
+            label = if (isDispatching) "正在派发至 Mac…" else if (chosenResumeSession != null) "发送并接续会话" else "立即启动任务",
+            icon = OmsIcons.ArrowUp,
+            enabled = macConnected && promptText.isNotBlank() && !isDispatching,
+            modifier = Modifier.fillMaxWidth(),
+            onClick = {
+                isDispatching = true
+                scope.launch {
+                    try {
+                        if (chosenResumeSession != null) {
+                            coordinator.continueRemoteAgentSession(
+                                backend = chosenResumeSession.backend,
+                                sessionId = chosenResumeSession.sessionId,
+                                prompt = promptText.trim(),
+                                workspacePath = selectedWorkspacePath.trim()
+                            )
+                        } else {
+                            coordinator.startRemoteAgentSession(
+                                backend = newBackend,
+                                prompt = promptText.trim(),
+                                workspacePath = selectedWorkspacePath.trim()
+                            )
+                        }
+                        onDispatched()
+                    } catch (e: Throwable) {
+                        OmsFeedbackController.show("派单失败：${e.message}", OmsToastKind.WARNING)
+                    } finally {
+                        isDispatching = false
+                    }
+                }
+            }
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+    }
+
+    if (showProjectPickerDialog) {
+        Dialog(onDismissRequest = { showProjectPickerDialog = false }) {
+            val visibleProjects = remember(projects, projectSearchText) {
+                val q = projectSearchText.trim().lowercase()
+                if (q.isEmpty()) projects
+                else projects.filter {
+                    it.displayName.lowercase().contains(q) ||
+                        it.projectPath.lowercase().contains(q) ||
+                        it.group.lowercase().contains(q)
+                }
+            }
+            OmsSurfaceCard(
+                containerColor = palette.composer,
+                borderColor = palette.strongBorder,
+                cornerRadius = 22.dp,
+                modifier = Modifier.fillMaxWidth().height(460.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("选择 Mac 工作区", color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                    OmsCircleIconButton(OmsIcons.Close, "关闭", size = 32.dp, iconSize = 16.dp, onClick = { showProjectPickerDialog = false })
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(palette.subtleSurface)
+                        .padding(horizontal = 12.dp, vertical = 10.dp)
+                ) {
+                    if (projectSearchText.isEmpty()) {
+                        Text("搜索仓库名或路径…", color = palette.textTertiary, fontSize = 13.5.sp)
+                    }
+                    BasicTextField(
+                        value = projectSearchText,
+                        onValueChange = { projectSearchText = it },
+                        singleLine = true,
+                        textStyle = TextStyle(color = palette.textPrimary, fontSize = 13.5.sp),
+                        cursorBrush = SolidColor(palette.accent),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+                LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(items = visibleProjects, key = { it.projectPath }) { proj ->
+                        val isSel = proj.projectPath.trimEnd('/') == selectedWorkspacePath.trimEnd('/')
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .omsBounceClick(scaleDown = 0.98f, shape = RoundedCornerShape(12.dp)) {
+                                    selectedWorkspacePath = proj.projectPath
+                                    targetResumeSessionId = ""
+                                    showProjectPickerDialog = false
+                                }
+                                .background(if (isSel) palette.accentSoft else palette.subtleSurface, RoundedCornerShape(12.dp))
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(proj.displayName, color = palette.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                Text(proj.projectPath, color = palette.textTertiary, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            if (proj.sessionCount > 0) {
+                                Text("${proj.sessionCount} 会话", color = palette.accent, fontSize = 11.5.sp, fontWeight = FontWeight.Medium)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Cross-Device Dropzone (Unified Bidirectional Phone ⇄ Mac Stream)
+// =============================================================================
+@Composable
+private fun CrossDeviceDropzoneList(streamItems: List<StreamItemModel>) {
+    val context = LocalContext.current
+    val palette = OmsTheme.colors
+    val app = OmsApplication.instance ?: return
+    var dirFilter by remember { mutableStateOf("ALL") }
+
+    val dropItems = remember(streamItems, dirFilter) {
+        streamItems.filter { item ->
+            when (dirFilter) {
+                "OUT" -> item.direction == "PHONE_TO_MAC"
+                "IN" -> item.direction == "MAC_TO_PHONE"
+                else -> true
+            }
         }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // Top Filter + Dispatch Action Bar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(Color(0xFF0D1424))
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                .padding(horizontal = 16.dp, vertical = 4.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(
-                modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                FilterPill("全部 (${sessions.size})", backendFilter == "ALL" && projectFilterPath.isBlank()) {
-                    backendFilter = "ALL"
-                    projectFilterPath = ""
-                }
-                FilterPill("🤖 Codex", backendFilter == "codex") { backendFilter = "codex" }
-                FilterPill("🌌 Antigravity", backendFilter == "agy") { backendFilter = "agy" }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OmsTogglePill("全部 (${streamItems.size})", dirFilter == "ALL", onClick = { dirFilter = "ALL" })
+                OmsTogglePill("发往 Mac", dirFilter == "OUT", onClick = { dirFilter = "OUT" })
+                OmsTogglePill("Mac 推来", dirFilter == "IN", onClick = { dirFilter = "IN" })
             }
-            Spacer(modifier = Modifier.width(6.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = "🔄",
-                    fontSize = 15.sp,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(Color(0xFF1E293B))
-                        .clickable { coordinator.refreshAgentSessions() }
-                        .padding(horizontal = 8.dp, vertical = 5.dp)
-                )
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(Color(0xFF0284C7))
-                        .clickable { showNewTaskSheet = !showNewTaskSheet }
-                        .padding(horizontal = 11.dp, vertical = 6.dp)
-                ) {
-                    Text(if (showNewTaskSheet) "收起派单" else "+ 远程派单", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            OmsCircleIconButton(
+                icon = OmsIcons.Trash,
+                contentDescription = "清理已同步历史",
+                size = 32.dp,
+                iconSize = 15.5.dp,
+                contentColor = palette.textTertiary,
+                onClick = {
+                    val removed = app.repository.clearDeliveredHistory()
+                    OmsFeedbackController.show("已清理 $removed 条已送达记录", OmsToastKind.INFO)
                 }
-            }
+            )
         }
 
-        if (!macConnected) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFF3B1D1D))
-                    .padding(horizontal = 14.dp, vertical = 7.dp)
-            ) {
-                Text("⚠️ 当前未连通 Mac omsd，连接恢复后即可实时查看桌面会话并远程派单/接续。", color = Color(0xFFFECACA), fontSize = 11.5.sp)
-            }
-        }
-
-        // Inline Smart Project & Session Dispatch Composer
-        if (showNewTaskSheet) {
-            val currentProjObj = projects.firstOrNull {
-                it.projectPath.trimEnd('/') == selectedWorkspacePath.trimEnd('/')
-            }
+        if (dropItems.isEmpty()) {
             Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 10.dp)
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(Color(0xFF131C31))
-                    .border(1.dp, Color(0xFF0284C7), RoundedCornerShape(16.dp))
-                    .padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                modifier = Modifier.fillMaxSize().padding(32.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // 1. Project Dropdown Selector
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text("📁 派单目标项目", color = Color(0xFF93C5FD), fontSize = 11.5.sp, fontWeight = FontWeight.Bold)
-                        Text(
-                            text = if (useCustomWorkspaceInput) "返回下拉选择列表" else "✏️ 手动输入路径",
-                            color = Color(0xFF38BDF8),
-                            fontSize = 11.sp,
-                            modifier = Modifier.clickable { useCustomWorkspaceInput = !useCustomWorkspaceInput }
-                        )
-                    }
-
-                    if (useCustomWorkspaceInput) {
-                        OutlinedTextField(
-                            value = selectedWorkspacePath,
-                            onValueChange = {
-                                selectedWorkspacePath = it
-                                targetResumeSessionId = ""
-                            },
-                            placeholder = { Text("输入 Mac 目录路径（如 ~/x_project/one_more_step）", color = Color(0xFF64748B), fontSize = 12.sp) },
-                            singleLine = true,
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White
-                            ),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    } else {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(Color(0xFF0B1120))
-                                .border(1.dp, Color(0xFF334155), RoundedCornerShape(10.dp))
-                                .clickable { showProjectPickerDialog = true }
-                                .padding(horizontal = 12.dp, vertical = 10.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = currentProjObj?.let { "${it.displayName}  (${it.group})" }
-                                        ?: selectedWorkspacePath.substringAfterLast('/').ifBlank { "点击选择 Mac 项目…" },
-                                    color = Color.White,
-                                    fontSize = 13.5.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                if (selectedWorkspacePath.isNotBlank()) {
-                                    Text(
-                                        text = selectedWorkspacePath,
-                                        color = Color(0xFF64748B),
-                                        fontSize = 11.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                            }
-                            Text(
-                                text = "共 ${projects.size} 个项目 ▼",
-                                color = Color(0xFF38BDF8),
-                                fontSize = 11.5.sp,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                        }
-                    }
-                }
-
-                // 2. Session Mode Selector: New Session vs Continue Existing Project Session!
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("💬 执行会话（新建会话 或 接续该项目已有会话）", color = Color(0xFF93C5FD), fontSize = 11.5.sp, fontWeight = FontWeight.Bold)
-                    Box(modifier = Modifier.fillMaxWidth()) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(Color(0xFF0B1120))
-                                .border(1.dp, Color(0xFF334155), RoundedCornerShape(10.dp))
-                                .clickable { showSessionDropdown = true }
-                                .padding(horizontal = 12.dp, vertical = 10.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                if (chosenResumeSession == null) {
-                                    Text("✨ 在此项目中开启新会话", color = Color(0xFF6EE7B7), fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                                    Text("该目录下现有 ${projectSessions.size} 个历史/活跃会话可供接续", color = Color(0xFF64748B), fontSize = 11.sp)
-                                } else {
-                                    Text(
-                                        text = "🔄 接续：${chosenResumeSession.title}",
-                                        color = Color(0xFFFDE047),
-                                        fontSize = 13.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    Text(
-                                        text = "${if (chosenResumeSession.backend == "codex") "🤖 Codex" else "🌌 Antigravity"} · ${chosenResumeSession.lastSummary.take(46)}",
-                                        color = Color(0xFF94A3B8),
-                                        fontSize = 11.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                            }
-                            Text("选择 ▼", color = Color(0xFF38BDF8), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                        }
-
-                        DropdownMenu(
-                            expanded = showSessionDropdown,
-                            onDismissRequest = { showSessionDropdown = false },
-                            modifier = Modifier
-                                .background(Color(0xFF0F172A))
-                                .width(330.dp)
-                        ) {
-                            DropdownMenuItem(
-                                text = {
-                                    Column {
-                                        Text("✨ 在此项目中开启新会话", color = Color(0xFF6EE7B7), fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                                        Text("不复用旧上下文，启动全新的独立 Agent 任务", color = Color(0xFF94A3B8), fontSize = 11.sp)
-                                    }
-                                },
-                                onClick = {
-                                    targetResumeSessionId = ""
-                                    showSessionDropdown = false
-                                }
-                            )
-                            projectSessions.forEach { sess ->
-                                DropdownMenuItem(
-                                    text = {
-                                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                            Text(
-                                                text = "${if (sess.backend == "codex") "🤖 Codex" else "🌌 AGY"} · ${sess.title}",
-                                                color = Color.White,
-                                                fontSize = 12.5.sp,
-                                                fontWeight = FontWeight.SemiBold,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                            Text(
-                                                text = sess.lastSummary.ifBlank { "点击选择接续此会话" },
-                                                color = Color(0xFF94A3B8),
-                                                fontSize = 11.sp,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                        }
-                                    },
-                                    onClick = {
-                                        targetResumeSessionId = sess.sessionId
-                                        newBackend = sess.backend
-                                        showSessionDropdown = false
-                                    }
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // 3. Agent Backend Picker (active when starting a new session)
-                if (chosenResumeSession == null) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterPill("🤖 OpenAI Codex", newBackend == "codex") { newBackend = "codex" }
-                        FilterPill("🌌 Google Antigravity", newBackend == "agy") { newBackend = "agy" }
-                    }
-                }
-
-                // 4. Task Prompt Input
-                OutlinedTextField(
-                    value = newPrompt,
-                    onValueChange = { newPrompt = it },
-                    placeholder = {
-                        Text(
-                            text = if (chosenResumeSession != null) "输入接续该会话的追问、修改意见或下一步指令…"
-                            else "输入要让 Mac Agent 自主完成的编码、检索或知识库治理任务…",
-                            color = Color(0xFF64748B),
-                            fontSize = 13.sp
-                        )
-                    },
-                    minLines = 3,
-                    maxLines = 6,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White
-                    ),
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                Button(
-                    enabled = macConnected && newPrompt.isNotBlank() && !isDispatching,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (chosenResumeSession != null) Color(0xFF059669) else Color(0xFF0284C7),
-                        disabledContainerColor = Color(0xFF1E293B),
-                        disabledContentColor = Color(0xFF94A3B8)
-                    ),
-                    modifier = Modifier.fillMaxWidth(),
-                    onClick = {
-                        isDispatching = true
-                        scope.launch {
-                            try {
-                                if (chosenResumeSession != null) {
-                                    coordinator.continueRemoteAgentSession(
-                                        backend = chosenResumeSession.backend,
-                                        sessionId = chosenResumeSession.sessionId,
-                                        prompt = newPrompt.trim(),
-                                        workspacePath = selectedWorkspacePath.trim()
-                                    )
-                                } else {
-                                    coordinator.startRemoteAgentSession(
-                                        backend = newBackend,
-                                        prompt = newPrompt.trim(),
-                                        workspacePath = selectedWorkspacePath.trim()
-                                    )
-                                }
-                                newPrompt = ""
-                                showNewTaskSheet = false
-                            } catch (e: Throwable) {
-                                Toast.makeText(context, "派单失败：${e.message}", Toast.LENGTH_SHORT).show()
-                            } finally {
-                                isDispatching = false
-                            }
-                        }
-                    }
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier.size(52.dp).clip(CircleShape).background(palette.subtleSurface)
                 ) {
-                    Text(
-                        text = when {
-                            isDispatching -> "🚀 正在派发至 Mac…"
-                            chosenResumeSession != null -> "🚀 发送并接续所选会话"
-                            newPrompt.isBlank() -> "🚀 请先输入任务内容后派发"
-                            else -> "🚀 立即在所选项目启动新会话"
-                        },
-                        fontWeight = FontWeight.Bold
-                    )
+                    Icon(OmsIcons.Send, contentDescription = null, tint = palette.textTertiary, modifier = Modifier.size(22.dp))
                 }
-            }
-        }
-
-        // Searchable Project Picker Modal
-        if (showProjectPickerDialog) {
-            Dialog(onDismissRequest = { showProjectPickerDialog = false }) {
-                val visibleProjects = remember(projects, projectSearchText) {
-                    val q = projectSearchText.trim().lowercase()
-                    if (q.isEmpty()) projects
-                    else projects.filter {
-                        it.displayName.lowercase().contains(q) ||
-                            it.projectPath.lowercase().contains(q) ||
-                            it.group.lowercase().contains(q)
-                    }
-                }
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(480.dp)
-                        .clip(RoundedCornerShape(18.dp))
-                        .background(Color(0xFF0F172A))
-                        .border(1.dp, Color(0xFF334155), RoundedCornerShape(18.dp))
-                        .padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("📁 选择 Mac 项目仓库", color = Color.White, fontSize = 15.5.sp, fontWeight = FontWeight.Bold)
-                        Text(
-                            text = "✕ 关闭",
-                            color = Color(0xFF94A3B8),
-                            fontSize = 13.sp,
-                            modifier = Modifier.clickable { showProjectPickerDialog = false }
-                        )
-                    }
-                    OutlinedTextField(
-                        value = projectSearchText,
-                        onValueChange = { projectSearchText = it },
-                        placeholder = { Text("🔍 搜索项目名（如 one_more_step / work / vpn）", color = Color(0xFF64748B), fontSize = 12.sp) },
-                        singleLine = true,
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    LazyColumn(
-                        modifier = Modifier.weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        items(items = visibleProjects, key = { it.projectPath }) { proj ->
-                            val isSelected = proj.projectPath.trimEnd('/') == selectedWorkspacePath.trimEnd('/')
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(if (isSelected) Color(0xFF1E3A8A) else Color(0xFF131C31))
-                                    .clickable {
-                                        selectedWorkspacePath = proj.projectPath
-                                        targetResumeSessionId = ""
-                                        showProjectPickerDialog = false
-                                    }
-                                    .padding(horizontal = 12.dp, vertical = 9.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = "📁 ${proj.displayName}",
-                                        color = Color.White,
-                                        fontSize = 13.5.sp,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Text(
-                                        text = "${proj.group} · ${proj.projectPath}",
-                                        color = Color(0xFF94A3B8),
-                                        fontSize = 10.5.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                                if (proj.sessionCount > 0) {
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(10.dp))
-                                            .background(Color(0xFF064E3B))
-                                            .padding(horizontal = 8.dp, vertical = 3.dp)
-                                    ) {
-                                        Text("${proj.sessionCount} 会话", color = Color(0xFF6EE7B7), fontSize = 10.5.sp, fontWeight = FontWeight.Bold)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (filtered.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("🕹️ 暂无活跃会话，点击右上角「+ 远程派单」或刷新桌面任务", color = Color(0xFF64748B), fontSize = 13.sp)
+                Spacer(modifier = Modifier.height(14.dp))
+                Text("跨端投递箱为空", color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(modifier = Modifier.height(6.dp))
+                Text("支持将多张照片、PDF/Office、剪贴板或闪念一键加密投递至 Mac", color = palette.textTertiary, fontSize = 13.sp)
             }
         } else {
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(14.dp),
+                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 32.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                items(items = filtered, key = { "${it.backend}:${it.sessionId}" }) { session ->
-                    AgentSessionCard(
-                        session = session,
-                        onClick = { coordinator.selectAndLoadAgentSession(session) }
-                    )
+                items(items = dropItems, key = { it.itemId }) { item ->
+                    RefinedDropzoneItemCard(item = item, context = context)
                 }
             }
         }
@@ -845,213 +1533,335 @@ fun MissionHubWorkspaceView(
 }
 
 @Composable
-private fun AgentSessionCard(session: RemoteAgentSessionUi, onClick: () -> Unit) {
-    val timeStr = remember(session.updatedAtMs) {
-        SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(Date(session.updatedAtMs))
+private fun RefinedDropzoneItemCard(item: StreamItemModel, context: Context) {
+    val palette = OmsTheme.colors
+    val app = OmsApplication.instance ?: return
+    val isFromPhone = item.direction == "PHONE_TO_MAC"
+    var expanded by remember(item.itemId) { mutableStateOf(false) }
+
+    val isAudio = remember(item.localFileUri) {
+        val u = item.localFileUri?.lowercase().orEmpty()
+        u.endsWith(".m4a") || u.endsWith(".mp3") || u.endsWith(".wav") || u.endsWith(".aac")
     }
-    val statusBadge = when (session.status) {
-        "running" -> "🟢 运行中" to Color(0xFF34D399)
-        "completed" -> "✅ 已完成" to Color(0xFF38BDF8)
-        "failed" -> "⚠️ 异常/中止" to Color(0xFFF87171)
-        else -> "⏸ 可接续" to Color(0xFF94A3B8)
+    var isPlayingAudio by remember(item.itemId) { mutableStateOf(VoiceRecorderHelper.playingItemId == item.itemId) }
+
+    val timeStr = remember(item.createdAtMs) {
+        SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(Date(item.createdAtMs))
     }
+    val (statusLabel, statusColor) = when (item.syncStatus) {
+        "DELIVERED" -> "已送达" to palette.success
+        "QUEUED" -> "待连接补发" to palette.warning
+        "FAILED" -> "发送失败" to palette.danger
+        else -> item.syncStatus to palette.textTertiary
+    }
+
+    val otpCode = remember(item.metadataJson, item.intentTag, item.textContent) {
+        runCatching {
+            item.metadataJson?.let { JSONObject(it).optString("otpCode", "") }?.takeIf { it.isNotBlank() }
+        }.getOrNull() ?: if (item.intentTag == "sms_otp") {
+            OtpExtractor.extractOtp(item.textContent, item.title)?.code
+        } else null
+    }
+
+    OmsSurfaceCard(
+        cornerRadius = 16.dp,
+        contentPadding = PaddingValues(14.dp),
+        onClick = { expanded = !expanded },
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Icon(
+                    imageVector = if (isFromPhone) OmsIcons.Send else OmsIcons.Laptop,
+                    contentDescription = null,
+                    tint = palette.accent,
+                    modifier = Modifier.size(13.5.dp)
+                )
+                Text(
+                    text = if (isFromPhone) "手机 ➔ Mac · #${item.intentTag}" else "Mac ➔ 手机",
+                    color = palette.textSecondary,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+            Text("$statusLabel · $timeStr", color = statusColor, fontSize = 11.sp)
+        }
+
+        if (!item.title.isNullOrBlank()) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = item.title,
+                color = palette.textPrimary,
+                fontSize = 14.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = if (expanded) 4 else 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        val body = item.textContent ?: item.voiceTranscript ?: item.macSavedPath ?: ""
+        if (body.isNotBlank()) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = body,
+                color = palette.textSecondary,
+                fontSize = 13.sp,
+                lineHeight = 19.sp,
+                maxLines = if (expanded) 30 else 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        if (item.syncStatus == "FAILED") {
+            val failedMeta = runCatching { JSONObject(item.metadataJson ?: "{}") }.getOrDefault(JSONObject())
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                Text(failedMeta.optString("failureReason", "发送未成功"), color = palette.danger, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                if (failedMeta.optString("failureCode") == "INBOX_QUOTA") {
+                    OmsSecondaryButton(
+                        label = "重试",
+                        height = 30.dp,
+                        onClick = { app.transportClient.retryQuotaRejectedItem(item.itemId) }
+                    )
+                }
+            }
+        }
+
+        // Compact Icon Action Strip
+        Spacer(modifier = Modifier.height(6.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                val copyable = otpCode ?: item.textContent ?: item.voiceTranscript ?: item.macSavedPath
+                if (!copyable.isNullOrBlank()) {
+                    OmsMorphIconAction(
+                        icon = OmsIcons.Copy,
+                        contentDescription = "复制",
+                        onClick = {
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("OMS", copyable))
+                            OmsFeedbackController.show(
+                                if (otpCode != null) "已复制验证码 $otpCode" else "已复制内容",
+                                OmsToastKind.SUCCESS
+                            )
+                        }
+                    )
+                }
+                if (isAudio && item.localFileUri != null) {
+                    OmsCircleIconButton(
+                        icon = if (isPlayingAudio) OmsIcons.StopSquare else OmsIcons.Play,
+                        contentDescription = "播放语音",
+                        size = 30.dp,
+                        iconSize = 15.dp,
+                        contentColor = palette.accent,
+                        onClick = {
+                            if (isPlayingAudio) {
+                                VoiceRecorderHelper.stopPlayback()
+                                isPlayingAudio = false
+                            } else {
+                                isPlayingAudio = VoiceRecorderHelper.playAudio(context, item.itemId, item.localFileUri) {
+                                    isPlayingAudio = false
+                                }
+                            }
+                        }
+                    )
+                }
+            }
+            OmsCircleIconButton(
+                icon = OmsIcons.Trash,
+                contentDescription = "删除记录",
+                size = 30.dp,
+                iconSize = 15.dp,
+                contentColor = palette.textTertiary,
+                onClick = { app.repository.deleteStreamItem(item.itemId) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun DropToMacSheetContent(onSubmitted: () -> Unit) {
+    val context = LocalContext.current
+    val palette = OmsTheme.colors
+    val app = OmsApplication.instance ?: return
+
+    var noteText by remember { mutableStateOf("") }
+    var selectedTag by remember { mutableStateOf("default_inbox") }
+    val stagedUris = remember { mutableStateListOf<Uri>() }
+    var isRecording by remember { mutableStateOf(false) }
+
+    val photoLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(AttachmentBudget.MAX_COUNT)
+    ) { uris ->
+        val next = (stagedUris + uris).distinct()
+        val err = AttachmentResolver.selectionError(context, next)
+        if (err != null) OmsFeedbackController.show(err, OmsToastKind.WARNING)
+        else {
+            stagedUris.clear()
+            stagedUris.addAll(next)
+        }
+    }
+
+    val docLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        val next = (stagedUris + uris).distinct()
+        val err = AttachmentResolver.selectionError(context, next)
+        if (err != null) OmsFeedbackController.show(err, OmsToastKind.WARNING)
+        else {
+            stagedUris.clear()
+            stagedUris.addAll(next)
+        }
+    }
+
+    val micPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+        if (ok && VoiceRecorderHelper.startRecording(context) != null) isRecording = true
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(15.dp))
-            .background(Color(0xFF131C31))
-            .border(
-                1.dp,
-                if (session.status == "running") Color(0xFF10B981) else Color(0xFF1E293B),
-                RoundedCornerShape(15.dp)
-            )
-            .clickable { onClick() }
-            .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp)
+            .navigationBarsPadding()
+            .imePadding()
+            .padding(horizontal = 18.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        Text("加密投递至 Mac 收件箱", color = palette.textPrimary, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+
         Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = (if (session.backend == "codex") "🤖 Codex" else "🌌 Antigravity") +
-                    (if (session.origin == "mobile") " · 📱手机派单" else " · 🖥桌面会话"),
-                color = Color(0xFF7DD3FC),
-                fontSize = 11.5.sp,
-                fontWeight = FontWeight.Bold
-            )
-            Text(statusBadge.first, color = statusBadge.second, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
-        }
-        Text(session.title, color = Color(0xFFF8FAFC), fontSize = 15.sp, fontWeight = FontWeight.Bold, maxLines = 2)
-        if (session.lastSummary.isNotBlank()) {
-            Text(session.lastSummary, color = Color(0xFFCBD5E1), fontSize = 12.5.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-        }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(session.workspacePath.substringAfterLast('/'), color = Color(0xFF64748B), fontSize = 11.sp)
-            Text("$timeStr · 点击盯盘或接续 →", color = Color(0xFF64748B), fontSize = 11.sp)
-        }
-    }
-}
-
-@Composable
-private fun AgentSessionDetailScreen(
-    session: RemoteAgentSessionUi,
-    steps: List<com.oms.client.cockpit.RemoteAgentStepUi>,
-    macConnected: Boolean,
-    onBack: () -> Unit,
-    onRefresh: () -> Unit,
-    onCancel: () -> Unit,
-    onContinuePrompt: (String) -> Unit
-) {
-    var followUpText by remember { mutableStateOf("") }
-
-    Column(modifier = Modifier.fillMaxSize()) {
-        // Detail Header
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xFF0D1424))
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "← 返回任务列表",
-                color = Color(0xFF38BDF8),
-                fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.clickable { onBack() }
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                if (session.status == "running") {
-                    Text(
-                        text = "⏹ 中止",
-                        color = Color(0xFFF87171),
-                        fontSize = 12.5.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.clickable { onCancel() }
-                    )
-                }
-                Text(
-                    text = "🔄 刷新轨迹",
-                    color = Color(0xFF94A3B8),
-                    fontSize = 12.5.sp,
-                    modifier = Modifier.clickable { onRefresh() }
-                )
-            }
-        }
-
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xFF131C31))
-                .padding(horizontal = 14.dp, vertical = 10.dp)
-        ) {
-            Text(
-                text = "${if (session.backend == "codex") "🤖 Codex" else "🌌 Antigravity"} · ${session.title}",
-                color = Color.White,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                text = "ID: ${session.sessionId.take(20)} ｜ 目录: ${session.workspacePath}",
-                color = Color(0xFF64748B),
-                fontSize = 11.sp
-            )
-        }
-
-        // Trajectory Step Timeline
-        LazyColumn(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth(),
-            contentPadding = PaddingValues(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            items(items = steps, key = { "${it.stepIndex}_${it.timestampMs}" }) { st ->
-                val bgColor = when (st.kind) {
-                    "user" -> Color(0xFF0C4A6E)
-                    "thinking" -> Color(0xFF1E1B4B)
-                    "tool" -> Color(0xFF0F2922)
-                    else -> Color(0xFF131C31)
-                }
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(bgColor)
-                        .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(12.dp))
-                        .padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    Text(st.title, color = Color(0xFF7DD3FC), fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                    IncrementalMarkdownView(markdown = st.detail)
-                }
-            }
-        }
-
-        // Cross-Device Session Resume Bar (`codex exec resume` / `agy --conversation`)
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xFF0D1424))
-                .padding(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            OutlinedTextField(
-                value = followUpText,
-                onValueChange = { followUpText = it },
-                placeholder = {
-                    Text(
-                        text = if (session.backend == "codex") "接续此 Codex 会话继续追问或改代码…"
-                        else "接续此 Antigravity 会话继续追问…",
-                        color = Color(0xFF64748B),
-                        fontSize = 13.sp
-                    )
-                },
-                maxLines = 4,
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedTextColor = Color.White,
-                    unfocusedTextColor = Color.White
-                ),
-                shape = RoundedCornerShape(18.dp),
-                modifier = Modifier.weight(1f)
-            )
-            Button(
-                enabled = macConnected && followUpText.isNotBlank() && session.status != "running",
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
-                onClick = {
-                    val prompt = followUpText.trim()
-                    followUpText = ""
-                    onContinuePrompt(prompt)
-                }
-            ) {
-                Text("接续")
+            listOf(
+                "default_inbox" to "默认收件箱",
+                "pkb_vault" to "存个人知识库",
+                "voice_idea" to "灵感闪念",
+                "ui_bug" to "界面问题"
+            ).forEach { (tag, label) ->
+                OmsTogglePill(label, selectedTag == tag, onClick = { selectedTag = tag })
             }
         }
-    }
-}
 
-@Composable
-private fun FilterPill(label: String, selected: Boolean, onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(14.dp))
-            .background(if (selected) Color(0xFF1E3A8A) else Color(0xFF162032))
-            .border(1.dp, if (selected) Color(0xFF38BDF8) else Color(0xFF283548), RoundedCornerShape(14.dp))
-            .clickable { onClick() }
-            .padding(horizontal = 10.dp, vertical = 5.dp)
-    ) {
-        Text(
-            text = label,
-            color = if (selected) Color.White else Color(0xFF94A3B8),
-            fontSize = 11.5.sp,
-            fontWeight = FontWeight.Medium
-        )
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            OmsSecondaryButton(
+                label = "相册多选",
+                icon = OmsIcons.Image,
+                modifier = Modifier.weight(1f),
+                onClick = { photoLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) }
+            )
+            OmsSecondaryButton(
+                label = "选择文档",
+                icon = OmsIcons.FileText,
+                modifier = Modifier.weight(1f),
+                onClick = { docLauncher.launch(arrayOf("*/*")) }
+            )
+        }
+
+        if (stagedUris.isNotEmpty()) {
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                stagedUris.forEach { uri ->
+                    val meta = remember(uri) { AttachmentResolver.describeUri(context, uri) }
+                    OmsTogglePill(
+                        label = "${meta.safeFileName.take(18)} ×",
+                        active = true,
+                        icon = OmsIcons.Paperclip,
+                        onClick = { stagedUris.remove(uri) }
+                    )
+                }
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 84.dp, max = 160.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(palette.subtleSurface)
+                .border(0.6.dp, palette.hairline, RoundedCornerShape(16.dp))
+                .padding(14.dp)
+        ) {
+            if (noteText.isEmpty()) {
+                Text("输入文字或补充附件说明…", color = palette.textTertiary, fontSize = 14.5.sp)
+            }
+            BasicTextField(
+                value = noteText,
+                onValueChange = { noteText = it },
+                textStyle = TextStyle(color = palette.textPrimary, fontSize = 14.5.sp, lineHeight = 21.sp),
+                cursorBrush = SolidColor(palette.accent),
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            OmsSecondaryButton(
+                label = if (isRecording) "结束并发送语音" else "录制语音闪念",
+                icon = if (isRecording) OmsIcons.StopSquare else OmsIcons.Mic,
+                contentColor = if (isRecording) palette.danger else palette.textPrimary,
+                onClick = {
+                    if (!isRecording) {
+                        val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                        if (granted) {
+                            if (VoiceRecorderHelper.startRecording(context) != null) isRecording = true
+                        } else micPerm.launch(Manifest.permission.RECORD_AUDIO)
+                    } else {
+                        isRecording = false
+                        val stopped = VoiceRecorderHelper.stopRecording()
+                        if (stopped != null) {
+                            val sec = ((stopped.second + 500L) / 1000L).toInt().coerceAtLeast(1)
+                            app.transportClient.submitItemToMacOrQueue(
+                                intentTag = if (selectedTag == "default_inbox") "voice_idea" else selectedTag,
+                                itemType = "VOICE_IDEA",
+                                title = "手机语音消息 (${sec}s)",
+                                textContent = noteText.trim().ifEmpty { null },
+                                voiceTranscript = null,
+                                fileUri = Uri.fromFile(stopped.first)
+                            )
+                            OmsFeedbackController.show("已发送 ${sec}s 语音至 Mac", OmsToastKind.SUCCESS)
+                            onSubmitted()
+                        }
+                    }
+                }
+            )
+
+            OmsPrimaryButton(
+                label = if (stagedUris.isNotEmpty()) "发送 (${stagedUris.size})" else "立即投递",
+                icon = OmsIcons.ArrowUp,
+                enabled = noteText.isNotBlank() || stagedUris.isNotEmpty(),
+                modifier = Modifier.weight(1f),
+                onClick = {
+                    val txt = noteText.trim()
+                    val attached = stagedUris.toList()
+                    val metas = attached.map { AttachmentResolver.describeUri(context, it) }
+                    val itemType = if (attached.isNotEmpty()) AttachmentResolver.inferItemType(metas.map { it.mimeType }) else "TEXT"
+                    val title = when {
+                        metas.size == 1 -> metas.first().safeFileName
+                        metas.size > 1 -> "${metas.first().safeFileName} 等 ${metas.size} 个附件"
+                        else -> txt.take(28)
+                    }
+                    app.transportClient.submitItemToMacOrQueue(
+                        intentTag = selectedTag,
+                        itemType = itemType,
+                        title = title,
+                        textContent = txt.ifEmpty { null },
+                        voiceTranscript = null,
+                        fileUri = attached.firstOrNull(),
+                        additionalFileUris = if (attached.size > 1) attached.drop(1) else emptyList()
+                    )
+                    OmsFeedbackController.show("已投递至 Mac 收件箱", OmsToastKind.SUCCESS)
+                    onSubmitted()
+                }
+            )
+        }
+        Spacer(modifier = Modifier.height(6.dp))
     }
 }

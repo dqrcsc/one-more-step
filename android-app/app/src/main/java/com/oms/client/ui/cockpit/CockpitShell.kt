@@ -1,44 +1,75 @@
 package com.oms.client.ui.cockpit
 
+import android.graphics.BitmapFactory
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -46,8 +77,36 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.oms.client.OmsApplication
+import com.oms.client.agent.OmsAccessibilityService
+import com.oms.client.capability.NotificationExecutor
+import com.oms.client.cockpit.ChatMessageModel
+import com.oms.client.cockpit.ChatThreadModel
+import com.oms.client.cockpit.CockpitRuntimeCoordinator
 import com.oms.client.edge.StandbyLeaseState
+import com.oms.client.transport.OtaUiState
+import com.oms.client.ui.theme.OmsAppearanceMode
+import com.oms.client.ui.theme.OmsCircleIconButton
+import com.oms.client.ui.theme.OmsFeedbackController
+import com.oms.client.ui.theme.OmsFloatingToastHost
+import com.oms.client.ui.theme.OmsIcons
+import com.oms.client.ui.theme.OmsPrimaryButton
+import com.oms.client.ui.theme.OmsSecondaryButton
+import com.oms.client.ui.theme.OmsSegmentItem
+import com.oms.client.ui.theme.OmsSlidingSegmentedBar
+import com.oms.client.ui.theme.OmsSurfaceCard
+import com.oms.client.ui.theme.OmsTheme
+import com.oms.client.ui.theme.OmsThemeController
+import com.oms.client.ui.theme.OmsThemeStyle
+import com.oms.client.ui.theme.OmsToastKind
+import com.oms.client.ui.theme.omsBounceClick
+import com.oms.client.ui.theme.omsCombinedBounce
+import com.oms.core.ai.FieldGuideSpecimenCard
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.util.Calendar
 
 enum class CockpitTab {
     CHAT,
@@ -56,16 +115,19 @@ enum class CockpitTab {
 }
 
 /**
- * Root 3-Workspace Cockpit Shell for 青简·咫尺 v2.0 (`✦ 对话 | 📖 尺素 | 🕹️ 任务舱`),
- * plus swipeable Global FTS Search & Thread History Drawer, Glass Camera / Live Voice Modals,
- * and 1-tap System Pairing & Diagnostics Console Sheet.
+ * v3.0 Root Flagship Shell (`对话 · 尺素 · 协同`), Form A Minimalist TopBar,
+ * ChatGPT-Grade Gesture History Drawer, Ambient Status Pill, and Global Commute Mini-Player.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun OmsCockpitRootScreen(legacySystemConsoleContent: @Composable () -> Unit) {
+fun OmsCockpitRootScreen() {
+    val context = LocalContext.current
+    val palette = OmsTheme.colors
     val app = OmsApplication.instance ?: return
     val coordinator = app.cockpitCoordinator
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+    val themeSettings by OmsThemeController.settingsFlow.collectAsState()
 
     val activeTier by app.transportClient.activeTierFlow.collectAsState()
     val streamItems by app.repository.itemsFlow.collectAsState()
@@ -73,18 +135,42 @@ fun OmsCockpitRootScreen(legacySystemConsoleContent: @Composable () -> Unit) {
     val threads by coordinator.chatRepo.threadsFlow.collectAsState()
     val activeThreadId by coordinator.chatRepo.activeThreadIdFlow.collectAsState()
     val agentSessions by coordinator.agentSessionsFlow.collectAsState()
+    val otaState by app.transportClient.otaStateFlow.collectAsState()
+    val isSpeakingTts by NotificationExecutor.isSpeakingFlow.collectAsState()
+    val speakingTtsText by NotificationExecutor.speakingTextFlow.collectAsState()
 
     var currentTab by remember { mutableStateOf(CockpitTab.CHAT) }
     var showBotanicalCamera by remember { mutableStateOf(false) }
     var showLiveVoiceModal by remember { mutableStateOf(false) }
     var liveModalInitialGlass by remember { mutableStateOf(false) }
-    var showSystemConsoleDialog by remember { mutableStateOf(false) }
-    var initialSettingsTab by remember { mutableStateOf(SettingsStudioTab.PROXY_TUNNEL) }
+    var showSettingsModal by remember { mutableStateOf(false) }
+    var initialSettingsTab by remember { mutableStateOf(SettingsStudioTab.APPEARANCE) }
+    var showQuickThemeSheet by remember { mutableStateOf(false) }
+    var showSpecimenGallery by remember { mutableStateOf(false) }
 
     var searchQuery by remember { mutableStateOf("") }
     var chatPrefillDraft by remember { mutableStateOf("") }
     var agentPrefillDraft by remember { mutableStateOf("") }
-    var forceAwayStandby by remember { mutableStateOf(app.edgeStore.isForceAwayStandbyEnabled()) }
+    var renamingThread by remember { mutableStateOf<ChatThreadModel?>(null) }
+    var renameInput by remember { mutableStateOf("") }
+
+    var isGuiEmergencyStopped by remember {
+        mutableStateOf(OmsAccessibilityService.instance?.isEmergencyStopped() == true)
+    }
+    LaunchedEffect(Unit) {
+        while (true) {
+            isGuiEmergencyStopped = OmsAccessibilityService.instance?.isEmergencyStopped() == true
+            delay(1200L)
+        }
+    }
+
+    // Predictive Back Gesture handling for Drawer and Secondary Tabs
+    BackHandler(enabled = drawerState.isOpen) {
+        scope.launch { drawerState.close() }
+    }
+    BackHandler(enabled = !drawerState.isOpen && currentTab != CockpitTab.CHAT) {
+        currentTab = CockpitTab.CHAT
+    }
 
     val pendingApprovalsCount = remember(streamItems) {
         streamItems.count { it.itemType == "APPROVAL" && it.syncStatus == "PENDING_APPROVAL" }
@@ -93,302 +179,626 @@ fun OmsCockpitRootScreen(legacySystemConsoleContent: @Composable () -> Unit) {
         agentSessions.count { it.status == "running" }
     }
 
-    ModalNavigationDrawer(
-        drawerState = drawerState,
-        drawerContent = {
-            ModalDrawerSheet(
-                drawerContainerColor = Color(0xFF0B1120),
-                modifier = Modifier.width(305.dp)
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxHeight()
-                        .padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+    val connectionDotColor = when {
+        activeTier != "DISCONNECTED" -> palette.success
+        standbyLease == StandbyLeaseState.ACTIVE_POLLING -> palette.accent
+        app.proxyManager.hasAvailableNodes() -> palette.textTertiary
+        else -> palette.warning
+    }
+
+    Box(modifier = Modifier.fillMaxSize().background(palette.canvas)) {
+        ModalNavigationDrawer(
+            drawerState = drawerState,
+            drawerContent = {
+                ModalDrawerSheet(
+                    drawerContainerColor = palette.drawer,
+                    drawerContentColor = palette.textPrimary,
+                    modifier = Modifier.width(308.dp)
                 ) {
-                    Text("✦ 咫尺记忆与历史", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-
-                    // New Thread + Incognito Row
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                        Button(
-                            onClick = {
-                                coordinator.chatRepo.createNewThread(incognito = false)
-                                currentTab = CockpitTab.CHAT
-                                scope.launch { drawerState.close() }
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
-                            modifier = Modifier.weight(1f)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .statusBarsPadding()
+                            .navigationBarsPadding()
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        // 1. Top Search Pill + 1-Tap Incognito Button
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text("+ 新对话", fontSize = 12.5.sp)
-                        }
-                        OutlinedButton(
-                            onClick = {
-                                coordinator.chatRepo.createNewThread(incognito = true)
-                                currentTab = CockpitTab.CHAT
-                                scope.launch { drawerState.close() }
-                            }
-                        ) {
-                            Text("🕵️ 无痕", color = Color(0xFFF5D0FE), fontSize = 12.5.sp)
-                        }
-                    }
-
-                    // Instant SQLite FTS Global Search
-                    OutlinedTextField(
-                        value = searchQuery,
-                        onValueChange = { searchQuery = it },
-                        placeholder = { Text("🔍 全文检索历史对话…", color = Color(0xFF64748B), fontSize = 12.5.sp) },
-                        singleLine = true,
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
-                        ),
-                        shape = RoundedCornerShape(14.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    if (searchQuery.isNotBlank()) {
-                        val hits = remember(searchQuery, threads) {
-                            coordinator.chatRepo.searchGlobalMessages(searchQuery, limit = 25)
-                        }
-                        Text("命中 ${hits.size} 条记录", color = Color(0xFF7DD3FC), fontSize = 11.sp)
-                        LazyColumn(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            items(items = hits, key = { it.messageId }) { hit ->
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(10.dp))
-                                        .background(Color(0xFF131C31))
-                                        .clickable {
-                                            coordinator.chatRepo.selectThread(hit.threadId)
-                                            currentTab = CockpitTab.CHAT
-                                            scope.launch { drawerState.close() }
-                                        }
-                                        .padding(10.dp)
-                                ) {
-                                    Text(hit.threadTitle, color = Color(0xFF38BDF8), fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                                    Text(hit.snippet, color = Color(0xFFCBD5E1), fontSize = 11.5.sp, maxLines = 2)
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(40.dp)
+                                    .clip(RoundedCornerShape(20.dp))
+                                    .background(palette.subtleSurface)
+                                    .border(0.6.dp, palette.hairline, RoundedCornerShape(20.dp))
+                                    .padding(horizontal = 12.dp)
+                            ) {
+                                Icon(
+                                    imageVector = OmsIcons.Search,
+                                    contentDescription = null,
+                                    tint = palette.textTertiary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Box(modifier = Modifier.weight(1f)) {
+                                    if (searchQuery.isEmpty()) {
+                                        Text("搜索历史对话与记忆…", color = palette.textTertiary, fontSize = 13.5.sp)
+                                    }
+                                    BasicTextField(
+                                        value = searchQuery,
+                                        onValueChange = { searchQuery = it },
+                                        singleLine = true,
+                                        textStyle = TextStyle(color = palette.textPrimary, fontSize = 13.5.sp),
+                                        cursorBrush = SolidColor(palette.accent),
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                }
+                                if (searchQuery.isNotEmpty()) {
+                                    OmsCircleIconButton(
+                                        icon = OmsIcons.Close,
+                                        contentDescription = "清空",
+                                        size = 24.dp,
+                                        iconSize = 13.dp,
+                                        contentColor = palette.textTertiary,
+                                        onClick = { searchQuery = "" }
+                                    )
                                 }
                             }
+
+                            OmsCircleIconButton(
+                                icon = OmsIcons.Incognito,
+                                contentDescription = "开启无痕对话",
+                                size = 40.dp,
+                                iconSize = 19.dp,
+                                containerColor = palette.subtleSurface,
+                                borderColor = palette.hairline,
+                                onClick = {
+                                    coordinator.chatRepo.createNewThread(incognito = true, initialTitle = "无痕对话")
+                                    currentTab = CockpitTab.CHAT
+                                    scope.launch { drawerState.close() }
+                                }
+                            )
                         }
-                    } else {
-                        LazyColumn(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
+
+                        // 2. Quick Curated Library & Instant Theme Bar
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            items(items = threads, key = { it.threadId }) { thr ->
-                                val isSel = thr.threadId == activeThreadId
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(10.dp))
-                                        .background(if (isSel) Color(0xFF1E3A8A) else Color(0xFF131C31))
-                                        .clickable {
-                                            coordinator.chatRepo.selectThread(thr.threadId)
-                                            currentTab = CockpitTab.CHAT
-                                            scope.launch { drawerState.close() }
-                                        }
-                                        .padding(horizontal = 10.dp, vertical = 9.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = (if (thr.pinned) "📌 " else "") + thr.title,
-                                        color = Color.White,
-                                        fontSize = 13.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Text(
-                                            text = "📌",
-                                            fontSize = 11.sp,
-                                            modifier = Modifier.clickable { coordinator.chatRepo.togglePinThread(thr.threadId) }
-                                        )
-                                        Text(
-                                            text = "✕",
-                                            color = Color(0xFF64748B),
-                                            fontSize = 12.sp,
-                                            modifier = Modifier.clickable { coordinator.chatRepo.deleteThread(thr.threadId) }
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(7.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(38.dp)
+                                    .omsBounceClick(scaleDown = 0.96f, shape = RoundedCornerShape(12.dp)) {
+                                        scope.launch { drawerState.close() }
+                                        showSpecimenGallery = true
+                                    }
+                                    .background(palette.cardSurface, RoundedCornerShape(12.dp))
+                                    .border(0.6.dp, palette.hairline, RoundedCornerShape(12.dp))
+                                    .padding(horizontal = 11.dp)
+                            ) {
+                                Icon(OmsIcons.Leaf, contentDescription = null, tint = palette.accent, modifier = Modifier.size(16.dp))
+                                Text("博物图鉴册", color = palette.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                            }
+
+                            // 1-Tap Appearance Mode Cycle (`跟随 / 素昼 / 玄夜`)
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier
+                                    .height(38.dp)
+                                    .omsBounceClick(scaleDown = 0.95f, shape = RoundedCornerShape(12.dp)) {
+                                        coordinator.vibrateTick()
+                                        OmsThemeController.cycleAppearanceMode(context)
+                                    }
+                                    .background(palette.cardSurface, RoundedCornerShape(12.dp))
+                                    .border(0.6.dp, palette.hairline, RoundedCornerShape(12.dp))
+                                    .padding(horizontal = 11.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (palette.isDark) OmsIcons.Moon else OmsIcons.Sun,
+                                    contentDescription = "切换日夜模式",
+                                    tint = palette.accent,
+                                    modifier = Modifier.size(15.5.dp)
+                                )
+                                Text(themeSettings.mode.label, color = palette.textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                            }
+                        }
+
+                        // 5-Palette Quick Swatch Strip right inside Drawer!
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(palette.subtleSurface)
+                                .padding(horizontal = 10.dp, vertical = 7.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("主题", color = palette.textTertiary, fontSize = 11.5.sp, fontWeight = FontWeight.Medium)
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                                OmsThemeStyle.entries.forEach { st ->
+                                    val isSel = themeSettings.style == st
+                                    Box(
+                                        contentAlignment = Alignment.Center,
+                                        modifier = Modifier
+                                            .size(22.dp)
+                                            .omsBounceClick(scaleDown = 0.85f, shape = CircleShape) {
+                                                coordinator.vibrateTick()
+                                                OmsThemeController.setThemeStyle(context, st)
+                                            }
+                                            .border(
+                                                width = if (isSel) 1.8.dp else 0.7.dp,
+                                                color = if (isSel) palette.accent else palette.strongBorder,
+                                                shape = CircleShape
+                                            )
+                                            .padding(2.5.dp)
+                                            .clip(CircleShape)
+                                            .background(if (palette.isDark) st.swatchDark else st.swatchLight)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(7.dp)
+                                                .clip(CircleShape)
+                                                .background(st.swatchAccent)
                                         )
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // Away-from-Home WeChat Takeover Toggle & System Console Entry
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(Color(0xFF131C31))
-                            .padding(horizontal = 10.dp, vertical = 6.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("🌙 离家 5G 接管尺素", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
-                            Text("默认同 Wi-Fi 确认 Mac 休眠后接管", color = Color(0xFF64748B), fontSize = 10.5.sp)
+                        // 3. FTS Search Results OR Grouped Conversation History
+                        if (searchQuery.isNotBlank()) {
+                            val hits = remember(searchQuery, threads) {
+                                coordinator.chatRepo.searchGlobalMessages(searchQuery, limit = 25)
+                            }
+                            Text(
+                                text = "检索命中 ${hits.size} 条记录",
+                                color = palette.textTertiary,
+                                fontSize = 11.5.sp,
+                                modifier = Modifier.padding(horizontal = 4.dp)
+                            )
+                            LazyColumn(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                items(items = hits, key = { it.messageId }) { hit ->
+                                    OmsSurfaceCard(
+                                        cornerRadius = 13.dp,
+                                        contentPadding = PaddingValues(11.dp),
+                                        onClick = {
+                                            coordinator.chatRepo.selectThread(hit.threadId)
+                                            currentTab = CockpitTab.CHAT
+                                            scope.launch { drawerState.close() }
+                                        },
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text(hit.threadTitle, color = palette.accent, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold)
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(hit.snippet, color = palette.textSecondary, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
+                            }
+                        } else {
+                            val groupedThreads = remember(threads) { groupThreadsByRecency(threads) }
+                            LazyColumn(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                groupedThreads.forEach { (sectionTitle, sectionItems) ->
+                                    item(key = "sec_$sectionTitle") {
+                                        Text(
+                                            text = sectionTitle,
+                                            color = palette.textTertiary,
+                                            fontSize = 11.5.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            modifier = Modifier.padding(start = 8.dp, top = 10.dp, bottom = 4.dp)
+                                        )
+                                    }
+                                    items(items = sectionItems, key = { it.threadId }) { thr ->
+                                        DrawerThreadItemRow(
+                                            thread = thr,
+                                            selected = thr.threadId == activeThreadId,
+                                            onSelect = {
+                                                coordinator.chatRepo.selectThread(thr.threadId)
+                                                currentTab = CockpitTab.CHAT
+                                                scope.launch { drawerState.close() }
+                                            },
+                                            onTogglePin = { coordinator.chatRepo.togglePinThread(thr.threadId) },
+                                            onRename = {
+                                                renamingThread = thr
+                                                renameInput = thr.title
+                                            },
+                                            onDelete = { coordinator.chatRepo.deleteThread(thr.threadId) }
+                                        )
+                                    }
+                                }
+                            }
                         }
-                        Switch(
-                            checked = forceAwayStandby,
-                            onCheckedChange = { checked ->
-                                forceAwayStandby = checked
-                                app.edgeStore.setForceAwayStandbyEnabled(checked)
-                                app.wechatStandby.refreshState()
+
+                        Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
+
+                        // 4. Minimalist Drawer Footer (Status + Settings Studio Button)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 2.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(9.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .omsBounceClick(scaleDown = 0.97f, shape = RoundedCornerShape(12.dp)) {
+                                        scope.launch { drawerState.close() }
+                                        initialSettingsTab = SettingsStudioTab.SYSTEM_PAIRING
+                                        showSettingsModal = true
+                                    }
+                                    .padding(vertical = 4.dp, horizontal = 4.dp)
+                            ) {
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier
+                                        .size(32.dp)
+                                        .clip(CircleShape)
+                                        .background(palette.accentSoft)
+                                ) {
+                                    Icon(OmsIcons.Sparkles, contentDescription = null, tint = palette.accent, modifier = Modifier.size(16.dp))
+                                }
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("青简 · 咫尺", color = palette.textPrimary, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold)
+                                    val sub = when {
+                                        activeTier == "LAN_WS" -> "Mac 局域网直连在线"
+                                        activeTier == "WAN_WEBRTC" -> "Mac 跨网远程在线"
+                                        activeTier == "BT_RFCOMM" -> "Mac 蓝牙近场在线"
+                                        standbyLease == StandbyLeaseState.ACTIVE_POLLING -> "手机接管尺素轮询中"
+                                        else -> "随身独立云端模式"
+                                    }
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                        Box(modifier = Modifier.size(5.5.dp).background(connectionDotColor, CircleShape))
+                                        Text(sub, color = palette.textTertiary, fontSize = 11.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
+                            }
+
+                            OmsCircleIconButton(
+                                icon = OmsIcons.Sliders,
+                                contentDescription = "打开偏好设置",
+                                size = 38.dp,
+                                iconSize = 18.5.dp,
+                                containerColor = palette.subtleSurface,
+                                borderColor = palette.hairline,
+                                onClick = {
+                                    scope.launch { drawerState.close() }
+                                    initialSettingsTab = SettingsStudioTab.APPEARANCE
+                                    showSettingsModal = true
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(palette.canvas)
+            ) {
+                // =================================================================
+                // Top 52dp Minimalist App Bar (Form A: Menu | 对话·尺素·协同 | Dot + NewChat)
+                // =================================================================
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(palette.topBar)
+                        .statusBarsPadding()
+                        .padding(horizontal = 12.dp, vertical = 7.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Left: Vector Menu Button
+                    OmsCircleIconButton(
+                        icon = OmsIcons.Menu,
+                        contentDescription = "打开历史与记忆抽屉",
+                        size = 38.dp,
+                        iconSize = 20.dp,
+                        onClick = { scope.launch { drawerState.open() } }
+                    )
+
+                    // Center: Silky Sliding 3-Domain Switcher (Zero Emoji!)
+                    val hubDot = when {
+                        pendingApprovalsCount > 0 -> palette.warning
+                        runningAgentsCount > 0 -> palette.success
+                        else -> null
+                    }
+                    OmsSlidingSegmentedBar(
+                        items = listOf(
+                            OmsSegmentItem(CockpitTab.CHAT, "对话"),
+                            OmsSegmentItem(CockpitTab.CHISU, "尺素"),
+                            OmsSegmentItem(CockpitTab.MISSION_HUB, "协同", dotColor = hubDot)
+                        ),
+                        selected = currentTab,
+                        onSelect = { chosen ->
+                            coordinator.vibrateTick()
+                            currentTab = chosen
+                        },
+                        height = 35.dp,
+                        modifier = Modifier.width(204.dp)
+                    )
+
+                    // Right: Subtle Ambient Status Orb + 1-Tap New Chat Button
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        OmsCircleIconButton(
+                            icon = OmsIcons.Palette,
+                            contentDescription = "主题与连接速览",
+                            size = 36.dp,
+                            iconSize = 18.dp,
+                            contentColor = palette.textSecondary,
+                            badgeColor = connectionDotColor,
+                            onClick = { showQuickThemeSheet = true }
+                        )
+
+                        OmsCircleIconButton(
+                            icon = OmsIcons.NewChat,
+                            contentDescription = "开启新对话",
+                            size = 38.dp,
+                            iconSize = 19.dp,
+                            contentColor = palette.textPrimary,
+                            onClick = {
+                                coordinator.vibrateTick()
+                                coordinator.chatRepo.createNewThread(incognito = false)
+                                currentTab = CockpitTab.CHAT
                             }
                         )
                     }
+                }
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                        OutlinedButton(
-                            onClick = {
-                                scope.launch { drawerState.close() }
-                                initialSettingsTab = SettingsStudioTab.PROXY_TUNNEL
-                                showSystemConsoleDialog = true
-                            },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("✈️ 代理节点", color = Color(0xFF7DD3FC), fontSize = 11.5.sp)
+                // Zero-Ops Global Ambient Status Pill (0px when healthy!)
+                GlobalAmbientStatusBanner(
+                    isGuiEmergencyStopped = isGuiEmergencyStopped,
+                    pendingApprovalsCount = if (currentTab == CockpitTab.MISSION_HUB) 0 else pendingApprovalsCount,
+                    otaState = otaState,
+                    onResumeGui = {
+                        OmsAccessibilityService.instance?.resumeFromPhoneUi()
+                        isGuiEmergencyStopped = false
+                        OmsFeedbackController.show("已解除急停，恢复远程协助", OmsToastKind.SUCCESS)
+                    },
+                    onOpenApprovals = { currentTab = CockpitTab.MISSION_HUB },
+                    onInstallOta = {
+                        app.transportClient.installOrResumeReadyOta { msg ->
+                            OmsFeedbackController.show(msg, OmsToastKind.INFO)
                         }
-                        OutlinedButton(
-                            onClick = {
-                                scope.launch { drawerState.close() }
-                                initialSettingsTab = SettingsStudioTab.AI_MODELS
-                                showSystemConsoleDialog = true
-                            },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("🧠 模型矩阵", color = Color(0xFFC4B5FD), fontSize = 11.5.sp)
+                    }
+                )
+
+                // Active Workspace Stage with Smooth Crossfade
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    Crossfade(
+                        targetState = currentTab,
+                        animationSpec = tween(durationMillis = 180),
+                        label = "workspaceCrossfade"
+                    ) { tab ->
+                        when (tab) {
+                            CockpitTab.CHAT -> ChatWorkspaceView(
+                                coordinator = coordinator,
+                                prefillDraft = chatPrefillDraft,
+                                onConsumePrefillDraft = { chatPrefillDraft = "" },
+                                onOpenBotanicalCamera = { showBotanicalCamera = true },
+                                onOpenLiveVoice = { glass ->
+                                    liveModalInitialGlass = glass
+                                    showLiveVoiceModal = true
+                                },
+                                onEscalateToMacAgent = { summary ->
+                                    agentPrefillDraft = summary
+                                    currentTab = CockpitTab.MISSION_HUB
+                                }
+                            )
+
+                            CockpitTab.CHISU -> ChisuWorkspaceView(
+                                streamItems = streamItems,
+                                onDiscussArticleInChat = { item ->
+                                    chatPrefillDraft = "请结合这篇尺素文章《${item.title ?: "文章"}》帮我进一步深入分析：\n${item.textContent.orEmpty().take(1500)}"
+                                    currentTab = CockpitTab.CHAT
+                                },
+                                onSendArticleToMacAgent = { item ->
+                                    agentPrefillDraft = "请根据尺素文章《${item.title ?: "文章"}》中的核心启发，在对应项目中设计原型或写入知识库深读笔记：\n${item.textContent.orEmpty().take(2000)}"
+                                    currentTab = CockpitTab.MISSION_HUB
+                                }
+                            )
+
+                            CockpitTab.MISSION_HUB -> MissionHubWorkspaceView(
+                                coordinator = coordinator,
+                                macConnected = activeTier != "DISCONNECTED",
+                                streamItems = streamItems,
+                                prefillAgentPrompt = agentPrefillDraft,
+                                onConsumePrefillAgentPrompt = { agentPrefillDraft = "" }
+                            )
                         }
                     }
 
-                    OutlinedButton(
-                        onClick = {
-                            scope.launch { drawerState.close() }
-                            initialSettingsTab = SettingsStudioTab.SYSTEM_PAIRING
-                            showSystemConsoleDialog = true
-                        },
-                        modifier = Modifier.fillMaxWidth()
+                    // Global Floating Commute Audio Mini-Player Bar (when TTS is speaking)
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = isSpeakingTts,
+                        enter = expandVertically(tween(180)) + fadeIn(tween(150)),
+                        exit = shrinkVertically(tween(150)) + fadeOut(tween(120)),
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(horizontal = 16.dp, vertical = 8.dp)
                     ) {
-                        Text("🔗 设备配对 · 权限向导 · OTA 控制台", color = Color(0xFF94A3B8), fontSize = 11.5.sp)
+                        GlobalMiniAudioPlayerPill(
+                            title = speakingTtsText.ifBlank { "正在语音播报…" },
+                            onStop = { NotificationExecutor.stopSpeaking(context) }
+                        )
                     }
                 }
             }
         }
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color(0xFF0B1120))
+
+        // Non-Intrusive Top Dynamic Pill Toast Host
+        OmsFloatingToastHost()
+    }
+
+    // Rename Thread Dialog
+    renamingThread?.let { target ->
+        AlertDialog(
+            onDismissRequest = { renamingThread = null },
+            containerColor = palette.composer,
+            title = { Text("重命名对话", color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold) },
+            text = {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(palette.subtleSurface)
+                        .border(0.6.dp, palette.hairline, RoundedCornerShape(12.dp))
+                        .padding(12.dp)
+                ) {
+                    BasicTextField(
+                        value = renameInput,
+                        onValueChange = { renameInput = it },
+                        singleLine = true,
+                        textStyle = TextStyle(color = palette.textPrimary, fontSize = 14.5.sp),
+                        cursorBrush = SolidColor(palette.accent),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    coordinator.chatRepo.renameThread(target.threadId, renameInput)
+                    renamingThread = null
+                }) { Text("保存", color = palette.accent, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { renamingThread = null }) { Text("取消", color = palette.textTertiary) }
+            }
+        )
+    }
+
+    // Quick Theme & Connection Popover Sheet (Top-Right Palette Button)
+    if (showQuickThemeSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showQuickThemeSheet = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = palette.composer,
+            contentColor = palette.textPrimary,
+            shape = RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp)
         ) {
-            // Top 3-Workspace Navigation Bar
-            Row(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF090E1A))
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                    .navigationBarsPadding()
+                    .padding(horizontal = 18.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
-                // Left Drawer Button
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(Color(0xFF162032))
-                        .clickable { scope.launch { drawerState.open() } }
-                        .padding(horizontal = 10.dp, vertical = 7.dp)
-                ) {
-                    Text("☰", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Text("外观主题与双脑链路", color = palette.textPrimary, fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold)
+
+                OmsSlidingSegmentedBar(
+                    items = listOf(
+                        OmsSegmentItem(OmsAppearanceMode.SYSTEM, "跟随系统"),
+                        OmsSegmentItem(OmsAppearanceMode.LIGHT, "素昼浅色"),
+                        OmsSegmentItem(OmsAppearanceMode.DARK, "玄夜深色")
+                    ),
+                    selected = themeSettings.mode,
+                    onSelect = { mode ->
+                        coordinator.vibrateTick()
+                        OmsThemeController.setAppearanceMode(context, mode)
+                    },
+                    height = 36.dp,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OmsThemeStyle.entries.forEach { st ->
+                        val isSel = themeSettings.style == st
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .omsBounceClick(scaleDown = 0.98f, shape = RoundedCornerShape(14.dp)) {
+                                    coordinator.vibrateTick()
+                                    OmsThemeController.setThemeStyle(context, st)
+                                }
+                                .background(if (isSel) palette.accentSoft else palette.subtleSurface, RoundedCornerShape(14.dp))
+                                .border(0.6.dp, if (isSel) palette.accent else palette.hairline, RoundedCornerShape(14.dp))
+                                .padding(horizontal = 14.dp, vertical = 11.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(20.dp)
+                                        .clip(CircleShape)
+                                        .background(if (palette.isDark) st.swatchDark else st.swatchLight)
+                                        .border(1.dp, st.swatchAccent, CircleShape)
+                                )
+                                Column {
+                                    Text(st.title, color = palette.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                    Text(st.subtitle, color = palette.textTertiary, fontSize = 11.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                            }
+                            if (isSel) {
+                                Icon(OmsIcons.Check, contentDescription = null, tint = palette.accent, modifier = Modifier.size(16.dp))
+                            }
+                        }
+                    }
                 }
 
-                // Center 3-Segment Workspace Switcher
-                Row(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(18.dp))
-                        .background(Color(0xFF131C31))
-                        .padding(3.dp),
-                    horizontalArrangement = Arrangement.spacedBy(2.dp)
-                ) {
-                    WorkspaceSegButton("✦ 对话", currentTab == CockpitTab.CHAT) { currentTab = CockpitTab.CHAT }
-                    WorkspaceSegButton(
-                        label = if (pendingApprovalsCount > 0) "📖 尺素($pendingApprovalsCount)" else "📖 尺素",
-                        selected = currentTab == CockpitTab.CHISU
-                    ) { currentTab = CockpitTab.CHISU }
-                    WorkspaceSegButton(
-                        label = if (runningAgentsCount > 0) "🕹️ 任务($runningAgentsCount)" else "🕹️ 任务舱",
-                        selected = currentTab == CockpitTab.MISSION_HUB
-                    ) { currentTab = CockpitTab.MISSION_HUB }
-                }
-
-                // Right Status + Settings Capsule
-                val statusLabel = when {
-                    activeTier != "DISCONNECTED" -> "🟢 Mac · ⚙️"
-                    standbyLease == StandbyLeaseState.ACTIVE_POLLING -> "🌙 接管 · ⚙️"
-                    app.proxyManager.hasAvailableNodes() -> "✈️ 云端 · ⚙️"
-                    else -> "⚙️ 配置"
-                }
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(Color(0xFF162032))
-                        .border(
-                            1.dp,
-                            if (activeTier != "DISCONNECTED") Color(0xFF10B981) else Color(0xFF334155),
-                            RoundedCornerShape(14.dp)
-                        )
-                        .clickable {
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                    OmsSecondaryButton(
+                        label = "代理网关",
+                        icon = OmsIcons.Globe,
+                        modifier = Modifier.weight(1f),
+                        onClick = {
+                            showQuickThemeSheet = false
                             initialSettingsTab = SettingsStudioTab.PROXY_TUNNEL
-                            showSystemConsoleDialog = true
-                        }
-                        .padding(horizontal = 9.dp, vertical = 6.dp)
-                ) {
-                    Text(statusLabel, color = Color(0xFFE2E8F0), fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-                }
-            }
-
-            // Active Workspace Body
-            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                when (currentTab) {
-                    CockpitTab.CHAT -> ChatWorkspaceView(
-                        coordinator = coordinator,
-                        prefillDraft = chatPrefillDraft,
-                        onConsumePrefillDraft = { chatPrefillDraft = "" },
-                        onOpenBotanicalCamera = { showBotanicalCamera = true },
-                        onOpenLiveVoice = { glass ->
-                            liveModalInitialGlass = glass
-                            showLiveVoiceModal = true
-                        },
-                        onEscalateToMacAgent = { summary ->
-                            agentPrefillDraft = summary
-                            currentTab = CockpitTab.MISSION_HUB
+                            showSettingsModal = true
                         }
                     )
-
-                    CockpitTab.CHISU -> ChisuWorkspaceView(
-                        streamItems = streamItems,
-                        onDiscussArticleInChat = { item ->
-                            chatPrefillDraft = "请结合这篇尺素文章《${item.title ?: "文章"}》帮我进一步深入分析：\n${item.textContent.orEmpty().take(1500)}"
-                            currentTab = CockpitTab.CHAT
-                        },
-                        onSendArticleToMacAgent = { item ->
-                            agentPrefillDraft = "请根据尺素文章《${item.title ?: "文章"}》中的核心启发，在对应项目中设计原型或写入知识库深读笔记：\n${item.textContent.orEmpty().take(2000)}"
-                            currentTab = CockpitTab.MISSION_HUB
+                    OmsSecondaryButton(
+                        label = "更多设置",
+                        icon = OmsIcons.Sliders,
+                        modifier = Modifier.weight(1f),
+                        onClick = {
+                            showQuickThemeSheet = false
+                            initialSettingsTab = SettingsStudioTab.SYSTEM_PAIRING
+                            showSettingsModal = true
                         }
-                    )
-
-                    CockpitTab.MISSION_HUB -> MissionHubWorkspaceView(
-                        coordinator = coordinator,
-                        macConnected = activeTier != "DISCONNECTED",
-                        prefillAgentPrompt = agentPrefillDraft,
-                        onConsumePrefillAgentPrompt = { agentPrefillDraft = "" }
                     )
                 }
+                Spacer(modifier = Modifier.height(6.dp))
             }
+        }
+    }
+
+    // Botanical Specimen Field Guide Gallery Modal
+    if (showSpecimenGallery) {
+        Dialog(
+            onDismissRequest = { showSpecimenGallery = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            SpecimenFieldGuideGalleryModal(
+                coordinator = coordinator,
+                onDismiss = { showSpecimenGallery = false },
+                onAskInChat = { card ->
+                    showSpecimenGallery = false
+                    chatPrefillDraft = "关于《${card.chineseName}》（${card.latinName}），我还想请教："
+                    currentTab = CockpitTab.CHAT
+                }
+            )
         }
     }
 
@@ -425,7 +835,7 @@ fun OmsCockpitRootScreen(legacySystemConsoleContent: @Composable () -> Unit) {
                         val tid = coordinator.chatRepo.activeThreadIdFlow.value
                         if (tid.isNotBlank()) {
                             coordinator.chatRepo.upsertMessage(
-                                com.oms.client.cockpit.ChatMessageModel(
+                                ChatMessageModel(
                                     messageId = "live_${System.currentTimeMillis()}",
                                     threadId = tid,
                                     role = "assistant",
@@ -443,36 +853,383 @@ fun OmsCockpitRootScreen(legacySystemConsoleContent: @Composable () -> Unit) {
         }
     }
 
-    // Unified Configuration Studio (`⚙️ 代理节点 | 🧠 模型矩阵 | 🔗 配对与权限`)
-    if (showSystemConsoleDialog) {
+    // Full-Screen Native Grouped Settings Studio
+    if (showSettingsModal) {
         Dialog(
-            onDismissRequest = { showSystemConsoleDialog = false },
+            onDismissRequest = { showSettingsModal = false },
             properties = DialogProperties(usePlatformDefaultWidth = false)
         ) {
             CockpitSettingsModal(
                 coordinator = coordinator,
                 initialTab = initialSettingsTab,
-                onDismiss = { showSystemConsoleDialog = false },
-                legacySystemConsoleContent = legacySystemConsoleContent
+                onDismiss = { showSettingsModal = false }
             )
         }
     }
 }
 
 @Composable
-private fun WorkspaceSegButton(label: String, selected: Boolean, onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(15.dp))
-            .background(if (selected) Color(0xFF0284C7) else Color.Transparent)
-            .clickable { onClick() }
-            .padding(horizontal = 12.dp, vertical = 6.dp)
+private fun DrawerThreadItemRow(
+    thread: ChatThreadModel,
+    selected: Boolean,
+    onSelect: () -> Unit,
+    onTogglePin: () -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit
+) {
+    val palette = OmsTheme.colors
+    var showMenu by remember { mutableStateOf(false) }
+    val shape = RoundedCornerShape(11.dp)
+    val cleanTitle = remember(thread.title) {
+        thread.title.removePrefix("🕵️ ").trim().ifBlank { "新对话" }
+    }
+
+    Box {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .omsCombinedBounce(
+                    scaleDown = 0.985f,
+                    shape = shape,
+                    onLongClick = { showMenu = true },
+                    onClick = onSelect
+                )
+                .background(if (selected) palette.subtleSurface else Color.Transparent, shape)
+                .padding(horizontal = 10.dp, vertical = 9.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                if (thread.incognito) {
+                    Icon(OmsIcons.Incognito, null, tint = palette.textTertiary, modifier = Modifier.size(13.5.dp))
+                } else if (thread.pinned) {
+                    Icon(OmsIcons.Pin, null, tint = palette.accent, modifier = Modifier.size(13.dp))
+                }
+                Text(
+                    text = cleanTitle,
+                    color = if (selected) palette.textPrimary else palette.textSecondary,
+                    fontSize = 13.8.sp,
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            if (selected) {
+                OmsCircleIconButton(
+                    icon = OmsIcons.MoreHorizontal,
+                    contentDescription = "会话操作",
+                    size = 24.dp,
+                    iconSize = 15.dp,
+                    contentColor = palette.textTertiary,
+                    onClick = { showMenu = true }
+                )
+            }
+        }
+
+        DropdownMenu(
+            expanded = showMenu,
+            onDismissRequest = { showMenu = false },
+            modifier = Modifier.background(palette.composer)
+        ) {
+            DropdownMenuItem(
+                leadingIcon = { Icon(OmsIcons.Pin, null, tint = palette.textSecondary, modifier = Modifier.size(16.dp)) },
+                text = { Text(if (thread.pinned) "取消置顶" else "置顶对话", color = palette.textPrimary, fontSize = 13.5.sp) },
+                onClick = {
+                    showMenu = false
+                    onTogglePin()
+                }
+            )
+            DropdownMenuItem(
+                leadingIcon = { Icon(OmsIcons.NewChat, null, tint = palette.textSecondary, modifier = Modifier.size(16.dp)) },
+                text = { Text("重命名", color = palette.textPrimary, fontSize = 13.5.sp) },
+                onClick = {
+                    showMenu = false
+                    onRename()
+                }
+            )
+            DropdownMenuItem(
+                leadingIcon = { Icon(OmsIcons.Trash, null, tint = palette.danger, modifier = Modifier.size(16.dp)) },
+                text = { Text("删除对话", color = palette.danger, fontSize = 13.5.sp) },
+                onClick = {
+                    showMenu = false
+                    onDelete()
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun GlobalAmbientStatusBanner(
+    isGuiEmergencyStopped: Boolean,
+    pendingApprovalsCount: Int,
+    otaState: OtaUiState,
+    onResumeGui: () -> Unit,
+    onOpenApprovals: () -> Unit,
+    onInstallOta: () -> Unit
+) {
+    val palette = OmsTheme.colors
+    val readyOta = when (otaState) {
+        is OtaUiState.ReadyToInstall -> otaState.ota
+        is OtaUiState.InstallerLaunched -> otaState.ota
+        is OtaUiState.UpdateAvailable -> otaState.ota
+        else -> null
+    }
+
+    val visible = isGuiEmergencyStopped || pendingApprovalsCount > 0 || readyOta != null
+    AnimatedVisibility(
+        visible = visible,
+        enter = expandVertically(tween(180)) + fadeIn(tween(150)),
+        exit = shrinkVertically(tween(150)) + fadeOut(tween(120))
     ) {
-        Text(
-            text = label,
-            color = if (selected) Color.White else Color(0xFF94A3B8),
-            fontSize = 12.5.sp,
-            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+        val shape = RoundedCornerShape(16.dp)
+        when {
+            isGuiEmergencyStopped -> {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 4.dp)
+                        .clip(shape)
+                        .background(palette.dangerSoft)
+                        .border(0.7.dp, palette.danger.copy(alpha = 0.5f), shape)
+                        .padding(horizontal = 14.dp, vertical = 9.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.weight(1f)) {
+                        Icon(OmsIcons.Shield, null, tint = palette.danger, modifier = Modifier.size(16.dp))
+                        Text("AI 界面协助已急停锁存", color = palette.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                    }
+                    OmsPrimaryButton(
+                        label = "解除恢复",
+                        height = 30.dp,
+                        containerColor = palette.danger,
+                        contentColor = Color.White,
+                        onClick = onResumeGui
+                    )
+                }
+            }
+
+            pendingApprovalsCount > 0 -> {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 4.dp)
+                        .omsBounceClick(scaleDown = 0.98f, shape = shape, onClick = onOpenApprovals)
+                        .background(palette.warningSoft, shape)
+                        .border(0.7.dp, palette.warning.copy(alpha = 0.5f), shape)
+                        .padding(horizontal = 14.dp, vertical = 9.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(OmsIcons.Shield, null, tint = palette.warning, modifier = Modifier.size(16.dp))
+                        Text("有 $pendingApprovalsCount 项远程敏感操作待确认", color = palette.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                    }
+                    Icon(OmsIcons.ChevronRight, null, tint = palette.warning, modifier = Modifier.size(16.dp))
+                }
+            }
+
+            readyOta != null -> {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 4.dp)
+                        .clip(shape)
+                        .background(palette.successSoft)
+                        .border(0.7.dp, palette.success.copy(alpha = 0.45f), shape)
+                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.weight(1f)) {
+                        Icon(OmsIcons.Bolt, null, tint = palette.success, modifier = Modifier.size(15.dp))
+                        Text("新版本 v${readyOta.remoteVersionName} 已就绪", color = palette.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                    }
+                    OmsPrimaryButton(
+                        label = "安装",
+                        height = 29.dp,
+                        containerColor = palette.success,
+                        contentColor = Color.White,
+                        onClick = onInstallOta
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GlobalMiniAudioPlayerPill(
+    title: String,
+    onStop: () -> Unit
+) {
+    val palette = OmsTheme.colors
+    val infinite = rememberInfiniteTransition(label = "miniAudio")
+    val barPulse by infinite.animateFloat(
+        initialValue = 0.45f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(tween(460), RepeatMode.Reverse),
+        label = "audioPulse"
+    )
+    val shape = RoundedCornerShape(22.dp)
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .shadow(elevation = 7.dp, shape = shape, clip = false)
+            .clip(shape)
+            .background(palette.composer)
+            .border(0.7.dp, palette.strongBorder, shape)
+            .padding(horizontal = 14.dp, vertical = 8.dp)
+    ) {
+        Icon(
+            imageVector = OmsIcons.Waveform,
+            contentDescription = null,
+            tint = palette.accent.copy(alpha = barPulse),
+            modifier = Modifier.size(18.dp)
         )
+        Text(
+            text = title.replace(Regex("\\s+"), " "),
+            color = palette.textPrimary,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+        OmsCircleIconButton(
+            icon = OmsIcons.StopSquare,
+            contentDescription = "停止朗读",
+            size = 30.dp,
+            iconSize = 15.dp,
+            containerColor = palette.dangerSoft,
+            contentColor = palette.danger,
+            onClick = onStop
+        )
+    }
+}
+
+@Composable
+private fun SpecimenFieldGuideGalleryModal(
+    coordinator: CockpitRuntimeCoordinator,
+    onDismiss: () -> Unit,
+    onAskInChat: (FieldGuideSpecimenCard) -> Unit
+) {
+    val palette = OmsTheme.colors
+    BackHandler { onDismiss() }
+    val specimens = remember { coordinator.chatRepo.loadRecentSpecimens(limit = 60) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(palette.canvas)
+            .statusBarsPadding()
+            .navigationBarsPadding()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OmsCircleIconButton(OmsIcons.ArrowLeft, "返回", onClick = onDismiss)
+            Text("随身博物图鉴册 (${specimens.size})", color = palette.textPrimary, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+        }
+
+        if (specimens.isEmpty()) {
+            Column(
+                modifier = Modifier.fillMaxSize().padding(32.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Icon(OmsIcons.Leaf, null, tint = palette.textTertiary, modifier = Modifier.size(32.dp))
+                Spacer(modifier = Modifier.height(12.dp))
+                Text("尚未收录博物标本", color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(modifier = Modifier.height(6.dp))
+                Text("在对话页打开「博物镜头」拍摄植物或展品，鉴定卡将自动沉淀于此", color = palette.textTertiary, fontSize = 13.sp)
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                items(items = specimens, key = { it.first.specimenId.ifBlank { it.first.chineseName + it.first.capturedAtIso } }) { (card, photoPath) ->
+                    OmsSurfaceCard(cornerRadius = 18.dp, modifier = Modifier.fillMaxWidth()) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            if (!photoPath.isNullOrBlank()) {
+                                val bmp by produceState<ImageBitmap?>(initialValue = null, key1 = photoPath) {
+                                    value = withContext(Dispatchers.IO) {
+                                        runCatching {
+                                            val f = File(photoPath)
+                                            if (f.exists()) BitmapFactory.decodeFile(photoPath)?.asImageBitmap() else null
+                                        }.getOrNull()
+                                    }
+                                }
+                                if (bmp != null) {
+                                    Image(
+                                        bitmap = bmp!!,
+                                        contentDescription = card.chineseName,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.size(64.dp).clip(RoundedCornerShape(12.dp))
+                                    )
+                                }
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(card.chineseName, color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                if (card.latinName.isNotBlank()) {
+                                    Text(card.latinName, color = palette.textSecondary, fontSize = 12.5.sp, fontStyle = FontStyle.Italic)
+                                }
+                                if (card.familyGenus.isNotBlank()) {
+                                    Text(card.familyGenus, color = palette.textTertiary, fontSize = 11.5.sp)
+                                }
+                            }
+                            OmsSecondaryButton(
+                                label = "追问",
+                                height = 32.dp,
+                                onClick = { onAskInChat(card) }
+                            )
+                        }
+                        if (card.oneLineSummary.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(card.oneLineSummary, color = palette.textSecondary, fontSize = 13.sp, lineHeight = 19.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun groupThreadsByRecency(threads: List<ChatThreadModel>): List<Pair<String, List<ChatThreadModel>>> {
+    val pinned = threads.filter { it.pinned }
+    val unpinned = threads.filter { !it.pinned }
+
+    val cal = Calendar.getInstance()
+    cal.set(Calendar.HOUR_OF_DAY, 0)
+    cal.set(Calendar.MINUTE, 0)
+    cal.set(Calendar.SECOND, 0)
+    cal.set(Calendar.MILLISECOND, 0)
+    val startOfToday = cal.timeInMillis
+    val sevenDaysAgo = startOfToday - 7L * 86_400_000L
+
+    val today = unpinned.filter { it.updatedAtMs >= startOfToday }
+    val week = unpinned.filter { it.updatedAtMs in sevenDaysAgo until startOfToday }
+    val older = unpinned.filter { it.updatedAtMs < sevenDaysAgo }
+
+    return buildList {
+        if (pinned.isNotEmpty()) add("置顶对话" to pinned)
+        if (today.isNotEmpty()) add("今天" to today)
+        if (week.isNotEmpty()) add("近 7 天" to week)
+        if (older.isNotEmpty()) add("更早" to older)
     }
 }
