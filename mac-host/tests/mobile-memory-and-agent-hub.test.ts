@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -7,6 +8,7 @@ import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import { MobileMemoryMirror } from "../src/memory/mobile-memory-mirror.js";
 import { AgentSessionHub, type SpawnedCliSpec } from "../src/agent/agent-session-hub.js";
+import { OmsIpcClient } from "../src/daemon/ipc-client.js";
 
 describe("Milestone 2 & 3: MobileMemoryMirror + AgentSessionHub", () => {
   test("3-tier memory mirror indexes non-incognito chats in FTS5, skips incognito, and promotes safely to Vault", () => {
@@ -253,6 +255,103 @@ describe("Milestone 2 & 3: MobileMemoryMirror + AgentSessionHub", () => {
       expect(events.some((e) => e.backend === "agy" && e.status === "completed")).toBe(true);
     } finally {
       hub.stopAll();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("AgentSessionHub safely parses oversized multi-MB rollout JSONL via bounded head+tail slices and OmsIpcClient fails fast on socket EOF", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oms-large-jsonl-"));
+    const codexDir = path.join(tmpDir, "codex_sessions", "2026", "05", "26");
+    const workspaceDir = path.join(tmpDir, "workspace");
+    const omsHome = path.join(tmpDir, "oms");
+    fs.mkdirSync(codexDir, { recursive: true });
+    fs.mkdirSync(workspaceDir, { recursive: true });
+    fs.mkdirSync(path.join(omsHome, "run"), { recursive: true });
+
+    const rolloutPath = path.join(
+      codexDir,
+      "rollout-2026-05-26T13-07-07-019e62ad-f37c-72c1-8446-7aa6d9bd6508.jsonl"
+    );
+    const fd = fs.openSync(rolloutPath, "w");
+    try {
+      fs.writeSync(
+        fd,
+        JSON.stringify({
+          timestamp: "2026-05-26T05:07:07Z",
+          type: "session_meta",
+          payload: { id: "019e62ad-f37c-72c1-8446-7aa6d9bd6508", cwd: workspaceDir },
+        }) + "\n"
+      );
+      fs.writeSync(
+        fd,
+        JSON.stringify({
+          timestamp: "2026-05-26T05:07:08Z",
+          type: "event_msg",
+          payload: { type: "user_message", message: "超长历史会话首条标题验证" },
+        }) + "\n"
+      );
+      // Write ~3 MB of middle tool output lines so both summary (768 KB) and detail (2 MB) hit bounded head+tail path
+      const fillerLine =
+        JSON.stringify({
+          timestamp: "2026-08-01T00:00:00Z",
+          type: "response_item",
+          payload: { type: "function_call", name: "shell", arguments: "x".repeat(4096) },
+        }) + "\n";
+      for (let i = 0; i < 750; i++) {
+        fs.writeSync(fd, fillerLine);
+      }
+      fs.writeSync(
+        fd,
+        JSON.stringify({
+          timestamp: "2026-11-20T11:48:00Z",
+          type: "event_msg",
+          payload: { type: "agent_message", message: "尾部最新回复摘要已成功提取" },
+        }) + "\n"
+      );
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    const hub = new AgentSessionHub({
+      omsHomeDir: omsHome,
+      codexSessionsDir: path.join(tmpDir, "codex_sessions"),
+      agyBrainDir: path.join(tmpDir, "agy_brain"),
+      defaultWorkspacePath: workspaceDir,
+    });
+
+    const sockPath = path.join(omsHome, "run", "omsd.sock");
+    let dropNextRequest = false;
+    const dummyServer = net.createServer((sock) => {
+      sock.on("data", () => {
+        if (dropNextRequest) {
+          sock.destroy();
+        }
+      });
+    });
+    await new Promise<void>((resolve) => dummyServer.listen(sockPath, resolve));
+
+    try {
+      const list = hub.listSessions();
+      const found = list.find((s) => s.sessionId === "019e62ad-f37c-72c1-8446-7aa6d9bd6508");
+      expect(found).toBeDefined();
+      expect(found?.title).toContain("超长历史会话首条标题验证");
+      expect(found?.lastSummary).toContain("尾部最新回复摘要已成功提取");
+
+      const detail = hub.getSessionDetail("codex", "019e62ad-f37c-72c1-8446-7aa6d9bd6508");
+      expect(detail.session.title).toContain("超长历史会话首条标题验证");
+      expect(detail.steps.some((st) => st.detail.includes("尾部最新回复摘要已成功提取"))).toBe(true);
+
+      // Verify OmsIpcClient rejects immediately on abrupt server EOF instead of waiting 30s
+      dropNextRequest = true;
+      const ipc = new OmsIpcClient(omsHome);
+      const t0 = performance.now();
+      await expect(ipc.call("phone_presence_status", {}, 15_000)).rejects.toThrow(
+        /closed unexpectedly|ECONNRESET/i
+      );
+      expect(performance.now() - t0).toBeLessThan(1500);
+    } finally {
+      hub.stopAll();
+      await new Promise<void>((resolve) => dummyServer.close(() => resolve()));
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });

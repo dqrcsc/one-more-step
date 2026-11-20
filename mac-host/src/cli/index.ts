@@ -382,6 +382,27 @@ async function main() {
     }
 
     if (sub === "stop" || sub === "restart") {
+      const defaultHome = path.join(os.homedir(), ".one_more_step");
+      const plistPath = path.join(os.homedir(), "Library/LaunchAgents/com.oms.daemon.plist");
+      const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+      const isManagedDefaultDaemon =
+        process.platform === "darwin" &&
+        uid !== undefined &&
+        path.resolve(homeDir) === path.resolve(defaultHome) &&
+        fs.existsSync(plistPath);
+
+      if (sub === "restart" && isManagedDefaultDaemon) {
+        const kick = spawnSync("launchctl", ["kickstart", "-k", `gui/${uid}/com.oms.daemon`], {
+          stdio: "ignore",
+        });
+        if (kick.status === 0) {
+          await new Promise((r) => setTimeout(r, 600));
+          const status = await ipc.call("phone_presence_status", {});
+          console.log(JSON.stringify(status, null, 2));
+          return;
+        }
+      }
+
       if (fs.existsSync(pidFile)) {
         const pid = Number(fs.readFileSync(pidFile, "utf8").trim());
         if (pid > 0) {

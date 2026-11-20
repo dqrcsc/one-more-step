@@ -55,6 +55,10 @@ export class AgentSessionHub extends EventEmitter {
   private readonly defaultWorkspacePath: string;
   private readonly cliSpawner: CliSpawnerFn;
   private readonly managedTasks = new Map<string, ManagedTaskState>();
+  private readonly fileSummaryCache = new Map<
+    string,
+    { mtimeMs: number; size: number; summary: AgentSessionSummary | null }
+  >();
 
   constructor(opts: AgentSessionHubOptions) {
     super();
@@ -599,9 +603,81 @@ export class AgentSessionHub extends EventEmitter {
     this.emit("session_event", evt);
   }
 
+  /**
+   * Bounded JSONL head + tail line reader.
+   * Prevents event-loop stalls and WebKit/JSC `WTF::StringImpl` >2GB SIGTRAP crashes
+   * when long-lived Codex or Antigravity rollout transcripts grow to hundreds of MB or multi-GB.
+   */
+  private readJsonlBoundedLines(
+    filePath: string,
+    headBytes: number,
+    tailBytes: number
+  ): string[] {
+    const st = fs.statSync(filePath);
+    if (st.size <= 0) return [];
+    if (st.size <= headBytes + tailBytes) {
+      return fs.readFileSync(filePath, "utf8").split(/\r?\n/).filter(Boolean);
+    }
+
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const headBuf = Buffer.allocUnsafe(headBytes);
+      const headRead = fs.readSync(fd, headBuf, 0, headBytes, 0);
+      const headLines = headBuf.subarray(0, headRead).toString("utf8").split(/\r?\n/);
+      if (headLines.length > 1) {
+        // Last line of head slice may be cut mid-UTF8 or mid-JSON
+        headLines.pop();
+      }
+
+      const tailOffset = Math.max(headRead, st.size - tailBytes);
+      const actualTailLen = Math.max(0, st.size - tailOffset);
+      if (actualTailLen === 0) {
+        return headLines.filter(Boolean);
+      }
+
+      const tailBuf = Buffer.allocUnsafe(actualTailLen);
+      const tailRead = fs.readSync(fd, tailBuf, 0, actualTailLen, tailOffset);
+      const tailLines = tailBuf.subarray(0, tailRead).toString("utf8").split(/\r?\n/);
+      if (tailOffset > 0 && tailLines.length > 0) {
+        // First line of tail slice starts mid-record
+        tailLines.shift();
+      }
+
+      const combined: string[] = [];
+      for (const l of headLines) {
+        if (l) combined.push(l);
+      }
+      for (const l of tailLines) {
+        if (l) combined.push(l);
+      }
+      return combined;
+    } finally {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private putSummaryCache(
+    filePath: string,
+    mtimeMs: number,
+    size: number,
+    summary: AgentSessionSummary | null
+  ): void {
+    if (this.fileSummaryCache.size >= 256 && !this.fileSummaryCache.has(filePath)) {
+      const oldestKey = this.fileSummaryCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.fileSummaryCache.delete(oldestKey);
+      }
+    }
+    this.fileSummaryCache.set(filePath, { mtimeMs, size, summary });
+  }
+
   private scanCodexSessions(maxCount: number): AgentSessionSummary[] {
     if (!fs.existsSync(this.codexSessionsDir)) return [];
-    const files: Array<{ filePath: string; mtimeMs: number }> = [];
+    const files: Array<{ filePath: string; mtimeMs: number; size: number }> = [];
     const walk = (dir: string, depth: number) => {
       if (depth > 4) return;
       let entries: fs.Dirent[] = [];
@@ -615,7 +691,8 @@ export class AgentSessionHub extends EventEmitter {
         if (e.isDirectory()) walk(full, depth + 1);
         else if (e.isFile() && e.name.endsWith(".jsonl")) {
           try {
-            files.push({ filePath: full, mtimeMs: fs.statSync(full).mtimeMs });
+            const st = fs.statSync(full);
+            files.push({ filePath: full, mtimeMs: st.mtimeMs, size: st.size });
           } catch {
             // ignore
           }
@@ -627,7 +704,18 @@ export class AgentSessionHub extends EventEmitter {
 
     const out: AgentSessionSummary[] = [];
     for (const f of files.slice(0, maxCount)) {
+      const cached = this.fileSummaryCache.get(f.filePath);
+      if (cached && cached.mtimeMs === f.mtimeMs && cached.size === f.size) {
+        if (cached.summary) {
+          out.push({
+            ...cached.summary,
+            status: Date.now() - f.mtimeMs < 20_000 ? "running" : "idle",
+          });
+        }
+        continue;
+      }
       const parsed = this.parseCodexRolloutFile(f.filePath, f.mtimeMs, false);
+      this.putSummaryCache(f.filePath, f.mtimeMs, f.size, parsed ? parsed.session : null);
       if (parsed) out.push(parsed.session);
     }
     return out;
@@ -668,8 +756,11 @@ export class AgentSessionHub extends EventEmitter {
     includeSteps: boolean
   ): AgentSessionDetailResult | null {
     try {
-      const raw = fs.readFileSync(filePath, "utf8");
-      const lines = raw.split(/\r?\n/).filter(Boolean);
+      const lines = this.readJsonlBoundedLines(
+        filePath,
+        includeSteps ? 512 * 1024 : 384 * 1024,
+        includeSteps ? 1536 * 1024 : 384 * 1024
+      );
       const fileMatch = path.basename(filePath).match(/([0-9a-f]{8}-[0-9a-f-]{27})/i);
       let sessionId = fileMatch ? fileMatch[1] : path.basename(filePath, ".jsonl");
       let workspacePath = this.defaultWorkspacePath;
@@ -773,13 +864,14 @@ export class AgentSessionHub extends EventEmitter {
     } catch {
       return [];
     }
-    const candidates: Array<{ convId: string; transcriptPath: string; mtimeMs: number }> = [];
+    const candidates: Array<{ convId: string; transcriptPath: string; mtimeMs: number; size: number }> = [];
     for (const e of entries) {
       if (!e.isDirectory() || e.name.startsWith(".")) continue;
       const tp = path.join(this.agyBrainDir, e.name, ".system_generated", "logs", "transcript.jsonl");
       if (fs.existsSync(tp)) {
         try {
-          candidates.push({ convId: e.name, transcriptPath: tp, mtimeMs: fs.statSync(tp).mtimeMs });
+          const st = fs.statSync(tp);
+          candidates.push({ convId: e.name, transcriptPath: tp, mtimeMs: st.mtimeMs, size: st.size });
         } catch {
           // ignore
         }
@@ -788,7 +880,18 @@ export class AgentSessionHub extends EventEmitter {
     candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
     const out: AgentSessionSummary[] = [];
     for (const c of candidates.slice(0, maxCount)) {
+      const cached = this.fileSummaryCache.get(c.transcriptPath);
+      if (cached && cached.mtimeMs === c.mtimeMs && cached.size === c.size) {
+        if (cached.summary) {
+          out.push({
+            ...cached.summary,
+            status: Date.now() - c.mtimeMs < 20_000 ? "running" : "idle",
+          });
+        }
+        continue;
+      }
       const parsed = this.parseAgyTranscript(c.convId, c.transcriptPath, c.mtimeMs, false);
+      this.putSummaryCache(c.transcriptPath, c.mtimeMs, c.size, parsed ? parsed.session : null);
       if (parsed) out.push(parsed.session);
     }
     return out;
@@ -812,8 +915,11 @@ export class AgentSessionHub extends EventEmitter {
     includeSteps: boolean
   ): AgentSessionDetailResult | null {
     try {
-      const raw = fs.readFileSync(transcriptPath, "utf8");
-      const lines = raw.split(/\r?\n/).filter(Boolean);
+      const lines = this.readJsonlBoundedLines(
+        transcriptPath,
+        includeSteps ? 512 * 1024 : 384 * 1024,
+        includeSteps ? 1536 * 1024 : 384 * 1024
+      );
       let title = "";
       let lastSummary = "";
       let workspacePath = this.defaultWorkspacePath;

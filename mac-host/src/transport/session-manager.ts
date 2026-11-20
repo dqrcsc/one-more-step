@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import dgram from "node:dgram";
-import { spawn, ChildProcess } from "node:child_process";
+import { spawn, spawnSync, ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
   DecodedScreenFrame,
@@ -823,12 +823,22 @@ export class PhoneSessionManager extends EventEmitter {
     }
 
     if (enableMdns && process.platform === "darwin") {
+      const serviceInstanceName = `OneMoreStep-${this.hostIdentity.deviceId.slice(-6)}`;
+      try {
+        const uid = typeof process.getuid === "function" ? String(process.getuid()) : undefined;
+        const pkillArgs = uid
+          ? ["-u", uid, "-f", `dns-sd -R ${serviceInstanceName} _oms._tcp`]
+          : ["-f", `dns-sd -R ${serviceInstanceName} _oms._tcp`];
+        spawnSync("pkill", pkillArgs, { stdio: "ignore" });
+      } catch {
+        // ignore if pkill unavailable or no stale dns-sd found
+      }
       try {
         this.mdnsAdvertiseProc = spawn(
           "dns-sd",
           [
             "-R",
-            `OneMoreStep-${this.hostIdentity.deviceId.slice(-6)}`,
+            serviceInstanceName,
             "_oms._tcp",
             "local",
             String(this.lanPort),
