@@ -510,8 +510,14 @@ export interface WeChatStandbyHandoffResult {
   cursorUpdated: boolean;
 }
 
+export type WeChatChisuMediaKind = "article" | "image_note" | "video" | "idea";
+
 export interface WeChatArticleListItem {
   id: number;
+  entryKind?: "article" | "turn";
+  turnId?: number;
+  mediaKind?: WeChatChisuMediaKind;
+  mediaSummary?: string;
   title: string;
   author: string;
   url: string;
@@ -536,6 +542,7 @@ export interface WeChatArticlesListResult {
 
 export interface WeChatArticleDetailParams {
   articleId?: number;
+  turnId?: number;
   sourceUrl?: string;
   title?: string;
 }
@@ -552,7 +559,8 @@ export interface WeChatArticleDetailResult {
 }
 
 export interface WeChatArticleAssetParams {
-  articleId: number;
+  articleId?: number;
+  turnId?: number;
   doc?: "note" | "source";
   path: string;
 }
@@ -616,13 +624,75 @@ export interface MemorySearchVaultParams {
   limit?: number;
 }
 
+export interface MemorySearchHit {
+  source: "vault" | "mobile_chat" | "chisu";
+  title: string;
+  pathOrRef: string;
+  snippet: string;
+  heading?: string;
+  category?: string;
+  score?: number;
+  articleId?: number;
+  turnId?: number;
+}
+
 export interface MemorySearchVaultResult {
-  hits: Array<{
-    source: "vault" | "mobile_chat";
-    title: string;
-    pathOrRef: string;
-    snippet: string;
-  }>;
+  hits: MemorySearchHit[];
+  indexedVaultFiles?: number;
+  indexedVaultChunks?: number;
+}
+
+export interface MemoryReadVaultDocResult {
+  ok: boolean;
+  relPath?: string;
+  title?: string;
+  category?: string;
+  markdown?: string;
+  truncated?: boolean;
+  error?: string;
+}
+
+export interface EpubBookSummary {
+  slug: string;
+  title: string;
+  author: string;
+  chapterCount: number;
+  indexRelPath: string;
+  noteRelPath?: string;
+  updatedAtIso: string;
+}
+
+export interface SecretaryCommitmentItem {
+  id: string;
+  title: string;
+  dueHint?: string;
+  source?: string;
+  status: "open" | "done" | "snoozed";
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface SecretaryNudgeItem {
+  id: string;
+  kind: "commute_chisu" | "agent_review" | "open_loop" | "vault_synthesis" | "book_reading";
+  title: string;
+  subtitle: string;
+  actionLabel: string;
+  actionType: "open_chisu" | "open_missions" | "ask_chat" | "open_vault_doc";
+  actionPayload: string;
+}
+
+export interface SecretaryBriefSnapshot {
+  greeting: string;
+  dateLabel: string;
+  headline: string;
+  profileItems: string[];
+  openLoops: SecretaryCommitmentItem[];
+  nudges: SecretaryNudgeItem[];
+  recentChisuCount: number;
+  activeAgentCount: number;
+  vaultFocusTitles: string[];
+  generatedAtMs: number;
 }
 
 /**

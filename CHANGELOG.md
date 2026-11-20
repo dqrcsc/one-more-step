@@ -1,5 +1,13 @@
 # Changelog · 更新日志
 
+## 3.3.0 - 2026-11-21 · 随身秘书今日简报与活记忆、尺素全模态（图文/视频/灵感）双文档、全库中文 FTS5 统一检索、EPUB 拆章入库与 Antigravity 额度修复
+
+- **尺素支持图片笔记、视频与灵感的双文档查看 (`WeChatBridgeSupervisor`、`OmsDaemon` & `ChisuWorkspaceView`)**：打通 `wechat_context.db` 的 `conversation_turns`（`multimodal_ingest` / `capture_idea` / `capture_inbox`）与 `articles` 合并视图；扩展 `wechat.article.detail` / `wechat.article.asset` 支持 `turnId` 维度，自动将多媒体笔记中的相对路径图片附件提升为正文内嵌原图（支持灯箱缩放）；手机端新增 `图片 / 视频 / 灵感` 分类快筛，阅读器标签自动适配为「分析报告 / 原图与原文 / 转录与原文 / 原始灵感」。
+- **Antigravity 额度与状态展示根治修复 (`AgentSessionHub` & `AgentQuotaDashboardCard`)**：移除已过期失效的旧版 IDE `state.vscdb`（2026-05）读取逻辑；合并扫描 `~/.gemini/antigravity/brain` 与 `~/.gemini/antigravity-cli/brain` 双目录真实推理轮次/Token/缓存命中率及近 6 小时真实限流报错；修复 Android 端 `statusNote.contains("限流")` 误把 `"未触发限流"` 判成 `"触发限流"` 的高亮 Bug，改为诚实准确的「运行正常 / 触发限流」状态呈现。
+- **全库增量中文分词 FTS5 混合检索与手机端全局统一搜索 (`MobileMemoryMirror` & `CockpitShell`)**：突破旧版仅扫最近 180 篇、截断 12KB 与无排序的局限，新增基于 `Intl.Segmenter("zh-CN")` 中文分词 + 标题分块 + BM25 × 目录权重（`04_topics` > `03_ideas` > `05_outputs` > `01_inputs/books` > `01_inputs`）的增量 SQLite FTS5 全库索引，并同步覆盖微信尺素与手机对话；手机端侧边抽屉升级为全局统一搜索（Omni-Search），支持新增全屏知识库文档阅读器（`memory.read_vault_doc`）与一键朗读/追问；新增 `oms search "<query>"` CLI。
+- **零依赖 EPUB 电子书拆章解析入库流水线 (`EpubVaultImporter` & `oms book import`)**：新增 `oms book import <path.epub>` 与 `oms book list`，自动解压解析 OPF 元数据、EPUB3/NCX 目录与章节 XHTML 为结构化 Markdown（保留插图至 `assets/`），严格遵循个人知识库规范写入 `01_inputs/books/sources/<slug>/`、生成非破坏性伴读笔记脚手架 `notes/<slug>_note.md`、幂等登记至 `bookshelf.md` 并立即同步进全库 FTS5 索引供跨书检索与通勤听书。
+- **随身秘书中枢：活记忆、未闭环事项与今日简报台 (`SecretaryCore`、`CockpitRuntimeCoordinator` & `ChatWorkspaceView`)**：新增透明可控的个人长期记忆（Profile）与未闭环事项（Open Loops）持久化存储（支持 `oms brief` / `oms todo` CLI 及 App 内管理），在非无痕对话中自动注入个人偏好与待办上下文，支持对话中自动捕获 `[COMMITMENT:事项|时间]`；手机端对话空白页升级为「随身秘书今日简报台」，聚合今日问候、未闭环事项勾选与快速记录、1~3 张可一键执行或忽略的主动建议卡（尺素听读、Mac 协同任务验收、书架直达、主题回顾）及长期记忆编辑器。
+
 ## 3.2.1 - 2026-11-20 · 尺素移动端双文档杂志阅读器、Mac 归档库双向同步与图文/链接渲染升级
 
 - **Mac 尺素归档库与手机端双向 RPC 同步 (`WeChatBridgeSupervisor`、`OmsDaemon` & `shared-protocol`)**：新增 `wechat.articles.list`、`wechat.article.detail` 与 `wechat.article.asset` 加密 RPC 协议，支持手机端实时拉取 Mac 微信尺素归档列表、按文章 ID/链接/标题按需获取完整「分析报告 / 初筛摘要 / 保存原文」Markdown 内容以及原文档内嵌图片资源（Base64 安全传输，单图上限 `3 MiB`）；同步在推送队列与 `StreamStartHeader` 中透传 `wechatArticleId` 与完整元数据。

@@ -165,11 +165,17 @@ fun ChisuWorkspaceView(
 
     val edgeCount = remember(mergedArticles) { mergedArticles.count { it.isEdgeNightStandby } }
     val withSourceCount = remember(mergedArticles) { mergedArticles.count { it.hasSource } }
+    val imageNoteCount = remember(mergedArticles) { mergedArticles.count { it.mediaKind == "image_note" } }
+    val videoCount = remember(mergedArticles) { mergedArticles.count { it.mediaKind == "video" } }
+    val ideaCount = remember(mergedArticles) { mergedArticles.count { it.mediaKind == "idea" } }
 
     val filteredItems = remember(mergedArticles, filterKey, searchQuery) {
         val q = searchQuery.trim().lowercase(Locale.ROOT)
         mergedArticles.filter { item ->
             val matchFilter = when (filterKey) {
+                "IMAGE_NOTE" -> item.mediaKind == "image_note"
+                "VIDEO" -> item.mediaKind == "video"
+                "IDEA" -> item.mediaKind == "idea"
                 "WITH_SOURCE" -> item.hasSource
                 "EDGE_NIGHT" -> item.isEdgeNightStandby
                 else -> true
@@ -202,7 +208,12 @@ fun ChisuWorkspaceView(
                 activeOpenedItem?.let { coordinator.openChisuArticle(it, forceRefresh = true) }
             },
             onLoadImageBytes = { docKind, src ->
-                coordinator.loadChisuInlineImageBytes(activeDetail?.articleId, docKind, src)
+                coordinator.loadChisuInlineImageBytes(
+                    articleId = activeDetail?.articleId,
+                    turnId = activeDetail?.turnId,
+                    docKind = docKind,
+                    src = src
+                )
             },
             onDiscussInChat = { title, cleanBody ->
                 activeOpenedItem = null
@@ -238,6 +249,30 @@ fun ChisuWorkspaceView(
                     icon = OmsIcons.BookOpen,
                     onClick = { filterKey = "ALL" }
                 )
+                if (imageNoteCount > 0) {
+                    OmsTogglePill(
+                        label = "图片 ($imageNoteCount)",
+                        active = filterKey == "IMAGE_NOTE",
+                        icon = OmsIcons.Image,
+                        onClick = { filterKey = "IMAGE_NOTE" }
+                    )
+                }
+                if (videoCount > 0) {
+                    OmsTogglePill(
+                        label = "视频 ($videoCount)",
+                        active = filterKey == "VIDEO",
+                        icon = OmsIcons.Video,
+                        onClick = { filterKey = "VIDEO" }
+                    )
+                }
+                if (ideaCount > 0) {
+                    OmsTogglePill(
+                        label = "灵感 ($ideaCount)",
+                        active = filterKey == "IDEA",
+                        icon = OmsIcons.Lightbulb,
+                        onClick = { filterKey = "IDEA" }
+                    )
+                }
                 if (withSourceCount > 0) {
                     OmsTogglePill(
                         label = "含原文 ($withSourceCount)",
@@ -434,12 +469,34 @@ private fun ChisuMagazineDigestCard(
     val triageLabel = remember(item.triage, item.processLevel) {
         ChisuDocumentParser.triageDisplayLabel(item.triage, item.processLevel)
     }
-    val sourceLabel = remember(item.author, item.isEdgeNightStandby) {
+    val sourceLabel = remember(item.author, item.isEdgeNightStandby, item.mediaKind) {
         when {
             item.author.isNotBlank() -> item.author
             item.isEdgeNightStandby -> "手机夜间初筛"
+            item.mediaKind == "image_note" -> "微信图片笔记"
+            item.mediaKind == "video" -> "微信视频笔记"
+            item.mediaKind == "idea" -> "个人灵感"
             else -> "尺素伴读"
         }
+    }
+    val mediaIcon = when {
+        item.isEdgeNightStandby -> OmsIcons.Moon
+        item.mediaKind == "image_note" -> OmsIcons.Image
+        item.mediaKind == "video" -> OmsIcons.Video
+        item.mediaKind == "idea" -> OmsIcons.Lightbulb
+        else -> OmsIcons.BookOpen
+    }
+    val mediaKindBadge = when (item.mediaKind) {
+        "image_note" -> "图片"
+        "video" -> "视频"
+        "idea" -> "灵感"
+        else -> ""
+    }
+    val sourceChipLabel = when (item.mediaKind) {
+        "image_note" -> "含原图"
+        "video" -> "含转录"
+        "idea" -> "含原记"
+        else -> "含原文"
     }
     val estReadMin = remember(item.localNoteMarkdown, item.previewExcerpt) {
         val len = item.localNoteMarkdown?.length ?: item.previewExcerpt.length
@@ -464,7 +521,7 @@ private fun ChisuMagazineDigestCard(
                 modifier = Modifier.weight(1f)
             ) {
                 Icon(
-                    imageVector = if (item.isEdgeNightStandby) OmsIcons.Moon else OmsIcons.BookOpen,
+                    imageVector = mediaIcon,
                     contentDescription = null,
                     tint = palette.accent,
                     modifier = Modifier.size(13.5.dp)
@@ -478,6 +535,18 @@ private fun ChisuMagazineDigestCard(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.widthIn(max = 140.dp)
                 )
+                if (mediaKindBadge.isNotBlank() && !sourceLabel.contains(mediaKindBadge)) {
+                    Text(
+                        text = mediaKindBadge,
+                        color = palette.accent,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(palette.accentSoft)
+                            .padding(horizontal = 6.dp, vertical = 1.5.dp)
+                    )
+                }
                 if (triageLabel.isNotBlank()) {
                     Text(
                         text = triageLabel,
@@ -564,7 +633,7 @@ private fun ChisuMagazineDigestCard(
                             .padding(horizontal = 7.dp, vertical = 2.5.dp)
                     ) {
                         Icon(OmsIcons.FileText, contentDescription = null, tint = palette.textSecondary, modifier = Modifier.size(11.dp))
-                        Text("含原文", color = palette.textSecondary, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                        Text(sourceChipLabel, color = palette.textSecondary, fontSize = 11.sp, fontWeight = FontWeight.Medium)
                     }
                 }
             }
@@ -662,26 +731,36 @@ private fun ChisuImmersiveReaderScreen(
         ChisuReaderDocMode.SOURCE -> parsedSource?.bodyMarkdown ?: ""
     }
     val activeDocKind = if (docMode == ChisuReaderDocMode.SOURCE) "source" else "note"
+    val reportTabLabel = when (detail.mediaKind) {
+        "idea" -> "AI 关联解读"
+        else -> "分析报告"
+    }
+    val sourceTabLabel = when (detail.mediaKind) {
+        "image_note" -> "原图与原文"
+        "video" -> "转录与原文"
+        "idea" -> "原始灵感"
+        else -> "保存原文"
+    }
     val activeDocLabel = when (docMode) {
-        ChisuReaderDocMode.REPORT -> "分析报告"
+        ChisuReaderDocMode.REPORT -> reportTabLabel
         ChisuReaderDocMode.SUMMARY -> "初筛摘要"
-        ChisuReaderDocMode.SOURCE -> "保存原文"
+        ChisuReaderDocMode.SOURCE -> sourceTabLabel
     }
     val estReadMin = remember(activeBodyMarkdown) {
         (activeBodyMarkdown.length / 360).coerceAtLeast(1)
     }
 
-    val segmentItems = remember(hasDistinctSummary) {
+    val segmentItems = remember(hasDistinctSummary, reportTabLabel, sourceTabLabel) {
         if (hasDistinctSummary) {
             listOf(
-                OmsSegmentItem(ChisuReaderDocMode.REPORT, "分析报告"),
+                OmsSegmentItem(ChisuReaderDocMode.REPORT, reportTabLabel),
                 OmsSegmentItem(ChisuReaderDocMode.SUMMARY, "初筛摘要"),
-                OmsSegmentItem(ChisuReaderDocMode.SOURCE, "保存原文")
+                OmsSegmentItem(ChisuReaderDocMode.SOURCE, sourceTabLabel)
             )
         } else {
             listOf(
-                OmsSegmentItem(ChisuReaderDocMode.REPORT, "分析报告"),
-                OmsSegmentItem(ChisuReaderDocMode.SOURCE, "保存原文")
+                OmsSegmentItem(ChisuReaderDocMode.REPORT, reportTabLabel),
+                OmsSegmentItem(ChisuReaderDocMode.SOURCE, sourceTabLabel)
             )
         }
     }
@@ -908,7 +987,7 @@ private fun ChisuImmersiveReaderScreen(
                             }
                         }
 
-                        val imgLoader = remember(detail.articleId, activeDocKind) {
+                        val imgLoader = remember(detail.articleId, detail.turnId, activeDocKind) {
                             val fn: suspend (String) -> ByteArray? = { src ->
                                 onLoadImageBytes(activeDocKind, src)
                             }
@@ -1606,9 +1685,12 @@ private fun AgentBackendQuotaRow(
                     fontWeight = FontWeight.Bold
                 )
             } else {
+                val isRateLimited = quota.statusNote.contains("上限") ||
+                    quota.statusNote.contains("受限") ||
+                    (quota.statusNote.contains("触发") && !quota.statusNote.contains("未触发"))
                 Text(
-                    text = if (quota.statusNote.contains("限流")) "触发限流" else "额度充足",
-                    color = if (quota.statusNote.contains("限流")) palette.warning else palette.success,
+                    text = if (isRateLimited) "触发限流" else "运行正常",
+                    color = if (isRateLimited) palette.warning else palette.success,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold
                 )

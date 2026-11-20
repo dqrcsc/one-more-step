@@ -5,9 +5,69 @@ import type {
   ChatSyncBatchParams,
   MemoryPromoteVaultParams,
   MemoryPromoteVaultResult,
+  MemoryReadVaultDocResult,
+  MemorySearchHit,
   MemorySearchVaultResult,
 } from "@oms/shared-protocol";
 import { parseDotEnvSafe } from "../wechat/edge-proxy-bootstrap.js";
+
+const zhSegmenter =
+  typeof Intl !== "undefined" && typeof (Intl as any).Segmenter === "function"
+    ? new (Intl as any).Segmenter("zh-CN", { granularity: "word" })
+    : null;
+
+/**
+ * Segments Chinese & Latin text into space-separated searchable tokens for SQLite FTS5.
+ * Uses native `Intl.Segmenter("zh-CN")` so Chinese compounds match accurately in BM25.
+ */
+export function segmentTextForFts(raw: string): string {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  const tokens: string[] = [];
+  if (zhSegmenter) {
+    for (const seg of zhSegmenter.segment(text)) {
+      const piece = String(seg.segment || "").trim();
+      if (!piece) continue;
+      if (seg.isWordLike) {
+        const lower = piece.toLowerCase();
+        tokens.push(lower);
+        // Also add CJK bigrams for long unsegmented Chinese compounds (>3 chars)
+        if (/^[\u4e00-\u9fff]{4,}$/.test(lower)) {
+          for (let i = 0; i < lower.length - 1; i++) {
+            tokens.push(lower.slice(i, i + 2));
+          }
+        }
+      }
+    }
+  } else {
+    const fallback = text
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+      .split(/\s+/)
+      .filter(Boolean);
+    tokens.push(...fallback);
+  }
+  return tokens.join(" ");
+}
+
+export function extractSearchTokens(query: string): string[] {
+  const raw = String(query || "").trim();
+  if (!raw) return [];
+  const seen = new Set<string>();
+  const add = (t: string) => {
+    const clean = t.trim().toLowerCase();
+    if (clean.length >= 1 && !seen.has(clean)) seen.add(clean);
+  };
+  if (zhSegmenter) {
+    for (const seg of zhSegmenter.segment(raw)) {
+      if (seg.isWordLike) add(String(seg.segment || ""));
+    }
+  }
+  for (const part of raw.replace(/[^\p{L}\p{N}\s]+/gu, " ").split(/\s+/)) {
+    if (part.trim()) add(part);
+  }
+  return Array.from(seen).slice(0, 10);
+}
 
 export interface MobileMemoryMirrorOptions {
   omsHomeDir: string;
@@ -23,14 +83,17 @@ export interface MobileMemoryMirrorOptions {
  * - L2: Promotes explicit highlights & Botanical Glass specimens into `VAULT_ROOT` with collision-safe paths (never overwrites).
  */
 export class MobileMemoryMirror {
+  private readonly omsHomeDir: string;
   private readonly chatDir: string;
   private readonly dbPath: string;
   private readonly workingMemoryPath: string;
   private readonly wechatEnvPath: string;
   private readonly vaultRootOverride?: string;
   private db: Database;
+  private lastVaultSyncMs = 0;
 
   constructor(opts: MobileMemoryMirrorOptions) {
+    this.omsHomeDir = opts.omsHomeDir;
     this.chatDir = path.join(opts.omsHomeDir, "chat");
     fs.mkdirSync(this.chatDir, { recursive: true, mode: 0o700 });
     this.dbPath = path.join(this.chatDir, "mobile_chat.db");
@@ -68,6 +131,23 @@ export class MobileMemoryMirror {
         thread_id UNINDEXED,
         title,
         content
+      );
+      CREATE TABLE IF NOT EXISTS vault_files_meta (
+        rel_path TEXT PRIMARY KEY,
+        mtime_ms INTEGER NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        category TEXT NOT NULL,
+        weight REAL NOT NULL
+      );
+      CREATE VIRTUAL TABLE IF NOT EXISTS vault_chunks_fts USING fts5(
+        rel_path UNINDEXED,
+        heading UNINDEXED,
+        category UNINDEXED,
+        title,
+        segmented_title,
+        segmented_body,
+        raw_excerpt UNINDEXED
       );
     `);
   }
@@ -238,106 +318,458 @@ export class MobileMemoryMirror {
     };
   }
 
-  public searchContext(query: string, limit = 6): MemorySearchVaultResult {
+  private classifyVaultCategory(relPath: string): { category: string; weight: number } {
+    const p = relPath.replace(/\\/g, "/").toLowerCase();
+    if (p.startsWith("04_topics/")) return { category: "主题", weight: 1.45 };
+    if (p.startsWith("03_ideas/")) return { category: "想法", weight: 1.35 };
+    if (p.startsWith("05_outputs/")) return { category: "产出", weight: 1.25 };
+    if (p.startsWith("01_inputs/books/")) return { category: "书库", weight: 1.2 };
+    if (p.startsWith("01_inputs/papers/")) return { category: "论文", weight: 1.12 };
+    if (p.startsWith("01_inputs/video/")) return { category: "视频", weight: 1.05 };
+    if (p.startsWith("01_inputs/") || p.startsWith("00_inbox/")) return { category: "资料", weight: 1.0 };
+    if (p.startsWith("00_home/")) return { category: "主页", weight: 1.15 };
+    if (p.startsWith("02_conversations/")) return { category: "对话归档", weight: 0.9 };
+    if (p.startsWith("06_archive/")) return { category: "归档", weight: 0.65 };
+    if (p.startsWith("_system/")) return { category: "系统", weight: 0.35 };
+    return { category: "知识库", weight: 1.0 };
+  }
+
+  private extractDocTitle(relPath: string, rawMarkdown: string): string {
+    const fmMatch = rawMarkdown.match(/^\uFEFF?\s*---\r?\n([\s\S]*?)\r?\n---/);
+    if (fmMatch) {
+      const titleLine = fmMatch[1].match(/^title:\s*(.+)$/m);
+      if (titleLine?.[1]) {
+        const cleaned = titleLine[1].trim().replace(/^["']|["']$/g, "").trim();
+        if (cleaned) return cleaned;
+      }
+    }
+    const h1 = rawMarkdown.match(/^#\s+(.+)$/m);
+    if (h1?.[1]?.trim()) return h1[1].trim().slice(0, 120);
+    return path.basename(relPath, ".md");
+  }
+
+  private chunkMarkdownForIndex(rawMarkdown: string): Array<{ heading: string; body: string }> {
+    const stripped = rawMarkdown.replace(/^\uFEFF?\s*---\r?\n[\s\S]*?\r?\n---\r?\n*/, "").trim();
+    if (!stripped) return [];
+    const lines = stripped.split(/\r?\n/);
+    const chunks: Array<{ heading: string; body: string }> = [];
+    let currentHeading = "";
+    let buf: string[] = [];
+    let bufLen = 0;
+
+    const flush = () => {
+      const text = buf.join("\n").trim();
+      if (text) {
+        chunks.push({ heading: currentHeading, body: text });
+      }
+      buf = [];
+      bufLen = 0;
+    };
+
+    for (const line of lines) {
+      const hMatch = line.match(/^(#{1,3})\s+(.+)$/);
+      if (hMatch) {
+        if (bufLen > 120) flush();
+        currentHeading = hMatch[2].trim().slice(0, 100);
+      }
+      buf.push(line);
+      bufLen += line.length + 1;
+      if (bufLen >= 1600) {
+        flush();
+      }
+      if (chunks.length >= 40) break;
+    }
+    if (chunks.length < 40) flush();
+    return chunks;
+  }
+
+  public syncVaultIndex(force = false): { indexedFiles: number; indexedChunks: number; updatedFiles: number } {
+    const now = Date.now();
+    const vaultRoot = this.resolveVaultRoot();
+    if (!fs.existsSync(vaultRoot)) {
+      return { indexedFiles: 0, indexedChunks: 0, updatedFiles: 0 };
+    }
+    if (!force && this.lastVaultSyncMs > 0 && now - this.lastVaultSyncMs < 30_000) {
+      const fileCount = (this.db.query("SELECT COUNT(*) AS c FROM vault_files_meta").get() as { c: number })?.c ?? 0;
+      const chunkCount = (this.db.query("SELECT COUNT(*) AS c FROM vault_chunks_fts").get() as { c: number })?.c ?? 0;
+      return { indexedFiles: fileCount, indexedChunks: chunkCount, updatedFiles: 0 };
+    }
+
+    const diskFiles = this.collectAllVaultMarkdownFiles(vaultRoot, 2500);
+    const existingRows = this.db
+      .query("SELECT rel_path, mtime_ms, size_bytes FROM vault_files_meta")
+      .all() as Array<{ rel_path: string; mtime_ms: number; size_bytes: number }>;
+    const existingMap = new Map(existingRows.map((r) => [r.rel_path, r]));
+    const seenRel = new Set<string>();
+
+    const toUpsert: Array<{
+      relPath: string;
+      absPath: string;
+      mtimeMs: number;
+      sizeBytes: number;
+    }> = [];
+
+    for (const f of diskFiles) {
+      seenRel.add(f.relPath);
+      const prev = existingMap.get(f.relPath);
+      if (!prev || prev.mtime_ms !== f.mtimeMs || prev.size_bytes !== f.sizeBytes) {
+        toUpsert.push(f);
+      }
+    }
+
+    const toDelete: string[] = [];
+    for (const rel of existingMap.keys()) {
+      if (!seenRel.has(rel)) toDelete.push(rel);
+    }
+
+    if (toUpsert.length > 0 || toDelete.length > 0) {
+      const delMeta = this.db.prepare("DELETE FROM vault_files_meta WHERE rel_path = $rel");
+      const delChunks = this.db.prepare("DELETE FROM vault_chunks_fts WHERE rel_path = $rel");
+      const upsertMeta = this.db.prepare(`
+        INSERT OR REPLACE INTO vault_files_meta (rel_path, mtime_ms, size_bytes, title, category, weight)
+        VALUES ($rel, $mtime, $size, $title, $cat, $weight)
+      `);
+      const insChunk = this.db.prepare(`
+        INSERT INTO vault_chunks_fts (rel_path, heading, category, title, segmented_title, segmented_body, raw_excerpt)
+        VALUES ($rel, $heading, $cat, $title, $segTitle, $segBody, $rawExcerpt)
+      `);
+
+      const tx = this.db.transaction(() => {
+        for (const rel of toDelete) {
+          delMeta.run({ $rel: rel });
+          delChunks.run({ $rel: rel });
+        }
+        for (const item of toUpsert) {
+          let raw = "";
+          try {
+            raw = fs.readFileSync(item.absPath, "utf8").slice(0, 120_000);
+          } catch {
+            continue;
+          }
+          const title = this.extractDocTitle(item.relPath, raw);
+          const { category, weight } = this.classifyVaultCategory(item.relPath);
+          const segTitle = segmentTextForFts(`${title} ${path.basename(item.relPath, ".md")}`);
+          delChunks.run({ $rel: item.relPath });
+          upsertMeta.run({
+            $rel: item.relPath,
+            $mtime: item.mtimeMs,
+            $size: item.sizeBytes,
+            $title: title,
+            $cat: category,
+            $weight: weight,
+          });
+          const chunks = this.chunkMarkdownForIndex(raw);
+          if (chunks.length === 0) {
+            insChunk.run({
+              $rel: item.relPath,
+              $heading: "",
+              $cat: category,
+              $title: title,
+              $segTitle: segTitle,
+              $segBody: segTitle,
+              $rawExcerpt: title,
+            });
+          } else {
+            for (const ch of chunks) {
+              const segBody = segmentTextForFts(`${ch.heading} ${ch.body}`);
+              const cleanExcerpt = ch.body.replace(/\s+/g, " ").trim().slice(0, 420);
+              insChunk.run({
+                $rel: item.relPath,
+                $heading: ch.heading,
+                $cat: category,
+                $title: title,
+                $segTitle: segTitle,
+                $segBody: segBody,
+                $rawExcerpt: cleanExcerpt,
+              });
+            }
+          }
+        }
+      });
+      tx();
+    }
+
+    this.lastVaultSyncMs = now;
+    const fileCount = (this.db.query("SELECT COUNT(*) AS c FROM vault_files_meta").get() as { c: number })?.c ?? 0;
+    const chunkCount = (this.db.query("SELECT COUNT(*) AS c FROM vault_chunks_fts").get() as { c: number })?.c ?? 0;
+    return { indexedFiles: fileCount, indexedChunks: chunkCount, updatedFiles: toUpsert.length };
+  }
+
+  public readVaultDocument(relPath: string, maxChars = 120_000): MemoryReadVaultDocResult {
+    const cleanRel = String(relPath || "").trim().replace(/^\/+/, "");
+    if (!cleanRel || cleanRel.includes("..") || cleanRel.includes("\\")) {
+      return { ok: false, error: "Invalid vault relative path" };
+    }
+    const vaultRoot = path.resolve(this.resolveVaultRoot());
+    const targetAbs = path.resolve(vaultRoot, cleanRel);
+    if (!targetAbs.startsWith(`${vaultRoot}${path.sep}`) && targetAbs !== vaultRoot) {
+      return { ok: false, error: "Path escapes vault root" };
+    }
+    if (!fs.existsSync(targetAbs)) {
+      return { ok: false, error: "Vault document not found" };
+    }
+    try {
+      const st = fs.statSync(targetAbs);
+      if (!st.isFile()) return { ok: false, error: "Not a file" };
+      const raw = fs.readFileSync(targetAbs, "utf8");
+      const truncated = raw.length > maxChars;
+      const markdown = truncated ? raw.slice(0, maxChars) : raw;
+      const { category } = this.classifyVaultCategory(cleanRel);
+      return {
+        ok: true,
+        relPath: cleanRel,
+        title: this.extractDocTitle(cleanRel, raw),
+        category,
+        markdown,
+        truncated,
+      };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  }
+
+  public searchContext(query: string, limit = 8): MemorySearchVaultResult {
     const q = (query || "").trim();
     if (!q) return { hits: [] };
-    const maxHits = Math.max(1, Math.min(15, limit));
-    const hits: MemorySearchVaultResult["hits"] = [];
+    const maxHits = Math.max(1, Math.min(24, limit));
+    const tokens = extractSearchTokens(q);
+    if (tokens.length === 0) return { hits: [] };
 
-    // 1. Search L0 Mobile Chat SQLite FTS5
+    const syncStats = this.syncVaultIndex(false);
+    const ftsExpr = tokens.map((t) => `"${t.replace(/"/g, '""')}"`).join(" OR ");
+    const lowerQ = q.toLowerCase();
+
+    const scoredHits: Array<MemorySearchHit & { _rank: number }> = [];
+
+    // 1. Full-Vault Incremental FTS5 Search with Chinese Segmentation + BM25 + Category Weighting
     try {
-      const tokens = q
-        .replace(/[^\p{L}\p{N}\s]+/gu, " ")
-        .split(/\s+/)
-        .filter((t) => t.length >= 1)
-        .slice(0, 5);
-      if (tokens.length > 0) {
-        const ftsExpr = tokens.map((t) => `"${t.replace(/"/g, '""')}"`).join(" OR ");
-        const rows = this.db
-          .query(
-            `SELECT title, thread_id, snippet(mobile_messages_fts, 3, '[', ']', '…', 36) AS snip
-             FROM mobile_messages_fts
-             WHERE mobile_messages_fts MATCH $expr
-             LIMIT $lim`
-          )
-          .all({ $expr: ftsExpr, $lim: maxHits }) as Array<{
-          title: string;
-          thread_id: string;
-          snip: string;
-        }>;
-        for (const r of rows) {
-          hits.push({
-            source: "mobile_chat",
-            title: r.title || "手机历史对话",
-            pathOrRef: `thread:${r.thread_id}`,
-            snippet: r.snip || "",
-          });
+      const rows = this.db
+        .query(
+          `SELECT
+             v.rel_path,
+             v.heading,
+             v.category,
+             v.title,
+             v.raw_excerpt,
+             m.weight AS cat_weight,
+             bm25(vault_chunks_fts, 4.0, 3.0, 1.0) AS raw_bm25
+           FROM vault_chunks_fts v
+           LEFT JOIN vault_files_meta m ON m.rel_path = v.rel_path
+           WHERE vault_chunks_fts MATCH $expr
+           ORDER BY raw_bm25 ASC
+           LIMIT $lim`
+        )
+        .all({ $expr: ftsExpr, $lim: maxHits * 4 }) as Array<{
+        rel_path: string;
+        heading: string;
+        category: string;
+        title: string;
+        raw_excerpt: string;
+        cat_weight: number | null;
+        raw_bm25: number;
+      }>;
+
+      const bestByRelPath = new Map<string, MemorySearchHit & { _rank: number }>();
+      for (const r of rows) {
+        const weight = Number(r.cat_weight || 1.0);
+        // bm25 is negative (more negative = stronger match)
+        let score = Math.max(0.1, -Number(r.raw_bm25 || -0.5)) * weight;
+        const lowerTitle = (r.title || "").toLowerCase();
+        const lowerExcerpt = (r.raw_excerpt || "").toLowerCase();
+        if (lowerTitle.includes(lowerQ)) score *= 1.8;
+        if (lowerExcerpt.includes(lowerQ)) score *= 1.35;
+        const matchedTokenCount = tokens.filter((t) => lowerTitle.includes(t) || lowerExcerpt.includes(t)).length;
+        score *= 1 + matchedTokenCount * 0.18;
+
+        const snippet = this.extractFocusedSnippet(r.raw_excerpt || "", tokens, lowerQ);
+        const candidate: MemorySearchHit & { _rank: number } = {
+          source: "vault",
+          title: r.title || path.basename(r.rel_path, ".md"),
+          pathOrRef: r.rel_path,
+          snippet,
+          heading: r.heading || undefined,
+          category: r.category || "知识库",
+          score: Number(score.toFixed(2)),
+          _rank: score,
+        };
+        const prev = bestByRelPath.get(r.rel_path);
+        if (!prev || candidate._rank > prev._rank) {
+          bestByRelPath.set(r.rel_path, candidate);
         }
       }
+      scoredHits.push(...bestByRelPath.values());
     } catch {
-      // Fallback LIKE search if FTS query syntax rejects special input
+      // ignore FTS syntax edge cases
+    }
+
+    // 2. L0 Mobile Chat SQLite FTS5 + LIKE fallback (covers CJK substrings cleanly)
+    const seenChatThreads = new Set<string>();
+    try {
+      const rows = this.db
+        .query(
+          `SELECT title, thread_id, snippet(mobile_messages_fts, 3, '[', ']', '…', 36) AS snip, bm25(mobile_messages_fts) AS raw_bm25
+           FROM mobile_messages_fts
+           WHERE mobile_messages_fts MATCH $expr
+           ORDER BY raw_bm25 ASC
+           LIMIT $lim`
+        )
+        .all({ $expr: ftsExpr, $lim: maxHits }) as Array<{
+        title: string;
+        thread_id: string;
+        snip: string;
+        raw_bm25: number;
+      }>;
+      for (const r of rows) {
+        if (seenChatThreads.has(r.thread_id)) continue;
+        seenChatThreads.add(r.thread_id);
+        const score = Math.max(0.2, -Number(r.raw_bm25 || -0.5)) * 1.1;
+        scoredHits.push({
+          source: "mobile_chat",
+          title: r.title || "手机历史对话",
+          pathOrRef: `thread:${r.thread_id}`,
+          snippet: r.snip || "",
+          category: "手机对话",
+          score: Number(score.toFixed(2)),
+          _rank: score,
+        });
+      }
+    } catch {}
+
+    if (seenChatThreads.size < 3) {
       try {
         const rows = this.db
           .query(
-            `SELECT m.thread_id, COALESCE(t.title, '手机历史对话') AS title, substr(m.content, 1, 180) AS snip
+            `SELECT m.thread_id, COALESCE(t.title, '手机历史对话') AS title, m.content
              FROM mobile_messages m
              LEFT JOIN mobile_threads t ON t.thread_id = m.thread_id
-             WHERE m.content LIKE $pat
+             WHERE m.content LIKE $pat OR t.title LIKE $pat
              ORDER BY m.created_at_ms DESC
              LIMIT $lim`
           )
-          .all({ $pat: `%${q}%`, $lim: maxHits }) as Array<{
+          .all({ $pat: `%${q}%`, $lim: Math.min(5, maxHits) }) as Array<{
           thread_id: string;
           title: string;
-          snip: string;
+          content: string;
         }>;
         for (const r of rows) {
-          hits.push({
+          if (seenChatThreads.has(r.thread_id)) continue;
+          seenChatThreads.add(r.thread_id);
+          scoredHits.push({
             source: "mobile_chat",
             title: r.title,
             pathOrRef: `thread:${r.thread_id}`,
-            snippet: r.snip,
+            snippet: this.extractFocusedSnippet(r.content || "", tokens, lowerQ),
+            category: "手机对话",
+            score: 1.15,
+            _rank: 1.15,
+          });
+        }
+      } catch {}
+    }
+
+    // 3. WeChat Chisu SQLite search (articles + multimodal image/video/idea turns)
+    const wechatDbPath = path.join(this.omsHomeDir, "wechat", "data", "wechat_context.db");
+    if (fs.existsSync(wechatDbPath)) {
+      let wxDb: Database | null = null;
+      try {
+        wxDb = new Database(wechatDbPath, { readonly: true });
+        const likePat = `%${q}%`;
+        const artRows = wxDb
+          .query(
+            `SELECT id, title, author, short_summary, digest, user_notes
+             FROM articles
+             WHERE title LIKE $pat OR short_summary LIKE $pat OR user_notes LIKE $pat OR author LIKE $pat
+             ORDER BY id DESC
+             LIMIT 6`
+          )
+          .all({ $pat: likePat }) as Array<{
+          id: number;
+          title: string;
+          author: string;
+          short_summary: string;
+          digest: string;
+          user_notes: string;
+        }>;
+        for (const a of artRows) {
+          const text = a.short_summary || a.digest || a.user_notes || "";
+          const titleBoost = (a.title || "").toLowerCase().includes(lowerQ) ? 1.6 : 1.05;
+          scoredHits.push({
+            source: "chisu",
+            title: a.title || `尺素文章 #${a.id}`,
+            pathOrRef: `chisu:article:${a.id}`,
+            snippet: this.extractFocusedSnippet(text, tokens, lowerQ),
+            category: a.author ? `尺素 · ${a.author}` : "尺素文章",
+            articleId: a.id,
+            score: Number((1.3 * titleBoost).toFixed(2)),
+            _rank: 1.3 * titleBoost,
+          });
+        }
+
+        const turnRows = wxDb
+          .query(
+            `SELECT id, intent, user_text, assistant_reply, media_summary
+             FROM conversation_turns
+             WHERE intent IN ('multimodal_ingest', 'capture_idea', 'capture_inbox')
+               AND (user_text LIKE $pat OR assistant_reply LIKE $pat)
+             ORDER BY id DESC
+             LIMIT 4`
+          )
+          .all({ $pat: likePat }) as Array<{
+          id: number;
+          intent: string;
+          user_text: string;
+          assistant_reply: string;
+          media_summary: string;
+        }>;
+        for (const t of turnRows) {
+          const headingMatch = String(t.assistant_reply || "").match(/^#{1,4}\s+(.+)$/m);
+          const title = headingMatch?.[1]?.trim() || (t.intent === "capture_idea" ? "微信灵感速记" : "微信多媒体笔记");
+          const snippet = this.extractFocusedSnippet(t.assistant_reply || t.user_text || "", tokens, lowerQ);
+          scoredHits.push({
+            source: "chisu",
+            title,
+            pathOrRef: `chisu:turn:${t.id}`,
+            snippet,
+            category: t.intent === "capture_idea" ? "尺素 · 灵感" : "尺素 · 多媒体",
+            turnId: t.id,
+            score: 1.25,
+            _rank: 1.25,
           });
         }
       } catch {
-        // ignore
+        // ignore readonly open errors
+      } finally {
+        try {
+          wxDb?.close();
+        } catch {}
       }
     }
 
-    // 2. Lightweight Vault Markdown scan (bounded to keep latency < 40ms)
-    const vaultRoot = this.resolveVaultRoot();
-    if (fs.existsSync(vaultRoot) && hits.length < maxHits) {
-      const lowerTerms = q
-        .toLowerCase()
-        .split(/\s+/)
-        .filter(Boolean);
-      const mdFiles = this.collectRecentMarkdownFiles(vaultRoot, 180);
-      for (const filePath of mdFiles) {
-        if (hits.length >= maxHits) break;
-        try {
-          const baseName = path.basename(filePath, ".md");
-          const content = fs.readFileSync(filePath, "utf8").slice(0, 12000);
-          const hay = `${baseName}\n${content}`.toLowerCase();
-          if (lowerTerms.some((term) => hay.includes(term))) {
-            const firstMatchIdx = Math.max(0, hay.indexOf(lowerTerms[0]) - 50);
-            const excerpt = content
-              .slice(firstMatchIdx, firstMatchIdx + 200)
-              .replace(/\s+/g, " ")
-              .trim();
-            hits.push({
-              source: "vault",
-              title: baseName,
-              pathOrRef: path.relative(vaultRoot, filePath),
-              snippet: excerpt,
-            });
-          }
-        } catch {
-          // ignore unreadable file
+    scoredHits.sort((a, b) => b._rank - a._rank);
+    return {
+      hits: scoredHits.slice(0, maxHits).map(({ _rank, ...rest }) => rest),
+      indexedVaultFiles: syncStats.indexedFiles,
+      indexedVaultChunks: syncStats.indexedChunks,
+    };
+  }
+
+  private extractFocusedSnippet(text: string, tokens: string[], lowerFullQuery: string): string {
+    const clean = text.replace(/\s+/g, " ").trim();
+    if (!clean) return "";
+    const lower = clean.toLowerCase();
+    let idx = lower.indexOf(lowerFullQuery);
+    if (idx < 0) {
+      for (const tok of tokens) {
+        const pos = lower.indexOf(tok);
+        if (pos >= 0) {
+          idx = pos;
+          break;
         }
       }
     }
-
-    return { hits: hits.slice(0, maxHits) };
+    const start = Math.max(0, (idx >= 0 ? idx : 0) - 48);
+    const slice = clean.slice(start, start + 210).trim();
+    return `${start > 0 ? "…" : ""}${slice}${start + 210 < clean.length ? "…" : ""}`;
   }
 
   public close(): void {
@@ -348,10 +780,13 @@ export class MobileMemoryMirror {
     }
   }
 
-  private collectRecentMarkdownFiles(rootDir: string, maxFiles: number): string[] {
-    const collected: Array<{ filePath: string; mtimeMs: number }> = [];
+  private collectAllVaultMarkdownFiles(
+    rootDir: string,
+    maxFiles: number
+  ): Array<{ relPath: string; absPath: string; mtimeMs: number; sizeBytes: number }> {
+    const collected: Array<{ relPath: string; absPath: string; mtimeMs: number; sizeBytes: number }> = [];
     const walk = (dir: string, depth: number) => {
-      if (depth > 4 || collected.length >= maxFiles * 2) return;
+      if (depth > 6 || collected.length >= maxFiles) return;
       let entries: fs.Dirent[] = [];
       try {
         entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -359,14 +794,20 @@ export class MobileMemoryMirror {
         return;
       }
       for (const entry of entries) {
-        if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "_system") continue;
+        if (collected.length >= maxFiles) break;
+        if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "assets") continue;
         const full = path.join(dir, entry.name);
         if (entry.isDirectory()) {
           walk(full, depth + 1);
         } else if (entry.isFile() && entry.name.endsWith(".md") && !entry.name.includes("_export_")) {
           try {
             const st = fs.statSync(full);
-            collected.push({ filePath: full, mtimeMs: st.mtimeMs });
+            collected.push({
+              relPath: path.relative(rootDir, full).replace(/\\/g, "/"),
+              absPath: full,
+              mtimeMs: Math.floor(st.mtimeMs),
+              sizeBytes: st.size,
+            });
           } catch {
             // ignore
           }
@@ -374,8 +815,7 @@ export class MobileMemoryMirror {
       }
     };
     walk(rootDir, 0);
-    collected.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    return collected.slice(0, maxFiles).map((x) => x.filePath);
+    return collected;
   }
 
   private sanitizeFileName(raw: string): string {

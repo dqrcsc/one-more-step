@@ -44,6 +44,8 @@ import { HudStatusPayload, MacHudServer } from "../hud/mac-hud-server.js";
 import { ManagedWeChatEvent, WeChatBridgeSupervisor } from "../wechat/wechat-supervisor.js";
 import { buildEdgeSyncPayloadFromHost } from "../wechat/edge-proxy-bootstrap.js";
 import { MobileMemoryMirror } from "../memory/mobile-memory-mirror.js";
+import { SecretaryCore } from "../memory/secretary-core.js";
+import { importEpubToVault, listImportedBooks } from "../knowledge/epub-importer.js";
 import { AgentSessionHub, type AgentSessionHubOptions } from "../agent/agent-session-hub.js";
 
 export interface OmsHostConfig {
@@ -120,6 +122,7 @@ export class OmsDaemon {
   public readonly dingtalk: DingTalkPlugin;
   public readonly wechat: WeChatBridgeSupervisor;
   public readonly memoryMirror: MobileMemoryMirror;
+  public readonly secretary: SecretaryCore;
   public readonly agentHub: AgentSessionHub;
 
   private readonly configPath: string;
@@ -231,6 +234,7 @@ export class OmsDaemon {
       omsHomeDir: this.homeDir,
       wechatEnvPath: path.join(this.wechat.wechatHomeDir, ".env"),
     });
+    this.secretary = new SecretaryCore(this.homeDir);
     this.agentHub = new AgentSessionHub({
       omsHomeDir: this.homeDir,
       defaultWorkspacePath: repoRoot,
@@ -1257,20 +1261,22 @@ export class OmsDaemon {
               .then((res) => reply({ result: res }))
               .catch((err: any) => reply({ result: { ok: false, articles: [], error: err?.message || String(err) } }));
           } else if (req.method === "wechat.article.detail") {
-            const p = (req.params || {}) as { articleId?: number; sourceUrl?: string; title?: string };
+            const p = (req.params || {}) as { articleId?: number; turnId?: number; sourceUrl?: string; title?: string };
             void this.wechat
               .fetchArticleDetail({
                 articleId: p.articleId,
+                turnId: p.turnId,
                 sourceUrl: p.sourceUrl,
                 title: p.title,
               })
               .then((res) => reply({ result: res }))
               .catch((err: any) => reply({ result: { ok: false, error: err?.message || String(err) } }));
           } else if (req.method === "wechat.article.asset") {
-            const p = (req.params || {}) as { articleId?: number; doc?: "note" | "source"; path?: string };
+            const p = (req.params || {}) as { articleId?: number; turnId?: number; doc?: "note" | "source"; path?: string };
             void this.wechat
               .fetchArticleAsset({
-                articleId: Number(p.articleId || 0),
+                articleId: p.articleId ? Number(p.articleId) : undefined,
+                turnId: p.turnId ? Number(p.turnId) : undefined,
                 doc: p.doc === "note" ? "note" : "source",
                 path: String(p.path || ""),
               })
@@ -1297,8 +1303,45 @@ export class OmsDaemon {
             reply({ result: promoted });
           } else if (req.method === "memory.search_vault") {
             const p = (req.params || {}) as { query?: string; limit?: number };
-            const found = this.memoryMirror.searchContext(String(p.query || ""), p.limit ?? 6);
+            const found = this.memoryMirror.searchContext(String(p.query || ""), p.limit ?? 8);
             reply({ result: found });
+          } else if (req.method === "memory.read_vault_doc") {
+            const p = (req.params || {}) as { relPath?: string };
+            reply({ result: this.memoryMirror.readVaultDocument(String(p.relPath || "")) });
+          } else if (req.method === "book.list") {
+            reply({ result: { ok: true, books: listImportedBooks(this.memoryMirror.resolveVaultRoot()) } });
+          } else if (req.method === "secretary.brief") {
+            const brief = this.secretary.buildTodayBrief({
+              vaultRoot: this.memoryMirror.resolveVaultRoot(),
+              wechatDbPath: path.join(this.wechat.wechatHomeDir, "data", "wechat_context.db"),
+              agentSessions: this.agentHub.listSessions(20),
+            });
+            reply({ result: { ok: true, brief } });
+          } else if (req.method === "secretary.commitment.upsert") {
+            const p = (req.params || {}) as { id?: string; title?: string; dueHint?: string; source?: string; status?: "open" | "done" | "snoozed" };
+            const item = this.secretary.upsertCommitment({
+              id: p.id,
+              title: String(p.title || ""),
+              dueHint: p.dueHint,
+              source: p.source || "mobile",
+              status: p.status,
+            });
+            reply({ result: { ok: true, item } });
+          } else if (req.method === "secretary.commitment.toggle") {
+            const p = (req.params || {}) as { id?: string };
+            const item = this.secretary.toggleCommitment(String(p.id || ""));
+            reply({ result: { ok: Boolean(item), item } });
+          } else if (req.method === "secretary.commitment.delete") {
+            const p = (req.params || {}) as { id?: string };
+            reply({ result: { ok: this.secretary.deleteCommitment(String(p.id || "")) } });
+          } else if (req.method === "secretary.profile.save") {
+            const p = (req.params || {}) as { items?: string[] };
+            const items = this.secretary.saveProfileItems(Array.isArray(p.items) ? p.items : []);
+            reply({ result: { ok: true, items } });
+          } else if (req.method === "secretary.nudge.dismiss") {
+            const p = (req.params || {}) as { id?: string };
+            this.secretary.dismissNudge(String(p.id || ""));
+            reply({ result: { ok: true } });
           } else if (req.method === "agent.sessions.list") {
             const p = (req.params || {}) as { limit?: number };
             reply({ result: { sessions: this.agentHub.listSessions(p.limit ?? 48) } });
@@ -1896,20 +1939,28 @@ export class OmsDaemon {
     }
 
     const workingMem = this.memoryMirror.loadWorkingMemory();
+    const secretaryProfile = this.secretary.getProfileItems().map((x) => `[偏好] ${x}`);
+    const secretaryOpenLoops = this.secretary
+      .listCommitments(false)
+      .slice(0, 6)
+      .map((c) => `[待办] ${c.title}${c.dueHint ? `（${c.dueHint}）` : ""}`);
+    const enrichedWorkingMem = Array.from(
+      new Set([...secretaryOpenLoops, ...secretaryProfile, ...workingMem])
+    ).slice(0, 18);
     const rawCapsule = wxSnap?.contextCapsule as Record<string, any> | undefined;
     const capsule: Record<string, unknown> | undefined = rawCapsule
       ? {
           ...rawCapsule,
           recentWorkingMemory: Array.from(
             new Set([
+              ...enrichedWorkingMem,
               ...(Array.isArray(rawCapsule.recentWorkingMemory) ? rawCapsule.recentWorkingMemory : []),
-              ...workingMem,
             ])
-          ).slice(0, 12),
+          ).slice(0, 18),
         }
-      : workingMem.length > 0
+      : enrichedWorkingMem.length > 0
         ? {
-            revision: `wm_${workingMem.length}_${workingMem[0]?.slice(0, 8) || ""}`,
+            revision: `wm_${enrichedWorkingMem.length}_${enrichedWorkingMem[0]?.slice(0, 8) || ""}`,
             generatedAtIso: new Date().toISOString(),
             nowSummary: "",
             queueSummary: "",
@@ -1917,7 +1968,7 @@ export class OmsDaemon {
             analysisBackgroundFormatted: "",
             analysisWarnings: [],
             matchedCandidates: [],
-            recentWorkingMemory: workingMem,
+            recentWorkingMemory: enrichedWorkingMem,
           }
         : undefined;
     if (
@@ -2769,6 +2820,84 @@ export class OmsDaemon {
       case "agent.session.cancel": {
         const backend = params.backend === "agy" ? "agy" : "codex";
         return { ok: this.agentHub.cancelSession(backend, String(params.sessionId || "")) };
+      }
+
+      case "memory.search_vault": {
+        return this.memoryMirror.searchContext(String(params.query || ""), Number(params.limit) || 10);
+      }
+
+      case "memory.read_vault_doc": {
+        return this.memoryMirror.readVaultDocument(String(params.relPath || ""));
+      }
+
+      case "book.import": {
+        const vaultRoot =
+          typeof params.vaultRoot === "string" && params.vaultRoot.trim()
+            ? params.vaultRoot.trim()
+            : this.memoryMirror.resolveVaultRoot();
+        const result = importEpubToVault({
+          epubPath: String(params.epubPath || ""),
+          vaultRoot,
+          slug: typeof params.slug === "string" ? params.slug : undefined,
+          dryRun: Boolean(params.dryRun),
+        });
+        if (result.ok && !result.dryRun) {
+          this.memoryMirror.syncVaultIndex(true);
+        }
+        return result;
+      }
+
+      case "book.list": {
+        const vaultRoot =
+          typeof params.vaultRoot === "string" && params.vaultRoot.trim()
+            ? params.vaultRoot.trim()
+            : this.memoryMirror.resolveVaultRoot();
+        return { ok: true, vaultRoot, books: listImportedBooks(vaultRoot) };
+      }
+
+      case "secretary.brief": {
+        return {
+          ok: true,
+          brief: this.secretary.buildTodayBrief({
+            vaultRoot: this.memoryMirror.resolveVaultRoot(),
+            wechatDbPath: path.join(this.wechat.wechatHomeDir, "data", "wechat_context.db"),
+            agentSessions: this.agentHub.listSessions(20),
+          }),
+        };
+      }
+
+      case "secretary.commitment.list": {
+        return { ok: true, commitments: this.secretary.listCommitments(params.includeDone !== false) };
+      }
+
+      case "secretary.commitment.upsert": {
+        const item = this.secretary.upsertCommitment({
+          id: typeof params.id === "string" ? params.id : undefined,
+          title: String(params.title || ""),
+          dueHint: typeof params.dueHint === "string" ? params.dueHint : undefined,
+          source: typeof params.source === "string" ? params.source : "cli",
+          status:
+            params.status === "done" || params.status === "snoozed" ? params.status : "open",
+        });
+        return { ok: true, item };
+      }
+
+      case "secretary.commitment.toggle": {
+        const item = this.secretary.toggleCommitment(String(params.id || ""));
+        return { ok: Boolean(item), item };
+      }
+
+      case "secretary.commitment.delete": {
+        return { ok: this.secretary.deleteCommitment(String(params.id || "")) };
+      }
+
+      case "secretary.profile.get": {
+        return { ok: true, items: this.secretary.getProfileItems() };
+      }
+
+      case "secretary.profile.save": {
+        const items = this.secretary.saveProfileItems(Array.isArray(params.items) ? params.items : []);
+        return { ok: true, items };
       }
 
       case "airpods.status": {

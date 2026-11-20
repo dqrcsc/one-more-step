@@ -23,6 +23,9 @@ data class ParsedChisuDocument(
 data class ChisuArticleItemUi(
     val stableKey: String,
     val articleId: Int? = null,
+    val turnId: Int? = null,
+    val entryKind: String = "article",
+    val mediaKind: String = "article",
     val localStreamItemId: String? = null,
     val title: String,
     val author: String = "",
@@ -46,6 +49,9 @@ data class ChisuArticleItemUi(
 data class ChisuArticleDetailUi(
     val stableKey: String,
     val articleId: Int? = null,
+    val turnId: Int? = null,
+    val entryKind: String = "article",
+    val mediaKind: String = "article",
     val title: String,
     val author: String = "",
     val sourceUrl: String = "",

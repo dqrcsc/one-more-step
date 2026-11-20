@@ -2657,112 +2657,110 @@ export class AgentSessionHub extends EventEmitter {
         path.resolve(path.join(os.homedir(), ".gemini", "antigravity", "brain"));
 
     let activeModel = "";
-    const freshIdeWindows: AgentQuotaWindowItem[] = [];
-
-    // 1. Check Antigravity IDE `state.vscdb` (`userStatus`) if a fresh non-expired quota window is present
-    if (isDefaultHome) {
-      const vscdbPath = path.join(
-        os.homedir(),
-        "Library",
-        "Application Support",
-        "Antigravity",
-        "User",
-        "globalStorage",
-        "state.vscdb"
-      );
-      if (fs.existsSync(vscdbPath)) {
-        try {
-          const parsedWindows = this.tryDecodeFreshAgyVscdbQuota(vscdbPath);
-          freshIdeWindows.push(...parsedWindows);
-        } catch {
-          // ignore
-        }
-      }
-
-      // Check CLI log / settings for active model label (sanctioned read-only local log, no tokens read)
-      const cliLogPath = path.join(os.homedir(), ".gemini", "antigravity-cli", "cli.log");
-      if (fs.existsSync(cliLogPath)) {
-        try {
-          const tailLines = this.readJsonlBoundedLines(cliLogPath, 4096, 65536);
-          for (let i = tailLines.length - 1; i >= 0; i--) {
-            const m = tailLines[i].match(/selected model override to backend:\s*label="([^"]+)"/);
-            if (m?.[1]) {
-              activeModel = m[1];
-              break;
-            }
-          }
-        } catch {}
-      }
-      if (!activeModel) {
-        const cliSettingsPath = path.join(os.homedir(), ".gemini", "antigravity-cli", "settings.json");
-        if (fs.existsSync(cliSettingsPath)) {
-          try {
-            const s = JSON.parse(fs.readFileSync(cliSettingsPath, "utf8"));
-            if (typeof s?.model === "string") activeModel = s.model;
-          } catch {}
-        }
-      }
-    }
-
-    // 2. Aggregate live today / 7-day step & token telemetry from `transcript.jsonl`
-    let todaySteps = 0;
-    let weekConvos = 0;
-    let totalInputTok = 0;
-    let totalCacheTok = 0;
-    let totalOutputTok = 0;
-    let latestStepAtMs = 0;
     let quotaHitError = "";
     const now = Date.now();
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
     const todayFloorMs = startOfToday.getTime();
 
-    if (fs.existsSync(this.agyBrainDir)) {
+    // 1. Read sanctioned CLI log / settings for active model label and recent 429/quota errors
+    const cliLogPath = path.join(this.agyCliDir, "cli.log");
+    if (fs.existsSync(cliLogPath)) {
       try {
-        const entries = fs.readdirSync(this.agyBrainDir, { withFileTypes: true });
-        const recentTranscripts: Array<{ tp: string; mtimeMs: number }> = [];
+        const logStat = fs.statSync(cliLogPath);
+        const tailLines = this.readJsonlBoundedLines(cliLogPath, 4096, 96 * 1024);
+        for (let i = tailLines.length - 1; i >= 0; i--) {
+          const line = tailLines[i];
+          if (!activeModel) {
+            const m = line.match(/selected model override to backend:\s*label="([^"]+)"/);
+            if (m?.[1]) activeModel = m[1];
+          }
+          if (!quotaHitError && now - logStat.mtimeMs <= 6 * 3600_000) {
+            if (/RESOURCE_EXHAUSTED|quota.?exceeded|rate.?limit.?exceeded|too many requests/i.test(line)) {
+              const resetMatch = line.match(/(?:reset|retry|try again)[^0-9]*(\d+\s*(?:m|min|h|hr|hour|s|sec))/i);
+              quotaHitError = resetMatch?.[1]
+                ? `近期触发配额上限（预计 ${resetMatch[1]} 后冷却恢复）`
+                : "近期触发速率/配额上限，请稍候冷却";
+            }
+          }
+        }
+      } catch {}
+    }
+    if (!activeModel && isDefaultHome) {
+      const cliSettingsPath = path.join(this.agyCliDir, "settings.json");
+      if (fs.existsSync(cliSettingsPath)) {
+        try {
+          const s = JSON.parse(fs.readFileSync(cliSettingsPath, "utf8"));
+          if (typeof s?.model === "string") activeModel = s.model;
+        } catch {}
+      }
+    }
+
+    // 2. Aggregate live today / 7-day step & token telemetry across BOTH Desktop & CLI brain directories
+    let todaySteps = 0;
+    let weekConvos = 0;
+    let totalInputTok = 0;
+    let totalCacheTok = 0;
+    let totalOutputTok = 0;
+    let latestStepAtMs = 0;
+
+    const brainRoots = [this.agyBrainDir];
+    const cliBrainDir = path.join(this.agyCliDir, "brain");
+    if (path.resolve(cliBrainDir) !== path.resolve(this.agyBrainDir)) {
+      brainRoots.push(cliBrainDir);
+    }
+
+    const dedupByConv = new Map<string, { tp: string; mtimeMs: number }>();
+    for (const root of brainRoots) {
+      if (!fs.existsSync(root)) continue;
+      try {
+        const entries = fs.readdirSync(root, { withFileTypes: true });
         for (const e of entries) {
           if (!e.isDirectory() || e.name.startsWith(".")) continue;
-          const tp = path.join(this.agyBrainDir, e.name, ".system_generated", "logs", "transcript.jsonl");
+          const tp = path.join(root, e.name, ".system_generated", "logs", "transcript.jsonl");
           if (!fs.existsSync(tp)) continue;
           try {
             const st = fs.statSync(tp);
             if (now - st.mtimeMs <= 7 * 86400_000) {
-              weekConvos += 1;
-              recentTranscripts.push({ tp, mtimeMs: st.mtimeMs });
+              const prev = dedupByConv.get(e.name);
+              if (!prev || st.mtimeMs > prev.mtimeMs) {
+                dedupByConv.set(e.name, { tp, mtimeMs: st.mtimeMs });
+              }
             }
           } catch {}
         }
-        recentTranscripts.sort((a, b) => b.mtimeMs - a.mtimeMs);
-        for (const item of recentTranscripts.slice(0, 12)) {
-          if (item.mtimeMs > latestStepAtMs) latestStepAtMs = item.mtimeMs;
-          const lines = this.readJsonlBoundedLines(item.tp, 16 * 1024, 192 * 1024);
-          for (const line of lines) {
-            try {
-              const obj = JSON.parse(line);
-              const ts = obj?.created_at ? Date.parse(String(obj.created_at)) || 0 : 0;
-              if (obj?.type === "PLANNER_RESPONSE") {
-                if (!activeModel && typeof obj.model === "string" && obj.model) {
-                  activeModel = obj.model;
-                }
-                if (ts >= todayFloorMs) {
-                  todaySteps += 1;
-                  totalInputTok += Number(obj.input_tokens || 0);
-                  totalCacheTok += Number(obj.cache_read_tokens || 0);
-                  totalOutputTok += Number(obj.output_tokens || 0);
-                }
-              }
-              if (obj?.status === "ERROR" && ts >= now - 6 * 3600_000) {
-                const c = String(obj?.content || "");
-                if (/RESOURCE_EXHAUSTED|quota|rate.?limit/i.test(c)) {
-                  quotaHitError = "近期曾触发速率/配额上限，请稍候冷却";
-                }
-              }
-            } catch {}
-          }
-        }
       } catch {
         // ignore
+      }
+    }
+
+    weekConvos = dedupByConv.size;
+    const recentTranscripts = Array.from(dedupByConv.values()).sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const item of recentTranscripts.slice(0, 20)) {
+      if (item.mtimeMs > latestStepAtMs) latestStepAtMs = item.mtimeMs;
+      const lines = this.readJsonlBoundedLines(item.tp, 16 * 1024, 192 * 1024);
+      for (const line of lines) {
+        try {
+          const obj = JSON.parse(line);
+          const ts = obj?.created_at ? Date.parse(String(obj.created_at)) || 0 : 0;
+          if (obj?.type === "PLANNER_RESPONSE") {
+            if (!activeModel && typeof obj.model === "string" && obj.model) {
+              activeModel = obj.model;
+            }
+            if (ts >= todayFloorMs) {
+              todaySteps += 1;
+              totalInputTok += Number(obj.input_tokens || 0);
+              totalCacheTok += Number(obj.cache_read_tokens || 0);
+              totalOutputTok += Number(obj.output_tokens || 0);
+            }
+          }
+          if (obj?.status === "ERROR" && ts >= now - 6 * 3600_000 && !quotaHitError) {
+            const c = String(obj?.content || "");
+            if (/RESOURCE_EXHAUSTED|quota.?exceeded|rate.?limit/i.test(c)) {
+              quotaHitError = "近期触发速率/配额上限，请稍候冷却";
+            }
+          }
+        } catch {}
       }
     }
 
@@ -2772,7 +2770,9 @@ export class AgentSessionHub extends EventEmitter {
       totalOutputTok >= 1000 ? `${(totalOutputTok / 1000).toFixed(1)}k` : `${totalOutputTok}`;
     const activitySummary =
       todaySteps > 0
-        ? `今日 ${todaySteps} 轮推理 · 输出 ${outTokLabel} tok · 缓存命中 ${cacheHitPct}%`
+        ? totalOutputTok > 0
+          ? `今日 ${todaySteps} 轮推理 · 输出 ${outTokLabel} tok · 缓存命中 ${cacheHitPct}% · 近 7 日 ${weekConvos} 会话`
+          : `今日 ${todaySteps} 轮推理 · 近 7 日活跃 ${weekConvos} 个会话`
         : weekConvos > 0
           ? `近 7 日活跃 ${weekConvos} 个会话 · 今日尚未消耗`
           : "暂无近期推理消耗";
@@ -2782,119 +2782,15 @@ export class AgentSessionHub extends EventEmitter {
       available: true,
       planLabel: "Google AI · Antigravity",
       activeModel: activeModel || "Gemini",
-      windows: freshIdeWindows,
+      windows: [],
       creditsSummary: activitySummary,
       statusNote:
         quotaHitError ||
-        (freshIdeWindows.length > 0
-          ? "实时同步自 Antigravity 本地配额快照"
-          : "状态正常 · 滚动动态配额（未触发限流）"),
+        "运行正常 · 动态云端配额（官方本地未开放剩余百分比接口）",
       capturedAtMs: Math.floor(latestStepAtMs || now),
     };
     this.cachedAgyQuota = { fetchedAtMs: now, status };
     return status;
-  }
-
-  private tryDecodeFreshAgyVscdbQuota(vscdbPath: string): AgentQuotaWindowItem[] {
-    const readVarint = (buf: Buffer, offset: number): [bigint, number] => {
-      let res = 0n;
-      let shift = 0n;
-      let pos = offset;
-      while (pos < buf.length) {
-        const b = buf[pos++];
-        res |= BigInt(b & 0x7f) << shift;
-        if ((b & 0x80) === 0) break;
-        shift += 7n;
-      }
-      return [res, pos];
-    };
-
-    const parseFields = (buf: Buffer): Array<{ field: number; wire: number; val: any }> => {
-      const out: Array<{ field: number; wire: number; val: any }> = [];
-      let pos = 0;
-      while (pos < buf.length) {
-        const [tag, p1] = readVarint(buf, pos);
-        pos = p1;
-        const field = Number(tag >> 3n);
-        const wire = Number(tag & 7n);
-        if (field === 0) break;
-        if (wire === 0) {
-          const [v, p2] = readVarint(buf, pos);
-          pos = p2;
-          out.push({ field, wire, val: v });
-        } else if (wire === 1) {
-          if (pos + 8 > buf.length) break;
-          out.push({ field, wire, val: buf.subarray(pos, pos + 8) });
-          pos += 8;
-        } else if (wire === 2) {
-          const [len, p2] = readVarint(buf, pos);
-          const n = Number(len);
-          if (p2 + n > buf.length) break;
-          out.push({ field, wire, val: buf.subarray(p2, p2 + n) });
-          pos = p2 + n;
-        } else if (wire === 5) {
-          if (pos + 4 > buf.length) break;
-          out.push({ field, wire, val: buf.readFloatLE(pos) });
-          pos += 4;
-        } else {
-          break;
-        }
-      }
-      return out;
-    };
-
-    const db = new Database(`file:${vscdbPath}?immutable=1`, { readonly: true });
-    let rawVal = "";
-    try {
-      const row = db
-        .query("SELECT value FROM ItemTable WHERE key = ?")
-        .get("antigravityUnifiedStateSync.userStatus") as { value?: string } | null;
-      rawVal = String(row?.value || "");
-    } finally {
-      db.close();
-    }
-    if (!rawVal) return [];
-
-    const nowMs = Date.now();
-    const windows: AgentQuotaWindowItem[] = [];
-    for (const f1 of parseFields(Buffer.from(rawVal, "base64"))) {
-      if (f1.wire !== 2) continue;
-      for (const f2 of parseFields(f1.val)) {
-        if (f2.wire !== 2) continue;
-        for (const f3 of parseFields(f2.val)) {
-          if (f3.wire !== 2) continue;
-          const usFields = parseFields(Buffer.from(f3.val.toString("utf8"), "base64"));
-          for (const uf of usFields) {
-            if (uf.wire !== 2 || uf.val.length < 40) continue;
-            for (const sf of parseFields(uf.val)) {
-              if (sf.wire !== 2) continue;
-              const mFields = parseFields(sf.val);
-              const labelF = mFields.find((x) => x.field === 1 && x.wire === 2);
-              const quotaF = mFields.find((x) => x.field === 15 && x.wire === 2);
-              if (!labelF || !quotaF) continue;
-              const label = labelF.val.toString("utf8").trim();
-              const qFields = parseFields(quotaF.val);
-              const remFrac = Number(qFields.find((x) => x.field === 1 && x.wire === 5)?.val ?? 1);
-              const tsBuf = qFields.find((x) => x.field === 2 && x.wire === 2)?.val as Buffer | undefined;
-              const tsSec = tsBuf ? Number(parseFields(tsBuf).find((x) => x.field === 1)?.val ?? 0n) : 0;
-              const resetsAtMs = tsSec * 1000;
-              // Only surface non-stale windows whose reset timestamp is still upcoming or within the last 6h
-              if (resetsAtMs > nowMs - 6 * 3600_000) {
-                const remPct = Math.max(0, Math.min(100, Math.round(remFrac * 100)));
-                windows.push({
-                  key: label,
-                  label,
-                  usedPercent: 100 - remPct,
-                  remainingPercent: remPct,
-                  resetsAtMs,
-                });
-              }
-            }
-          }
-        }
-      }
-    }
-    return windows.slice(0, 4);
   }
 
   private cleanBoilerplatePrompt(raw: string): string {

@@ -1235,6 +1235,91 @@ async function main() {
       break;
     }
 
+    case "search":
+    case "find-note": {
+      const query = (flags.q as string) || positional.join(" ");
+      if (!query.trim()) {
+        throw new Error('Usage: oms search "<query>" [--limit N]');
+      }
+      const res = await ipc.call(
+        "memory.search_vault",
+        { query: query.trim(), limit: Number(flags.limit || 12) },
+        15000
+      );
+      console.log(JSON.stringify(res, null, 2));
+      break;
+    }
+
+    case "book":
+    case "books":
+    case "epub": {
+      const bookSub = (sub || "list").toLowerCase();
+      if (bookSub === "import" || bookSub === "add") {
+        const epubPath = (flags.file as string) || positional[1];
+        if (!epubPath) {
+          throw new Error("Usage: oms book import <path.epub> [--slug <slug>] [--vault <dir>] [--dry-run]");
+        }
+        const res = await ipc.call(
+          "book.import",
+          {
+            epubPath: path.resolve(epubPath),
+            slug: typeof flags.slug === "string" ? flags.slug : undefined,
+            vaultRoot: typeof flags.vault === "string" ? path.resolve(flags.vault) : undefined,
+            dryRun: Boolean(flags["dry-run"] || flags.dryRun),
+          },
+          60000
+        );
+        console.log(JSON.stringify(res, null, 2));
+      } else {
+        const res = await ipc.call(
+          "book.list",
+          {
+            vaultRoot: typeof flags.vault === "string" ? path.resolve(flags.vault) : undefined,
+          },
+          10000
+        );
+        console.log(JSON.stringify(res, null, 2));
+      }
+      break;
+    }
+
+    case "brief":
+    case "today": {
+      const res = await ipc.call("secretary.brief", {}, 12000);
+      console.log(JSON.stringify(res, null, 2));
+      break;
+    }
+
+    case "todo":
+    case "todos":
+    case "commitment": {
+      const op = (sub || "list").toLowerCase();
+      if (op === "add" || op === "new") {
+        const title = (flags.title as string) || positional.slice(1).join(" ");
+        if (!title.trim()) throw new Error('Usage: oms todo add "<事项>" [--due "<时间提示>"]');
+        const res = await ipc.call("secretary.commitment.upsert", {
+          title: title.trim(),
+          dueHint: typeof flags.due === "string" ? flags.due : undefined,
+          source: "cli",
+        });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "done" || op === "toggle") {
+        const id = positional[1];
+        if (!id) throw new Error("Usage: oms todo done <commitmentId>");
+        const res = await ipc.call("secretary.commitment.toggle", { id });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "rm" || op === "delete" || op === "del") {
+        const id = positional[1];
+        if (!id) throw new Error("Usage: oms todo rm <commitmentId>");
+        const res = await ipc.call("secretary.commitment.delete", { id });
+        console.log(JSON.stringify(res, null, 2));
+      } else {
+        const res = await ipc.call("secretary.commitment.list", { includeDone: Boolean(flags.all) });
+        console.log(JSON.stringify(res, null, 2));
+      }
+      break;
+    }
+
     case "wx":
     case "wechat": {
       const wxSub = (sub || "list").toLowerCase();

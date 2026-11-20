@@ -85,9 +85,14 @@ import androidx.compose.ui.window.DialogProperties
 import com.oms.client.OmsApplication
 import com.oms.client.agent.OmsAccessibilityService
 import com.oms.client.capability.NotificationExecutor
+import com.oms.client.capability.SpeechAudioPolicy
 import com.oms.client.cockpit.ChatMessageModel
 import com.oms.client.cockpit.ChatThreadModel
+import com.oms.client.cockpit.ChisuArticleItemUi
+import com.oms.client.cockpit.ChisuDocumentParser
 import com.oms.client.cockpit.CockpitRuntimeCoordinator
+import com.oms.client.cockpit.VaultDocPreviewUi
+import com.oms.client.ui.markdown.IncrementalMarkdownView
 import com.oms.client.edge.StandbyLeaseState
 import com.oms.client.transport.OtaUiState
 import com.oms.client.ui.theme.OmsAppearanceMode
@@ -151,6 +156,10 @@ fun OmsCockpitRootScreen() {
     val otaState by app.transportClient.otaStateFlow.collectAsState()
     val isSpeakingTts by NotificationExecutor.isSpeakingFlow.collectAsState()
     val speakingTtsText by NotificationExecutor.speakingTextFlow.collectAsState()
+    val omniSearchHits by coordinator.omniSearchHitsFlow.collectAsState()
+    val isOmniSearching by coordinator.isOmniSearchingFlow.collectAsState()
+    val activeVaultDoc by coordinator.activeVaultDocFlow.collectAsState()
+    val isLoadingVaultDoc by coordinator.isLoadingVaultDocFlow.collectAsState()
 
     var currentTab by remember { mutableStateOf(CockpitTab.CHAT) }
     var showBotanicalCamera by remember { mutableStateOf(false) }
@@ -242,7 +251,7 @@ fun OmsCockpitRootScreen() {
                                 )
                                 Box(modifier = Modifier.weight(1f)) {
                                     if (searchQuery.isEmpty()) {
-                                        Text("搜索历史对话与记忆…", color = palette.textTertiary, fontSize = 13.5.sp)
+                                        Text("搜索对话、尺素与个人知识库…", color = palette.textTertiary, fontSize = 13.5.sp)
                                     }
                                     BasicTextField(
                                         value = searchQuery,
@@ -369,41 +378,145 @@ fun OmsCockpitRootScreen() {
                             }
                         }
 
-                        // 3. FTS Search Results OR Grouped Conversation History
+                        // 3. Omni-Search Results (Local Chat + Mac Full-Vault FTS5 & Chisu) OR Grouped Conversation History
+                        LaunchedEffect(searchQuery, activeTier) {
+                            val q = searchQuery.trim()
+                            if (q.length < 2) {
+                                coordinator.searchOmniContext("")
+                            } else {
+                                delay(260L)
+                                coordinator.searchOmniContext(q)
+                            }
+                        }
+
                         if (searchQuery.isNotBlank()) {
                             val hits = remember(searchQuery, threads) {
-                                coordinator.chatRepo.searchGlobalMessages(searchQuery, limit = 25)
+                                coordinator.chatRepo.searchGlobalMessages(searchQuery, limit = 15)
                             }
-                            Text(
-                                text = "检索命中 ${hits.size} 条记录",
-                                color = palette.textTertiary,
-                                fontSize = 11.5.sp,
-                                modifier = Modifier.padding(horizontal = 4.dp)
-                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "对话 ${hits.size} 条 · 知识库/尺素 ${omniSearchHits.size} 条",
+                                    color = palette.textTertiary,
+                                    fontSize = 11.5.sp
+                                )
+                                if (isOmniSearching) {
+                                    Text("检索中…", color = palette.accent, fontSize = 11.sp)
+                                }
+                            }
                             LazyColumn(
                                 modifier = Modifier.weight(1f),
                                 verticalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
-                                items(items = hits, key = { it.messageId }) { hit ->
-                                    OmsSurfaceCard(
-                                        cornerRadius = 13.dp,
-                                        contentPadding = PaddingValues(11.dp),
-                                        onClick = {
-                                            val kw = searchQuery.trim()
-                                            coordinator.chatRepo.selectThread(hit.threadId)
-                                            pendingSearchJump = SearchJumpRequest(
-                                                threadId = hit.threadId,
-                                                messageId = hit.messageId,
-                                                keyword = kw
-                                            )
-                                            currentTab = CockpitTab.CHAT
-                                            scope.launch { drawerState.close() }
-                                        },
-                                        modifier = Modifier.fillMaxWidth()
-                                    ) {
-                                        Text(hit.threadTitle, color = palette.accent, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold)
-                                        Spacer(modifier = Modifier.height(2.dp))
-                                        Text(hit.snippet, color = palette.textSecondary, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                if (omniSearchHits.isNotEmpty()) {
+                                    item(key = "sec_omni_remote") {
+                                        Text(
+                                            text = "个人知识库、书库与尺素",
+                                            color = palette.textTertiary,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            modifier = Modifier.padding(start = 4.dp, top = 2.dp, bottom = 2.dp)
+                                        )
+                                    }
+                                    items(
+                                        items = omniSearchHits,
+                                        key = { "omni_${it.source}_${it.pathOrRef}" }
+                                    ) { hit ->
+                                        OmsSurfaceCard(
+                                            cornerRadius = 13.dp,
+                                            contentPadding = PaddingValues(11.dp),
+                                            onClick = {
+                                                if (hit.source == "chisu" && (hit.articleId != null || hit.turnId != null)) {
+                                                    coordinator.openChisuArticle(
+                                                        ChisuArticleItemUi(
+                                                            stableKey = hit.turnId?.let { "turn_$it" } ?: "wx_${hit.articleId ?: 0}",
+                                                            articleId = hit.articleId,
+                                                            turnId = hit.turnId,
+                                                            entryKind = if (hit.turnId != null) "turn" else "article",
+                                                            title = hit.title,
+                                                            createdAtMs = System.currentTimeMillis()
+                                                        )
+                                                    )
+                                                    currentTab = CockpitTab.CHISU
+                                                    scope.launch { drawerState.close() }
+                                                } else if (hit.source == "vault" && hit.pathOrRef.isNotBlank()) {
+                                                    coordinator.openVaultDoc(hit.pathOrRef)
+                                                    scope.launch { drawerState.close() }
+                                                }
+                                            },
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Row(
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    text = hit.category.ifBlank { if (hit.source == "chisu") "尺素" else "知识库" },
+                                                    color = palette.accent,
+                                                    fontSize = 10.5.sp,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    modifier = Modifier
+                                                        .clip(RoundedCornerShape(5.dp))
+                                                        .background(palette.accentSoft)
+                                                        .padding(horizontal = 5.dp, vertical = 1.dp)
+                                                )
+                                                Text(
+                                                    text = hit.title,
+                                                    color = palette.textPrimary,
+                                                    fontSize = 12.5.sp,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                            }
+                                            if (hit.snippet.isNotBlank()) {
+                                                Spacer(modifier = Modifier.height(3.dp))
+                                                Text(
+                                                    text = hit.snippet,
+                                                    color = palette.textSecondary,
+                                                    fontSize = 11.5.sp,
+                                                    maxLines = 2,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                                if (hits.isNotEmpty()) {
+                                    item(key = "sec_local_chat_hits") {
+                                        Text(
+                                            text = "手机历史对话",
+                                            color = palette.textTertiary,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            modifier = Modifier.padding(start = 4.dp, top = 6.dp, bottom = 2.dp)
+                                        )
+                                    }
+                                    items(items = hits, key = { it.messageId }) { hit ->
+                                        OmsSurfaceCard(
+                                            cornerRadius = 13.dp,
+                                            contentPadding = PaddingValues(11.dp),
+                                            onClick = {
+                                                val kw = searchQuery.trim()
+                                                coordinator.chatRepo.selectThread(hit.threadId)
+                                                pendingSearchJump = SearchJumpRequest(
+                                                    threadId = hit.threadId,
+                                                    messageId = hit.messageId,
+                                                    keyword = kw
+                                                )
+                                                currentTab = CockpitTab.CHAT
+                                                scope.launch { drawerState.close() }
+                                            },
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text(hit.threadTitle, color = palette.accent, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold)
+                                            Spacer(modifier = Modifier.height(2.dp))
+                                            Text(hit.snippet, color = palette.textSecondary, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                        }
                                     }
                                 }
                             }
@@ -626,7 +739,9 @@ fun OmsCockpitRootScreen() {
                                 onEscalateToMacAgent = { summary ->
                                     agentPrefillDraft = summary
                                     currentTab = CockpitTab.MISSION_HUB
-                                }
+                                },
+                                onSwitchTab = { targetTab -> currentTab = targetTab },
+                                onOpenVaultDoc = { relPath -> coordinator.openVaultDoc(relPath) }
                             )
 
                             CockpitTab.CHISU -> ChisuWorkspaceView(
@@ -673,6 +788,120 @@ fun OmsCockpitRootScreen() {
 
         // Non-Intrusive Top Dynamic Pill Toast Host
         OmsFloatingToastHost()
+    }
+
+    // Vault Document Fullscreen Reader Modal (from Omni-Search or Today Brief Book/Note Nudges)
+    if (activeVaultDoc != null || isLoadingVaultDoc) {
+        Dialog(
+            onDismissRequest = { coordinator.closeVaultDoc() },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            val doc = activeVaultDoc
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(palette.canvas)
+                    .statusBarsPadding()
+                    .navigationBarsPadding()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(palette.topBar)
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OmsCircleIconButton(
+                        icon = OmsIcons.ArrowLeft,
+                        contentDescription = "关闭文档",
+                        onClick = { coordinator.closeVaultDoc() }
+                    )
+                    Text(
+                        text = doc?.category?.ifBlank { "知识库文档" } ?: "正在读取知识库…",
+                        color = palette.textSecondary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (doc != null) {
+                            OmsCircleIconButton(
+                                icon = if (isSpeakingTts) OmsIcons.StopSquare else OmsIcons.Volume,
+                                contentDescription = "朗读本篇",
+                                contentColor = if (isSpeakingTts) palette.danger else palette.textPrimary,
+                                onClick = {
+                                    if (isSpeakingTts) {
+                                        NotificationExecutor.stopSpeaking(context)
+                                    } else {
+                                        val speakText = ChisuDocumentParser.cleanForTts(doc.markdown, doc.title)
+                                        app.transportClient.speakTextSmart(
+                                            speakText,
+                                            useAlarmStream = false,
+                                            audioPolicy = SpeechAudioPolicy.MEDIA_COMMUTE
+                                        )
+                                    }
+                                }
+                            )
+                            OmsPrimaryButton(
+                                label = "追问",
+                                icon = OmsIcons.Sparkles,
+                                height = 34.dp,
+                                onClick = {
+                                    val clean = ChisuDocumentParser.parse(doc.markdown, fallbackTitle = doc.title).bodyMarkdown
+                                    chatPrefillDraft = "请结合我知识库里的《${doc.title}》（${doc.relPath}）帮我深入分析与延展：\n${clean.take(1800)}"
+                                    coordinator.closeVaultDoc()
+                                    currentTab = CockpitTab.CHAT
+                                }
+                            )
+                        }
+                    }
+                }
+                Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
+                if (doc == null) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        androidx.compose.material3.CircularProgressIndicator(
+                            color = palette.accent,
+                            strokeWidth = 2.4.dp,
+                            modifier = Modifier.size(28.dp)
+                        )
+                    }
+                } else {
+                    val parsed = remember(doc.markdown, doc.title) {
+                        ChisuDocumentParser.parse(doc.markdown, fallbackTitle = doc.title, stripHeaderBlock = true)
+                    }
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 20.dp, vertical = 18.dp)
+                    ) {
+                        Text(
+                            text = parsed.cleanTitle.ifBlank { doc.title },
+                            color = palette.textPrimary,
+                            fontSize = 21.sp,
+                            fontWeight = FontWeight.Bold,
+                            lineHeight = 29.sp
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = doc.relPath,
+                            color = palette.textTertiary,
+                            fontSize = 11.5.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
+                        Spacer(modifier = Modifier.height(14.dp))
+                        IncrementalMarkdownView(
+                            markdown = parsed.bodyMarkdown.ifBlank { doc.markdown },
+                            bodyFontSize = 16.sp,
+                            bodyLineHeight = 27.sp
+                        )
+                    }
+                }
+            }
+        }
     }
 
     // Rename Thread Dialog

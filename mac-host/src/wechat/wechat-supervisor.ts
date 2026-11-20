@@ -360,14 +360,213 @@ export class WeChatBridgeSupervisor extends EventEmitter {
     return data;
   }
 
+  private classifyArticleMediaKind(url: string, title = ""): "article" | "image_note" | "video" | "idea" {
+    const u = String(url || "").toLowerCase();
+    const t = String(title || "").toLowerCase();
+    if (
+      u.includes("youtube.com/") ||
+      u.includes("youtu.be/") ||
+      u.includes("douyin.com/") ||
+      u.includes("bilibili.com/") ||
+      u.includes("weixin.qq.com/sph/") ||
+      t.includes("视频语音转写")
+    ) {
+      return "video";
+    }
+    if (u.includes("xiaohongshu.com/") || u.includes("xhslink.com/")) {
+      return "image_note";
+    }
+    return "article";
+  }
+
+  private decodeDepositedPaths(raw: unknown): string[] {
+    const text = String(raw || "").trim();
+    if (!text) return [];
+    if (text.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(text);
+        if (Array.isArray(parsed)) {
+          return parsed.map((x) => String(x || "").trim()).filter(Boolean);
+        }
+      } catch {}
+    }
+    return [text];
+  }
+
+  private cleanTurnReplyForReport(rawReply: string): string {
+    const lines = String(rawReply || "").replace(/\r\n/g, "\n").split("\n");
+    const kept: string[] = [];
+    let skippedHeader = false;
+    for (const line of lines) {
+      const t = line.trim();
+      if (
+        !skippedHeader &&
+        (t.startsWith("🖼️ 已解密并归档") ||
+          t.startsWith("🎬 已归档视频") ||
+          t.startsWith("💡 想法已保存") ||
+          t.startsWith("📥 已归档") ||
+          t.startsWith("📋 内容提炼"))
+      ) {
+        if (t.startsWith("📋 内容提炼")) skippedHeader = true;
+        continue;
+      }
+      if (kept.length === 0 && t === "") continue;
+      kept.push(line);
+    }
+    return kept.join("\n").trim() || String(rawReply || "").trim();
+  }
+
+  private promoteInlineImageAttachments(markdown: string): string {
+    if (!markdown) return "";
+    const imagePaths: string[] = [];
+    const linkRe = /(?<!!)\[([^\]]*)\]\(([^)\n]+\.(?:png|jpe?g|webp|gif|bmp)(?:\?[^)\n]*)?)\)/gi;
+    let m: RegExpExecArray | null;
+    while ((m = linkRe.exec(markdown)) !== null) {
+      const target = String(m[2] || "").trim();
+      if (target && !imagePaths.includes(target)) {
+        imagePaths.push(target);
+      }
+    }
+    if (imagePaths.length === 0) return markdown;
+
+    const alreadyInline = new Set<string>();
+    const imgRe = /!\[[^\]]*\]\(([^)\n]+)\)/g;
+    while ((m = imgRe.exec(markdown)) !== null) {
+      alreadyInline.add(String(m[1] || "").trim());
+    }
+    const missing = imagePaths.filter((p) => !alreadyInline.has(p));
+    if (missing.length === 0) return markdown;
+
+    const galleryMd = missing
+      .map((p, idx) => `![原图附件${missing.length > 1 ? ` ${idx + 1}` : ""}](${p})`)
+      .join("\n\n");
+
+    // Inject right after YAML frontmatter (if any) so ChisuDocumentParser keeps the images in the body
+    const fmMatch = markdown.match(/^\uFEFF?\s*---\r?\n[\s\S]*?\r?\n---\r?\n*/);
+    if (fmMatch) {
+      const fmBlock = fmMatch[0];
+      const rest = markdown.slice(fmBlock.length);
+      return `${fmBlock}${galleryMd}\n\n${rest}`;
+    }
+    return `${galleryMd}\n\n${markdown}`;
+  }
+
+  private extractCleanTurnTitle(
+    raw: Record<string, any>,
+    mediaKind: "article" | "image_note" | "video" | "idea",
+    depositedPath: string
+  ): string {
+    const reply = String(raw.assistant_reply || "");
+    const headingMatch = reply.match(/^(?:#{1,4})\s+(.+)$/m);
+    if (headingMatch?.[1]) {
+      const h = headingMatch[1].replace(/[*`#]/g, "").trim();
+      if (h.length >= 2) return h.slice(0, 72);
+    }
+    const coreMatch = reply.match(/核心提炼[：:]\s*([^\n]+)/);
+    if (coreMatch?.[1]) {
+      return coreMatch[1].replace(/[*`]/g, "").trim().slice(0, 72);
+    }
+    const userText = String(raw.user_text || "").trim();
+    if (userText && !userText.startsWith("[多媒体消息:") && !userText.startsWith("[电脑端主动推送:")) {
+      const firstLine = userText.split(/\r?\n/)[0]?.trim() || "";
+      if (firstLine.length >= 2) return firstLine.slice(0, 64);
+    }
+    if (depositedPath) {
+      const stem = path.basename(depositedPath, path.extname(depositedPath));
+      if (stem && !/^20\d{2}_\d{2}_\d{2}_wechat_(media_capture|video_transcript)_/i.test(stem)) {
+        return stem.replace(/_/g, " ").slice(0, 64);
+      }
+    }
+    return mediaKind === "video"
+      ? "微信视频口播笔记"
+      : mediaKind === "image_note"
+        ? "微信图片笔记"
+        : mediaKind === "idea"
+          ? "微信灵感速记"
+          : "微信尺素记录";
+  }
+
+  private mapRawTurnSummary(raw: Record<string, any>): WeChatArticleListItem | null {
+    const turnId = Number(raw.id || 0);
+    if (!Number.isFinite(turnId) || turnId <= 0) return null;
+    const intent = String(raw.intent || "").trim().toLowerCase();
+    if (intent !== "multimodal_ingest" && intent !== "capture_idea" && intent !== "capture_inbox") {
+      return null;
+    }
+    const paths = this.decodeDepositedPaths(raw.deposited_path);
+    const mdPath = paths.find((p) => /\.(md|markdown|txt)$/i.test(p)) || paths[0] || "";
+    const mediaSummary = String(raw.media_summary || "").trim();
+    const userText = String(raw.user_text || "").trim();
+    const assistantReply = String(raw.assistant_reply || "").trim();
+    if (!mdPath && !assistantReply) return null;
+
+    let mediaKind: "article" | "image_note" | "video" | "idea" = "idea";
+    if (intent === "capture_idea") {
+      mediaKind = "idea";
+    } else if (
+      /video/i.test(mediaSummary) ||
+      /\[多媒体消息:\s*video/i.test(userText) ||
+      mdPath.includes("/01_inputs/video/") ||
+      mdPath.includes("video_transcript")
+    ) {
+      mediaKind = "video";
+    } else if (
+      /image|photo|jpg|jpeg|png|webp/i.test(mediaSummary) ||
+      /\[多媒体消息:\s*image/i.test(userText) ||
+      mdPath.includes("media_capture")
+    ) {
+      mediaKind = "image_note";
+    }
+
+    const cleanReport = this.cleanTurnReplyForReport(assistantReply);
+    const authorLabel =
+      mediaKind === "video"
+        ? "微信视频"
+        : mediaKind === "image_note"
+          ? "微信图片笔记"
+          : intent === "capture_idea"
+            ? "个人灵感"
+            : "微信速记";
+    const userNotes =
+      userText && !userText.startsWith("[多媒体消息:") && intent === "multimodal_ingest"
+        ? userText.slice(0, 140)
+        : "";
+
+    return {
+      id: 0,
+      entryKind: "turn",
+      turnId,
+      mediaKind,
+      mediaSummary,
+      title: this.extractCleanTurnTitle(raw, mediaKind, mdPath),
+      author: authorLabel,
+      url: "",
+      publishDate: String(raw.created_at || "").slice(0, 10),
+      createdAt: String(raw.created_at || "").trim(),
+      status: intent,
+      processLevel: cleanReport ? "light" : "raw",
+      triage: mediaKind === "idea" ? "process_now" : "reference",
+      userNotes,
+      shortSummary: cleanReport.slice(0, 320),
+      digest: userText && !userText.startsWith("[多媒体消息:") ? userText.slice(0, 220) : "",
+      hasNote: Boolean(cleanReport),
+      hasSource: Boolean(mdPath && fs.existsSync(mdPath)),
+      isFallbackNote: false,
+    };
+  }
+
   private mapRawArticleSummary(raw: Record<string, any>): WeChatArticleListItem {
     const notePath = typeof raw.note_md_path === "string" ? raw.note_md_path.trim() : "";
     const sourcePath = typeof raw.source_md_path === "string" ? raw.source_md_path.trim() : "";
+    const url = String(raw.url || "").trim();
+    const title = String(raw.title || "").trim();
     return {
       id: Number(raw.id || 0),
-      title: String(raw.title || "").trim(),
+      entryKind: "article",
+      mediaKind: this.classifyArticleMediaKind(url, title),
+      title,
       author: String(raw.author || "").trim(),
-      url: String(raw.url || "").trim(),
+      url,
       publishDate: String(raw.publish_date || "").trim(),
       createdAt: String(raw.created_at || "").trim(),
       status: String(raw.status || "").trim(),
@@ -406,11 +605,24 @@ export class WeChatBridgeSupervisor extends EventEmitter {
       }
       const data = (await res.json()) as Record<string, any>;
       const rawList = Array.isArray(data.articles) ? data.articles : [];
+      const rawTurns = Array.isArray(data.turns) ? data.turns : [];
+
+      const mappedArticles = rawList
+        .map((item: Record<string, any>) => this.mapRawArticleSummary(item))
+        .filter((item: WeChatArticleListItem) => item.id > 0);
+      const mappedTurns = rawTurns
+        .map((t: Record<string, any>) => this.mapRawTurnSummary(t))
+        .filter((item: WeChatArticleListItem | null): item is WeChatArticleListItem => item !== null);
+
+      const merged = [...mappedArticles, ...mappedTurns].sort((a, b) => {
+        const ta = Date.parse(a.createdAt || "") || 0;
+        const tb = Date.parse(b.createdAt || "") || 0;
+        return tb - ta;
+      });
+
       return {
         ok: true,
-        articles: rawList
-          .map((item: Record<string, any>) => this.mapRawArticleSummary(item))
-          .filter((item: WeChatArticleListItem) => item.id > 0),
+        articles: merged,
       };
     } catch (err: any) {
       return { ok: false, articles: [], error: err?.message || String(err) };
@@ -421,6 +633,64 @@ export class WeChatBridgeSupervisor extends EventEmitter {
     if (!this.isRunning()) {
       return { ok: false, error: "WeChat Context worker is not running" };
     }
+
+    const turnId = Number(params.turnId || 0);
+    if (Number.isFinite(turnId) && turnId > 0) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${this.internalPort}/api/article?turnId=${turnId}`, {
+          headers: { Host: `127.0.0.1:${this.internalPort}` },
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!res.ok) {
+          return { ok: false, error: `Turn fetch HTTP ${res.status}` };
+        }
+        const data = (await res.json()) as Record<string, any>;
+        if (!data.ok || !data.turn) {
+          return { ok: false, error: String(data.error || "Turn not found") };
+        }
+        const rawTurn = data.turn as Record<string, any>;
+        const mapped = this.mapRawTurnSummary(rawTurn) || {
+          id: 0,
+          entryKind: "turn" as const,
+          turnId,
+          mediaKind: "idea" as const,
+          title: `微信记录 #${turnId}`,
+          author: "微信尺素",
+          url: "",
+          publishDate: String(rawTurn.created_at || "").slice(0, 10),
+          createdAt: String(rawTurn.created_at || ""),
+          status: String(rawTurn.intent || ""),
+          processLevel: "light",
+          triage: "reference",
+          userNotes: "",
+          shortSummary: "",
+          digest: "",
+          hasNote: false,
+          hasSource: false,
+          isFallbackNote: false,
+        };
+        const rawDeposited = typeof data.depositedMarkdown === "string" ? data.depositedMarkdown : "";
+        const sourceMarkdown = rawDeposited
+          ? this.promoteInlineImageAttachments(rawDeposited)
+          : (String(rawTurn.user_text || "").trim() || null);
+        const replyClean = this.cleanTurnReplyForReport(String(rawTurn.assistant_reply || ""));
+        const noteMarkdown = replyClean || (rawDeposited ? this.promoteInlineImageAttachments(rawDeposited) : null);
+        mapped.hasNote = Boolean(noteMarkdown);
+        mapped.hasSource = Boolean(sourceMarkdown);
+        return {
+          ok: true,
+          article: mapped,
+          noteMarkdown,
+          sourceMarkdown,
+          summaryMarkdown: mapped.shortSummary || null,
+          noteTruncated: false,
+          sourceTruncated: Boolean(data.depositedTruncated),
+        };
+      } catch (err: any) {
+        return { ok: false, error: err?.message || String(err) };
+      }
+    }
+
     let targetId = Number(params.articleId || 0);
     if (!Number.isFinite(targetId) || targetId <= 0) {
       const overview = await this.fetchArticlesOverview(200);
@@ -432,7 +702,12 @@ export class WeChatBridgeSupervisor extends EventEmitter {
           if (wantTitle && this.normalizeMatchTitle(a.title) === wantTitle) return true;
           return false;
         });
-        if (matched) targetId = matched.id;
+        if (matched) {
+          if (matched.entryKind === "turn" && matched.turnId) {
+            return this.fetchArticleDetail({ turnId: matched.turnId });
+          }
+          targetId = matched.id;
+        }
       }
     }
     if (!Number.isFinite(targetId) || targetId <= 0) {
@@ -459,7 +734,10 @@ export class WeChatBridgeSupervisor extends EventEmitter {
         ok: true,
         article: mapped,
         noteMarkdown: typeof data.noteMarkdown === "string" ? data.noteMarkdown : null,
-        sourceMarkdown: typeof data.sourceMarkdown === "string" ? data.sourceMarkdown : null,
+        sourceMarkdown:
+          typeof data.sourceMarkdown === "string"
+            ? this.promoteInlineImageAttachments(data.sourceMarkdown)
+            : null,
         summaryMarkdown,
         noteTruncated: Boolean(data.noteTruncated),
         sourceTruncated: Boolean(data.sourceTruncated),
@@ -474,17 +752,20 @@ export class WeChatBridgeSupervisor extends EventEmitter {
       return { ok: false, error: "WeChat Context worker is not running" };
     }
     const articleId = Number(params.articleId || 0);
+    const turnId = Number(params.turnId || 0);
     const relPath = String(params.path || "").trim();
     const doc = params.doc === "note" ? "note" : "source";
-    if (!Number.isFinite(articleId) || articleId <= 0 || !relPath) {
-      return { ok: false, error: "Valid articleId and path required" };
+    if (!relPath || ((!Number.isFinite(articleId) || articleId <= 0) && (!Number.isFinite(turnId) || turnId <= 0))) {
+      return { ok: false, error: "Valid articleId/turnId and path required" };
     }
     try {
-      const qs = new URLSearchParams({
-        articleId: String(articleId),
-        doc,
-        path: relPath,
-      });
+      const qs = new URLSearchParams({ path: relPath });
+      if (Number.isFinite(turnId) && turnId > 0) {
+        qs.set("turnId", String(turnId));
+      } else {
+        qs.set("articleId", String(articleId));
+        qs.set("doc", doc);
+      }
       const res = await fetch(`http://127.0.0.1:${this.internalPort}/api/asset?${qs.toString()}`, {
         headers: { Host: `127.0.0.1:${this.internalPort}` },
         signal: AbortSignal.timeout(8000),

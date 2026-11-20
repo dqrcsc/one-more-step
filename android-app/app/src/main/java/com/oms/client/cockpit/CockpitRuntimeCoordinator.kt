@@ -115,6 +115,58 @@ data class RemoteAgentProjectUi(
     val lastActiveAtMs: Long
 )
 
+data class OmniSearchHitUi(
+    val source: String,
+    val title: String,
+    val pathOrRef: String,
+    val snippet: String,
+    val heading: String = "",
+    val category: String = "",
+    val articleId: Int? = null,
+    val turnId: Int? = null
+)
+
+data class VaultDocPreviewUi(
+    val relPath: String,
+    val title: String,
+    val category: String,
+    val markdown: String,
+    val truncated: Boolean = false
+)
+
+data class SecretaryCommitmentUi(
+    val id: String,
+    val title: String,
+    val dueHint: String = "",
+    val source: String = "",
+    val status: String = "open",
+    val createdAtMs: Long = 0L,
+    val updatedAtMs: Long = 0L
+)
+
+data class SecretaryNudgeUi(
+    val id: String,
+    val kind: String,
+    val title: String,
+    val subtitle: String,
+    val actionLabel: String,
+    val actionType: String,
+    val actionPayload: String
+)
+
+data class SecretaryBriefUi(
+    val greeting: String,
+    val dateLabel: String,
+    val headline: String,
+    val profileItems: List<String> = emptyList(),
+    val openLoops: List<SecretaryCommitmentUi> = emptyList(),
+    val nudges: List<SecretaryNudgeUi> = emptyList(),
+    val recentChisuCount: Int = 0,
+    val activeAgentCount: Int = 0,
+    val vaultFocusTitles: List<String> = emptyList(),
+    val generatedAtMs: Long = 0L
+)
+
 /**
  * Application-scoped coordinator for 咫尺 v2.0:
  *  - Unlock TLS Prewarmer (`<800ms` TTFT)
@@ -171,6 +223,26 @@ class CockpitRuntimeCoordinator(
 
     private val _chisuDetailErrorFlow = MutableStateFlow<String?>(null)
     val chisuDetailErrorFlow: StateFlow<String?> = _chisuDetailErrorFlow
+
+    // Omni-Search (Full Vault FTS5 + Chisu + Chat) & Vault Document Reader
+    private val _omniSearchHitsFlow = MutableStateFlow<List<OmniSearchHitUi>>(emptyList())
+    val omniSearchHitsFlow: StateFlow<List<OmniSearchHitUi>> = _omniSearchHitsFlow
+
+    private val _isOmniSearchingFlow = MutableStateFlow(false)
+    val isOmniSearchingFlow: StateFlow<Boolean> = _isOmniSearchingFlow
+
+    private val _activeVaultDocFlow = MutableStateFlow<VaultDocPreviewUi?>(null)
+    val activeVaultDocFlow: StateFlow<VaultDocPreviewUi?> = _activeVaultDocFlow
+
+    private val _isLoadingVaultDocFlow = MutableStateFlow(false)
+    val isLoadingVaultDocFlow: StateFlow<Boolean> = _isLoadingVaultDocFlow
+
+    // Chief-of-Staff Executive Core (Today Brief + Living Memory + Open Loops)
+    private val _secretaryBriefFlow = MutableStateFlow<SecretaryBriefUi?>(null)
+    val secretaryBriefFlow: StateFlow<SecretaryBriefUi?> = _secretaryBriefFlow
+
+    private val _isRefreshingBriefFlow = MutableStateFlow(false)
+    val isRefreshingBriefFlow: StateFlow<Boolean> = _isRefreshingBriefFlow
 
     // Proxy & Model Studio Reactive Flows
     private val _proxyNodesFlow = MutableStateFlow<List<ProxyNodeStatusView>>(emptyList())
@@ -254,6 +326,7 @@ class CockpitRuntimeCoordinator(
         edgeStore.loadCachedChisuCatalogJson()?.let { raw ->
             runCatching { applyChisuArticlesCatalogJson(JSONObject(raw)) }
         }
+        loadCachedSecretaryBrief()?.let { _secretaryBriefFlow.value = it }
 
         scope.launch {
             transportClient.activeTierFlow.collect { tier ->
@@ -261,6 +334,7 @@ class CockpitRuntimeCoordinator(
                     flushPendingSyncToMac()
                     refreshAgentSessions()
                     refreshChisuArticles()
+                    refreshSecretaryBrief()
                 }
             }
         }
@@ -273,6 +347,7 @@ class CockpitRuntimeCoordinator(
                 flushPendingSyncToMac()
                 refreshAgentSessions()
                 refreshChisuArticles()
+                refreshSecretaryBrief()
             }
         }
     }
@@ -402,12 +477,15 @@ class CockpitRuntimeCoordinator(
             else -> RouteIntent.AUTO
         }
         val nowFmt = SimpleDateFormat("yyyy-MM-dd HH:mm EEEE", Locale.CHINA).format(Date())
-        val devPrompt = CockpitAiServices.buildCockpitDeveloperPrompt(
+        val baseDevPrompt = CockpitAiServices.buildCockpitDeveloperPrompt(
             nowEpochMs = System.currentTimeMillis(),
             nowFormatted = nowFmt,
             deepThinking = deepThinking,
             webSearchEnabled = forceWebSearch
         )
+        val activeThreadForPrompt = chatRepo.getThreadById(threadId)
+        val secretaryContextSuffix = if (activeThreadForPrompt?.incognito == true) "" else buildSecretaryMemoryPromptBlock()
+        val devPrompt = if (secretaryContextSuffix.isNotBlank()) "$baseDevPrompt\n\n$secretaryContextSuffix" else baseDevPrompt
 
         try {
             val firstPass = streamSinglePassWithRetry(
@@ -448,12 +526,18 @@ class CockpitRuntimeCoordinator(
             }
 
             val (completed, parsedActions) = finalCompletedAndActions
+            val rawCleanMd = parsedActions.cleanMarkdown.ifBlank { completed.fullText }
+            val finalCleanMd = if (activeThreadForPrompt?.incognito == true) {
+                rawCleanMd
+            } else {
+                extractAndApplySecretaryCommitments(rawCleanMd)
+            }
             chatRepo.upsertMessage(
                 ChatMessageModel(
                     messageId = assistantMsgId,
                     threadId = threadId,
                     role = "assistant",
-                    content = parsedActions.cleanMarkdown.ifBlank { completed.fullText },
+                    content = finalCleanMd,
                     reasoning = completed.fullReasoning,
                     modelUsed = completed.modelUsed,
                     sources = completed.sources,
@@ -796,18 +880,32 @@ class CockpitRuntimeCoordinator(
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             val id = o.optInt("id", 0)
-            if (id <= 0) continue
+            val turnId = o.optInt("turnId", 0)
+            if (id <= 0 && turnId <= 0) continue
+            val entryKind = o.optString("entryKind", "").ifBlank { if (turnId > 0) "turn" else "article" }
+            val mediaKind = o.optString("mediaKind", "").ifBlank { "article" }
             val rawTitle = o.optString("title", "")
             val summary = o.optString("shortSummary", "").trim()
             val digest = o.optString("digest", "").trim()
             val createdMs = ChisuDocumentParser.parseIsoToEpochMs(o.optString("createdAt", ""))
                 .takeIf { it > 0L } ?: System.currentTimeMillis()
             val preview = ChisuDocumentParser.buildPlainExcerpt(summary.ifBlank { digest }, 220)
+            val stableKey = if (turnId > 0 && entryKind == "turn") "turn_$turnId" else "wx_$id"
+            val fallbackTitle = when {
+                turnId > 0 && mediaKind == "video" -> "微信视频笔记 #$turnId"
+                turnId > 0 && mediaKind == "image_note" -> "微信图片笔记 #$turnId"
+                turnId > 0 && mediaKind == "idea" -> "微信灵感 #$turnId"
+                turnId > 0 -> "微信记录 #$turnId"
+                else -> "微信文章 #$id"
+            }
             out.add(
                 ChisuArticleItemUi(
-                    stableKey = "wx_$id",
-                    articleId = id,
-                    title = ChisuDocumentParser.cleanTitle(rawTitle).ifBlank { "微信文章 #$id" },
+                    stableKey = stableKey,
+                    articleId = id.takeIf { it > 0 },
+                    turnId = turnId.takeIf { it > 0 },
+                    entryKind = entryKind,
+                    mediaKind = mediaKind,
+                    title = ChisuDocumentParser.cleanTitle(rawTitle).ifBlank { fallbackTitle },
                     author = o.optString("author", "").trim(),
                     sourceUrl = o.optString("url", "").trim(),
                     publishDate = o.optString("publishDate", "").trim(),
@@ -832,10 +930,13 @@ class CockpitRuntimeCoordinator(
         val localSource = item.localSourceFilePath?.let { p ->
             runCatching { File(p).takeIf { it.exists() }?.readText(Charsets.UTF_8) }.getOrNull()
         }
-        val cached = loadCachedChisuDetail(item.articleId)
+        val cached = loadCachedChisuDetail(item.articleId, item.turnId)
         val initial = ChisuArticleDetailUi(
             stableKey = item.stableKey,
             articleId = item.articleId ?: cached?.articleId,
+            turnId = item.turnId ?: cached?.turnId,
+            entryKind = item.entryKind,
+            mediaKind = item.mediaKind.ifBlank { cached?.mediaKind ?: "article" },
             title = cached?.title?.ifBlank { item.title } ?: item.title,
             author = item.author.ifBlank { cached?.author.orEmpty() },
             sourceUrl = item.sourceUrl.ifBlank { cached?.sourceUrl.orEmpty() },
@@ -856,7 +957,7 @@ class CockpitRuntimeCoordinator(
         _activeChisuDetailFlow.value = initial
 
         val canQueryMac = transportClient.activeTierFlow.value != "DISCONNECTED" &&
-            (item.articleId != null || item.sourceUrl.isNotBlank() || item.title.isNotBlank())
+            (item.articleId != null || item.turnId != null || item.sourceUrl.isNotBlank() || item.title.isNotBlank())
         val needsRemote = forceRefresh || initial.sourceMarkdown.isNullOrBlank() || initial.noteMarkdown.isNullOrBlank()
         if (!canQueryMac || !needsRemote) {
             _isLoadingChisuDetailFlow.value = false
@@ -868,6 +969,7 @@ class CockpitRuntimeCoordinator(
             try {
                 val req = JSONObject().apply {
                     item.articleId?.let { put("articleId", it) }
+                    item.turnId?.let { put("turnId", it) }
                     if (item.sourceUrl.isNotBlank()) put("sourceUrl", item.sourceUrl)
                     if (item.title.isNotBlank()) put("title", item.title)
                 }
@@ -875,12 +977,18 @@ class CockpitRuntimeCoordinator(
                 if (resp != null && resp.optBoolean("ok", false)) {
                     val artObj = resp.optJSONObject("article")
                     val resolvedId = artObj?.optInt("id", 0)?.takeIf { it > 0 } ?: item.articleId
+                    val resolvedTurnId = artObj?.optInt("turnId", 0)?.takeIf { it > 0 } ?: item.turnId
+                    val resolvedEntryKind = artObj?.optString("entryKind", "").orEmpty().ifBlank { item.entryKind }
+                    val resolvedMediaKind = artObj?.optString("mediaKind", "").orEmpty().ifBlank { item.mediaKind }
                     val noteMd = resp.optString("noteMarkdown", "").takeIf { it.isNotBlank() && it != "null" }
                     val sourceMd = resp.optString("sourceMarkdown", "").takeIf { it.isNotBlank() && it != "null" }
                     val summaryMd = resp.optString("summaryMarkdown", "").takeIf { it.isNotBlank() && it != "null" }
                     val remoteDetail = ChisuArticleDetailUi(
                         stableKey = item.stableKey,
                         articleId = resolvedId,
+                        turnId = resolvedTurnId,
+                        entryKind = resolvedEntryKind,
+                        mediaKind = resolvedMediaKind,
                         title = ChisuDocumentParser.cleanTitle(artObj?.optString("title", "")).ifBlank { item.title },
                         author = artObj?.optString("author", "").orEmpty().ifBlank { initial.author },
                         sourceUrl = artObj?.optString("url", "").orEmpty().ifBlank { initial.sourceUrl },
@@ -897,14 +1005,14 @@ class CockpitRuntimeCoordinator(
                         sourceTruncated = resp.optBoolean("sourceTruncated", false),
                         fromCache = false
                     )
-                    if (resolvedId != null) {
-                        saveCachedChisuDetail(resolvedId, remoteDetail)
+                    if (resolvedId != null || resolvedTurnId != null) {
+                        saveCachedChisuDetail(resolvedId, resolvedTurnId, remoteDetail)
                     }
                     if (_activeChisuDetailFlow.value?.stableKey == item.stableKey) {
                         _activeChisuDetailFlow.value = remoteDetail
                     }
                 } else if (initial.sourceMarkdown.isNullOrBlank() && initial.noteMarkdown.isNullOrBlank()) {
-                    _chisuDetailErrorFlow.value = resp?.optString("error", "").orEmpty().ifBlank { "未能从 Mac 读取该文章详情" }
+                    _chisuDetailErrorFlow.value = resp?.optString("error", "").orEmpty().ifBlank { "未能从 Mac 读取该记录详情" }
                 }
             } catch (e: Throwable) {
                 if (initial.sourceMarkdown.isNullOrBlank() && initial.noteMarkdown.isNullOrBlank()) {
@@ -924,12 +1032,14 @@ class CockpitRuntimeCoordinator(
 
     suspend fun loadChisuInlineImageBytes(
         articleId: Int?,
+        turnId: Int?,
         docKind: String,
         src: String
     ): ByteArray? = withContext(Dispatchers.IO) {
         val trimmed = src.trim()
         if (trimmed.isEmpty()) return@withContext null
-        val cacheKey = "${articleId ?: 0}_${docKind}_${trimmed.hashCode().toUInt()}"
+        val ownerTag = if (turnId != null && turnId > 0) "t$turnId" else "a${articleId ?: 0}"
+        val cacheKey = "${ownerTag}_${docKind}_${trimmed.hashCode().toUInt()}"
         val cacheFile = File(chisuAssetCacheDir(), "$cacheKey.img")
         if (cacheFile.exists() && cacheFile.length() > 0L) {
             return@withContext runCatching { cacheFile.readBytes() }.getOrNull()
@@ -944,16 +1054,18 @@ class CockpitRuntimeCoordinator(
                     else resp.body?.bytes()?.takeIf { it.isNotEmpty() && it.size <= 4 * 1024 * 1024 }
                 }
             }.getOrNull()
-        } else if (articleId != null && articleId > 0 && transportClient.activeTierFlow.value != "DISCONNECTED") {
+        } else if (((turnId != null && turnId > 0) || (articleId != null && articleId > 0)) && transportClient.activeTierFlow.value != "DISCONNECTED") {
             runCatching {
-                val resp = transportClient.callHostRpc(
-                    "wechat.article.asset",
-                    JSONObject()
-                        .put("articleId", articleId)
-                        .put("doc", if (docKind == "note") "note" else "source")
-                        .put("path", trimmed),
-                    10_000L
-                )
+                val reqObj = JSONObject().apply {
+                    if (turnId != null && turnId > 0) {
+                        put("turnId", turnId)
+                    } else if (articleId != null && articleId > 0) {
+                        put("articleId", articleId)
+                        put("doc", if (docKind == "note") "note" else "source")
+                    }
+                    put("path", trimmed)
+                }
+                val resp = transportClient.callHostRpc("wechat.article.asset", reqObj, 10_000L)
                 val b64 = resp?.takeIf { it.optBoolean("ok", false) }?.optString("dataBase64", "").orEmpty()
                 if (b64.isNotBlank()) Base64.decode(b64, Base64.DEFAULT) else null
             }.getOrNull()
@@ -967,11 +1079,19 @@ class CockpitRuntimeCoordinator(
         bytes
     }
 
-    private fun saveCachedChisuDetail(articleId: Int, detail: ChisuArticleDetailUi) {
+    private fun saveCachedChisuDetail(articleId: Int?, turnId: Int?, detail: ChisuArticleDetailUi) {
         runCatching {
-            val file = File(chisuCacheDir(), "article_$articleId.json")
+            val fileName = when {
+                turnId != null && turnId > 0 -> "turn_$turnId.json"
+                articleId != null && articleId > 0 -> "article_$articleId.json"
+                else -> return
+            }
+            val file = File(chisuCacheDir(), fileName)
             val obj = JSONObject().apply {
-                put("articleId", articleId)
+                articleId?.takeIf { it > 0 }?.let { put("articleId", it) }
+                turnId?.takeIf { it > 0 }?.let { put("turnId", it) }
+                put("entryKind", detail.entryKind)
+                put("mediaKind", detail.mediaKind)
                 put("title", detail.title)
                 put("author", detail.author)
                 put("sourceUrl", detail.sourceUrl)
@@ -991,15 +1111,24 @@ class CockpitRuntimeCoordinator(
         }
     }
 
-    private fun loadCachedChisuDetail(articleId: Int?): ChisuArticleDetailUi? {
-        if (articleId == null || articleId <= 0) return null
+    private fun loadCachedChisuDetail(articleId: Int?, turnId: Int? = null): ChisuArticleDetailUi? {
+        val fileName = when {
+            turnId != null && turnId > 0 -> "turn_$turnId.json"
+            articleId != null && articleId > 0 -> "article_$articleId.json"
+            else -> return null
+        }
         return runCatching {
-            val file = File(chisuCacheDir(), "article_$articleId.json")
+            val file = File(chisuCacheDir(), fileName)
             if (!file.exists()) return null
             val o = JSONObject(file.readText(Charsets.UTF_8))
+            val resolvedArticleId = o.optInt("articleId", 0).takeIf { it > 0 } ?: articleId
+            val resolvedTurnId = o.optInt("turnId", 0).takeIf { it > 0 } ?: turnId
             ChisuArticleDetailUi(
-                stableKey = "wx_$articleId",
-                articleId = articleId,
+                stableKey = if (resolvedTurnId != null && resolvedTurnId > 0) "turn_$resolvedTurnId" else "wx_${resolvedArticleId ?: 0}",
+                articleId = resolvedArticleId,
+                turnId = resolvedTurnId,
+                entryKind = o.optString("entryKind", if (resolvedTurnId != null && resolvedTurnId > 0) "turn" else "article"),
+                mediaKind = o.optString("mediaKind", "article"),
                 title = o.optString("title", ""),
                 author = o.optString("author", ""),
                 sourceUrl = o.optString("sourceUrl", ""),
@@ -1016,6 +1145,290 @@ class CockpitRuntimeCoordinator(
                 fromCache = true
             )
         }.getOrNull()
+    }
+
+    // =========================================================================
+    // Omni-Search (Full Vault FTS5 + Chisu + Chat) & Executive Secretary Core
+    // =========================================================================
+
+    private fun secretaryBriefCacheFile(): File = File(appContext.filesDir, "secretary_brief_cache.json")
+
+    private fun buildSecretaryMemoryPromptBlock(): String {
+        val brief = _secretaryBriefFlow.value ?: return ""
+        val parts = ArrayList<String>()
+        if (brief.profileItems.isNotEmpty()) {
+            parts.add("长期个人偏好：\n" + brief.profileItems.take(8).joinToString("\n") { "- $it" })
+        }
+        if (brief.openLoops.isNotEmpty()) {
+            parts.add(
+                "当前未闭环事项（Open Loops）：\n" +
+                    brief.openLoops.take(6).joinToString("\n") {
+                        "- ${it.title}${if (it.dueHint.isNotBlank()) "（${it.dueHint}）" else ""}"
+                    }
+            )
+        }
+        if (brief.vaultFocusTitles.isNotEmpty()) {
+            parts.add("近期知识库聚焦主题：${brief.vaultFocusTitles.take(5).joinToString("、")}")
+        }
+        if (parts.isEmpty()) return ""
+        return """
+            |<PERSONAL_SECRETARY_MEMORY>
+            |你是用户的长期随身秘书（Chief of Staff），拥有跨对话的持续记忆。回答时自然承接以下背景，不要机械复述。
+            |当用户明确表达某项待办/承诺（如“提醒我这周……”“记一下明天……”）时，可在回复末尾追加一行隐藏指令 `[COMMITMENT:精炼事项标题|时间提示]`（无时间提示可留空），系统会自动记入今日简报的未闭环事项。
+            |${parts.joinToString("\n")}
+            |</PERSONAL_SECRETARY_MEMORY>
+        """.trimMargin()
+    }
+
+    private fun extractAndApplySecretaryCommitments(markdown: String): String {
+        val re = Regex("""\[COMMITMENT:([^|\]]+)(?:\|([^\]]*))?\]""")
+        val matches = re.findAll(markdown).toList()
+        if (matches.isEmpty()) return markdown
+        for (m in matches) {
+            val title = m.groupValues.getOrNull(1)?.trim().orEmpty()
+            val due = m.groupValues.getOrNull(2)?.trim().orEmpty()
+            if (title.isNotBlank()) {
+                addCommitment(title, due, source = "chat_auto")
+            }
+        }
+        return markdown.replace(re, "").trimEnd()
+    }
+
+    fun searchOmniContext(query: String, limit: Int = 14) {
+        val q = query.trim()
+        if (q.length < 2) {
+            _omniSearchHitsFlow.value = emptyList()
+            _isOmniSearchingFlow.value = false
+            return
+        }
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") {
+            _omniSearchHitsFlow.value = emptyList()
+            _isOmniSearchingFlow.value = false
+            return
+        }
+        scope.launch {
+            _isOmniSearchingFlow.value = true
+            try {
+                val resp = transportClient.callHostRpc(
+                    "memory.search_vault",
+                    JSONObject().put("query", q).put("limit", limit),
+                    6_000L
+                )
+                val arr = resp?.optJSONArray("hits")
+                val out = ArrayList<OmniSearchHitUi>()
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val h = arr.optJSONObject(i) ?: continue
+                        val src = h.optString("source", "vault")
+                        if (src == "mobile_chat") continue // local chat FTS already covers mobile threads instantly
+                        out.add(
+                            OmniSearchHitUi(
+                                source = src,
+                                title = h.optString("title", "知识库文档"),
+                                pathOrRef = h.optString("pathOrRef", ""),
+                                snippet = h.optString("snippet", ""),
+                                heading = h.optString("heading", ""),
+                                category = h.optString("category", if (src == "chisu") "尺素" else "知识库"),
+                                articleId = h.optInt("articleId", 0).takeIf { it > 0 },
+                                turnId = h.optInt("turnId", 0).takeIf { it > 0 }
+                            )
+                        )
+                    }
+                }
+                _omniSearchHitsFlow.value = out
+            } catch (_: Throwable) {
+            } finally {
+                _isOmniSearchingFlow.value = false
+            }
+        }
+    }
+
+    fun openVaultDoc(relPath: String) {
+        val clean = relPath.trim()
+        if (clean.isEmpty() || transportClient.activeTierFlow.value == "DISCONNECTED") return
+        scope.launch {
+            _isLoadingVaultDocFlow.value = true
+            try {
+                val resp = transportClient.callHostRpc(
+                    "memory.read_vault_doc",
+                    JSONObject().put("relPath", clean),
+                    10_000L
+                )
+                if (resp != null && resp.optBoolean("ok", false)) {
+                    _activeVaultDocFlow.value = VaultDocPreviewUi(
+                        relPath = resp.optString("relPath", clean),
+                        title = resp.optString("title", clean.substringAfterLast('/')),
+                        category = resp.optString("category", "知识库"),
+                        markdown = resp.optString("markdown", ""),
+                        truncated = resp.optBoolean("truncated", false)
+                    )
+                }
+            } catch (_: Throwable) {
+            } finally {
+                _isLoadingVaultDocFlow.value = false
+            }
+        }
+    }
+
+    fun closeVaultDoc() {
+        _activeVaultDocFlow.value = null
+        _isLoadingVaultDocFlow.value = false
+    }
+
+    fun refreshSecretaryBrief() {
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") return
+        scope.launch {
+            _isRefreshingBriefFlow.value = true
+            try {
+                val resp = transportClient.callHostRpc("secretary.brief", JSONObject(), 8_000L)
+                val briefObj = resp?.takeIf { it.optBoolean("ok", false) }?.optJSONObject("brief")
+                if (briefObj != null) {
+                    runCatching { secretaryBriefCacheFile().writeText(briefObj.toString(), Charsets.UTF_8) }
+                    _secretaryBriefFlow.value = parseSecretaryBriefJson(briefObj)
+                }
+            } catch (_: Throwable) {
+            } finally {
+                _isRefreshingBriefFlow.value = false
+            }
+        }
+    }
+
+    fun addCommitment(title: String, dueHint: String = "", source: String = "mobile") {
+        val clean = title.trim()
+        if (clean.isEmpty()) return
+        val localTemp = SecretaryCommitmentUi(
+            id = "local_${System.currentTimeMillis()}",
+            title = clean,
+            dueHint = dueHint.trim(),
+            source = source,
+            status = "open",
+            createdAtMs = System.currentTimeMillis(),
+            updatedAtMs = System.currentTimeMillis()
+        )
+        _secretaryBriefFlow.value?.let { cur ->
+            _secretaryBriefFlow.value = cur.copy(openLoops = listOf(localTemp) + cur.openLoops)
+        }
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") return
+        scope.launch {
+            runCatching {
+                transportClient.callHostRpc(
+                    "secretary.commitment.upsert",
+                    JSONObject().put("title", clean).put("dueHint", dueHint.trim()).put("source", source),
+                    6_000L
+                )
+                refreshSecretaryBrief()
+            }
+        }
+    }
+
+    fun toggleCommitment(id: String) {
+        _secretaryBriefFlow.value?.let { cur ->
+            _secretaryBriefFlow.value = cur.copy(openLoops = cur.openLoops.filterNot { it.id == id })
+        }
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") return
+        scope.launch {
+            runCatching {
+                transportClient.callHostRpc("secretary.commitment.toggle", JSONObject().put("id", id), 6_000L)
+                refreshSecretaryBrief()
+            }
+        }
+    }
+
+    fun saveSecretaryProfile(items: List<String>) {
+        val cleaned = items.map { it.trim() }.filter { it.isNotBlank() }.distinct().take(24)
+        _secretaryBriefFlow.value?.let { cur ->
+            _secretaryBriefFlow.value = cur.copy(profileItems = cleaned)
+        }
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") return
+        scope.launch {
+            runCatching {
+                val arr = JSONArray()
+                cleaned.forEach { arr.put(it) }
+                transportClient.callHostRpc("secretary.profile.save", JSONObject().put("items", arr), 6_000L)
+                refreshSecretaryBrief()
+            }
+        }
+    }
+
+    fun dismissSecretaryNudge(id: String) {
+        _secretaryBriefFlow.value?.let { cur ->
+            _secretaryBriefFlow.value = cur.copy(nudges = cur.nudges.filterNot { it.id == id })
+        }
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") return
+        scope.launch {
+            runCatching {
+                transportClient.callHostRpc("secretary.nudge.dismiss", JSONObject().put("id", id), 5_000L)
+            }
+        }
+    }
+
+    private fun loadCachedSecretaryBrief(): SecretaryBriefUi? = runCatching {
+        val f = secretaryBriefCacheFile()
+        if (!f.exists()) return null
+        parseSecretaryBriefJson(JSONObject(f.readText(Charsets.UTF_8)))
+    }.getOrNull()
+
+    private fun parseSecretaryBriefJson(o: JSONObject): SecretaryBriefUi {
+        val profile = ArrayList<String>()
+        o.optJSONArray("profileItems")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val s = arr.optString(i, "").trim()
+                if (s.isNotBlank()) profile.add(s)
+            }
+        }
+        val loops = ArrayList<SecretaryCommitmentUi>()
+        o.optJSONArray("openLoops")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val c = arr.optJSONObject(i) ?: continue
+                loops.add(
+                    SecretaryCommitmentUi(
+                        id = c.optString("id", ""),
+                        title = c.optString("title", ""),
+                        dueHint = c.optString("dueHint", ""),
+                        source = c.optString("source", ""),
+                        status = c.optString("status", "open"),
+                        createdAtMs = c.optLong("createdAtMs", 0L),
+                        updatedAtMs = c.optLong("updatedAtMs", 0L)
+                    )
+                )
+            }
+        }
+        val nudges = ArrayList<SecretaryNudgeUi>()
+        o.optJSONArray("nudges")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val n = arr.optJSONObject(i) ?: continue
+                nudges.add(
+                    SecretaryNudgeUi(
+                        id = n.optString("id", ""),
+                        kind = n.optString("kind", ""),
+                        title = n.optString("title", ""),
+                        subtitle = n.optString("subtitle", ""),
+                        actionLabel = n.optString("actionLabel", "查看"),
+                        actionType = n.optString("actionType", "ask_chat"),
+                        actionPayload = n.optString("actionPayload", "")
+                    )
+                )
+            }
+        }
+        val focus = ArrayList<String>()
+        o.optJSONArray("vaultFocusTitles")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val s = arr.optString(i, "").trim()
+                if (s.isNotBlank()) focus.add(s)
+            }
+        }
+        return SecretaryBriefUi(
+            greeting = o.optString("greeting", "你好"),
+            dateLabel = o.optString("dateLabel", ""),
+            headline = o.optString("headline", ""),
+            profileItems = profile,
+            openLoops = loops,
+            nudges = nudges,
+            recentChisuCount = o.optInt("recentChisuCount", 0),
+            activeAgentCount = o.optInt("activeAgentCount", 0),
+            vaultFocusTitles = focus,
+            generatedAtMs = o.optLong("generatedAtMs", 0L)
+        )
     }
 
     // =========================================================================

@@ -37,6 +37,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -152,7 +153,9 @@ fun ChatWorkspaceView(
     onConsumeSearchJump: () -> Unit = {},
     onOpenBotanicalCamera: () -> Unit,
     onOpenLiveVoice: (glassCameraMode: Boolean) -> Unit,
-    onEscalateToMacAgent: (promptSummary: String) -> Unit
+    onEscalateToMacAgent: (promptSummary: String) -> Unit,
+    onSwitchTab: (CockpitTab) -> Unit = {},
+    onOpenVaultDoc: (relPath: String) -> Unit = {}
 ) {
     val context = LocalContext.current
     val palette = OmsTheme.colors
@@ -454,8 +457,28 @@ fun ChatWorkspaceView(
             // Main Conversation Stage
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 if (messages.isEmpty() && !streaming.isStreaming) {
+                    val secretaryBrief by coordinator.secretaryBriefFlow.collectAsState()
+                    val isRefreshingBrief by coordinator.isRefreshingBriefFlow.collectAsState()
                     EmptyChatWelcomeHero(
                         shortModelName = shortModelTag,
+                        brief = secretaryBrief,
+                        isRefreshingBrief = isRefreshingBrief,
+                        onRefreshBrief = { coordinator.refreshSecretaryBrief() },
+                        onAddCommitment = { title, due -> coordinator.addCommitment(title, due) },
+                        onToggleCommitment = { id -> coordinator.toggleCommitment(id) },
+                        onSaveProfile = { items -> coordinator.saveSecretaryProfile(items) },
+                        onDismissNudge = { id -> coordinator.dismissSecretaryNudge(id) },
+                        onTriggerNudge = { nudge ->
+                            when (nudge.actionType) {
+                                "open_chisu" -> onSwitchTab(CockpitTab.CHISU)
+                                "open_missions" -> onSwitchTab(CockpitTab.MISSION_HUB)
+                                "open_vault_doc" -> onOpenVaultDoc(nudge.actionPayload)
+                                else -> {
+                                    val p = nudge.actionPayload.ifBlank { nudge.title }
+                                    coordinator.sendChatTurn(p, deepThinking = false, forceWebSearch = false)
+                                }
+                            }
+                        },
                         onQuickPrompt = { prompt, deep, search ->
                             deepThinking = deep
                             forceWebSearch = search
@@ -1034,94 +1057,435 @@ fun ChatWorkspaceView(
 @Composable
 private fun EmptyChatWelcomeHero(
     shortModelName: String,
+    brief: com.oms.client.cockpit.SecretaryBriefUi?,
+    isRefreshingBrief: Boolean,
+    onRefreshBrief: () -> Unit,
+    onAddCommitment: (title: String, dueHint: String) -> Unit,
+    onToggleCommitment: (id: String) -> Unit,
+    onSaveProfile: (items: List<String>) -> Unit,
+    onDismissNudge: (id: String) -> Unit,
+    onTriggerNudge: (com.oms.client.cockpit.SecretaryNudgeUi) -> Unit,
     onQuickPrompt: (prompt: String, deep: Boolean, search: Boolean) -> Unit,
     onOpenBotanicalCamera: () -> Unit,
     onOpenLiveVoice: () -> Unit,
     onOpenMacDrop: () -> Unit
 ) {
     val palette = OmsTheme.colors
-    val greeting = remember {
+    var showAddLoopDialog by remember { mutableStateOf(false) }
+    var newLoopTitle by remember { mutableStateOf("") }
+    var newLoopDue by remember { mutableStateOf("") }
+    var showMemoryDialog by remember { mutableStateOf(false) }
+    var memoryEditorText by remember { mutableStateOf("") }
+
+    val fallbackGreeting = remember {
         val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
         when {
-            hour < 6 -> "夜深了，有什么正在思考的事？"
-            hour < 12 -> "早上好，今天想探索什么？"
-            hour < 18 -> "下午好，随时开始推演或记录"
-            else -> "晚上好，有什么想一起梳理的？"
+            hour < 6 -> "夜深了"
+            hour < 12 -> "早上好"
+            hour < 18 -> "下午好"
+            else -> "晚上好"
         }
     }
+    val greetingTitle = brief?.let { "${it.greeting} · ${it.dateLabel}" } ?: fallbackGreeting
+    val subtitleLine = brief?.headline?.ifBlank { "$shortModelName · 随身秘书持续记忆中" }
+        ?: "$shortModelName · 随身秘书与知识库按需共鸣"
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 26.dp),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 18.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Minimalist Breathing Brand Halo
+        // Executive Header: Greeting + Transparent Living Memory + Refresh
+        Row(
+            modifier = Modifier.widthIn(max = 420.dp).fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = greetingTitle,
+                    color = palette.textPrimary,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = (-0.3).sp
+                )
+                Spacer(modifier = Modifier.height(3.dp))
+                Text(
+                    text = subtitleLine,
+                    color = palette.textTertiary,
+                    fontSize = 12.5.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                OmsSecondaryButton(
+                    label = "记忆${if ((brief?.profileItems?.size ?: 0) > 0) " (${brief?.profileItems?.size})" else ""}",
+                    icon = OmsIcons.Bookmark,
+                    height = 32.dp,
+                    onClick = {
+                        memoryEditorText = brief?.profileItems?.joinToString("\n") ?: ""
+                        showMemoryDialog = true
+                    }
+                )
+                OmsCircleIconButton(
+                    icon = OmsIcons.Refresh,
+                    contentDescription = "刷新今日简报",
+                    size = 32.dp,
+                    iconSize = 15.dp,
+                    containerColor = palette.subtleSurface,
+                    contentColor = if (isRefreshingBrief) palette.accent else palette.textSecondary,
+                    borderColor = palette.hairline,
+                    onClick = onRefreshBrief
+                )
+            }
+        }
+
+        // Active Open Loops (Commitments) Card
+        OmsSurfaceCard(
+            cornerRadius = 18.dp,
+            contentPadding = PaddingValues(14.dp),
+            modifier = Modifier.widthIn(max = 420.dp).fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(OmsIcons.Check, contentDescription = null, tint = palette.accent, modifier = Modifier.size(15.dp))
+                    Text(
+                        text = "未闭环事项 (${brief?.openLoops?.size ?: 0})",
+                        color = palette.textPrimary,
+                        fontSize = 13.5.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                OmsSecondaryButton(
+                    label = "记一件",
+                    icon = OmsIcons.Plus,
+                    height = 28.dp,
+                    onClick = {
+                        newLoopTitle = ""
+                        newLoopDue = ""
+                        showAddLoopDialog = true
+                    }
+                )
+            }
+
+            val loops = brief?.openLoops.orEmpty()
+            if (loops.isEmpty()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "暂无待跟进事项。对话中随口说「提醒我这周……」，秘书会自动为你记入这里。",
+                    color = palette.textTertiary,
+                    fontSize = 12.sp,
+                    lineHeight = 18.sp
+                )
+            } else {
+                Spacer(modifier = Modifier.height(8.dp))
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    loops.take(4).forEach { loop ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(9.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(palette.subtleSurface)
+                                .clickable { onToggleCommitment(loop.id) }
+                                .padding(horizontal = 10.dp, vertical = 8.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(16.dp)
+                                    .clip(CircleShape)
+                                    .border(1.4.dp, palette.accent, CircleShape)
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = loop.title,
+                                    color = palette.textPrimary,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                if (loop.dueHint.isNotBlank()) {
+                                    Text(
+                                        text = loop.dueHint,
+                                        color = palette.accent,
+                                        fontSize = 11.sp
+                                    )
+                                }
+                            }
+                            Text("完成", color = palette.textTertiary, fontSize = 11.sp)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Proactive Chief-of-Staff Nudges (Calm, 1-Tap Actionable, Dismissible)
+        val nudges = brief?.nudges.orEmpty()
+        if (nudges.isNotEmpty()) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.widthIn(max = 420.dp).fillMaxWidth()
+            ) {
+                nudges.take(3).forEach { nudge ->
+                    val nudgeIcon = when (nudge.kind) {
+                        "commute_chisu" -> OmsIcons.BookOpen
+                        "agent_review" -> OmsIcons.Laptop
+                        "book_reading" -> OmsIcons.FileText
+                        else -> OmsIcons.Sparkles
+                    }
+                    OmsSurfaceCard(
+                        cornerRadius = 16.dp,
+                        contentPadding = PaddingValues(13.dp),
+                        onClick = { onTriggerNudge(nudge) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(34.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(palette.accentSoft)
+                            ) {
+                                Icon(nudgeIcon, contentDescription = null, tint = palette.accent, modifier = Modifier.size(17.dp))
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = nudge.title,
+                                    color = palette.textPrimary,
+                                    fontSize = 13.5.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = nudge.subtitle,
+                                    color = palette.textSecondary,
+                                    fontSize = 12.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            OmsCircleIconButton(
+                                icon = OmsIcons.Close,
+                                contentDescription = "暂不提示",
+                                size = 24.dp,
+                                iconSize = 12.dp,
+                                contentColor = palette.textTertiary,
+                                onClick = { onDismissNudge(nudge.id) }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Compact 2x2 Quick Executive Actions
+        Column(
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.widthIn(max = 420.dp).fillMaxWidth()
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                WelcomeCompactActionTile(
+                    icon = OmsIcons.Waveform,
+                    title = "散步语音",
+                    subtitle = "全双工随行对谈",
+                    onClick = onOpenLiveVoice,
+                    modifier = Modifier.weight(1f)
+                )
+                WelcomeCompactActionTile(
+                    icon = OmsIcons.Leaf,
+                    title = "博物镜头",
+                    subtitle = "实景识物入图鉴",
+                    onClick = onOpenBotanicalCamera,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                WelcomeCompactActionTile(
+                    icon = OmsIcons.Sparkles,
+                    title = "梳理今日主线",
+                    subtitle = "结合记忆定优先级",
+                    onClick = {
+                        onQuickPrompt("请作为我的随身秘书，结合我的个人偏好、未闭环事项和知识库近期主线，帮我梳理今天最值得优先推进的 3 件事。", true, false)
+                    },
+                    modifier = Modifier.weight(1f)
+                )
+                WelcomeCompactActionTile(
+                    icon = OmsIcons.Send,
+                    title = "快传至 Mac",
+                    subtitle = "图文文档加密直达",
+                    onClick = onOpenMacDrop,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+
+    if (showAddLoopDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showAddLoopDialog = false },
+            containerColor = palette.composer,
+            title = { Text("记录未闭环事项", color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(palette.subtleSurface)
+                            .border(0.6.dp, palette.hairline, RoundedCornerShape(12.dp))
+                            .padding(11.dp)
+                    ) {
+                        if (newLoopTitle.isEmpty()) {
+                            Text("例如：整理 EPUB 电子书库并同步手机", color = palette.textTertiary, fontSize = 13.5.sp)
+                        }
+                        BasicTextField(
+                            value = newLoopTitle,
+                            onValueChange = { newLoopTitle = it },
+                            textStyle = TextStyle(color = palette.textPrimary, fontSize = 14.sp),
+                            cursorBrush = SolidColor(palette.accent),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(palette.subtleSurface)
+                            .border(0.6.dp, palette.hairline, RoundedCornerShape(12.dp))
+                            .padding(11.dp)
+                    ) {
+                        if (newLoopDue.isEmpty()) {
+                            Text("时间提示（可选，如：本周五前 / 明早）", color = palette.textTertiary, fontSize = 13.sp)
+                        }
+                        BasicTextField(
+                            value = newLoopDue,
+                            onValueChange = { newLoopDue = it },
+                            singleLine = true,
+                            textStyle = TextStyle(color = palette.textPrimary, fontSize = 13.5.sp),
+                            cursorBrush = SolidColor(palette.accent),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                androidx.compose.material3.TextButton(onClick = {
+                    if (newLoopTitle.isNotBlank()) {
+                        onAddCommitment(newLoopTitle.trim(), newLoopDue.trim())
+                        showAddLoopDialog = false
+                    }
+                }) { Text("记下", color = palette.accent, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { showAddLoopDialog = false }) {
+                    Text("取消", color = palette.textTertiary)
+                }
+            }
+        )
+    }
+
+    if (showMemoryDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showMemoryDialog = false },
+            containerColor = palette.composer,
+            title = { Text("随身秘书长期记忆（每行一条）", color = palette.textPrimary, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "所有个人偏好与工作原则完全透明可控，会在非无痕对话中自动注入，让秘书更懂你的节奏。",
+                        color = palette.textTertiary,
+                        fontSize = 12.sp,
+                        lineHeight = 17.sp
+                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 120.dp, max = 220.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(palette.subtleSurface)
+                            .border(0.6.dp, palette.hairline, RoundedCornerShape(12.dp))
+                            .padding(11.dp)
+                    ) {
+                        if (memoryEditorText.isEmpty()) {
+                            Text("例如：\n回答先给结论再展开细节\n关注 AI Agent 记忆与知识工程\n通勤时偏好 3 分钟语音摘要", color = palette.textTertiary, fontSize = 13.sp)
+                        }
+                        BasicTextField(
+                            value = memoryEditorText,
+                            onValueChange = { memoryEditorText = it },
+                            textStyle = TextStyle(color = palette.textPrimary, fontSize = 13.5.sp, lineHeight = 20.sp),
+                            cursorBrush = SolidColor(palette.accent),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                androidx.compose.material3.TextButton(onClick = {
+                    val lines = memoryEditorText.split('\n').map { it.trim() }.filter { it.isNotBlank() }
+                    onSaveProfile(lines)
+                    showMemoryDialog = false
+                    OmsFeedbackController.show("已更新秘书长期记忆", OmsToastKind.SUCCESS)
+                }) { Text("保存", color = palette.accent, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { showMemoryDialog = false }) {
+                    Text("取消", color = palette.textTertiary)
+                }
+            }
+        )
+    }
+}
+
+@Composable
+private fun WelcomeCompactActionTile(
+    icon: ImageVector,
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val palette = OmsTheme.colors
+    val shape = RoundedCornerShape(15.dp)
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(9.dp),
+        modifier = modifier
+            .omsBounceClick(scaleDown = 0.965f, shape = shape, onClick = onClick)
+            .background(palette.cardSurface, shape)
+            .border(0.6.dp, palette.hairline, shape)
+            .padding(horizontal = 11.dp, vertical = 10.dp)
+    ) {
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
-                .size(54.dp)
-                .clip(CircleShape)
-                .background(palette.accentSoft)
-                .border(0.7.dp, palette.accent.copy(alpha = 0.3f), CircleShape)
+                .size(30.dp)
+                .clip(RoundedCornerShape(9.dp))
+                .background(palette.subtleSurface)
         ) {
-            Icon(
-                imageVector = OmsIcons.Sparkles,
-                contentDescription = null,
-                tint = palette.accent,
-                modifier = Modifier.size(25.dp)
-            )
+            Icon(icon, contentDescription = null, tint = palette.accent, modifier = Modifier.size(16.dp))
         }
-
-        Spacer(modifier = Modifier.height(18.dp))
-
-        Text(
-            text = greeting,
-            color = palette.textPrimary,
-            fontSize = 21.sp,
-            fontWeight = FontWeight.SemiBold,
-            letterSpacing = (-0.3).sp
-        )
-        Spacer(modifier = Modifier.height(6.dp))
-        Text(
-            text = "$shortModelName · 个人知识库按需共鸣",
-            color = palette.textTertiary,
-            fontSize = 13.sp
-        )
-
-        Spacer(modifier = Modifier.height(28.dp))
-
-        Column(
-            verticalArrangement = Arrangement.spacedBy(9.dp),
-            modifier = Modifier.widthIn(max = 360.dp).fillMaxWidth()
-        ) {
-            WelcomeSuggestionRow(
-                icon = OmsIcons.Leaf,
-                title = "博物识物镜头",
-                subtitle = "实景拍摄植物或展品，联网核验学名与辨识要点",
-                onClick = onOpenBotanicalCamera
-            )
-            WelcomeSuggestionRow(
-                icon = OmsIcons.Waveform,
-                title = "散步全双工语音对谈",
-                subtitle = "支持自然开口打断与 English Only 口语实战",
-                onClick = onOpenLiveVoice
-            )
-            WelcomeSuggestionRow(
-                icon = OmsIcons.Sparkles,
-                title = "结合我的知识库梳理近期主线",
-                subtitle = "按需检索近期工作记忆与笔记，提炼优先事项",
-                onClick = {
-                    onQuickPrompt("请结合我的知识库与近期工作记忆，帮我梳理当前最值得优先推进的 3 件事。", true, false)
-                }
-            )
-            WelcomeSuggestionRow(
-                icon = OmsIcons.Send,
-                title = "快传图片或文档至 Mac",
-                subtitle = "多选相册照片、PDF 或剪贴板，加密直达桌面收件箱",
-                onClick = onOpenMacDrop
-            )
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, color = palette.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            Text(subtitle, color = palette.textTertiary, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
 }
