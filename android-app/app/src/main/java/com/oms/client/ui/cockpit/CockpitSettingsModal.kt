@@ -576,7 +576,12 @@ private fun AiModelMatrixSettingsPane(coordinator: CockpitRuntimeCoordinator) {
     val catalog by coordinator.modelCatalogFlow.collectAsState()
     val refreshedAt by coordinator.modelRefreshedAtFlow.collectAsState()
     val selections by coordinator.roleSelectionsFlow.collectAsState()
+    val quotas by coordinator.agentQuotasFlow.collectAsState()
     var isRefreshing by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        coordinator.refreshAgentSessions()
+    }
 
     val refreshedTimeLabel = remember(refreshedAt) {
         if (refreshedAt <= 0L) "内置预设模型库（尚未联网刷新）"
@@ -588,6 +593,12 @@ private fun AiModelMatrixSettingsPane(coordinator: CockpitRuntimeCoordinator) {
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        quotas?.let { qSnap ->
+            item(key = "settings_agent_quotas") {
+                AgentQuotaDashboardCard(quotas = qSnap)
+            }
+        }
+
         item {
             OmsSurfaceCard(modifier = Modifier.fillMaxWidth()) {
                 Text("双擎全场景模型分配", color = palette.textPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)

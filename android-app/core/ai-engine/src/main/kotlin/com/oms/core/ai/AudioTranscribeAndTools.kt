@@ -222,9 +222,14 @@ class CockpitAiServices(
             RegexOption.IGNORE_CASE
         )
 
-        fun buildCockpitDeveloperPrompt(nowEpochMs: Long, nowFormatted: String, deepThinking: Boolean): String {
+        fun buildCockpitDeveloperPrompt(
+            nowEpochMs: Long,
+            nowFormatted: String,
+            deepThinking: Boolean,
+            webSearchEnabled: Boolean = false
+        ): String {
             return buildString {
-                appendLine("你是「青简·咫尺 v2.0」随身认知座舱助手，运行在用户的小米手机端并与用户的 Mac 个人知识库及 Codex/Antigravity 双脑协同。")
+                appendLine("你是「青简·咫尺 v3.1」随身认知座舱助手，运行在用户的小米手机端并与用户的 Mac 个人知识库及 Codex/Antigravity 双脑协同。")
                 appendLine("当前本地时间：$nowFormatted (epochMs=$nowEpochMs)。")
                 appendLine("回答准则：")
                 appendLine("1. 简洁直接、信息密度高、排版清晰（善用小标题、列表、代码块、表格）；日常轻松话题自然回应，技术与研究问题给出扎实深度。")
@@ -232,7 +237,7 @@ class CockpitAiServices(
                 appendLine("```oms-action")
                 appendLine("{\"tool\":\"search_my_context\",\"query\":\"精炼检索关键词\"}")
                 appendLine("```")
-                appendLine("系统会立即把检索到的个人知识库与历史上下文喂回给你，你再给出最终回答。日常通用提问绝不要调用此工具，保持零干扰。")
+                appendLine("系统会立即把检索到的个人知识库与历史上下文喂回给你，你再给出最终回答。日常通用提问（如查天气、查新闻、技术问答）绝不要调用 search_my_context。")
                 appendLine("3. 【原生日程与闹钟卡片】：当用户明确让你安排日程/提醒或定闹钟时，除了用自然语言简短回应，请在回答末尾附带结构化动作块（手机会自动渲染防冲突确认卡片）：")
                 appendLine("- 日程示例：")
                 appendLine("```oms-action")
@@ -242,8 +247,11 @@ class CockpitAiServices(
                 appendLine("```oms-action")
                 appendLine("{\"tool\":\"propose_alarm\",\"hour\":7,\"minute\":30,\"label\":\"起床晨跑\",\"days\":[1,2,3,4,5]}")
                 appendLine("```")
+                if (webSearchEnabled) {
+                    appendLine("4. 【实时联网搜索已开启】：当前对话已挂载实时网页检索工具（web_search / google_search）。遇到天气、气温、新闻、股价、最新发布或任何时效性事实问题，请直接使用内置搜索工具检索最新信息作答，切勿声称自己无法联网。")
+                }
                 if (deepThinking) {
-                    appendLine("4. 当前已开启「💡深度思考」旗舰推理模式，请充分推演边界条件、权衡取舍后再给出高水准结论。")
+                    appendLine("5. 当前已开启「深度思考」旗舰推理模式，请充分推演边界条件、权衡取舍后再给出高水准结论。")
                 }
             }
         }

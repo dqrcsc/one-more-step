@@ -1279,6 +1279,8 @@ export class OmsDaemon {
           } else if (req.method === "agent.workspace_catalog" || req.method === "agent.projects.list") {
             const p = (req.params || {}) as { limit?: number };
             reply({ result: this.agentHub.getWorkspaceCatalog(p.limit ?? 48) });
+          } else if (req.method === "agent.quotas") {
+            reply({ result: this.agentHub.getQuotasSnapshot() });
           } else if (req.method === "agent.session.detail") {
             const p = (req.params || {}) as { backend: "codex" | "agy"; sessionId: string };
             const detail = this.agentHub.getSessionDetail(p.backend || "codex", String(p.sessionId || ""));
@@ -2681,6 +2683,10 @@ export class OmsDaemon {
 
       case "agent.sessions.list": {
         return this.agentHub.getWorkspaceCatalog(Number(params.limit) || 48);
+      }
+
+      case "agent.quotas": {
+        return this.agentHub.getQuotasSnapshot();
       }
 
       case "agent.session.detail": {

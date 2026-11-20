@@ -826,4 +826,47 @@ object OmsIcons {
             }
         }
     }
+
+    val Folder: ImageVector by lazy {
+        strokeIcon("Folder") {
+            linePath {
+                moveTo(3.5f, 6.5f)
+                curveTo(3.5f, 5.4f, 4.4f, 4.5f, 5.5f, 4.5f)
+                horizontalLineTo(9.4f)
+                lineTo(11.4f, 6.8f)
+                horizontalLineTo(18.5f)
+                curveTo(19.6f, 6.8f, 20.5f, 7.7f, 20.5f, 8.8f)
+                verticalLineTo(17.5f)
+                curveTo(20.5f, 18.6f, 19.6f, 19.5f, 18.5f, 19.5f)
+                horizontalLineTo(5.5f)
+                curveTo(4.4f, 19.5f, 3.5f, 18.6f, 3.5f, 17.5f)
+                close()
+            }
+        }
+    }
+
+    val Cpu: ImageVector by lazy {
+        strokeIcon("Cpu") {
+            linePath {
+                moveTo(7f, 5.5f); horizontalLineTo(17f)
+                curveTo(18f, 5.5f, 18.5f, 6f, 18.5f, 7f)
+                verticalLineTo(17f)
+                curveTo(18.5f, 18f, 18f, 18.5f, 17f, 18.5f)
+                horizontalLineTo(7f)
+                curveTo(6f, 18.5f, 5.5f, 18f, 5.5f, 17f)
+                verticalLineTo(7f)
+                curveTo(5.5f, 6f, 6f, 5.5f, 7f, 5.5f)
+                close()
+                moveTo(9.5f, 9.5f); horizontalLineTo(14.5f); verticalLineTo(14.5f); horizontalLineTo(9.5f); close()
+                moveTo(9f, 3f); verticalLineTo(5.5f)
+                moveTo(15f, 3f); verticalLineTo(5.5f)
+                moveTo(9f, 18.5f); verticalLineTo(21f)
+                moveTo(15f, 18.5f); verticalLineTo(21f)
+                moveTo(3f, 9f); horizontalLineTo(5.5f)
+                moveTo(3f, 15f); horizontalLineTo(5.5f)
+                moveTo(18.5f, 9f); horizontalLineTo(21f)
+                moveTo(18.5f, 15f); horizontalLineTo(21f)
+            }
+        }
+    }
 }

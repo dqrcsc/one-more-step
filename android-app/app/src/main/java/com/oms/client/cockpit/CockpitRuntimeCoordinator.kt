@@ -65,10 +65,37 @@ data class RemoteAgentSessionUi(
     val origin: String,  // "desktop" | "mobile"
     val title: String,
     val workspacePath: String,
+    val projectDisplayName: String = "",
     val status: String,  // "running" | "idle" | "completed" | "failed"
     val lastSummary: String,
     val updatedAtMs: Long,
     val canContinue: Boolean
+)
+
+data class RemoteAgentQuotaWindowUi(
+    val key: String,
+    val label: String,
+    val usedPercent: Int,
+    val remainingPercent: Int,
+    val windowMinutes: Int?,
+    val resetsAtMs: Long?
+)
+
+data class RemoteAgentBackendQuotaUi(
+    val backend: String,
+    val available: Boolean,
+    val planLabel: String,
+    val activeModel: String,
+    val windows: List<RemoteAgentQuotaWindowUi>,
+    val creditsSummary: String,
+    val statusNote: String,
+    val capturedAtMs: Long
+)
+
+data class RemoteAgentQuotasUi(
+    val codex: RemoteAgentBackendQuotaUi,
+    val agy: RemoteAgentBackendQuotaUi,
+    val fetchedAtMs: Long
 )
 
 data class RemoteAgentStepUi(
@@ -121,6 +148,9 @@ class CockpitRuntimeCoordinator(
 
     private val _agentProjectsFlow = MutableStateFlow<List<RemoteAgentProjectUi>>(emptyList())
     val agentProjectsFlow: StateFlow<List<RemoteAgentProjectUi>> = _agentProjectsFlow
+
+    private val _agentQuotasFlow = MutableStateFlow<RemoteAgentQuotasUi?>(null)
+    val agentQuotasFlow: StateFlow<RemoteAgentQuotasUi?> = _agentQuotasFlow
 
     private val _selectedAgentStepsFlow = MutableStateFlow<List<RemoteAgentStepUi>>(emptyList())
     val selectedAgentStepsFlow: StateFlow<List<RemoteAgentStepUi>> = _selectedAgentStepsFlow
@@ -309,7 +339,12 @@ class CockpitRuntimeCoordinator(
             threadId = threadId,
             messageId = assistantMsgId,
             startedAtMs = startedMs,
-            statusHint = if (deepThinking) "💭 正在深度思考…" else "✦ 正在连接…"
+            statusHint = when {
+                deepThinking && forceWebSearch -> "正在联网检索并深度推演…"
+                forceWebSearch -> "正在实时联网检索…"
+                deepThinking -> "正在深度思考…"
+                else -> "正在连接…"
+            }
         )
 
         val history = chatRepo.loadMessagesForThread(threadId)
@@ -334,7 +369,12 @@ class CockpitRuntimeCoordinator(
             else -> RouteIntent.AUTO
         }
         val nowFmt = SimpleDateFormat("yyyy-MM-dd HH:mm EEEE", Locale.CHINA).format(Date())
-        val devPrompt = CockpitAiServices.buildCockpitDeveloperPrompt(System.currentTimeMillis(), nowFmt, deepThinking)
+        val devPrompt = CockpitAiServices.buildCockpitDeveloperPrompt(
+            nowEpochMs = System.currentTimeMillis(),
+            nowFormatted = nowFmt,
+            deepThinking = deepThinking,
+            webSearchEnabled = forceWebSearch
+        )
 
         try {
             val firstPass = streamSinglePassWithRetry(
@@ -343,7 +383,8 @@ class CockpitRuntimeCoordinator(
                 startedMs = startedMs,
                 intent = intent,
                 devPrompt = devPrompt,
-                turns = turns
+                turns = turns,
+                forceWebSearch = forceWebSearch
             )
             val parsedFirst = CockpitAiServices.parseAssistantActions(firstPass.fullText)
 
@@ -351,7 +392,7 @@ class CockpitRuntimeCoordinator(
             val finalCompletedAndActions = if (parsedFirst.contextSearchQuery != null) {
                 val query = parsedFirst.contextSearchQuery!!
                 _streamingFlow.value = _streamingFlow.value.copy(
-                    statusHint = "🔍 正在按需检索个人知识库：$query",
+                    statusHint = "正在按需检索个人知识库：$query",
                     markdownText = ""
                 )
                 val recallBlock = recallPersonalContext(query)
@@ -365,7 +406,8 @@ class CockpitRuntimeCoordinator(
                     startedMs = startedMs,
                     intent = intent,
                     devPrompt = devPrompt,
-                    turns = augmentedTurns
+                    turns = augmentedTurns,
+                    forceWebSearch = forceWebSearch
                 )
                 secondPass to CockpitAiServices.parseAssistantActions(secondPass.fullText)
             } else {
@@ -425,7 +467,8 @@ class CockpitRuntimeCoordinator(
         startedMs: Long,
         intent: RouteIntent,
         devPrompt: String,
-        turns: List<LlmTurnMessage>
+        turns: List<LlmTurnMessage>,
+        forceWebSearch: Boolean = false
     ): LlmStreamEvent.Completed {
         var lastErr: Throwable? = null
         for (attempt in 1..2) {
@@ -438,7 +481,7 @@ class CockpitRuntimeCoordinator(
             var completedEvent: LlmStreamEvent.Completed? = null
 
             try {
-                llmEngine.streamTurn(intent, devPrompt, turns).collect { evt ->
+                llmEngine.streamTurn(intent, devPrompt, turns, forceWebSearch).collect { evt ->
                     val now = System.currentTimeMillis()
                     when (evt) {
                         is LlmStreamEvent.ReasoningDelta -> {
@@ -715,6 +758,9 @@ class CockpitRuntimeCoordinator(
                 sList.add(parseSessionJson(o))
             }
             _agentSessionsFlow.value = sList
+        }
+        resp.optJSONObject("quotas")?.let { qObj ->
+            _agentQuotasFlow.value = parseQuotasJson(qObj)
         }
     }
 
@@ -1016,17 +1062,60 @@ class CockpitRuntimeCoordinator(
         }
     }
 
-    private fun parseSessionJson(o: JSONObject) = RemoteAgentSessionUi(
-        sessionId = o.optString("sessionId"),
-        backend = o.optString("backend", "codex"),
-        origin = o.optString("origin", "desktop"),
-        title = o.optString("title", "Agent 会话"),
-        workspacePath = o.optString("workspacePath", ""),
-        status = o.optString("status", "idle"),
-        lastSummary = o.optString("lastSummary", ""),
-        updatedAtMs = o.optLong("updatedAtMs", System.currentTimeMillis()),
-        canContinue = o.optBoolean("canContinue", true)
-    )
+    private fun parseSessionJson(o: JSONObject): RemoteAgentSessionUi {
+        val ws = o.optString("workspacePath", "")
+        val projName = o.optString("projectDisplayName", "").ifBlank {
+            ws.trimEnd('/').substringAfterLast('/').ifBlank { "工作区" }
+        }
+        return RemoteAgentSessionUi(
+            sessionId = o.optString("sessionId"),
+            backend = o.optString("backend", "codex"),
+            origin = o.optString("origin", "desktop"),
+            title = o.optString("title", "").ifBlank { "${if (o.optString("backend") == "agy") "Antigravity" else "Codex"} · $projName" },
+            workspacePath = ws,
+            projectDisplayName = projName,
+            status = o.optString("status", "idle"),
+            lastSummary = o.optString("lastSummary", ""),
+            updatedAtMs = o.optLong("updatedAtMs", System.currentTimeMillis()),
+            canContinue = o.optBoolean("canContinue", true)
+        )
+    }
+
+    private fun parseQuotasJson(qObj: JSONObject): RemoteAgentQuotasUi {
+        fun parseBackend(bKey: String): RemoteAgentBackendQuotaUi {
+            val b = qObj.optJSONObject(bKey) ?: JSONObject()
+            val wArr = b.optJSONArray("windows") ?: JSONArray()
+            val winList = ArrayList<RemoteAgentQuotaWindowUi>(wArr.length())
+            for (i in 0 until wArr.length()) {
+                val w = wArr.optJSONObject(i) ?: continue
+                winList.add(
+                    RemoteAgentQuotaWindowUi(
+                        key = w.optString("key", "primary"),
+                        label = w.optString("label", "配额窗口"),
+                        usedPercent = w.optInt("usedPercent", 0).coerceIn(0, 100),
+                        remainingPercent = w.optInt("remainingPercent", 100).coerceIn(0, 100),
+                        windowMinutes = if (w.has("windowMinutes")) w.optInt("windowMinutes") else null,
+                        resetsAtMs = if (w.has("resetsAtMs") && w.optLong("resetsAtMs", 0L) > 0L) w.optLong("resetsAtMs") else null
+                    )
+                )
+            }
+            return RemoteAgentBackendQuotaUi(
+                backend = b.optString("backend", bKey),
+                available = b.optBoolean("available", false),
+                planLabel = b.optString("planLabel", bKey.uppercase(Locale.US)),
+                activeModel = b.optString("activeModel", ""),
+                windows = winList,
+                creditsSummary = b.optString("creditsSummary", ""),
+                statusNote = b.optString("statusNote", ""),
+                capturedAtMs = b.optLong("capturedAtMs", 0L)
+            )
+        }
+        return RemoteAgentQuotasUi(
+            codex = parseBackend("codex"),
+            agy = parseBackend("agy"),
+            fetchedAtMs = qObj.optLong("fetchedAtMs", System.currentTimeMillis())
+        )
+    }
 
     private fun parseStepJson(o: JSONObject) = RemoteAgentStepUi(
         stepIndex = o.optInt("stepIndex", 1),

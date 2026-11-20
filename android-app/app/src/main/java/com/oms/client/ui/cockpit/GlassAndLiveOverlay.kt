@@ -1,13 +1,13 @@
 package com.oms.client.ui.cockpit
 
 import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.ImageFormat
-import android.graphics.Rect
-import android.graphics.YuvImage
+import android.graphics.Matrix
+import android.media.AudioManager
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -61,6 +61,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -590,6 +591,14 @@ fun LiveVoiceAndGlassModal(
         )
     }
     var englishOnly by remember { mutableStateOf(false) }
+    var useFrontCamera by remember { mutableStateOf(false) }
+    var hasCameraPerm by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val currentSelectedMode by rememberUpdatedState(selectedMode)
+    val currentEnglishOnly by rememberUpdatedState(englishOnly)
 
     fun finishAndArchive() {
         val turns = liveState.transcriptTurns
@@ -605,20 +614,38 @@ fun LiveVoiceAndGlassModal(
 
     BackHandler { finishAndArchive() }
 
+    // Bind hardware volume keys to STREAM_VOICE_CALL while Live modal is active so user volume adjustments directly control Live voice!
+    DisposableEffect(context) {
+        val act = context as? Activity
+        val prevStream = act?.volumeControlStream ?: AudioManager.USE_DEFAULT_STREAM_TYPE
+        act?.volumeControlStream = AudioManager.STREAM_VOICE_CALL
+        onDispose {
+            act?.volumeControlStream = prevStream
+            coordinator.liveVoiceController.stop()
+        }
+    }
+
     val permLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { _ ->
-        val capsule = OmsApplication.instance?.edgeStore?.loadContextCapsule()
-        coordinator.liveVoiceController.start(
-            RealtimeSessionOptions(
-                mode = selectedMode,
-                englishOnlyFluencyMode = englishOnly,
-                extraContextSummary = capsule?.nowSummary.orEmpty()
+    ) { grantMap ->
+        hasCameraPerm = grantMap[Manifest.permission.CAMERA] == true ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        val micGranted = grantMap[Manifest.permission.RECORD_AUDIO] == true ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        if (micGranted) {
+            val capsule = OmsApplication.instance?.edgeStore?.loadContextCapsule()
+            coordinator.liveVoiceController.start(
+                RealtimeSessionOptions(
+                    mode = currentSelectedMode,
+                    englishOnlyFluencyMode = currentEnglishOnly,
+                    extraContextSummary = capsule?.nowSummary.orEmpty()
+                )
             )
-        )
+        }
     }
 
     LaunchedEffect(selectedMode, englishOnly) {
+        hasCameraPerm = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         val needed = mutableListOf(Manifest.permission.RECORD_AUDIO)
         if (selectedMode == RealtimeBackendMode.GEMINI_GLASS_LIVE) {
             needed.add(Manifest.permission.CAMERA)
@@ -637,12 +664,6 @@ fun LiveVoiceAndGlassModal(
             )
         } else {
             permLauncher.launch(needed.toTypedArray())
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            coordinator.liveVoiceController.stop()
         }
     }
 
@@ -732,50 +753,109 @@ fun LiveVoiceAndGlassModal(
             ) {
                 Spacer(modifier = Modifier.weight(0.4f))
 
-                if (selectedMode == RealtimeBackendMode.GEMINI_GLASS_LIVE &&
-                    ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-                ) {
+                if (selectedMode == RealtimeBackendMode.GEMINI_GLASS_LIVE && hasCameraPerm) {
                     val lastFrameSentAt = remember { AtomicLong(0L) }
                     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
                     DisposableEffect(selectedMode) {
                         onDispose { runCatching { analysisExecutor.shutdown() } }
                     }
-                    AndroidView(
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(210.dp)
+                            .height(226.dp)
                             .clip(RoundedCornerShape(24.dp))
-                            .border(1.dp, Color(0x44FFFFFF), RoundedCornerShape(24.dp)),
-                        factory = { ctx ->
-                            val pv = PreviewView(ctx)
-                            val fut = ProcessCameraProvider.getInstance(ctx)
-                            fut.addListener({
-                                runCatching {
-                                    val provider = fut.get()
-                                    val preview = Preview.Builder().build().also { it.setSurfaceProvider(pv.surfaceProvider) }
-                                    val analyzer = ImageAnalysis.Builder()
-                                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                                        .build().also { ia ->
-                                            ia.setAnalyzer(analysisExecutor) { proxy ->
-                                                val now = System.currentTimeMillis()
-                                                if (now - lastFrameSentAt.get() >= 1000L) {
-                                                    lastFrameSentAt.set(now)
-                                                    runCatching {
-                                                        imageProxyToJpeg(proxy, maxWidth = 640)?.let { jpeg ->
-                                                            coordinator.liveVoiceController.sendCameraJpegFrameIfGlassActive(jpeg)
+                            .border(1.dp, Color(0x44FFFFFF), RoundedCornerShape(24.dp))
+                    ) {
+                        androidx.compose.runtime.key(useFrontCamera) {
+                            AndroidView(
+                                modifier = Modifier.fillMaxSize(),
+                                factory = { ctx ->
+                                    val pv = PreviewView(ctx)
+                                    val fut = ProcessCameraProvider.getInstance(ctx)
+                                    fut.addListener({
+                                        runCatching {
+                                            val provider = fut.get()
+                                            val preview = Preview.Builder().build().also { it.setSurfaceProvider(pv.surfaceProvider) }
+                                            val analyzer = ImageAnalysis.Builder()
+                                                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                                                .build().also { ia ->
+                                                    ia.setAnalyzer(analysisExecutor) { proxy ->
+                                                        try {
+                                                            val now = System.currentTimeMillis()
+                                                            if (now - lastFrameSentAt.get() >= 900L) {
+                                                                val jpeg = imageProxyToJpeg(proxy, maxDim = 768)
+                                                                if (jpeg != null) {
+                                                                    lastFrameSentAt.set(now)
+                                                                    coordinator.liveVoiceController.sendCameraJpegFrameIfGlassActive(jpeg)
+                                                                }
+                                                            }
+                                                        } catch (_: Throwable) {
+                                                        } finally {
+                                                            proxy.close()
                                                         }
                                                     }
                                                 }
-                                                proxy.close()
+                                            val selector = if (useFrontCamera) {
+                                                CameraSelector.DEFAULT_FRONT_CAMERA
+                                            } else {
+                                                CameraSelector.DEFAULT_BACK_CAMERA
                                             }
+                                            provider.unbindAll()
+                                            provider.bindToLifecycle(lifecycleOwner, selector, preview, analyzer)
                                         }
-                                    provider.unbindAll()
-                                    provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analyzer)
+                                    }, ContextCompat.getMainExecutor(ctx))
+                                    pv
                                 }
-                            }, ContextCompat.getMainExecutor(ctx))
-                            pv
+                            )
                         }
-                    )
+
+                        // Top-Left Live Vision Frame Sync Indicator Pill
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .padding(10.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color(0x9907090F))
+                                .border(0.5.dp, Color(0x38FFFFFF), RoundedCornerShape(14.dp))
+                                .padding(horizontal = 10.dp, vertical = 5.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(7.dp)
+                                    .background(
+                                        if (liveState.videoFramesSent > 0) Color(0xFF34D399) else Color(0xFFFBBF24),
+                                        CircleShape
+                                    )
+                            )
+                            Text(
+                                text = if (liveState.videoFramesSent > 0) {
+                                    "视觉流已连通 · 已同步 ${liveState.videoFramesSent} 帧"
+                                } else {
+                                    "正在连接视觉画面流…"
+                                },
+                                color = Color.White,
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+
+                        // Top-Right Camera Flip Button (Back / Front)
+                        OmsCircleIconButton(
+                            icon = OmsIcons.Refresh,
+                            contentDescription = "切换前后摄像头",
+                            size = 34.dp,
+                            iconSize = 16.dp,
+                            containerColor = Color(0x9907090F),
+                            borderColor = Color(0x38FFFFFF),
+                            contentColor = Color.White,
+                            onClick = { useFrontCamera = !useFrontCamera },
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(10.dp)
+                        )
+                    }
                 }
 
                 FluidAcousticOrbCanvas(
@@ -819,7 +899,7 @@ fun LiveVoiceAndGlassModal(
                 Spacer(modifier = Modifier.weight(0.6f))
             }
 
-            // Bottom Call-Grade Tactile Controls
+            // Bottom Call-Grade Tactile Controls (Mic Mute | End Session | Loudness Boost)
             Row(
                 modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
                 horizontalArrangement = Arrangement.SpaceEvenly,
@@ -828,8 +908,8 @@ fun LiveVoiceAndGlassModal(
                 OmsCircleIconButton(
                     icon = if (liveState.micMuted) OmsIcons.MicOff else OmsIcons.Mic,
                     contentDescription = if (liveState.micMuted) "取消静音" else "静音",
-                    size = 58.dp,
-                    iconSize = 24.dp,
+                    size = 54.dp,
+                    iconSize = 22.dp,
                     containerColor = if (liveState.micMuted) Color.White else Color(0x26FFFFFF),
                     contentColor = if (liveState.micMuted) Color.Black else Color.White,
                     onClick = { coordinator.liveVoiceController.setMicMuted(!liveState.micMuted) }
@@ -843,6 +923,24 @@ fun LiveVoiceAndGlassModal(
                     containerColor = Color(0xFFEF4444),
                     contentColor = Color.White,
                     onClick = { finishAndArchive() }
+                )
+
+                OmsCircleIconButton(
+                    icon = OmsIcons.Volume,
+                    contentDescription = if (liveState.speakerBoostEnabled) "响度增强已开启" else "标准音量",
+                    size = 54.dp,
+                    iconSize = 22.dp,
+                    containerColor = if (liveState.speakerBoostEnabled) Color(0x4038BDF8) else Color(0x26FFFFFF),
+                    borderColor = if (liveState.speakerBoostEnabled) Color(0x8838BDF8) else Color.Transparent,
+                    contentColor = Color.White,
+                    onClick = {
+                        val next = !liveState.speakerBoostEnabled
+                        coordinator.liveVoiceController.setSpeakerBoostEnabled(next)
+                        OmsFeedbackController.show(
+                            if (next) "已开启外放语音响度增强" else "已切换为原始标准响度",
+                            com.oms.client.ui.theme.OmsToastKind.INFO
+                        )
+                    }
                 )
             }
         }
@@ -1002,26 +1100,27 @@ private fun scaleDownBitmap(src: Bitmap, maxDim: Int): Bitmap {
     return Bitmap.createScaledBitmap(src, (w * ratio).toInt().coerceAtLeast(1), (h * ratio).toInt().coerceAtLeast(1), true)
 }
 
-private fun imageProxyToJpeg(image: ImageProxy, maxWidth: Int): ByteArray? {
-    if (image.format != ImageFormat.YUV_420_888 || image.planes.size < 3) return null
-    val yBuf = image.planes[0].buffer
-    val uBuf = image.planes[1].buffer
-    val vBuf = image.planes[2].buffer
-    val ySize = yBuf.remaining()
-    val uSize = uBuf.remaining()
-    val vSize = vBuf.remaining()
-    val nv21 = ByteArray(ySize + uSize + vSize)
-    yBuf.get(nv21, 0, ySize)
-    vBuf.get(nv21, ySize, vSize)
-    uBuf.get(nv21, ySize + vSize, uSize)
-    val yuv = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
-    val rawOut = ByteArrayOutputStream()
-    yuv.compressToJpeg(Rect(0, 0, image.width, image.height), 72, rawOut)
-    val rawBytes = rawOut.toByteArray()
-    if (image.width <= maxWidth) return rawBytes
-    val decoded = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size) ?: return rawBytes
-    val scaled = scaleDownBitmap(decoded, maxWidth)
-    val finalOut = ByteArrayOutputStream()
-    scaled.compress(Bitmap.CompressFormat.JPEG, 76, finalOut)
-    return finalOut.toByteArray()
+/**
+ * Converts CameraX `ImageProxy` (`YUV_420_888` or `RGBA_8888`) into an upright, scaled JPEG frame
+ * using CameraX 1.3's stride-safe `toBitmap()` + `imageInfo.rotationDegrees` rotation matrix.
+ */
+private fun imageProxyToJpeg(image: ImageProxy, maxDim: Int): ByteArray? {
+    val rawBitmap = image.toBitmap()
+    val rot = image.imageInfo.rotationDegrees
+    val oriented = if (rot != 0) {
+        val m = Matrix().apply { postRotate(rot.toFloat()) }
+        Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, m, true).also {
+            if (it !== rawBitmap) rawBitmap.recycle()
+        }
+    } else {
+        rawBitmap
+    }
+    val scaled = scaleDownBitmap(oriented, maxDim)
+    if (scaled !== oriented) {
+        oriented.recycle()
+    }
+    val out = ByteArrayOutputStream()
+    scaled.compress(Bitmap.CompressFormat.JPEG, 80, out)
+    scaled.recycle()
+    return out.toByteArray().takeIf { it.isNotEmpty() }
 }

@@ -307,4 +307,98 @@ class AiEngineUnitTest {
         assertNull(ModelCatalogRegistry.classifyDiscoveredModel("openai", "text-embedding-3-small"))
         assertNull(ModelCatalogRegistry.classifyDiscoveredModel("gemini", "models/gemini-1.5-pro"))
     }
+
+    @Test
+    fun openAiWebSearchToolCitationsAndGeminiLiveCompressionWorkEndToEnd() {
+        val oaiOnlyCfg = EdgeAiRuntimeConfig(
+            openai = ProviderEndpointConfig(
+                providerId = "openai",
+                baseUrl = "https://api.openai.com/v1",
+                apiKey = "sk-test",
+                fastModel = AiModelCatalog.OPENAI_SOL,
+                flagshipModel = AiModelCatalog.OPENAI_SOL,
+                reasoningModel = AiModelCatalog.OPENAI_ASTRA
+            )
+        )
+        val engine = DualLlmEngine(
+            httpClientProvider = { OkHttpClient() },
+            runtimeConfig = oaiOnlyCfg,
+            roleOverrides = mapOf(
+                ModelRoleCategory.CHAT_PRIMARY to "openai:gpt-6.2-sol",
+                ModelRoleCategory.DEEP_REASONING to "openai:gpt-6.2-astra"
+            )
+        )
+
+        // 1. WEB_SEARCH_GROUNDED with OpenAI primary attaches `tools: [{"type": "web_search"}]`
+        val webDecision = engine.decideRoute(RouteIntent.WEB_SEARCH_GROUNDED, "今天北京天气怎么样", forceWebSearch = true)
+        assertEquals("gpt-6.2-sol", webDecision.model)
+        assertTrue(webDecision.useWebSearch)
+        val webPayload = engine.buildOpenAiResponsesPayload(
+            webDecision,
+            CockpitAiServices.buildCockpitDeveloperPrompt(1795170000000L, "2026-11-20", deepThinking = false, webSearchEnabled = true),
+            listOf(LlmTurnMessage("user", "今天北京天气怎么样")),
+            jsonMode = false,
+            stream = true
+        )
+        @Suppress("UNCHECKED_CAST")
+        val tools = webPayload["tools"] as? List<Map<String, Any?>>
+        assertNotNull(tools)
+        assertEquals("web_search", tools!![0]["type"])
+
+        // 2. DEEP_THINKING + forceWebSearch preserves BOTH high effort AND web_search!
+        val deepWebDecision = engine.decideRoute(RouteIntent.DEEP_THINKING, "分析今日最新行业动态", forceWebSearch = true)
+        assertEquals("gpt-6.2-astra", deepWebDecision.model)
+        assertEquals("high", deepWebDecision.effort.wireValue)
+        assertTrue(deepWebDecision.useWebSearch)
+
+        // 3. OpenAI `url_citation` annotations parse into GroundingSource pills
+        val parsedMock = MiniJson.parseObject(
+            """
+            {
+              "output": [
+                {"type": "web_search_call", "id": "ws_1"},
+                {
+                  "type": "message",
+                  "content": [
+                    {
+                      "type": "output_text",
+                      "text": "北京今日晴，最高温 10℃。",
+                      "annotations": [
+                        {"type": "url_citation", "title": "中国天气网", "url": "https://www.weather.com.cn/beijing"}
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+            """.trimIndent()
+        )
+        val (outText, _, citations) = engine.extractOpenAiResponsesOutputWithSources(parsedMock)
+        assertEquals("北京今日晴，最高温 10℃。", outText)
+        assertEquals(1, citations.size)
+        assertEquals("中国天气网", citations[0].title)
+        assertEquals("https://www.weather.com.cn/beijing", citations[0].uri)
+
+        // 4. Gemini Live setup includes contextWindowCompression.slidingWindow & refuses silent audio-only fallback
+        val gemSetup = RealtimeVoiceSessionEngine.buildGeminiLiveSetupPayload(AiModelCatalog.GEMINI_LIVE, "Vision", "Puck")
+        val inner = gemSetup["setup"] as Map<*, *>
+        assertNotNull(inner["contextWindowCompression"])
+
+        var capturedErr = ""
+        val liveEngine = RealtimeVoiceSessionEngine({ OkHttpClient() }, { oaiOnlyCfg })
+        liveEngine.startSession(
+            RealtimeSessionOptions(mode = RealtimeBackendMode.GEMINI_GLASS_LIVE),
+            object : RealtimeSessionListener {
+                override fun onSessionReady(mode: RealtimeBackendMode, modelId: String) {}
+                override fun onPcm24kAudioOut(pcm24kMonoLe: ByteArray) {}
+                override fun onUserTranscript(text: String, isFinal: Boolean) {}
+                override fun onAssistantTranscriptDelta(delta: String) {}
+                override fun onTurnComplete() {}
+                override fun onInterruptedBargeIn() {}
+                override fun onError(message: String) { capturedErr = message }
+                override fun onClosed() {}
+            }
+        )
+        assertTrue(capturedErr.contains("Gemini API Key"))
+    }
 }

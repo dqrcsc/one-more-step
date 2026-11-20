@@ -64,9 +64,8 @@ class RealtimeVoiceSessionEngine(
             }
             RealtimeBackendMode.GEMINI_GLASS_LIVE -> {
                 if (cfg.gemini?.apiKey?.isNotBlank() == true) RealtimeBackendMode.GEMINI_GLASS_LIVE
-                else if (cfg.openai?.apiKey?.isNotBlank() == true) RealtimeBackendMode.OPENAI_WALK_TALK
                 else {
-                    listener.onError("尚未配置 Gemini API Key")
+                    listener.onError("尚未同步 Gemini API Key，请连接 Mac 同步密钥后再使用实时镜头")
                     return
                 }
             }
@@ -236,15 +235,21 @@ class RealtimeVoiceSessionEngine(
     companion object {
         fun buildLiveInstructions(mode: RealtimeBackendMode, options: RealtimeSessionOptions): String {
             return buildString {
-                if (options.englishOnlyFluencyMode) {
+                if (mode == RealtimeBackendMode.GEMINI_GLASS_LIVE) {
+                    if (options.englishOnlyFluencyMode) {
+                        appendLine("You are the user's real-time multimodal Google Glass vision & voice companion.")
+                        appendLine("You continuously receive live JPEG frames from the user's phone camera (`realtimeInput.video`) along with live audio.")
+                        appendLine("Speak ONLY natural, concise English (2 to 4 sentences). Directly describe what you see in the live camera frame whenever asked.")
+                    } else {
+                        appendLine("你是用户的随身实时视觉与语音伴游助手（青简·咫尺 Live 镜头模式）。")
+                        appendLine("你正在持续接收用户手机摄像头传来的实时画面帧（realtimeInput.video）与双向语音。")
+                        appendLine("当用户询问「能看到吗 / 这是什么 / 帮我看看」时，请直接根据最新收到的摄像头画面具体描述你看到的物体、文字、颜色或植物特征；每次回答控制在 2~4 句自然口语，方便随时打断追问。")
+                    }
+                } else if (options.englishOnlyFluencyMode) {
                     appendLine("You are the user's crisp, thoughtful English walking partner on AirPods.")
                     appendLine("Speak ONLY natural, idiomatic English at a comfortable conversational pace.")
                     appendLine("Keep each spoken turn concise (2 to 4 sentences) so dialogue flows naturally back and forth.")
                     appendLine("Do NOT interrupt the conversation flow with pedantic grammar drills unless the user explicitly asks how to phrase something better.")
-                } else if (mode == RealtimeBackendMode.GEMINI_GLASS_LIVE) {
-                    appendLine("你是用户的随身 Google Glass 实时视觉与博物伴游助手（青简·咫尺 Live）。")
-                    appendLine("你会持续收到用户手机摄像头每秒 1 帧的实时画面与双向语音。")
-                    appendLine("看到植物、花草、建筑或器物时，请用自然简洁的口语直接告诉用户这是什么、画面里哪个特征最关键、有什么有趣背景；每次回答控制在 2~4 句口语长度，方便随时打断追问。")
                 } else {
                     appendLine("你是用户的随身散步深度对谈伙伴（青简·咫尺 Live）。")
                     appendLine("请用自然、敏锐、不啰嗦的口语与用户头脑风暴，每次回应控制在 2~5 句话，像老朋友并肩散步交谈一样留白。")
@@ -294,6 +299,9 @@ class RealtimeVoiceSessionEngine(
                     ),
                     "inputAudioTranscription" to linkedMapOf<String, Any?>(),
                     "outputAudioTranscription" to linkedMapOf<String, Any?>(),
+                    "contextWindowCompression" to linkedMapOf(
+                        "slidingWindow" to linkedMapOf<String, Any?>()
+                    ),
                     "tools" to listOf(linkedMapOf("googleSearch" to linkedMapOf<String, Any?>())),
                     "systemInstruction" to linkedMapOf(
                         "parts" to listOf(linkedMapOf("text" to instructions))

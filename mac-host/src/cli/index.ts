@@ -1181,6 +1181,9 @@ async function main() {
       if (op === "projects") {
         const res = await ipc.call("agent.sessions.list", { limit: Number(flags.limit || 20) }, 10000);
         console.log(JSON.stringify({ projects: res.projects || [] }, null, 2));
+      } else if (op === "quotas" || op === "quota") {
+        const res = await ipc.call("agent.quotas", {}, 10000);
+        console.log(JSON.stringify(res, null, 2));
       } else if (op === "show" || op === "detail") {
         const backend = (positional[1] || (flags.backend as string) || "codex").toLowerCase();
         const sessionId = positional[2] || (flags.id as string) || positional[1];

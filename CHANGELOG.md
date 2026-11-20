@@ -1,5 +1,12 @@
 # Changelog · 更新日志
 
+## 3.1.0 - 2026-11-20 · 双脑项目会话标题精准对齐、Live 响度与实时镜头视觉修复、双擎联网搜索打通与配额重置看板
+
+- **Codex & Antigravity 官方 SQLite 会话标题与命名项目深度对齐 (`AgentSessionHub` & `MissionHubWorkspaceView`)**：直连解析 `~/.codex/state_*.sqlite`（`threads.name`、`projects` + `project_roots`、`session_index.jsonl`）与 `~/.gemini/antigravity/conversation_summaries.db`，完整还原桌面端精炼会话标题与用户自定义中文项目名；修复超长首行 `.jsonl` 标题为空及 `<user_information>` 路径正则误匹配源码问题，手机端新增横向项目快筛胶囊栏与醒目项目名徽章。
+- **Live 全双工外放响度增强与实时镜头视觉全链路打通 (`LiveAudioDuplexController`、`GlassAndLiveOverlay` & `RealtimeVoiceProtocol`)**：在小米 HyperOS（Android 12+ API 31+）显式调用 `AudioManager.setCommunicationDevice(TYPE_BUILTIN_SPEAKER)` 根治音频误落顶部微弱听筒问题，自动对齐 `STREAM_VOICE_CALL` 通话声道音量、绑定物理音量键并内置无削波软限幅语音响度增益（支持面板内一键开关）；重写 CameraX 1.3 `ImageProxy.toBitmap()` + 旋转矩阵 JPEG 编码器，修复权限授权回调旧状态捕获与静默降级丢帧 Bug，开启 Gemini 3.8 Live `contextWindowCompression` 滑动窗口并新增实时同步帧数徽章与前后镜头翻转。
+- **普通对话与深度思考双擎原生「联网搜索」全面修复 (`DualLlmEngine` & `CockpitRuntimeCoordinator`)**：为 OpenAI `/v1/responses`（`gpt-6.2-sol` / `gpt-6.2-astra`）补齐原生 `tools: [{"type": "web_search"}]` 挂载与 `url_citation` 引用溯源解析，修复同时开启「思考 + 联网」时搜索开关被吞的问题，并增加流式首包跨厂商搜索自动容灾切换。
+- **Codex & Antigravity 额度余量与重置日期实时看板 (`AgentQuotaDashboardCard` & `oms agents quotas`)**：自动从 Codex 最新本地 `rate_limits` 遥测与 Antigravity 本地状态/推理轨迹提取套餐档位、剩余额度百分比进度条、精确重置日期与相对倒计时及今日缓存命中率，在「协同 · Agent 会话」顶部与「设置 · 模型与路由」双入口同步呈现。
+
 ## 3.0.0 - 2026-11-20 · 旗舰级消费态交互重塑、五套素笺/玄墨多主题引擎与纯矢量微交互设计系统
 
 - **五套精选双态主题与日夜自适应系统 (`OmsTheme` & `OmsThemeController`)**：支持「跟随系统 / 素昼浅色 / 玄夜深色」自由切换，内置 **素笺·玄墨**（宣纸暖白 + 纯净 OLED 曜黑）、**极简·纯粹**（对标 ChatGPT 无色相黑白）、**星云·流光**（对标 Gemini 深空蓝紫）、**松烟·苔痕**（森系护眼）与 **琥珀·暖咖**（零蓝光羊皮纸）五套精心调校色板，全界面色彩平滑渐变过渡。

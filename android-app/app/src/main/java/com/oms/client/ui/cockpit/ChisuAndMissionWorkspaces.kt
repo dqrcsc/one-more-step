@@ -84,6 +84,8 @@ import com.oms.client.capability.NotificationExecutor
 import com.oms.client.capability.SpeechAudioPolicy
 import com.oms.client.capability.VoiceRecorderHelper
 import com.oms.client.cockpit.CockpitRuntimeCoordinator
+import com.oms.client.cockpit.RemoteAgentBackendQuotaUi
+import com.oms.client.cockpit.RemoteAgentQuotasUi
 import com.oms.client.cockpit.RemoteAgentSessionUi
 import com.oms.client.cockpit.RemoteAgentStepUi
 import com.oms.client.data.StreamItemModel
@@ -512,11 +514,13 @@ fun MissionHubWorkspaceView(
 
     val sessions by coordinator.agentSessionsFlow.collectAsState()
     val projects by coordinator.agentProjectsFlow.collectAsState()
+    val quotas by coordinator.agentQuotasFlow.collectAsState()
     val selectedSession by coordinator.selectedAgentSessionFlow.collectAsState()
     val selectedSteps by coordinator.selectedAgentStepsFlow.collectAsState()
 
     var activeSubView by remember { mutableStateOf(HubSubView.AGENTS) }
     var backendFilter by remember { mutableStateOf("ALL") }
+    var projectFilterPath by remember { mutableStateOf("ALL") }
     var showDispatchSheet by remember { mutableStateOf(false) }
     var showMacDropSheet by remember { mutableStateOf(false) }
     var dispatchInitialPrompt by remember { mutableStateOf("") }
@@ -565,8 +569,21 @@ fun MissionHubWorkspaceView(
         streamItems.filter { it.itemType == "APPROVAL" && it.syncStatus == "PENDING_APPROVAL" }
     }
 
-    val filteredSessions = remember(sessions, backendFilter) {
-        sessions.filter { backendFilter == "ALL" || it.backend == backendFilter }
+    val activeProjectsWithSessions = remember(projects, sessions) {
+        val countsByPath = sessions.groupingBy { it.workspacePath.trim().trimEnd('/') }.eachCount()
+        projects.filter { p ->
+            val norm = p.projectPath.trim().trimEnd('/')
+            (countsByPath[norm] ?: p.sessionCount) > 0
+        }
+    }
+
+    val filteredSessions = remember(sessions, backendFilter, projectFilterPath) {
+        val normProj = projectFilterPath.trim().trimEnd('/')
+        sessions.filter { s ->
+            val matchBackend = backendFilter == "ALL" || s.backend == backendFilter
+            val matchProj = projectFilterPath == "ALL" || s.workspacePath.trim().trimEnd('/') == normProj
+            matchBackend && matchProj
+        }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -660,6 +677,36 @@ fun MissionHubWorkspaceView(
                 OmsTogglePill("Antigravity", backendFilter == "agy", icon = OmsIcons.Sparkles, onClick = { backendFilter = "agy" })
             }
 
+            // Project Quick-Filter Strip (human project names + session counts)
+            if (activeProjectsWithSessions.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 16.dp, vertical = 3.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OmsTogglePill(
+                        label = "全部项目",
+                        active = projectFilterPath == "ALL",
+                        onClick = { projectFilterPath = "ALL" }
+                    )
+                    activeProjectsWithSessions.forEach { proj ->
+                        val norm = proj.projectPath.trim().trimEnd('/')
+                        val cnt = sessions.count { it.workspacePath.trim().trimEnd('/') == norm }.coerceAtLeast(proj.sessionCount)
+                        OmsTogglePill(
+                            label = "${proj.displayName} · $cnt",
+                            active = projectFilterPath == proj.projectPath,
+                            icon = OmsIcons.Folder,
+                            onClick = {
+                                projectFilterPath = if (projectFilterPath == proj.projectPath) "ALL" else proj.projectPath
+                            }
+                        )
+                    }
+                }
+            }
+
             if (!macConnected) {
                 Row(
                     modifier = Modifier
@@ -673,40 +720,48 @@ fun MissionHubWorkspaceView(
                 ) {
                     Icon(OmsIcons.Laptop, contentDescription = null, tint = palette.warning, modifier = Modifier.size(15.dp))
                     Text(
-                        text = "当前未连通 Mac，恢复连接后可实时查看桌面轨迹或派单接续",
+                        text = "当前未连通 Mac，展示上次缓存快照；恢复连接后可实时刷新额度与会话",
                         color = palette.textSecondary,
                         fontSize = 12.sp
                     )
                 }
             }
 
-            if (filteredSessions.isEmpty()) {
-                Column(
-                    modifier = Modifier.fillMaxSize().padding(32.dp),
-                    verticalArrangement = Arrangement.Center,
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier.size(52.dp).clip(CircleShape).background(palette.subtleSurface)
-                    ) {
-                        Icon(OmsIcons.Terminal, contentDescription = null, tint = palette.textTertiary, modifier = Modifier.size(24.dp))
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 32.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                quotas?.let { qSnap ->
+                    item(key = "agent_quotas_dashboard") {
+                        AgentQuotaDashboardCard(quotas = qSnap)
                     }
-                    Spacer(modifier = Modifier.height(14.dp))
-                    Text("暂无活跃 Agent 会话", color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        "点击右上角「派发任务」可在任意 Mac 仓库启动 Codex 或 Antigravity",
-                        color = palette.textTertiary,
-                        fontSize = 13.sp
-                    )
                 }
-            } else {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 32.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
+
+                if (filteredSessions.isEmpty()) {
+                    item(key = "empty_agent_sessions") {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 48.dp, horizontal = 24.dp),
+                            verticalArrangement = Arrangement.Center,
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier.size(52.dp).clip(CircleShape).background(palette.subtleSurface)
+                            ) {
+                                Icon(OmsIcons.Terminal, contentDescription = null, tint = palette.textTertiary, modifier = Modifier.size(24.dp))
+                            }
+                            Spacer(modifier = Modifier.height(14.dp))
+                            Text("当前筛选下暂无会话", color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                "可切换上方项目胶囊，或点击右上角「派发任务」在 Mac 仓库启动新会话",
+                                color = palette.textTertiary,
+                                fontSize = 13.sp
+                            )
+                        }
+                    }
+                } else {
                     items(items = filteredSessions, key = { "${it.backend}:${it.sessionId}" }) { session ->
                         AgentSessionCard(
                             session = session,
@@ -810,11 +865,241 @@ private fun PinnedRemoteApprovalCard(
     }
 }
 
+private fun cleanAgentPreviewSnippet(raw: String): String {
+    return raw
+        .replace(Regex("""\[([^\]]+)\]\([^)]+\)"""), "$1")
+        .replace(Regex("""[#*>`~]+"""), " ")
+        .replace(Regex("""\s+"""), " ")
+        .trim()
+}
+
+private fun formatResetCountdown(resetsAtMs: Long): String {
+    val dateStr = SimpleDateFormat("MM月dd日 HH:mm", Locale.CHINA).format(Date(resetsAtMs))
+    val diffMs = resetsAtMs - System.currentTimeMillis()
+    if (diffMs <= 0L) return "$dateStr（即将重置）"
+    val totalMin = (diffMs / 60_000L).toInt()
+    val rel = when {
+        totalMin < 60 -> "约 ${totalMin.coerceAtLeast(1)} 分钟后"
+        totalMin < 24 * 60 -> {
+            val h = totalMin / 60
+            val m = totalMin % 60
+            if (m > 0) "约 ${h}小时${m}分后" else "约 ${h} 小时后"
+        }
+        else -> {
+            val d = totalMin / (24 * 60)
+            val h = (totalMin % (24 * 60)) / 60
+            if (h > 0) "约 ${d}天${h}小时后" else "约 ${d} 天后"
+        }
+    }
+    return "$dateStr 重置 · $rel"
+}
+
+@Composable
+internal fun AgentQuotaDashboardCard(quotas: RemoteAgentQuotasUi) {
+    val palette = OmsTheme.colors
+    var expanded by remember { mutableStateOf(true) }
+
+    OmsSurfaceCard(
+        cornerRadius = 18.dp,
+        contentPadding = PaddingValues(horizontal = 15.dp, vertical = 13.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .omsBounceClick(scaleDown = 0.985f) { expanded = !expanded },
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                Icon(OmsIcons.Cpu, contentDescription = null, tint = palette.accent, modifier = Modifier.size(15.dp))
+                Text(
+                    text = "Mac 双脑额度余量与重置周期",
+                    color = palette.textPrimary,
+                    fontSize = 13.5.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                val codexRem = quotas.codex.windows.firstOrNull()?.remainingPercent
+                if (!expanded && codexRem != null) {
+                    Text(
+                        text = "Codex 剩 $codexRem%",
+                        color = if (codexRem <= 20) palette.warning else palette.textSecondary,
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+                Icon(
+                    imageVector = if (expanded) OmsIcons.ChevronUp else OmsIcons.ChevronDown,
+                    contentDescription = null,
+                    tint = palette.textTertiary,
+                    modifier = Modifier.size(15.dp)
+                )
+            }
+        }
+
+        AnimatedVisibility(
+            visible = expanded,
+            enter = expandVertically(tween(180)) + fadeIn(tween(140)),
+            exit = shrinkVertically(tween(150)) + fadeOut(tween(110))
+        ) {
+            Column(
+                modifier = Modifier.padding(top = 11.dp),
+                verticalArrangement = Arrangement.spacedBy(11.dp)
+            ) {
+                AgentBackendQuotaRow(
+                    title = "OpenAI Codex",
+                    icon = OmsIcons.Terminal,
+                    quota = quotas.codex
+                )
+                Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
+                AgentBackendQuotaRow(
+                    title = "Antigravity",
+                    icon = OmsIcons.Sparkles,
+                    quota = quotas.agy
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AgentBackendQuotaRow(
+    title: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    quota: RemoteAgentBackendQuotaUi
+) {
+    val palette = OmsTheme.colors
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(icon, contentDescription = null, tint = palette.accent, modifier = Modifier.size(14.dp))
+                Text(title, color = palette.textPrimary, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold)
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(palette.subtleSurface)
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        text = quota.activeModel.ifBlank { quota.planLabel },
+                        color = palette.textSecondary,
+                        fontSize = 10.5.sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            if (quota.windows.isNotEmpty()) {
+                val primary = quota.windows.first()
+                val remColor = when {
+                    primary.remainingPercent <= 12 -> palette.danger
+                    primary.remainingPercent <= 25 -> palette.warning
+                    else -> palette.success
+                }
+                Text(
+                    text = "剩余 ${primary.remainingPercent}%",
+                    color = remColor,
+                    fontSize = 12.5.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            } else {
+                Text(
+                    text = if (quota.statusNote.contains("限流")) "触发限流" else "额度充足",
+                    color = if (quota.statusNote.contains("限流")) palette.warning else palette.success,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+
+        if (quota.windows.isNotEmpty()) {
+            quota.windows.forEach { win ->
+                val barColor = when {
+                    win.remainingPercent <= 12 -> palette.danger
+                    win.remainingPercent <= 25 -> palette.warning
+                    else -> palette.accent
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    // Remaining quota progress bar (filled portion = remaining %)
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(6.dp)
+                            .clip(CircleShape)
+                            .background(palette.subtleSurface)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth((win.remainingPercent / 100f).coerceIn(0.03f, 1f))
+                                .height(6.dp)
+                                .clip(CircleShape)
+                                .background(barColor)
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "${win.label}（已用 ${win.usedPercent}%）",
+                            color = palette.textSecondary,
+                            fontSize = 11.5.sp
+                        )
+                        win.resetsAtMs?.let { rMs ->
+                            Text(
+                                text = formatResetCountdown(rMs),
+                                color = palette.textTertiary,
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if (quota.creditsSummary.isNotBlank()) {
+            Text(
+                text = quota.creditsSummary,
+                color = palette.textSecondary,
+                fontSize = 12.sp
+            )
+        }
+        if (quota.statusNote.isNotBlank() && quota.windows.isEmpty()) {
+            Text(
+                text = quota.statusNote,
+                color = palette.textTertiary,
+                fontSize = 11.sp
+            )
+        }
+    }
+}
+
 @Composable
 private fun AgentSessionCard(session: RemoteAgentSessionUi, onClick: () -> Unit) {
     val palette = OmsTheme.colors
     val timeStr = remember(session.updatedAtMs) {
         SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(Date(session.updatedAtMs))
+    }
+    val projectLabel = remember(session.projectDisplayName, session.workspacePath) {
+        session.projectDisplayName.ifBlank {
+            session.workspacePath.trimEnd('/').substringAfterLast('/').ifBlank { "工作区" }
+        }
+    }
+    val cleanSummary = remember(session.lastSummary) {
+        cleanAgentPreviewSnippet(session.lastSummary)
     }
     val (statusText, statusColor) = when (session.status) {
         "running" -> "运行中" to palette.success
@@ -834,7 +1119,11 @@ private fun AgentSessionCard(session: RemoteAgentSessionUi, onClick: () -> Unit)
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.weight(1f)
+            ) {
                 Icon(
                     imageVector = if (session.backend == "codex") OmsIcons.Terminal else OmsIcons.Sparkles,
                     contentDescription = null,
@@ -842,12 +1131,31 @@ private fun AgentSessionCard(session: RemoteAgentSessionUi, onClick: () -> Unit)
                     modifier = Modifier.size(14.dp)
                 )
                 Text(
-                    text = (if (session.backend == "codex") "Codex" else "Antigravity") +
-                        (if (session.origin == "mobile") " · 手机派单" else " · 桌面会话"),
+                    text = if (session.backend == "codex") "Codex" else "Antigravity",
                     color = palette.textSecondary,
                     fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium
+                    fontWeight = FontWeight.SemiBold
                 )
+                // Prominent Project Name Pill
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(palette.subtleSurface)
+                        .border(0.5.dp, palette.hairline, RoundedCornerShape(8.dp))
+                        .padding(horizontal = 7.dp, vertical = 2.5.dp)
+                ) {
+                    Icon(OmsIcons.Folder, contentDescription = null, tint = palette.textTertiary, modifier = Modifier.size(11.dp))
+                    Text(
+                        text = projectLabel,
+                        color = palette.textPrimary,
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 Box(modifier = Modifier.size(6.dp).background(statusColor, CircleShape))
@@ -855,20 +1163,21 @@ private fun AgentSessionCard(session: RemoteAgentSessionUi, onClick: () -> Unit)
             }
         }
 
-        Spacer(modifier = Modifier.height(7.dp))
+        Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = session.title,
+            text = session.title.ifBlank { "${if (session.backend == "codex") "Codex" else "Antigravity"} · $projectLabel" },
             color = palette.textPrimary,
-            fontSize = 15.5.sp,
+            fontSize = 16.sp,
             fontWeight = FontWeight.SemiBold,
+            lineHeight = 22.5.sp,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis
         )
 
-        if (session.lastSummary.isNotBlank()) {
-            Spacer(modifier = Modifier.height(4.dp))
+        if (cleanSummary.isNotBlank()) {
+            Spacer(modifier = Modifier.height(5.dp))
             Text(
-                text = session.lastSummary,
+                text = cleanSummary,
                 color = palette.textSecondary,
                 fontSize = 13.sp,
                 lineHeight = 19.sp,
@@ -884,9 +1193,9 @@ private fun AgentSessionCard(session: RemoteAgentSessionUi, onClick: () -> Unit)
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = session.workspacePath.substringAfterLast('/').ifBlank { "工作区" },
+                text = if (session.origin == "mobile") "手机派单 · ${session.sessionId.take(8)}" else "Mac 桌面 · ${session.sessionId.take(8)}",
                 color = palette.textTertiary,
-                fontSize = 11.5.sp
+                fontSize = 11.sp
             )
             Text(
                 text = timeStr,
@@ -974,7 +1283,7 @@ private fun AgentSessionDetailScreen(
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = "${if (session.backend == "codex") "Codex" else "Antigravity"} · ${session.workspacePath.substringAfterLast('/')}",
+                        text = "${if (session.backend == "codex") "Codex" else "Antigravity"} · ${session.projectDisplayName.ifBlank { session.workspacePath.substringAfterLast('/') }}",
                         color = palette.textTertiary,
                         fontSize = 11.5.sp,
                         maxLines = 1,
@@ -1226,9 +1535,13 @@ private fun AgentDispatchSheetContent(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(modifier = Modifier.weight(1f)) {
+                    val matchedProj = projects.firstOrNull {
+                        it.projectPath.trim().trimEnd('/') == selectedWorkspacePath.trim().trimEnd('/')
+                    }
                     Text("目标工作区", color = palette.textTertiary, fontSize = 11.sp)
                     Text(
-                        text = selectedWorkspacePath.substringAfterLast('/').ifBlank { "点击选择 Mac 仓库…" },
+                        text = matchedProj?.displayName
+                            ?: selectedWorkspacePath.substringAfterLast('/').ifBlank { "点击选择 Mac 仓库…" },
                         color = palette.textPrimary,
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold

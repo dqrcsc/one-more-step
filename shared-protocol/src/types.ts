@@ -580,6 +580,7 @@ export interface AgentSessionSummary {
   origin: "desktop" | "mobile";
   title: string;
   workspacePath: string;
+  projectDisplayName?: string;
   status: "running" | "idle" | "completed" | "failed";
   lastSummary: string;
   updatedAtMs: number;
@@ -595,9 +596,36 @@ export interface AgentProjectItem {
   lastActiveAtMs: number;
 }
 
+export interface AgentQuotaWindowItem {
+  key: string;
+  label: string;
+  usedPercent: number;
+  remainingPercent: number;
+  windowMinutes?: number;
+  resetsAtMs?: number;
+}
+
+export interface AgentBackendQuotaStatus {
+  backend: AgentBackendType;
+  available: boolean;
+  planLabel: string;
+  activeModel?: string;
+  windows: AgentQuotaWindowItem[];
+  creditsSummary?: string;
+  statusNote?: string;
+  capturedAtMs: number;
+}
+
+export interface AgentQuotasSnapshot {
+  codex: AgentBackendQuotaStatus;
+  agy: AgentBackendQuotaStatus;
+  fetchedAtMs: number;
+}
+
 export interface AgentWorkspaceCatalogResult {
   projects: AgentProjectItem[];
   sessions: AgentSessionSummary[];
+  quotas?: AgentQuotasSnapshot;
 }
 
 export interface AgentStepItem {

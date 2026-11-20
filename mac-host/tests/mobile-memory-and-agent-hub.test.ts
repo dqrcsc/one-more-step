@@ -355,4 +355,143 @@ describe("Milestone 2 & 3: MobileMemoryMirror + AgentSessionHub", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  test("AgentSessionHub enriches titles/projects from Codex & Antigravity SQLite DBs, blocks regex path pollution, and extracts quotas", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oms-sqlite-meta-"));
+    const codexRoot = path.join(tmpDir, "codex");
+    const codexSessions = path.join(codexRoot, "sessions", "2026", "11", "20");
+    const agyRoot = path.join(tmpDir, "antigravity");
+    const agyBrain = path.join(agyRoot, "brain");
+    const projDir = path.join(tmpDir, "ai_research");
+    const omsHome = path.join(tmpDir, "oms");
+    fs.mkdirSync(codexSessions, { recursive: true });
+    fs.mkdirSync(path.join(agyBrain, "conv-agy-001", ".system_generated", "logs"), { recursive: true });
+    fs.mkdirSync(projDir, { recursive: true });
+    fs.mkdirSync(omsHome, { recursive: true });
+
+    // 1. Seed Codex `state_5.sqlite` + rollout with `token_count.rate_limits`
+    const { Database } = require("bun:sqlite");
+    const cdb = new Database(path.join(codexRoot, "state_5.sqlite"));
+    cdb.exec(`
+      CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+      CREATE TABLE project_roots (project_id TEXT NOT NULL, path TEXT NOT NULL);
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        title TEXT,
+        cwd TEXT,
+        preview TEXT,
+        updated_at INTEGER,
+        archived INTEGER DEFAULT 0,
+        agent_role TEXT DEFAULT ''
+      );
+    `);
+    cdb.run("INSERT INTO projects VALUES (?, ?)", ["p1", "AI调研分析"]);
+    cdb.run("INSERT INTO project_roots VALUES (?, ?)", ["p1", projDir]);
+    cdb.run("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
+      "01a1f8c8-bb49-7b10-bcd3-3c74e878f6f0",
+      "学习笔记卡片",
+      "原始长提示词",
+      projDir,
+      "预览文本",
+      1795178000,
+      0,
+      "",
+    ]);
+    cdb.close();
+
+    fs.writeFileSync(
+      path.join(codexSessions, "rollout-2026-11-20T19-47-47-01a1f8c8-bb49-7b10-bcd3-3c74e878f6f0.jsonl"),
+      [
+        JSON.stringify({ timestamp: "2026-11-20T11:47:47Z", type: "session_meta", payload: { id: "01a1f8c8-bb49-7b10-bcd3-3c74e878f6f0", cwd: projDir } }),
+        JSON.stringify({ timestamp: "2026-11-20T11:48:00Z", type: "turn_context", payload: { model: "gpt-5.4", cwd: projDir } }),
+        JSON.stringify({
+          timestamp: "2026-11-20T11:49:00Z",
+          type: "event_msg",
+          payload: {
+            type: "token_count",
+            rate_limits: {
+              plan_type: "prolite",
+              primary: { used_percent: 82, window_minutes: 10080, resets_at: 1795217109 },
+              secondary: null,
+            },
+          },
+        }),
+      ].join("\n") + "\n"
+    );
+
+    // 2. Seed Antigravity `conversation_summaries.db` + transcript containing regex-like source code output
+    const adb = new Database(path.join(agyRoot, "conversation_summaries.db"));
+    adb.exec(`
+      CREATE TABLE conversation_summaries (
+        conversation_id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        preview TEXT NOT NULL,
+        workspace_uris TEXT NOT NULL,
+        status TEXT NOT NULL,
+        nesting_depth INTEGER NOT NULL DEFAULT 0,
+        killed NUMERIC NOT NULL DEFAULT 0,
+        last_modified_time DATETIME NOT NULL
+      );
+    `);
+    adb.run("INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
+      "conv-agy-001",
+      "OMS App Redesign Proposal",
+      "Preview",
+      JSON.stringify([`file://${projDir}`]),
+      "CASCADE_RUN_STATUS_IDLE",
+      0,
+      0,
+      "2026-11-20 12:15:33+00:00",
+    ]);
+    adb.close();
+
+    fs.writeFileSync(
+      path.join(agyBrain, "conv-agy-001", ".system_generated", "logs", "transcript.jsonl"),
+      [
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-20T12:10:00Z",
+          content: "read_file output: content.match(/Command Working Directory:\\s*([^\\n<]+)/)",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-20T12:15:00Z",
+          model: "Gemini 4 Neon (High)",
+          input_tokens: 1000,
+          cache_read_tokens: 9000,
+          output_tokens: 2000,
+          content: "已完成体验升级。",
+        }),
+      ].join("\n") + "\n"
+    );
+
+    const hub = new AgentSessionHub({
+      omsHomeDir: omsHome,
+      codexSessionsDir: path.join(codexRoot, "sessions"),
+      agyBrainDir: agyBrain,
+      defaultWorkspacePath: tmpDir,
+    });
+
+    try {
+      const cat = hub.getWorkspaceCatalog(20);
+      const codexSess = cat.sessions.find((s) => s.backend === "codex");
+      const agySess = cat.sessions.find((s) => s.backend === "agy");
+
+      expect(codexSess?.title).toBe("学习笔记卡片");
+      expect(codexSess?.projectDisplayName).toBe("AI调研分析");
+      expect(agySess?.title).toBe("OMS App Redesign Proposal");
+      expect(agySess?.workspacePath).toBe(projDir);
+      expect(agySess?.projectDisplayName).toBe("AI调研分析");
+
+      expect(cat.quotas?.codex.available).toBe(true);
+      expect(cat.quotas?.codex.planLabel).toBe("Pro Lite");
+      expect(cat.quotas?.codex.windows[0]?.remainingPercent).toBe(18);
+      expect(cat.quotas?.codex.windows[0]?.resetsAtMs).toBe(1795217109000);
+      expect(cat.quotas?.agy.activeModel).toBe("Gemini 4 Neon (High)");
+    } finally {
+      hub.stopAll();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

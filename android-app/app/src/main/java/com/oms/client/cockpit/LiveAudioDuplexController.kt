@@ -3,6 +3,7 @@ package com.oms.client.cockpit
 import android.annotation.SuppressLint
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
@@ -10,6 +11,7 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
+import android.os.Build
 import com.oms.client.capability.NotificationExecutor
 import com.oms.core.ai.EdgeAiRuntimeConfig
 import com.oms.core.ai.RealtimeBackendMode
@@ -26,7 +28,9 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import java.util.concurrent.LinkedBlockingQueue
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import kotlin.math.tanh
 
 data class LiveVoiceUiState(
     val isActive: Boolean = false,
@@ -35,6 +39,9 @@ data class LiveVoiceUiState(
     val englishOnly: Boolean = false,
     val modelLabel: String = "",
     val micMuted: Boolean = false,
+    val speakerBoostEnabled: Boolean = true,
+    val usingSpeakerphone: Boolean = true,
+    val videoFramesSent: Int = 0,
     val audioLevel: Float = 0f,
     val assistantSpeaking: Boolean = false,
     val latestUserTranscript: String = "",
@@ -67,6 +74,10 @@ class LiveAudioDuplexController(
     private var echoCanceler: AcousticEchoCanceler? = null
     @Volatile
     private var noiseSuppressor: NoiseSuppressor? = null
+    @Volatile
+    private var savedVoiceCallVolume: Int? = null
+    @Volatile
+    private var pendingLatestCameraJpeg: ByteArray? = null
 
     private var captureJob: Job? = null
     private var playbackJob: Job? = null
@@ -74,16 +85,20 @@ class LiveAudioDuplexController(
     private val currentAssistantText = StringBuilder()
 
     fun start(options: RealtimeSessionOptions) {
+        val keepBoost = _stateFlow.value.speakerBoostEnabled
         stop()
         NotificationExecutor.stopSpeaking(appContext)
+        pendingLatestCameraJpeg = null
+        val onSpeaker = setupAudioRoute(enableCommunicationMode = true)
         _stateFlow.value = LiveVoiceUiState(
             isActive = true,
             isConnecting = true,
             mode = options.mode,
-            englishOnly = options.englishOnlyFluencyMode
+            englishOnly = options.englishOnlyFluencyMode,
+            speakerBoostEnabled = keepBoost,
+            usingSpeakerphone = onSpeaker
         )
 
-        setupAudioRoute(enableCommunicationMode = true)
         startPlaybackPipeline()
 
         engine.startSession(
@@ -97,6 +112,16 @@ class LiveAudioDuplexController(
                         errorText = null
                     )
                     startMicCapturePipeline()
+                    // Immediately flush any camera frame captured while WebSocket setup was completing!
+                    if (mode == RealtimeBackendMode.GEMINI_GLASS_LIVE) {
+                        pendingLatestCameraJpeg?.let { firstJpeg ->
+                            pendingLatestCameraJpeg = null
+                            engine.sendCameraJpegFrame(firstJpeg)
+                            _stateFlow.value = _stateFlow.value.copy(
+                                videoFramesSent = _stateFlow.value.videoFramesSent + 1
+                            )
+                        }
+                    }
                 }
 
                 override fun onPcm24kAudioOut(pcm24kMonoLe: ByteArray) {
@@ -171,14 +196,27 @@ class LiveAudioDuplexController(
         }
     }
 
+    fun setSpeakerBoostEnabled(enabled: Boolean) {
+        _stateFlow.value = _stateFlow.value.copy(speakerBoostEnabled = enabled)
+    }
+
     fun sendCameraJpegFrameIfGlassActive(jpegBytes: ByteArray) {
+        if (jpegBytes.isEmpty()) return
         val st = _stateFlow.value
-        if (st.isActive && !st.isConnecting && st.mode == RealtimeBackendMode.GEMINI_GLASS_LIVE) {
+        if (!st.isActive) return
+        if (st.isConnecting) {
+            // Buffer latest frame during handshake so millisecond-zero vision is available upon setupComplete
+            pendingLatestCameraJpeg = jpegBytes
+            return
+        }
+        if (st.mode == RealtimeBackendMode.GEMINI_GLASS_LIVE) {
             engine.sendCameraJpegFrame(jpegBytes)
+            _stateFlow.value = _stateFlow.value.copy(videoFramesSent = _stateFlow.value.videoFramesSent + 1)
         }
     }
 
     fun stop() {
+        pendingLatestCameraJpeg = null
         engine.stopSession()
         stopAudioHardwareOnly()
         _stateFlow.value = _stateFlow.value.copy(
@@ -273,6 +311,7 @@ class LiveAudioDuplexController(
                 .setBufferSizeInBytes(minOut * 3)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
+            runCatching { track.setVolume(AudioTrack.getMaxVolume()) }
             audioTrack = track
             track.play()
 
@@ -283,32 +322,116 @@ class LiveAudioDuplexController(
                     break
                 }
                 if (chunk.isEmpty()) continue
+                val st = _stateFlow.value
+                val outChunk = if (st.speakerBoostEnabled) {
+                    val gain = if (st.usingSpeakerphone) 2.35f else 1.45f
+                    applyPcm16SoftLimiterGain(chunk, gain)
+                } else {
+                    chunk
+                }
+                val outRms = computeNormalizedRms(outChunk)
+                if (st.assistantSpeaking) {
+                    _stateFlow.value = st.copy(audioLevel = outRms)
+                }
                 runCatching {
-                    track.write(chunk, 0, chunk.size)
+                    track.write(outChunk, 0, outChunk.size)
                 }
             }
         }
     }
 
-    private fun setupAudioRoute(enableCommunicationMode: Boolean) {
-        val am = appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+    /**
+     * Routes audio explicitly to `TYPE_BUILTIN_SPEAKER` on Android 12+ (`API 31+`) when no headset is worn
+     * (fixing Xiaomi HyperOS earpiece low-volume routing) and aligns `STREAM_VOICE_CALL` loudness with `STREAM_MUSIC`.
+     */
+    private fun setupAudioRoute(enableCommunicationMode: Boolean): Boolean {
+        val am = appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return true
+        var usingSpeaker = true
         runCatching {
             if (enableCommunicationMode) {
                 am.mode = AudioManager.MODE_IN_COMMUNICATION
-                val hasHeadset = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any { dev ->
-                    dev.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-                        dev.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-                        dev.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                        dev.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET ||
-                        dev.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
-                        dev.type == android.media.AudioDeviceInfo.TYPE_USB_HEADSET
+                val outputDevices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                val hasHeadset = outputDevices.any { dev ->
+                    dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                        dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                        dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                        dev.type == AudioDeviceInfo.TYPE_BLE_SPEAKER ||
+                        dev.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                        dev.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                        dev.type == AudioDeviceInfo.TYPE_USB_HEADSET
+                }
+                usingSpeaker = !hasHeadset
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    if (usingSpeaker) {
+                        val speakerDev = am.availableCommunicationDevices.firstOrNull {
+                            it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                        }
+                        if (speakerDev != null) {
+                            am.setCommunicationDevice(speakerDev)
+                        }
+                    } else {
+                        am.clearCommunicationDevice()
+                    }
                 }
                 @Suppress("DEPRECATION")
-                am.isSpeakerphoneOn = !hasHeadset
+                am.isSpeakerphoneOn = usingSpeaker
+
+                // Align hidden STREAM_VOICE_CALL volume when user already turned STREAM_MUSIC up on speakerphone
+                if (usingSpeaker) {
+                    val maxCall = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL).coerceAtLeast(1)
+                    val curCall = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+                    val maxMusic = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                    val curMusic = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                    val musicFrac = curMusic.toFloat() / maxMusic.toFloat()
+                    val targetFrac = maxOf(musicFrac, 0.85f)
+                    val targetCall = (maxCall * targetFrac).roundToInt().coerceIn(1, maxCall)
+                    if (curCall < targetCall) {
+                        savedVoiceCallVolume = curCall
+                        am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, targetCall, 0)
+                    }
+                }
             } else {
+                savedVoiceCallVolume?.let { prevVol ->
+                    savedVoiceCallVolume = null
+                    runCatching { am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, prevVol, 0) }
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    runCatching { am.clearCommunicationDevice() }
+                }
+                @Suppress("DEPRECATION")
+                am.isSpeakerphoneOn = false
                 am.mode = AudioManager.MODE_NORMAL
             }
         }
+        return usingSpeaker
+    }
+
+    /**
+     * Clean soft-knee limiter for 16-bit LE mono PCM audio: boosts quiet cloud TTS speech (-16 dBFS)
+     * while smoothly saturating peaks above ~68% full scale so speech never clips harshly.
+     */
+    private fun applyPcm16SoftLimiterGain(pcm16Le: ByteArray, gain: Float): ByteArray {
+        if (gain <= 1.02f || pcm16Le.size < 2) return pcm16Le
+        val out = ByteArray(pcm16Le.size)
+        val samples = pcm16Le.size / 2
+        val knee = 22000.0
+        val ceiling = 32600.0
+        val headroom = ceiling - knee
+        for (i in 0 until samples) {
+            val lo = pcm16Le[i * 2].toInt() and 0xFF
+            val hi = pcm16Le[i * 2 + 1].toInt()
+            val raw = (hi shl 8) or lo
+            val boosted = raw.toDouble() * gain.toDouble()
+            val shaped = when {
+                boosted > knee -> knee + headroom * tanh((boosted - knee) / headroom)
+                boosted < -knee -> -knee - headroom * tanh((-boosted - knee) / headroom)
+                else -> boosted
+            }
+            val clamped = shaped.roundToInt().coerceIn(-32767, 32767)
+            out[i * 2] = (clamped and 0xFF).toByte()
+            out[i * 2 + 1] = ((clamped shr 8) and 0xFF).toByte()
+        }
+        return out
     }
 
     private fun stopAudioHardwareOnly() {
