@@ -16,6 +16,7 @@ import com.oms.core.ai.ProxyNodeCodec
 import com.oms.core.ai.VaultCandidateNote
 import com.oms.core.proxy.DEFAULT_MAX_PREFER_LATENCY_MS
 import com.oms.core.proxy.DEFAULT_PREFER_REGIONS
+import com.oms.core.proxy.LEGACY_DEFAULT_PREFER_REGIONS
 import com.oms.core.proxy.ProxyNode
 import java.security.KeyStore
 import javax.crypto.Cipher
@@ -147,7 +148,12 @@ class EdgeSecureStore(context: Context) {
             ?: return Triple(emptyList(), emptyList(), DEFAULT_PREFER_REGIONS to DEFAULT_MAX_PREFER_LATENCY_MS)
         val nodes = (m["bootstrapNodes"] as? List<*>)?.let { ProxyNodeCodec.fromJsonList(it) } ?: emptyList()
         val urls = (m["subscriptionUrls"] as? List<*>)?.mapNotNull { it?.toString()?.trim()?.takeIf(String::isNotEmpty) } ?: emptyList()
-        val prefer = m["preferRegions"]?.toString()?.ifBlank { DEFAULT_PREFER_REGIONS } ?: DEFAULT_PREFER_REGIONS
+        val rawPrefer = m["preferRegions"]?.toString()?.trim().orEmpty()
+        val prefer = if (rawPrefer.isEmpty() || rawPrefer == LEGACY_DEFAULT_PREFER_REGIONS) {
+            DEFAULT_PREFER_REGIONS
+        } else {
+            rawPrefer
+        }
         val maxLat = (m["maxPreferredLatencyMs"] as? Number)?.toDouble() ?: DEFAULT_MAX_PREFER_LATENCY_MS
         Triple(nodes, urls, prefer to maxLat)
     }

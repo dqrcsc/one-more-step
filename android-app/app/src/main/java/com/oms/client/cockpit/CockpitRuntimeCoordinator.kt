@@ -708,7 +708,7 @@ class CockpitRuntimeCoordinator(
     }
 
     fun setProxyRoutingPolicy(mode: String, pinnedNodeKey: String? = proxyManager.router.pinnedNodeKey) {
-        proxyManager.router.setRoutingPolicy(mode, pinnedNodeKey)
+        proxyManager.setRoutingPolicyAndEvict(mode, pinnedNodeKey)
         edgeStore.saveProxyUserPolicy(mode, pinnedNodeKey)
         vibrateTick()
         refreshProxyUiState()
@@ -729,7 +729,13 @@ class CockpitRuntimeCoordinator(
     }
 
     suspend fun probeAiConnectivity(): AiConnectivityReport {
-        val rep = proxyManager.probeAiEndpointsConnectivity()
+        val cfg = llmEngine.runtimeConfig
+        val rep = proxyManager.probeAiEndpointsConnectivity(
+            openAiApiKey = cfg.openai?.apiKey.orEmpty(),
+            openAiBaseUrl = cfg.openai?.baseUrl ?: "https://api.openai.com/v1",
+            geminiApiKey = cfg.gemini?.apiKey.orEmpty(),
+            geminiBaseUrl = cfg.gemini?.baseUrl ?: "https://generativelanguage.googleapis.com/v1beta"
+        )
         _aiConnectivityFlow.value = rep
         refreshProxyUiState()
         vibrateConfirm()
@@ -771,6 +777,8 @@ class CockpitRuntimeCoordinator(
         _modelCatalogFlow.value = res.items
         _modelRefreshedAtFlow.value = res.refreshedAtMs
         edgeStore.saveCachedModelCatalog(res.items, res.refreshedAtMs)
+        // Refresh proxy UI state in case AiGeoBlockFailoverInterceptor flagged & bypassed a geo-blocked node!
+        refreshProxyUiState()
         vibrateConfirm()
         return res
     }

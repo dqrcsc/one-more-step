@@ -292,6 +292,17 @@ class AiEngineUnitTest {
         assertNotNull(futureMusic)
         assertTrue(ModelRoleCategory.MUSIC_GENERATION in futureMusic!!.categories)
 
+        val liveTranscribe = ModelCatalogRegistry.classifyDiscoveredModel("gemini", "models/gemini-3.5-transcribe-live", "Gemini 3.5 Transcribe Live")
+        assertNotNull(liveTranscribe)
+        assertTrue(ModelRoleCategory.SPEECH_TRANSCRIBE in liveTranscribe!!.categories)
+
+        val friendlyGeoErr = ModelCatalogRegistry.formatProviderHttpError(
+            "Gemini",
+            400,
+            """{"error":{"code":400,"message":"User location is not supported for the API use."}}"""
+        )
+        assertTrue(friendlyGeoErr.contains("地区不受 Gemini 支持"))
+
         // Deprecated & embedding models are strictly filtered out
         assertNull(ModelCatalogRegistry.classifyDiscoveredModel("openai", "text-embedding-3-small"))
         assertNull(ModelCatalogRegistry.classifyDiscoveredModel("gemini", "models/gemini-1.5-pro"))

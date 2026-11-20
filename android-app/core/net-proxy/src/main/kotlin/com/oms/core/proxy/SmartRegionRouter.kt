@@ -12,11 +12,17 @@ import java.net.InetAddress
 import kotlin.math.min
 import kotlin.math.pow
 
-const val DEFAULT_PREFER_REGIONS = "美国|新加坡"
+const val DEFAULT_PREFER_REGIONS = "新加坡|日本|美国|台湾"
+const val LEGACY_DEFAULT_PREFER_REGIONS = "美国|新加坡"
 const val DEFAULT_MAX_PREFER_LATENCY_MS = 4000.0
 const val DEFAULT_PROBE_HOST = "www.gstatic.com"
 const val DEFAULT_PROBE_PORT = 80
 const val DEFAULT_PROBE_PATH = "/generate_204"
+
+private val RESTRICTED_AI_REGION_REGEX = Regex(
+    """(?:香港|Hong\s*Kong|🇭🇰|(?<![A-Za-z])HK(?![A-Za-z])|(?<![A-Za-z])HKG(?![A-Za-z])|澳门|澳門|Macau|🇲🇴|俄罗斯|Russia|🇷🇺)""",
+    RegexOption.IGNORE_CASE
+)
 
 private val REGION_ALIAS_PATTERNS = mapOf(
     "us" to """(?:美国|United\s*States|America|🇺🇸|(?<![A-Za-z])US(?![A-Za-z])|(?<![A-Za-z])USA(?![A-Za-z])|洛杉矶|硅谷|圣何塞|西雅图|芝加哥|纽约|达拉斯|凤凰城|波特兰)""",
@@ -207,7 +213,15 @@ data class ProxyNodeStatusView(
     val latencyMs: Long?,
     val healthy: Boolean,
     val isActive: Boolean,
-    val isPinned: Boolean
+    val isPinned: Boolean,
+    val aiGeoBlocked: Boolean = false
+)
+
+data class RoutedTunnelResult(
+    val tunnel: ProxyTunnel,
+    val initialServerChunk: ByteArray,
+    val node: ProxyNode?,
+    val targetHost: String
 )
 
 class SmartRegionRouter(
@@ -224,12 +238,17 @@ class SmartRegionRouter(
     private val lock = Any()
     private var nodes: List<ProxyNode> = initialNodes.toList()
     private var matcher: RuleMatcher = RuleMatcher(rules)
+    private val lastUsedNodeByHost = java.util.concurrent.ConcurrentHashMap<String, ProxyNode>()
     @Volatile
     var pinnedNodeKey: String? = null
-    val regionTiers: List<RegionTier> = compileRegionTiers(preferRegions)
+    @Volatile
+    var regionTiers: List<RegionTier> = compileRegionTiers(preferRegions)
 
     companion object {
         fun nodeKey(node: ProxyNode): String = "${node.name}@${node.server}:${node.port}"
+
+        fun isRestrictedAiRegionName(name: String): Boolean =
+            RESTRICTED_AI_REGION_REGEX.containsMatchIn(name)
 
         fun detectRegionBadge(name: String): String {
             for ((label, pat) in listOf(
@@ -248,14 +267,36 @@ class SmartRegionRouter(
         }
     }
 
+    fun updatePreferRegions(preferRegions: String?) {
+        regionTiers = compileRegionTiers(preferRegions)
+    }
+
     fun setRoutingPolicy(mode: String, pinnedKey: String? = pinnedNodeKey) {
         routing = mode.lowercase()
         pinnedNodeKey = pinnedKey?.takeIf { it.isNotBlank() }
     }
 
+    fun markAiGeoBlocked(node: ProxyNode) {
+        node.aiGeoBlocked = true
+    }
+
+    fun lastUsedNodeForHost(host: String): ProxyNode? =
+        lastUsedNodeByHost[host.trim().lowercase()]
+
     fun updateNodes(newNodes: List<ProxyNode>, newRules: List<String> = emptyList(), newClockOffsetSec: Int = 0) {
         synchronized(lock) {
-            nodes = newNodes.toList()
+            val prevByKey = nodes.associateBy { nodeKey(it) }
+            nodes = newNodes.map { incoming ->
+                val prev = prevByKey[nodeKey(incoming)]
+                if (prev != null) {
+                    if (prev.aiGeoBlocked) incoming.aiGeoBlocked = true
+                    if (!incoming.latencyMs.isFinite() && prev.latencyMs.isFinite()) {
+                        incoming.latencyMs = prev.latencyMs
+                        incoming.healthy = prev.healthy
+                    }
+                }
+                incoming
+            }
             if (newRules.isNotEmpty()) {
                 matcher = RuleMatcher(newRules)
             }
@@ -268,8 +309,9 @@ class SmartRegionRouter(
     fun allNodesSnapshot(): List<ProxyNode> = synchronized(lock) { nodes.toList() }
 
     fun matchRegionTier(node: ProxyNode): Int? {
-        for (idx in regionTiers.indices) {
-            if (regionTiers[idx].regex.containsMatchIn(node.name)) {
+        val tiers = regionTiers
+        for (idx in tiers.indices) {
+            if (tiers[idx].regex.containsMatchIn(node.name)) {
                 return idx
             }
         }
@@ -292,11 +334,18 @@ class SmartRegionRouter(
 
     private fun priorityKey(node: ProxyNode): SortKey {
         if (!node.healthy) {
-            return SortKey(2, 999, node.failCount, node.latencyMs)
+            return SortKey(4, 999, node.failCount, node.latencyMs)
+        }
+        if (node.aiGeoBlocked) {
+            return SortKey(3, 999, node.failCount, node.latencyMs)
         }
         val tIdx = matchRegionTier(node)
-        if (tIdx != null && node.failCount == 0 && node.latencyMs <= maxPreferredLatencyMs) {
+        val isUntestedOrWithinBudget = !node.latencyMs.isFinite() || node.latencyMs <= maxPreferredLatencyMs
+        if (tIdx != null && node.failCount == 0 && isUntestedOrWithinBudget) {
             return SortKey(0, tIdx, 0, node.latencyMs)
+        }
+        if (!node.latencyMs.isFinite() && isRestrictedAiRegionName(node.name)) {
+            return SortKey(2, 0, node.failCount, node.latencyMs)
         }
         return SortKey(1, 0, node.failCount, node.latencyMs)
     }
@@ -324,15 +373,19 @@ class SmartRegionRouter(
         if (routing.equals("direct", ignoreCase = true)) return "🔗 仅直连模式（已停用代理）"
         val best = bestNode ?: return "无可用节点"
         val lat = if (best.latencyMs.isFinite()) "${best.latencyMs.toLong()}ms" else "未测速"
+        val geoTag = if (best.aiGeoBlocked) " · 🚫AI锁区" else ""
         if (routing.equals("manual", ignoreCase = true) && !pinnedNodeKey.isNullOrBlank()) {
-            return "📌 手动锁定 -> ${best.name} ($lat)"
+            return "📌 手动锁定 -> ${best.name} ($lat$geoTag)"
         }
-        if (regionTiers.isEmpty()) return "全局最快 -> ${best.name} ($lat)"
+        val tiers = regionTiers
+        if (tiers.isEmpty()) return "全局最快 -> ${best.name} ($lat$geoTag)"
         val tIdx = matchRegionTier(best)
-        if (tIdx != null && best.healthy && best.failCount == 0 && best.latencyMs <= maxPreferredLatencyMs) {
-            return "优先地区 [${regionTiers[tIdx].label}] -> ${best.name} ($lat)"
+        if (tIdx != null && best.healthy && !best.aiGeoBlocked && best.failCount == 0 &&
+            (!best.latencyMs.isFinite() || best.latencyMs <= maxPreferredLatencyMs)
+        ) {
+            return "优先地区 [${tiers[tIdx].label}] -> ${best.name} ($lat)"
         }
-        return "降级优选 -> ${best.name} ($lat)"
+        return "降级优选 -> ${best.name} ($lat$geoTag)"
     }
 
     fun getNodesStatusViews(): List<ProxyNodeStatusView> {
@@ -349,7 +402,8 @@ class SmartRegionRouter(
                 latencyMs = if (n.latencyMs.isFinite()) n.latencyMs.toLong() else null,
                 healthy = n.healthy,
                 isActive = active != null && nodeKey(active) == key,
-                isPinned = pinKey != null && (pinKey == key || pinKey == n.name)
+                isPinned = pinKey != null && (pinKey == key || pinKey == n.name),
+                aiGeoBlocked = n.aiGeoBlocked
             )
         }
     }
@@ -447,6 +501,19 @@ class SmartRegionRouter(
             ProxyTunnelConnector.openNodeTunnel(n, h, p, init, clk, tmo)
         }
     ): Pair<ProxyTunnel, ByteArray> {
+        val res = openRoutedTunnelWithNodeBlocking(targetHost, targetPort, initialPayload, nodeConnector)
+        return res.tunnel to res.initialServerChunk
+    }
+
+    fun openRoutedTunnelWithNodeBlocking(
+        targetHost: String,
+        targetPort: Int,
+        initialPayload: ByteArray = ByteArray(0),
+        nodeConnector: (ProxyNode, String, Int, ByteArray, Int, Int) -> ProxyTunnel = { n, h, p, init, clk, tmo ->
+            ProxyTunnelConnector.openNodeTunnel(n, h, p, init, clk, tmo)
+        }
+    ): RoutedTunnelResult {
+        val cleanHost = targetHost.trim().lowercase()
         if (shouldUseDirect(targetHost)) {
             val direct = ProxyTunnelConnector.openDirectTunnel(
                 targetHost = targetHost,
@@ -454,7 +521,7 @@ class SmartRegionRouter(
                 initialPayload = initialPayload,
                 connectTimeoutMs = connectTimeoutMs
             )
-            return direct to ByteArray(0)
+            return RoutedTunnelResult(direct, ByteArray(0), null, cleanHost)
         }
 
         val candidates = orderedCandidates()
@@ -481,7 +548,8 @@ class SmartRegionRouter(
                 }
                 val elapsedMs = (System.nanoTime() - t0) / 1_000_000.0
                 markSuccess(node, if (initialPayload.isNotEmpty()) elapsedMs else null)
-                return tunnel to firstChunk
+                lastUsedNodeByHost[cleanHost] = node
+                return RoutedTunnelResult(tunnel, firstChunk, node, cleanHost)
             } catch (t: Throwable) {
                 lastErr = t
                 markFailure(node)

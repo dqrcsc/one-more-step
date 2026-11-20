@@ -315,7 +315,7 @@ export async function buildEdgeSyncPayloadFromHost(opts: {
     }
   }
 
-  const preferRegions = mergedEnv.VPN_PREFER_REGIONS?.trim() || "美国|新加坡";
+  const preferRegions = mergedEnv.VPN_PREFER_REGIONS?.trim() || "新加坡|日本|美国|台湾";
   const maxPreferredLatencyMs = Number(mergedEnv.VPN_MAX_PREFER_LATENCY_MS) || 4000;
 
   // 2. Load or refresh bootstrapNodes snapshot (cached 30 min in ~/.one_more_step/cache/edge_proxy_nodes.json)

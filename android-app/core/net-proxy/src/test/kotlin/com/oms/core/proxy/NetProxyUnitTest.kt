@@ -262,4 +262,102 @@ class NetProxyUnitTest {
             echoPool.shutdownNow()
         }
     }
+
+    @Test
+    fun coldStartAvoidsHkAndGeoBlockInterceptorAutoFailsOverToCleanSgNode() {
+        // 1. Cold-start (untested latency = +Infinity): HK node at index 0 MUST NOT beat preferred SG/JP/US nodes
+        val hkUntested = ProxyNode(name = "- HK Premium 1 -", protocol = "ss", server = "1.1.1.1", port = 1680)
+        val sgUntested = ProxyNode(name = "- SG 新加坡 1-", protocol = "ss", server = "1.1.1.2", port = 1680)
+        val coldRouter = SmartRegionRouter(initialNodes = listOf(hkUntested, sgUntested))
+        assertEquals("- SG 新加坡 1-", coldRouter.bestNode?.name)
+
+        // 2. End-to-end OkHttp Geo-Block Auto-Failover:
+        //    Node 1 (US-4, faster 120ms) returns Google Gemini HTTP 400 "User location is not supported"
+        //    Node 2 (SG-1, 220ms) returns HTTP 200 OK
+        val pool = Executors.newCachedThreadPool()
+        val geoBlockedProxySrv = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
+        val cleanSgProxySrv = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
+
+        fun serveMockHttpProxy(srv: ServerSocket, innerHttpResponse: String) {
+            pool.execute {
+                runCatching {
+                    while (!srv.isClosed) {
+                        val s = srv.accept()
+                        val inp = s.getInputStream()
+                        val out = s.getOutputStream()
+                        val buf = ByteArray(4096)
+                        val n1 = inp.read(buf)
+                        if (n1 > 0) {
+                            val req1 = String(buf, 0, n1, Charsets.ISO_8859_1)
+                            if (req1.startsWith("CONNECT ")) {
+                                out.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                                out.flush()
+                                inp.read(buf)
+                            }
+                            out.write(innerHttpResponse.toByteArray(Charsets.UTF_8))
+                            out.flush()
+                        }
+                        s.close()
+                    }
+                }
+            }
+        }
+
+        val errJson = """{"error":{"code":400,"message":"User location is not supported for the API use.","status":"FAILED_PRECONDITION"}}"""
+        serveMockHttpProxy(
+            geoBlockedProxySrv,
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: ${errJson.length}\r\nConnection: close\r\n\r\n$errJson"
+        )
+        val okJson = """{"models":[{"name":"models/gemini-4-argon","displayName":"Gemini 4 Argon"}]}"""
+        serveMockHttpProxy(
+            cleanSgProxySrv,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${okJson.length}\r\nConnection: close\r\n\r\n$okJson"
+        )
+
+        val manager = OmsProxyManager()
+        try {
+            val fakeUs4 = ProxyNode(
+                name = "- US 美国 4 -",
+                protocol = "http",
+                server = "127.0.0.1",
+                port = geoBlockedProxySrv.localPort,
+                latencyMs = 120.0,
+                healthy = true
+            )
+            val cleanSg1 = ProxyNode(
+                name = "- SG 新加坡 1-",
+                protocol = "http",
+                server = "127.0.0.1",
+                port = cleanSgProxySrv.localPort,
+                latencyMs = 220.0,
+                healthy = true
+            )
+            manager.router.updateNodes(listOf(fakeUs4, cleanSg1))
+            assertEquals("- US 美国 4 -", manager.router.bestNode?.name)
+
+            val client = manager.getOrCreateOkHttpClient()
+            val req = Request.Builder()
+                .url("http://generativelanguage.googleapis.com/v1beta/models?pageSize=200")
+                .header("x-goog-api-key", "test-key")
+                .get()
+                .build()
+
+            client.newCall(req).execute().use { resp ->
+                assertEquals(200, resp.code)
+                val body = resp.body?.string().orEmpty()
+                assertTrue(body.contains("gemini-4-argon"))
+            }
+
+            // US-4 must now be flagged aiGeoBlocked and SG-1 promoted to bestNode!
+            assertTrue(fakeUs4.aiGeoBlocked)
+            assertEquals("- SG 新加坡 1-", manager.router.bestNode?.name)
+            val views = manager.router.getNodesStatusViews()
+            assertTrue(views.first { it.name == "- US 美国 4 -" }.aiGeoBlocked)
+        } finally {
+            manager.close()
+            runCatching { geoBlockedProxySrv.close() }
+            runCatching { cleanSgProxySrv.close() }
+            pool.shutdownNow()
+        }
+    }
 }

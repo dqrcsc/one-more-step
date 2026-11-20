@@ -108,9 +108,10 @@ class OmsApplication : Application() {
     }
 
     fun reloadEdgeRuntimeFromStore() {
-        val (bootNodes, subUrls, _) = edgeStore.loadProxyBootstrapConfig()
+        val (bootNodes, subUrls, regionPrefs) = edgeStore.loadProxyBootstrapConfig()
         val (userProxyMode, userPinnedNode) = edgeStore.loadProxyUserPolicy()
-        proxyManager.router.setRoutingPolicy(userProxyMode, userPinnedNode)
+        proxyManager.router.updatePreferRegions(regionPrefs.first)
+        proxyManager.setRoutingPolicyAndEvict(userProxyMode, userPinnedNode)
         if (bootNodes.isNotEmpty() || subUrls.isNotEmpty()) {
             proxyManager.applySyncedConfig(bootNodes, subUrls, refreshSubscriptionsInBackground = true)
         }

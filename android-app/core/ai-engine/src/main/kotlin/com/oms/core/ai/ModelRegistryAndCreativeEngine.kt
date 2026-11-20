@@ -228,6 +228,8 @@ object ModelCatalogRegistry {
 
         val cats = LinkedHashSet<ModelRoleCategory>()
         when {
+            low.contains("-tts") -> return null
+            low.contains("transcribe") -> cats.add(ModelRoleCategory.SPEECH_TRANSCRIBE)
             low.contains("lyria") || low.contains("music") -> cats.add(ModelRoleCategory.MUSIC_GENERATION)
             low.contains("omni-") || low.contains("veo") || low.contains("video") -> cats.add(ModelRoleCategory.VIDEO_GENERATION)
             low.contains("gpt-image") || low.contains("banana") || low.endsWith("-image") || low.contains("imagen") ->
@@ -236,8 +238,6 @@ object ModelCatalogRegistry {
                 cats.add(ModelRoleCategory.LIVE_WALK_TALK)
                 if (providerId == "gemini") cats.add(ModelRoleCategory.LIVE_GLASS_CAMERA)
             }
-            low.contains("transcribe") -> cats.add(ModelRoleCategory.SPEECH_TRANSCRIBE)
-            low.contains("-tts") -> return null
             providerId == "openai" && (low.startsWith("gpt-6") || low.startsWith("gpt-7") || low.startsWith("gpt-5") || low.startsWith("o3") || low.startsWith("o4") || low.startsWith("o5")) -> {
                 cats.add(ModelRoleCategory.CHAT_PRIMARY)
                 cats.add(ModelRoleCategory.WECHAT_TRIAGE)
@@ -267,6 +267,21 @@ object ModelCatalogRegistry {
         )
     }
 
+    internal fun formatProviderHttpError(providerLabel: String, statusCode: Int, rawBody: String): String {
+        val low = rawBody.lowercase()
+        if (low.contains("user location is not supported") ||
+            low.contains("unsupported_country_region_territory") ||
+            low.contains("region is not supported")
+        ) {
+            return "HTTP $statusCode（当前节点所在地区不受 $providerLabel 支持，请切回「智能优选」或改选新加坡/日本/美国节点）"
+        }
+        val detail = runCatching {
+            val obj = MiniJson.parseObject(rawBody)
+            (obj["error"] as? Map<*, *>)?.get("message")?.toString()?.trim().orEmpty()
+        }.getOrDefault("").take(120)
+        return if (detail.isNotEmpty()) "HTTP $statusCode ($detail)" else "HTTP $statusCode"
+    }
+
     @Suppress("UNCHECKED_CAST")
     suspend fun refreshLiveProviderCatalog(
         httpClient: OkHttpClient,
@@ -287,7 +302,7 @@ object ModelCatalogRegistry {
                     .build()
                 httpClient.newCall(req).execute().use { resp ->
                     val raw = resp.body?.string().orEmpty()
-                    if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
+                    if (!resp.isSuccessful) throw IOException(formatProviderHttpError("OpenAI", resp.code, raw))
                     val obj = MiniJson.parseObject(raw)
                     val data = obj["data"] as? List<*> ?: emptyList<Any?>()
                     data.mapNotNull { item ->
@@ -314,7 +329,7 @@ object ModelCatalogRegistry {
                     .build()
                 httpClient.newCall(req).execute().use { resp ->
                     val raw = resp.body?.string().orEmpty()
-                    if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
+                    if (!resp.isSuccessful) throw IOException(formatProviderHttpError("Gemini", resp.code, raw))
                     val obj = MiniJson.parseObject(raw)
                     val models = obj["models"] as? List<*> ?: emptyList<Any?>()
                     models.mapNotNull { item ->

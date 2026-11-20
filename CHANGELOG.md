@@ -1,5 +1,12 @@
 # Changelog · 更新日志
 
+## 2.1.1 - 2026-11-20 · 内置代理防 AI 锁区自动切换与带鉴权连通性探测
+
+- **AI 地域限制自动熔断与无感换线重试 (`AiGeoBlockFailoverInterceptor`)**：自动识别 Google Gemini (`User location is not supported`) 与 OpenAI 地域锁区响应，将触发锁区的代理节点（含香港节点及被送中的假美区节点）实时标记为 `🚫 AI锁区`、立即淘汰复用的 HTTP/2 长连接并自动切换至新/日/美纯净节点无感重试。
+- **冷启动选路与连接池即时驱逐修复 (`SmartRegionRouter` & `OmsProxyManager`)**：默认优先地区扩展为 `新加坡|日本|美国|台湾`，修复冷启动尚未完成测速时落入首个香港节点并被 HTTP/2 Keep-Alive 持续锁定的问题；手动切节点或全量测速优选变更后立即驱逐旧隧道连接。
+- **HTTPS `CONNECT` 首包 `ClientHello` 预读故障转移**：对齐 `vpn_proxy` 握手时序，支持 TLS 握手阶段单次请求多节点自动兜底重试。
+- **真实带 Key 鉴权与锁区感知的 AI 连通性测试**：`🌐 实测 AI 连通性` 升级为携带真实 OpenAI / Gemini 密钥校验，准确区分「鉴权通过 / 节点被锁区 / 密钥无效 / 网络不可达」，消除假阳性提示。
+
 ## 2.1.0 - 2026-11-20 · 青简·咫尺认知座舱、内置免 VPN 代理、尺素休眠接管与双脑协同中枢
 
 - **内置免 VPN 纯 Kotlin 代理引擎 (`:core:net-proxy`)**：移植 `vpn_proxy` 协议栈（Shadowsocks-2022 `SIP022`/`SIP023`、SS-AEAD、Trojan、防 `198.18.0.0/15` UDP DNS 污染），支持「智能优选（美国|新加坡优先）/ 手动锁定节点 / 仅直连」切换、并发全节点测速、OpenAI/Gemini 端到端连通延迟探测及 Mac 预解析 `bootstrapNodes` 快照下发。

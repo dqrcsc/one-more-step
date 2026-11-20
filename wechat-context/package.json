@@ -1,6 +1,6 @@
 {
   "name": "@oms/wechat-context",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "青简·尺素 (WeChat Context Submodule of OneMoreStep) — Bridge mobile WeChat Official Account articles, videos & ideas into OneMoreStep, Personal Knowledge Base & AI Agents.",
   "type": "module",
   "license": "MIT",

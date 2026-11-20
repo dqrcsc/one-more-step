@@ -7,6 +7,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Authenticator
 import okhttp3.Credentials
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.ByteArrayOutputStream
@@ -23,6 +24,7 @@ import java.net.SocketAddress
 import java.net.URI
 import java.nio.ByteBuffer
 import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -48,8 +50,40 @@ class LoopbackMixedGateway(
     var port: Int = 0
         private set
 
+    private data class ActiveClientConnection(
+        val client: Socket,
+        val tunnel: ProxyTunnel,
+        val node: ProxyNode?,
+        val targetHost: String
+    )
+
+    private val activeConnections = ConcurrentHashMap.newKeySet<ActiveClientConnection>()
+
     private val expectedBasicHeader: String =
         Credentials.basic(authUser, authSecret)
+
+    fun findActiveNodeForHost(host: String): ProxyNode? {
+        val clean = host.trim().lowercase()
+        return activeConnections.firstOrNull { it.targetHost == clean && it.node != null }?.node
+    }
+
+    fun closeConnectionsForNode(node: ProxyNode) {
+        val targetKey = SmartRegionRouter.nodeKey(node)
+        for (conn in activeConnections) {
+            val n = conn.node ?: continue
+            if (SmartRegionRouter.nodeKey(n) == targetKey) {
+                runCatching { conn.tunnel.close() }
+                runCatching { conn.client.close() }
+            }
+        }
+    }
+
+    fun closeAllConnections() {
+        for (conn in activeConnections) {
+            runCatching { conn.tunnel.close() }
+            runCatching { conn.client.close() }
+        }
+    }
 
     fun start(bindPort: Int = 0): Int {
         if (running.compareAndSet(false, true)) {
@@ -76,6 +110,7 @@ class LoopbackMixedGateway(
 
     private fun handleClient(client: Socket) {
         var tunnel: ProxyTunnel? = null
+        var tracked: ActiveClientConnection? = null
         try {
             if (!client.inetAddress.isLoopbackAddress) {
                 client.close()
@@ -90,17 +125,20 @@ class LoopbackMixedGateway(
             if (first < 0) return
             client.soTimeout = 90_000
 
-            if (first == 0x05) {
-                val (tun, initChunk) = handleSocks5(input, output) ?: return
-                tunnel = tun
-                pumpBidirectional(client, input, output, tun, initChunk)
+            val routed = if (first == 0x05) {
+                handleSocks5(client, input, output)
             } else {
-                val (tun, initChunk) = handleHttp(first.toByte(), input, output) ?: return
-                tunnel = tun
-                pumpBidirectional(client, input, output, tun, initChunk)
-            }
+                handleHttp(client, first.toByte(), input, output)
+            } ?: return
+
+            tunnel = routed.tunnel
+            val entry = ActiveClientConnection(client, routed.tunnel, routed.node, routed.targetHost)
+            tracked = entry
+            activeConnections.add(entry)
+            pumpBidirectional(client, input, output, routed.tunnel, routed.initialServerChunk)
         } catch (_: Throwable) {
         } finally {
+            tracked?.let { activeConnections.remove(it) }
             runCatching { tunnel?.close() }
             runCatching { client.close() }
         }
@@ -120,7 +158,7 @@ class LoopbackMixedGateway(
     private fun peekInitialClientPayload(client: Socket, input: InputStream): ByteArray {
         val prevTimeout = client.soTimeout
         return try {
-            client.soTimeout = 60
+            client.soTimeout = 90
             val buf = ByteArray(16384)
             val r = input.read(buf)
             if (r > 0) buf.copyOf(r) else ByteArray(0)
@@ -131,7 +169,7 @@ class LoopbackMixedGateway(
         }
     }
 
-    private fun handleSocks5(input: InputStream, output: OutputStream): Pair<ProxyTunnel, ByteArray>? {
+    private fun handleSocks5(client: Socket, input: InputStream, output: OutputStream): RoutedTunnelResult? {
         val nMethods = readExactBytes(input, 1)[0].toInt() and 0xFF
         val methods = readExactBytes(input, nMethods)
         if (!methods.any { (it.toInt() and 0xFF) == 0x02 }) {
@@ -177,14 +215,16 @@ class LoopbackMixedGateway(
         output.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
         output.flush()
 
-        return router.openRoutedTunnelBlocking(targetHost, targetPort, ByteArray(0))
+        val initPayload = peekInitialClientPayload(client, input)
+        return router.openRoutedTunnelWithNodeBlocking(targetHost, targetPort, initPayload)
     }
 
     private fun handleHttp(
+        client: Socket,
         firstByte: Byte,
         input: InputStream,
         output: OutputStream
-    ): Pair<ProxyTunnel, ByteArray>? {
+    ): RoutedTunnelResult? {
         val hdrBuf = ByteArrayOutputStream(1024)
         hdrBuf.write(firstByte.toInt() and 0xFF)
         val tmp = ByteArray(4096)
@@ -240,15 +280,15 @@ class LoopbackMixedGateway(
             val host = if (colon > 0) rawTarget.substring(0, colon).removeSurrounding("[", "]") else rawTarget
             val targetPort = if (colon > 0) rawTarget.substring(colon + 1).toIntOrNull() ?: 443 else 443
             return try {
-                val (tun, firstChunk) = router.openRoutedTunnelBlocking(host, targetPort, bodyRemainder)
                 output.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII))
                 output.flush()
-                tun to firstChunk
-            } catch (_: Throwable) {
-                runCatching {
-                    output.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".toByteArray(Charsets.US_ASCII))
-                    output.flush()
+                val initPayload = if (bodyRemainder.isNotEmpty()) {
+                    bodyRemainder
+                } else {
+                    peekInitialClientPayload(client, input)
                 }
+                router.openRoutedTunnelWithNodeBlocking(host, targetPort, initPayload)
+            } catch (_: Throwable) {
                 null
             }
         }
@@ -276,7 +316,7 @@ class LoopbackMixedGateway(
         }.toByteArray(Charsets.ISO_8859_1)
 
         val initPayload = rebuiltHeaders + bodyRemainder
-        return router.openRoutedTunnelBlocking(host, targetPort, initPayload)
+        return router.openRoutedTunnelWithNodeBlocking(host, targetPort, initPayload)
     }
 
     private fun pumpBidirectional(
@@ -354,6 +394,17 @@ class OmsProxyManager(
     @Volatile
     private var sharedProxiedClient: OkHttpClient? = null
 
+    companion object {
+        fun isAiGeoBlockResponse(statusCode: Int, bodyText: String): Boolean {
+            if (statusCode !in listOf(400, 403, 451)) return false
+            val low = bodyText.lowercase()
+            return low.contains("user location is not supported") ||
+                low.contains("unsupported_country_region_territory") ||
+                low.contains("country, region, or territory not supported") ||
+                low.contains("region is not supported")
+        }
+    }
+
     fun ensureStarted(): Int {
         if (gateway.port == 0) {
             gateway.start(0)
@@ -362,6 +413,24 @@ class OmsProxyManager(
     }
 
     fun hasAvailableNodes(): Boolean = router.allNodesSnapshot().isNotEmpty()
+
+    /**
+     * Immediately drops pooled HTTP/1.1 & HTTP/2 connections so node switches or geo-block failovers
+     * take effect on the very next request without waiting for OkHttp keep-alive expiry.
+     */
+    fun evictStaleConnections(onlyNode: ProxyNode? = null) {
+        if (onlyNode != null) {
+            gateway.closeConnectionsForNode(onlyNode)
+        } else {
+            gateway.closeAllConnections()
+        }
+        runCatching { sharedProxiedClient?.connectionPool?.evictAll() }
+    }
+
+    fun setRoutingPolicyAndEvict(mode: String, pinnedKey: String? = router.pinnedNodeKey) {
+        router.setRoutingPolicy(mode, pinnedKey)
+        evictStaleConnections()
+    }
 
     /**
      * Loads bootstrap nodes synced from Mac immediately, then optionally refreshes raw subscription URLs.
@@ -375,12 +444,25 @@ class OmsProxyManager(
         if (bootstrapNodes.isNotEmpty()) {
             router.updateNodes(bootstrapNodes)
             bgScope.launch {
+                val prevKey = router.bestNode?.let(SmartRegionRouter::nodeKey)
                 runCatching { router.healthCheckAll(concurrency = 12, timeoutMs = 4000) }
+                val nextKey = router.bestNode?.let(SmartRegionRouter::nodeKey)
+                if (prevKey != nextKey) {
+                    evictStaleConnections()
+                }
             }
         }
         if (subscriptionUrls.isNotEmpty() && refreshSubscriptionsInBackground) {
             bgScope.launch {
-                refreshFromSubscriptionUrls(subscriptionUrls)
+                val prevKey = router.bestNode?.let(SmartRegionRouter::nodeKey)
+                val cnt = refreshFromSubscriptionUrls(subscriptionUrls)
+                if (cnt > 0) {
+                    runCatching { router.healthCheckAll(concurrency = 12, timeoutMs = 4000) }
+                    val nextKey = router.bestNode?.let(SmartRegionRouter::nodeKey)
+                    if (prevKey != nextKey) {
+                        evictStaleConnections()
+                    }
+                }
             }
         }
     }
@@ -458,9 +540,45 @@ class OmsProxyManager(
                         .build()
                 } else null
             }
+            val geoFailoverInterceptor = Interceptor { chain ->
+                val req = chain.request()
+                val reqBody = req.body
+                val canReplay = reqBody == null || !reqBody.isOneShot()
+                val autoFailoverAllowed = canReplay &&
+                    !router.routing.equals("direct", ignoreCase = true) &&
+                    !router.routing.equals("manual", ignoreCase = true)
+                val maxAttempts = if (autoFailoverAllowed) 4 else 1
+
+                var lastResp: okhttp3.Response? = null
+                for (attempt in 1..maxAttempts) {
+                    val resp = chain.proceed(req)
+                    if (resp.code in listOf(400, 403, 451)) {
+                        val preview = runCatching { resp.peekBody(4096).string() }.getOrDefault("")
+                        if (isAiGeoBlockResponse(resp.code, preview)) {
+                            val host = req.url.host
+                            val badNode = gateway.findActiveNodeForHost(host)
+                                ?: router.lastUsedNodeForHost(host)
+                                ?: router.bestNode
+                            if (badNode != null) {
+                                router.markAiGeoBlocked(badNode)
+                                val hasCleanAlternative = router.orderedCandidates().any { !it.aiGeoBlocked && it.healthy }
+                                if (attempt < maxAttempts && hasCleanAlternative) {
+                                    resp.close()
+                                    evictStaleConnections(badNode)
+                                    continue
+                                }
+                            }
+                        }
+                    }
+                    lastResp = resp
+                    break
+                }
+                checkNotNull(lastResp)
+            }
             val client = OkHttpClient.Builder()
                 .proxySelector(selector)
                 .proxyAuthenticator(auth)
+                .addInterceptor(geoFailoverInterceptor)
                 .connectTimeout(connectTimeoutSec, TimeUnit.SECONDS)
                 .readTimeout(readTimeoutSec, TimeUnit.SECONDS)
                 .writeTimeout(30, TimeUnit.SECONDS)
@@ -497,12 +615,18 @@ class OmsProxyManager(
     }
 
     override fun close() {
+        evictStaleConnections()
         gateway.close()
     }
 
     suspend fun runFullSpeedTest(concurrency: Int = 14, timeoutMs: Int = 4000): List<ProxyNodeStatusView> =
         withContext(Dispatchers.IO) {
+            val prevKey = router.bestNode?.let(SmartRegionRouter::nodeKey)
             router.healthCheckAll(concurrency = concurrency, timeoutMs = timeoutMs)
+            val nextKey = router.bestNode?.let(SmartRegionRouter::nodeKey)
+            if (prevKey != nextKey) {
+                evictStaleConnections()
+            }
             router.getNodesStatusViews()
         }
 
@@ -515,28 +639,72 @@ class OmsProxyManager(
             if (ms.isFinite()) ms.toLong() else null
         }
 
-    suspend fun probeAiEndpointsConnectivity(): AiConnectivityReport = withContext(Dispatchers.IO) {
+    suspend fun probeAiEndpointsConnectivity(
+        openAiApiKey: String = "",
+        openAiBaseUrl: String = "https://api.openai.com/v1",
+        geminiApiKey: String = "",
+        geminiBaseUrl: String = "https://generativelanguage.googleapis.com/v1beta"
+    ): AiConnectivityReport = withContext(Dispatchers.IO) {
         val client = getOrCreateOkHttpClient(connectTimeoutSec = 8, readTimeoutSec = 10)
-        fun probeUrl(url: String): Pair<Boolean, Long?> {
+        data class ProbeOutcome(val ok: Boolean, val ms: Long?, val statusText: String)
+
+        fun probeProvider(label: String, url: String, headerName: String?, headerValue: String?): ProbeOutcome {
             val t0 = System.nanoTime()
             return try {
-                val req = Request.Builder().url(url).get().build()
-                client.newCall(req).execute().use { resp ->
+                val rb = Request.Builder().url(url).get()
+                val hasKey = !headerName.isNullOrBlank() && !headerValue.isNullOrBlank()
+                if (hasKey) {
+                    rb.header(headerName!!, headerValue!!)
+                }
+                client.newCall(rb.build()).execute().use { resp ->
                     val ms = (System.nanoTime() - t0) / 1_000_000L
-                    // 200 / 401 / 403 / 404 all prove TLS + HTTP tunnel reached upstream AI server!
-                    (resp.code in 200..499) to ms
+                    val body = resp.body?.string().orEmpty()
+                    when {
+                        isAiGeoBlockResponse(resp.code, body) ->
+                            ProbeOutcome(false, ms, "$label: 🚫 节点被锁区 (${ms}ms)")
+                        hasKey && resp.isSuccessful ->
+                            ProbeOutcome(true, ms, "$label: ✅ ${ms}ms")
+                        hasKey && (resp.code == 401 || body.contains("API_KEY_INVALID", ignoreCase = true)) ->
+                            ProbeOutcome(false, ms, "$label: ❌ 密钥无效 (${resp.code})")
+                        hasKey ->
+                            ProbeOutcome(false, ms, "$label: ❌ HTTP ${resp.code}")
+                        resp.code in 200..499 ->
+                            ProbeOutcome(true, ms, "$label: ✅ 隧道可达 ${ms}ms")
+                        else ->
+                            ProbeOutcome(false, ms, "$label: ❌ HTTP ${resp.code}")
+                    }
                 }
             } catch (_: Throwable) {
-                false to null
+                ProbeOutcome(false, null, "$label: ❌ 不可达")
             }
         }
-        val (oaiOk, oaiMs) = probeUrl("https://api.openai.com/v1/models")
-        val (gemOk, gemMs) = probeUrl("https://generativelanguage.googleapis.com/v1beta/models")
+
+        val oaiUrl = "${openAiBaseUrl.ifBlank { "https://api.openai.com/v1" }.trimEnd('/')}/models"
+        val gemBase = geminiBaseUrl.ifBlank { "https://generativelanguage.googleapis.com/v1beta" }.trimEnd('/').let {
+            if (it.endsWith("/v1beta") || it.endsWith("/v1")) it else "$it/v1beta"
+        }
+        val gemUrl = "$gemBase/models?pageSize=5"
+
+        val oai = probeProvider(
+            label = "OpenAI",
+            url = oaiUrl,
+            headerName = "Authorization",
+            headerValue = openAiApiKey.trim().takeIf { it.isNotEmpty() }?.let { "Bearer $it" }
+        )
+        val gem = probeProvider(
+            label = "Gemini",
+            url = gemUrl,
+            headerName = "x-goog-api-key",
+            headerValue = geminiApiKey.trim().takeIf { it.isNotEmpty() }
+        )
+
         AiConnectivityReport(
-            openAiReachable = oaiOk,
-            openAiLatencyMs = oaiMs,
-            geminiReachable = gemOk,
-            geminiLatencyMs = gemMs,
+            openAiReachable = oai.ok,
+            openAiLatencyMs = oai.ms,
+            openAiStatusText = oai.statusText,
+            geminiReachable = gem.ok,
+            geminiLatencyMs = gem.ms,
+            geminiStatusText = gem.statusText,
             routeDescription = router.describeSelection()
         )
     }
@@ -545,7 +713,9 @@ class OmsProxyManager(
 data class AiConnectivityReport(
     val openAiReachable: Boolean,
     val openAiLatencyMs: Long?,
+    val openAiStatusText: String = "",
     val geminiReachable: Boolean,
     val geminiLatencyMs: Long?,
+    val geminiStatusText: String = "",
     val routeDescription: String
 )

@@ -175,7 +175,7 @@ private fun ProxyTunnelSettingsPane(coordinator: CockpitRuntimeCoordinator) {
                 // Routing Mode Selector
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
                     ModeSelectChip(
-                        label = "⚡ 智能优选(美|新)",
+                        label = "⚡ 智能优选(新|日|美)",
                         selected = routingMode == "rule" || routingMode == "proxy",
                         modifier = Modifier.weight(1f)
                     ) { coordinator.setProxyRoutingPolicy("rule", null) }
@@ -282,15 +282,19 @@ private fun ProxyTunnelSettingsPane(coordinator: CockpitRuntimeCoordinator) {
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = if (rep.openAiReachable) "OpenAI: ✅ ${rep.openAiLatencyMs}ms" else "OpenAI: ❌ 不可达",
+                            text = rep.openAiStatusText.ifBlank {
+                                if (rep.openAiReachable) "OpenAI: ✅ ${rep.openAiLatencyMs}ms" else "OpenAI: ❌ 不可达"
+                            },
                             color = if (rep.openAiReachable) Color(0xFF34D399) else Color(0xFFF87171),
-                            fontSize = 12.sp,
+                            fontSize = 11.5.sp,
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = if (rep.geminiReachable) "Gemini: ✅ ${rep.geminiLatencyMs}ms" else "Gemini: ❌ 不可达",
+                            text = rep.geminiStatusText.ifBlank {
+                                if (rep.geminiReachable) "Gemini: ✅ ${rep.geminiLatencyMs}ms" else "Gemini: ❌ 不可达"
+                            },
                             color = if (rep.geminiReachable) Color(0xFF34D399) else Color(0xFFF87171),
-                            fontSize = 12.sp,
+                            fontSize = 11.5.sp,
                             fontWeight = FontWeight.Bold
                         )
                     }
@@ -396,8 +400,9 @@ private fun ProxyNodeCard(
             Spacer(modifier = Modifier.height(3.dp))
             Text(
                 text = "${node.regionBadge} · ${node.protocol}" +
+                    (if (node.aiGeoBlocked) " · 🚫AI锁区" else "") +
                     (if (node.isPinned) " · 📌手动锁定" else if (node.isActive) " · ⚡当前优选" else ""),
-                color = Color(0xFF94A3B8),
+                color = if (node.aiGeoBlocked) Color(0xFFFB923C) else Color(0xFF94A3B8),
                 fontSize = 11.sp
             )
         }

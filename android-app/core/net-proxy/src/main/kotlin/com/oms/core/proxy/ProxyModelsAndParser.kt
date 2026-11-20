@@ -30,7 +30,8 @@ data class ProxyNode(
     @Volatile var latencyMs: Double = Double.POSITIVE_INFINITY,
     @Volatile var healthy: Boolean = true,
     @Volatile var failCount: Int = 0,
-    @Volatile var cooldownUntilMs: Long = 0L
+    @Volatile var cooldownUntilMs: Long = 0L,
+    @Volatile var aiGeoBlocked: Boolean = false
 ) {
     /**
      * Redacted string representation: NEVER exposes server hostname/IP or password in logs.
@@ -38,8 +39,9 @@ data class ProxyNode(
     override fun toString(): String {
         val lat = if (latencyMs.isFinite()) "${latencyMs.toLong()}ms" else "untested"
         val plg = if (!plugin.isNullOrBlank()) "+$plugin(${pluginOpts["mode"] ?: ""})" else ""
+        val geo = if (aiGeoBlocked) " geoBlocked=true" else ""
         val src = if (source.isNotBlank()) " src=$source" else ""
-        return "<ProxyNode name='$name' proto=$protocol$plg latency=$lat healthy=$healthy$src>"
+        return "<ProxyNode name='$name' proto=$protocol$plg latency=$lat healthy=$healthy$geo$src>"
     }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "@oms/mac-host",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "type": "module",
   "bin": {
     "oms": "./src/cli/index.ts",
