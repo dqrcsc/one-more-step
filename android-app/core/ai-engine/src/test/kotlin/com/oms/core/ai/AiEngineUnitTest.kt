@@ -401,4 +401,154 @@ class AiEngineUnitTest {
         )
         assertTrue(capturedErr.contains("Gemini API Key"))
     }
+
+    @Test
+    fun modelCatalogHidesDatedAndLegacyModelsWhileRealtimeVoiceMountsWebSearchAndCreativeUsesV1Beta() = kotlinx.coroutines.runBlocking {
+        // 1. Issue 5: Dated snapshots, previews, and pre-GPT-6 / Gemini-2.x / Omni-1.1 / Lyria-3-preview models are hidden!
+        val hiddenIds = listOf(
+            "openai" to "gpt-5.4-2026-03-05",
+            "openai" to "gpt-5",
+            "openai" to "gpt-4o",
+            "openai" to "gpt-4o-2024-08-06",
+            "openai" to "o3-2025-04-16",
+            "openai" to "gpt-image-2.5-sunburst-2026-09-08",
+            "openai" to "gpt-realtime-mini-2025-12-15",
+            "gemini" to "models/gemini-2.5-flash-native-audio-preview-12-2025",
+            "gemini" to "models/gemini-3.1-pro-preview",
+            "gemini" to "models/gemini-omni-1.1-flash",
+            "gemini" to "models/lyria-3-pro-preview",
+            "gemini" to "models/gemini-3.6-flash"
+        )
+        for ((prov, id) in hiddenIds) {
+            assertEquals("Expected $prov:$id to be hidden", null, ModelCatalogRegistry.classifyDiscoveredModel(prov, id))
+        }
+
+        // Canonical current models MUST be retained and classified accurately
+        assertNotNull(ModelCatalogRegistry.classifyDiscoveredModel("openai", "gpt-6.2-sol"))
+        assertNotNull(ModelCatalogRegistry.classifyDiscoveredModel("openai", "gpt-realtime-2.1"))
+        assertNotNull(ModelCatalogRegistry.classifyDiscoveredModel("gemini", "models/gemini-4-argon"))
+        assertNotNull(ModelCatalogRegistry.classifyDiscoveredModel("gemini", "models/gemini-3.8-live"))
+        assertNotNull(ModelCatalogRegistry.classifyDiscoveredModel("gemini", "models/gemini-omni-1.2-flash"))
+        assertNotNull(ModelCatalogRegistry.classifyDiscoveredModel("gemini", "models/lyria-3.5"))
+
+        // 2. Issue 2: OpenAI Walk & Talk session.update mounts `web_search` function tool & parses function_call_arguments.done
+        val oaiSessionUpdate = RealtimeVoiceSessionEngine.buildOpenAiSessionUpdatePayload("Walk", "marin", enableWebSearchTool = true)
+        val sess = oaiSessionUpdate["session"] as Map<*, *>
+        assertEquals("auto", sess["tool_choice"])
+        val tools = sess["tools"] as List<*>
+        assertEquals(1, tools.size)
+        assertEquals("web_search", (tools[0] as Map<*, *>)["name"])
+
+        var parsedFnQuery = ""
+        RealtimeVoiceSessionEngine.parseOpenAiServerEvent(
+            """{"type":"response.function_call_arguments.done","call_id":"call_99","name":"web_search","arguments":"{\"query\":\"杭州今天天气\"}"}""",
+            object : RealtimeSessionListener {
+                override fun onSessionReady(mode: RealtimeBackendMode, modelId: String) {}
+                override fun onPcm24kAudioOut(pcm24kMonoLe: ByteArray) {}
+                override fun onUserTranscript(text: String, isFinal: Boolean) {}
+                override fun onAssistantTranscriptDelta(delta: String) {}
+                override fun onTurnComplete() {}
+                override fun onInterruptedBargeIn() {}
+                override fun onError(message: String) {}
+                override fun onClosed() {}
+            }
+        ) { fn ->
+            if (fn.name == "web_search") {
+                parsedFnQuery = MiniJson.parseObject(fn.argumentsJson)["query"]?.toString().orEmpty()
+            }
+        }
+        assertEquals("杭州今天天气", parsedFnQuery)
+
+        // 3. Issue 4: CreativeMediaEngine calls `/v1beta/interactions` with `Api-Revision: 2026-05-20`,
+        //    `response_format: {type: "audio"}` for Lyria 3.5 and `{type: "video"}` WITHOUT `background: true` for Omni 1.2!
+        val server = java.net.ServerSocket(0, 8, java.net.InetAddress.getByName("127.0.0.1"))
+        val capturedPaths = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val capturedRevisions = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val capturedBodies = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val pool = java.util.concurrent.Executors.newSingleThreadExecutor()
+        pool.execute {
+            repeat(2) { idx ->
+                val s = server.accept()
+                val inp = s.getInputStream()
+                val hdrOut = java.io.ByteArrayOutputStream()
+                val tmp = ByteArray(4096)
+                var sep = -1
+                while (sep < 0) {
+                    val r = inp.read(tmp)
+                    if (r <= 0) break
+                    hdrOut.write(tmp, 0, r)
+                    sep = String(hdrOut.toByteArray(), Charsets.ISO_8859_1).indexOf("\r\n\r\n")
+                }
+                val rawAll = hdrOut.toByteArray()
+                val hdrStr = String(rawAll, 0, sep, Charsets.ISO_8859_1)
+                val reqLine = hdrStr.lineSequence().first()
+                capturedPaths.add(reqLine.split(' ')[1])
+                val rev = hdrStr.lineSequence()
+                    .firstOrNull { it.startsWith("Api-Revision:", ignoreCase = true) }
+                    ?.substringAfter(':')?.trim().orEmpty()
+                capturedRevisions.add(rev)
+                val cLen = hdrStr.lineSequence()
+                    .firstOrNull { it.startsWith("Content-Length:", ignoreCase = true) }
+                    ?.substringAfter(':')?.trim()?.toIntOrNull() ?: 0
+                val bodyStart = sep + 4
+                val bodyOut = java.io.ByteArrayOutputStream()
+                if (rawAll.size > bodyStart) bodyOut.write(rawAll, bodyStart, rawAll.size - bodyStart)
+                while (bodyOut.size() < cLen) {
+                    val r = inp.read(tmp)
+                    if (r <= 0) break
+                    bodyOut.write(tmp, 0, r)
+                }
+                capturedBodies.add(String(bodyOut.toByteArray(), Charsets.UTF_8))
+
+                val fakeB64 = java.util.Base64.getEncoder().encodeToString("fake-media-$idx".toByteArray())
+                val respJson = if (idx == 0) {
+                    """{"id":"int_music","status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":"[[A0]]\n晴天旋律"}]},{"type":"model_output","content":[{"type":"audio","mime_type":"audio/mpeg","data":"$fakeB64"}]}]}"""
+                } else {
+                    """{"id":"int_vid","status":"completed","steps":[{"type":"thought","content":[]},{"type":"model_output","content":[{"type":"video","mime_type":"video/mp4","data":"$fakeB64"}]}]}"""
+                }
+                val respBytes = respJson.toByteArray(Charsets.UTF_8)
+                val httpResp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${respBytes.size}\r\nConnection: close\r\n\r\n"
+                s.getOutputStream().write(httpResp.toByteArray(Charsets.US_ASCII))
+                s.getOutputStream().write(respBytes)
+                s.getOutputStream().flush()
+                s.close()
+            }
+        }
+
+        try {
+            val mockCfg = EdgeAiRuntimeConfig(
+                gemini = ProviderEndpointConfig(
+                    providerId = "gemini",
+                    baseUrl = "http://127.0.0.1:${server.localPort}/v1beta",
+                    apiKey = "test-gem-key",
+                    fastModel = "gemini-3.8-flash",
+                    flagshipModel = "gemini-4-argon"
+                )
+            )
+            val creative = CreativeMediaEngine(
+                httpClientProvider = { OkHttpClient() },
+                runtimeConfigProvider = { mockCfg },
+                roleSelectionProvider = { it.defaultSelection }
+            )
+            val musicRes = creative.generateCreativeMedia(ModelRoleCategory.MUSIC_GENERATION, "写一首轻快木吉他曲")
+            assertEquals("music", musicRes.mediaKind)
+            assertEquals("audio/mpeg", musicRes.mimeType)
+            assertEquals("晴天旋律", musicRes.caption)
+            assertEquals("fake-media-0", String(musicRes.bytes))
+
+            val videoRes = creative.generateCreativeMedia(ModelRoleCategory.VIDEO_GENERATION, "雨滴落在绿叶上")
+            assertEquals("video", videoRes.mediaKind)
+            assertEquals("video/mp4", videoRes.mimeType)
+            assertEquals("fake-media-1", String(videoRes.bytes))
+
+            assertEquals(listOf("/v1beta/interactions", "/v1beta/interactions"), capturedPaths.toList())
+            assertEquals(listOf("2026-05-20", "2026-05-20"), capturedRevisions.toList())
+            assertTrue(capturedBodies[0].contains("\"type\":\"audio\""))
+            assertTrue(capturedBodies[1].contains("\"type\":\"video\""))
+            assertTrue(!capturedBodies[1].contains("\"background\":true"))
+        } finally {
+            runCatching { server.close() }
+            pool.shutdownNow()
+        }
+    }
 }

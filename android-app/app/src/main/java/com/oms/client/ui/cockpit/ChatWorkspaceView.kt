@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
@@ -147,6 +148,8 @@ fun ChatWorkspaceView(
     coordinator: CockpitRuntimeCoordinator,
     prefillDraft: String,
     onConsumePrefillDraft: () -> Unit,
+    searchJumpRequest: SearchJumpRequest? = null,
+    onConsumeSearchJump: () -> Unit = {},
     onOpenBotanicalCamera: () -> Unit,
     onOpenLiveVoice: (glassCameraMode: Boolean) -> Unit,
     onEscalateToMacAgent: (promptSummary: String) -> Unit
@@ -181,6 +184,8 @@ fun ChatWorkspaceView(
     var showPlusSheet by remember { mutableStateOf(false) }
     var showModelQuickMenu by remember { mutableStateOf(false) }
     var fullScreenPreviewPath by remember { mutableStateOf<String?>(null) }
+    var highlightedMessageId by remember { mutableStateOf("") }
+    var highlightedKeyword by remember { mutableStateOf("") }
 
     LaunchedEffect(prefillDraft) {
         if (prefillDraft.isNotBlank()) {
@@ -230,12 +235,33 @@ fun ChatWorkspaceView(
         }
     }
 
-    // Smooth scroll on new turn; gentle throttled follow during streaming without per-char jumpiness
+    // Smooth scroll on new turn; gentle throttled follow during streaming without overriding active search jump!
     LaunchedEffect(messages.size, streaming.isStreaming) {
-        if (autoFollowPinned) {
+        if (autoFollowPinned && searchJumpRequest == null && highlightedMessageId.isEmpty()) {
             val count = messages.size + (if (streaming.isStreaming && streaming.threadId == activeThreadId) 1 else 0)
             if (count > 0) {
                 runCatching { listState.animateScrollToItem(count - 1) }
+            }
+        }
+    }
+
+    // Exact Message Auto-Scroll & Highlight on FTS Search Hit Selection
+    LaunchedEffect(searchJumpRequest?.nonce, activeThreadId, messages) {
+        val req = searchJumpRequest ?: return@LaunchedEffect
+        if (activeThreadId != req.threadId || messages.isEmpty()) return@LaunchedEffect
+        val targetIdx = messages.indexOfFirst { it.messageId == req.messageId }
+        if (targetIdx >= 0) {
+            autoFollowPinned = false
+            highlightedMessageId = req.messageId
+            highlightedKeyword = req.keyword
+            onConsumeSearchJump()
+            runCatching {
+                listState.scrollToItem(targetIdx, scrollOffset = -48)
+            }
+            delay(5000L)
+            if (highlightedMessageId == req.messageId) {
+                highlightedMessageId = ""
+                highlightedKeyword = ""
             }
         }
     }
@@ -458,6 +484,7 @@ fun ChatWorkspaceView(
                             ChatMessageTurn(
                                 msg = msg,
                                 isLatestAssistant = msg.messageId == lastAssistantId && !streaming.isStreaming,
+                                highlightKeyword = if (msg.messageId == highlightedMessageId) highlightedKeyword else "",
                                 coordinator = coordinator,
                                 onEditUserPrompt = { oldText -> inputText = oldText },
                                 onPreviewImage = { path -> fullScreenPreviewPath = path },
@@ -995,45 +1022,12 @@ fun ChatWorkspaceView(
         }
     }
 
-    // Full-Screen Image Lightbox
+    // Full-Screen Pinch-to-Zoom Image Lightbox
     fullScreenPreviewPath?.let { path ->
-        Dialog(
-            onDismissRequest = { fullScreenPreviewPath = null },
-            properties = DialogProperties(usePlatformDefaultWidth = false)
-        ) {
-            val bmp = remember(path) {
-                runCatching { BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
-            }
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color(0xEE050507))
-                    .clickable { fullScreenPreviewPath = null }
-            ) {
-                if (bmp != null) {
-                    Image(
-                        bitmap = bmp,
-                        contentDescription = "图片预览",
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(16.dp)
-                            .clip(RoundedCornerShape(14.dp))
-                    )
-                }
-                OmsCircleIconButton(
-                    icon = OmsIcons.Close,
-                    contentDescription = "关闭预览",
-                    containerColor = Color(0x55FFFFFF),
-                    contentColor = Color.White,
-                    onClick = { fullScreenPreviewPath = null },
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(24.dp)
-                )
-            }
-        }
+        OmsZoomableImageLightbox(
+            imagePath = path,
+            onDismiss = { fullScreenPreviewPath = null }
+        )
     }
 }
 
@@ -1193,6 +1187,7 @@ private fun WelcomeSuggestionRow(
 private fun ChatMessageTurn(
     msg: ChatMessageModel,
     isLatestAssistant: Boolean,
+    highlightKeyword: String = "",
     coordinator: CockpitRuntimeCoordinator,
     onEditUserPrompt: (String) -> Unit,
     onPreviewImage: (String) -> Unit,
@@ -1204,12 +1199,42 @@ private fun ChatMessageTurn(
     val palette = OmsTheme.colors
     val scope = rememberCoroutineScope()
     val isUser = msg.role == "user"
+    val isSearchTarget = highlightKeyword.isNotBlank()
     var showUserMenu by remember { mutableStateOf(false) }
 
     Column(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(
+                if (isSearchTarget) {
+                    Modifier
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(palette.accentSoft.copy(alpha = 0.45f))
+                        .border(1.2.dp, palette.accent, RoundedCornerShape(18.dp))
+                        .padding(10.dp)
+                } else Modifier
+            ),
         horizontalAlignment = if (isUser) Alignment.End else Alignment.Start
     ) {
+        if (isSearchTarget) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                modifier = Modifier
+                    .padding(bottom = 6.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(palette.accentSoft)
+                    .padding(horizontal = 8.dp, vertical = 3.dp)
+            ) {
+                Icon(OmsIcons.Search, contentDescription = null, tint = palette.accent, modifier = Modifier.size(12.dp))
+                Text(
+                    text = "检索命中 ·「$highlightKeyword」",
+                    color = palette.accent,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
         if (isUser) {
             // User Image Attachment Thumbnail (previously missing!)
             msg.imageLocalPath?.let { path ->
@@ -1335,6 +1360,8 @@ private fun ChatMessageTurn(
                 if (msg.specimenCard != null) {
                     BotanicalSpecimenCardView(
                         card = msg.specimenCard,
+                        photoPath = msg.imageLocalPath,
+                        onPreviewPhoto = onPreviewImage,
                         onSaveVault = {
                             scope.launch {
                                 val ok = coordinator.promoteSpecimenToVault(msg.specimenCard, msg.imageLocalPath)
@@ -1661,38 +1688,171 @@ private fun InlineGeneratedMediaPreview(
         }
         low.endsWith(".mp3") || low.endsWith(".wav") || low.endsWith(".m4a") -> {
             var isPlaying by remember { mutableStateOf(false) }
-            OmsSecondaryButton(
-                label = if (isPlaying) "停止播放曲目" else "播放生成的音乐",
-                icon = if (isPlaying) OmsIcons.StopSquare else OmsIcons.Play,
-                onClick = {
-                    if (isPlaying) {
-                        VoiceRecorderHelper.stopPlayback()
-                        isPlaying = false
-                    } else {
-                        isPlaying = VoiceRecorderHelper.playAudio(context, messageId, Uri.fromFile(file).toString()) {
-                            isPlaying = false
+            val sizeKb = remember(file) { (file.length() / 1024L).coerceAtLeast(1L) }
+            OmsSurfaceCard(
+                containerColor = palette.subtleSurface,
+                borderColor = if (isPlaying) palette.accent else palette.hairline,
+                cornerRadius = 18.dp,
+                contentPadding = PaddingValues(14.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .size(44.dp)
+                                .clip(CircleShape)
+                                .background(palette.accentSoft)
+                        ) {
+                            Icon(
+                                imageVector = OmsIcons.Music,
+                                contentDescription = null,
+                                tint = palette.accent,
+                                modifier = Modifier.size(21.dp)
+                            )
+                        }
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = if (isPlaying) "正在播放 AI 原创曲目…" else "AI 原创音乐曲目",
+                                color = palette.textPrimary,
+                                fontSize = 14.5.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "${file.extension.uppercase()} · ${sizeKb} KB",
+                                color = palette.textTertiary,
+                                fontSize = 12.sp
+                            )
                         }
                     }
-                }
-            )
-        }
-        low.endsWith(".mp4") -> {
-            OmsSecondaryButton(
-                label = "播放生成的视频 (${file.name})",
-                icon = OmsIcons.Video,
-                onClick = {
-                    runCatching {
-                        val uri = FileProvider.getUriForFile(context, "${context.packageName}.ota", file)
-                        context.startActivity(
-                            Intent(Intent.ACTION_VIEW)
-                                .setDataAndType(uri, "video/mp4")
-                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        OmsPrimaryButton(
+                            label = if (isPlaying) "停止" else "播放",
+                            icon = if (isPlaying) OmsIcons.StopSquare else OmsIcons.Play,
+                            height = 36.dp,
+                            onClick = {
+                                if (isPlaying) {
+                                    VoiceRecorderHelper.stopPlayback()
+                                    isPlaying = false
+                                } else {
+                                    isPlaying = VoiceRecorderHelper.playAudio(context, messageId, Uri.fromFile(file).toString()) {
+                                        isPlaying = false
+                                    }
+                                }
+                            }
                         )
-                    }.onFailure {
-                        OmsFeedbackController.show("视频保存在: ${file.absolutePath}", OmsToastKind.INFO)
+                        OmsCircleIconButton(
+                            icon = OmsIcons.Send,
+                            contentDescription = "用外部播放器打开或分享",
+                            size = 36.dp,
+                            iconSize = 16.5.dp,
+                            containerColor = palette.cardSurface,
+                            borderColor = palette.hairline,
+                            onClick = {
+                                runCatching {
+                                    val uri = FileProvider.getUriForFile(context, "${context.packageName}.ota", file)
+                                    val mime = if (low.endsWith(".wav")) "audio/wav" else "audio/mpeg"
+                                    context.startActivity(
+                                        Intent(Intent.ACTION_VIEW)
+                                            .setDataAndType(uri, mime)
+                                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    )
+                                }
+                            }
+                        )
                     }
                 }
-            )
+            }
+        }
+        low.endsWith(".mp4") -> {
+            val videoThumb by produceState<ImageBitmap?>(initialValue = null, key1 = mediaPath) {
+                value = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val mmr = MediaMetadataRetriever()
+                        try {
+                            mmr.setDataSource(file.absolutePath)
+                            mmr.getFrameAtTime(0L)?.asImageBitmap()
+                        } finally {
+                            runCatching { mmr.release() }
+                        }
+                    }.getOrNull()
+                }
+            }
+            val openVideo = {
+                runCatching {
+                    val uri = FileProvider.getUriForFile(context, "${context.packageName}.ota", file)
+                    context.startActivity(
+                        Intent(Intent.ACTION_VIEW)
+                            .setDataAndType(uri, "video/mp4")
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    )
+                }.onFailure {
+                    OmsFeedbackController.show("视频保存在: ${file.absolutePath}", OmsToastKind.INFO)
+                }
+            }
+
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(216.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(Color(0xFF0A0D14))
+                    .border(0.7.dp, palette.hairline, RoundedCornerShape(18.dp))
+                    .clickable { openVideo() }
+            ) {
+                if (videoThumb != null) {
+                    Image(
+                        bitmap = videoThumb!!,
+                        contentDescription = "生成的视频预览",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(56.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xB8090D16))
+                        .border(1.dp, Color(0x66FFFFFF), CircleShape)
+                ) {
+                    Icon(
+                        imageVector = OmsIcons.Play,
+                        contentDescription = "播放视频",
+                        tint = Color.White,
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(10.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color(0xB8090D16))
+                        .padding(horizontal = 10.dp, vertical = 5.dp)
+                ) {
+                    Icon(OmsIcons.Video, contentDescription = null, tint = Color.White, modifier = Modifier.size(13.dp))
+                    Text(
+                        text = "点击全屏播放有声视频 (${file.length() / 1024} KB)",
+                        color = Color.White,
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
         }
     }
 }

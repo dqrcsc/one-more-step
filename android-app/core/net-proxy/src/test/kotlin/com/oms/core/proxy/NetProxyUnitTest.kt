@@ -353,6 +353,14 @@ class NetProxyUnitTest {
             assertEquals("- SG 新加坡 1-", manager.router.bestNode?.name)
             val views = manager.router.getNodesStatusViews()
             assertTrue(views.first { it.name == "- US 美国 4 -" }.aiGeoBlocked)
+
+            // Verify per-caller timeouts are never poisoned by short probe timeouts!
+            val shortProbeClient = manager.getOrCreateOkHttpClient(connectTimeoutSec = 8, readTimeoutSec = 10)
+            val wsClient = manager.getOrCreateOkHttpClient(connectTimeoutSec = 10, readTimeoutSec = 0)
+            val videoClient = manager.getOrCreateOkHttpClient(connectTimeoutSec = 20, readTimeoutSec = 600, writeTimeoutSec = 60)
+            assertEquals(10_000, shortProbeClient.readTimeoutMillis)
+            assertEquals(0, wsClient.readTimeoutMillis)
+            assertEquals(600_000, videoClient.readTimeoutMillis)
         } finally {
             manager.close()
             runCatching { geoBlockedProxySrv.close() }

@@ -134,11 +134,6 @@ class CockpitRuntimeCoordinator(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val aiServices = CockpitAiServices({ proxyManager.getOrCreateOkHttpClient() }, llmEngine)
     val botanicalAnalyzer = BotanicalGlassAnalyzer(llmEngine)
-    val liveVoiceController = LiveAudioDuplexController(
-        appContext = appContext,
-        httpClientProvider = { proxyManager.getOrCreateOkHttpClient() },
-        runtimeConfigProvider = { llmEngine.runtimeConfig }
-    )
 
     private val _streamingFlow = MutableStateFlow(StreamingTurnState())
     val streamingFlow: StateFlow<StreamingTurnState> = _streamingFlow
@@ -157,6 +152,9 @@ class CockpitRuntimeCoordinator(
 
     private val _selectedAgentSessionFlow = MutableStateFlow<RemoteAgentSessionUi?>(null)
     val selectedAgentSessionFlow: StateFlow<RemoteAgentSessionUi?> = _selectedAgentSessionFlow
+
+    private val _isLoadingAgentDetailFlow = MutableStateFlow(false)
+    val isLoadingAgentDetailFlow: StateFlow<Boolean> = _isLoadingAgentDetailFlow
 
     // Proxy & Model Studio Reactive Flows
     private val _proxyNodesFlow = MutableStateFlow<List<ProxyNodeStatusView>>(emptyList())
@@ -180,8 +178,22 @@ class CockpitRuntimeCoordinator(
     private val _roleSelectionsFlow = MutableStateFlow(ModelCatalogRegistry.defaultRoleSelections())
     val roleSelectionsFlow: StateFlow<Map<ModelRoleCategory, String>> = _roleSelectionsFlow
 
+    val liveVoiceController = LiveAudioDuplexController(
+        appContext = appContext,
+        // readTimeoutSec = 0 disables socket idle read timeouts on persistent full-duplex WebSockets (relying on 15s WS ping)
+        httpClientProvider = { proxyManager.getOrCreateOkHttpClient(connectTimeoutSec = 10, readTimeoutSec = 0) },
+        runtimeConfigProvider = { llmEngine.runtimeConfig },
+        roleSelectionProvider = { cat -> _roleSelectionsFlow.value[cat] ?: cat.defaultSelection },
+        webSearchExecutor = { query -> executeLiveVoiceWebSearch(query) },
+        onNodeHandshakeFailed = { host, geoBlocked ->
+            proxyManager.penalizeActiveNodeForHost(host, geoBlocked)
+            refreshProxyUiState()
+        }
+    )
+
     val creativeEngine = CreativeMediaEngine(
-        httpClientProvider = { proxyManager.getOrCreateOkHttpClient(connectTimeoutSec = 20, readTimeoutSec = 180) },
+        // 600s read timeout for unary Lyria 3.5 music & Gemini Omni 1.2 Flash 5s HD video synthesis
+        httpClientProvider = { proxyManager.getOrCreateOkHttpClient(connectTimeoutSec = 20, readTimeoutSec = 600, writeTimeoutSec = 60) },
         runtimeConfigProvider = { llmEngine.runtimeConfig },
         roleSelectionProvider = { cat -> _roleSelectionsFlow.value[cat] ?: cat.defaultSelection }
     )
@@ -595,6 +607,21 @@ class CockpitRuntimeCoordinator(
         return aiServices.transcribeAudioFile(audioFile, mimeType = "audio/mp4")
     }
 
+    private suspend fun executeLiveVoiceWebSearch(query: String): String = withContext(Dispatchers.IO) {
+        val nowFmt = SimpleDateFormat("yyyy-MM-dd HH:mm EEEE", Locale.CHINA).format(Date())
+        val completed = llmEngine.completeSync(
+            intent = RouteIntent.WEB_SEARCH_GROUNDED,
+            developerPrompt = "当前北京时间：$nowFmt。请针对查询立即执行实时联网搜索，用 3~5 句精炼准确的中文要点返回最新事实、气温/数值与时间（不要寒暄，方便语音助手直接口语播报）。",
+            turns = listOf(LlmTurnMessage("user", query)),
+            jsonMode = false,
+            forceWebSearch = true
+        )
+        val srcNote = if (completed.sources.isNotEmpty()) {
+            "\n来源：" + completed.sources.take(3).joinToString("、") { it.title.ifBlank { it.uri } }
+        } else ""
+        (completed.fullText.trim() + srcNote).ifBlank { "未检索到相关公开网页信息。" }
+    }
+
     suspend fun identifyBotanicalSpecimen(
         jpegBytes: ByteArray,
         savedLocalPath: String?,
@@ -938,25 +965,40 @@ class CockpitRuntimeCoordinator(
         }
     }
 
-    fun selectAndLoadAgentSession(session: RemoteAgentSessionUi) {
+    fun selectAndLoadAgentSession(session: RemoteAgentSessionUi, preserveExistingStepsWhileLoading: Boolean = false) {
         _selectedAgentSessionFlow.value = session
-        _selectedAgentStepsFlow.value = emptyList()
+        if (!preserveExistingStepsWhileLoading) {
+            _selectedAgentStepsFlow.value = emptyList()
+        }
         if (transportClient.activeTierFlow.value == "DISCONNECTED") return
+        _isLoadingAgentDetailFlow.value = true
         scope.launch {
-            runCatching {
+            try {
                 val resp = transportClient.callHostRpc(
                     "agent.session.detail",
                     JSONObject().put("backend", session.backend).put("sessionId", session.sessionId),
-                    8000L
+                    15_000L
                 )
-                resp?.optJSONObject("session")?.let { _selectedAgentSessionFlow.value = parseSessionJson(it) }
-                val stepsArr = resp?.optJSONArray("steps") ?: JSONArray()
-                val steps = ArrayList<RemoteAgentStepUi>(stepsArr.length())
-                for (i in 0 until stepsArr.length()) {
-                    val s = stepsArr.optJSONObject(i) ?: continue
-                    steps.add(parseStepJson(s))
+                resp?.optJSONObject("session")?.let { parsedSess ->
+                    val currentSel = _selectedAgentSessionFlow.value
+                    if (currentSel != null && currentSel.backend == session.backend) {
+                        _selectedAgentSessionFlow.value = parseSessionJson(parsedSess)
+                    }
                 }
-                _selectedAgentStepsFlow.value = steps
+                val stepsArr = resp?.optJSONArray("steps")
+                if (stepsArr != null) {
+                    val steps = ArrayList<RemoteAgentStepUi>(stepsArr.length())
+                    for (i in 0 until stepsArr.length()) {
+                        val s = stepsArr.optJSONObject(i) ?: continue
+                        steps.add(parseStepJson(s))
+                    }
+                    if (steps.isNotEmpty() || !preserveExistingStepsWhileLoading) {
+                        _selectedAgentStepsFlow.value = steps
+                    }
+                }
+            } catch (_: Throwable) {
+            } finally {
+                _isLoadingAgentDetailFlow.value = false
             }
         }
     }
@@ -964,6 +1006,7 @@ class CockpitRuntimeCoordinator(
     fun closeSelectedAgentSession() {
         _selectedAgentSessionFlow.value = null
         _selectedAgentStepsFlow.value = emptyList()
+        _isLoadingAgentDetailFlow.value = false
     }
 
     suspend fun startRemoteAgentSession(
@@ -1026,6 +1069,7 @@ class CockpitRuntimeCoordinator(
     fun onRemoteAgentSessionEvent(params: JSONObject) {
         val backend = params.optString("backend", "codex")
         val sessionId = params.optString("sessionId")
+        val previousSessionId = params.optString("previousSessionId")
         val status = params.optString("status", "running")
         val finalSummary = params.optString("finalSummary")
         val updatedAtMs = params.optLong("updatedAtMs", System.currentTimeMillis())
@@ -1033,10 +1077,16 @@ class CockpitRuntimeCoordinator(
         val parsedStep = stepObj?.let(::parseStepJson)
 
         val currentList = _agentSessionsFlow.value.toMutableList()
-        val idx = currentList.indexOfFirst { it.backend == backend && it.sessionId == sessionId }
+        val idx = currentList.indexOfFirst {
+            it.backend == backend && (
+                it.sessionId == sessionId ||
+                    (previousSessionId.isNotBlank() && it.sessionId == previousSessionId)
+                )
+        }
         if (idx >= 0) {
             val prev = currentList[idx]
             currentList[idx] = prev.copy(
+                sessionId = sessionId.ifBlank { prev.sessionId },
                 status = status,
                 lastSummary = finalSummary.ifBlank {
                     parsedStep?.let { "${it.title}: ${it.detail}".take(120) } ?: prev.lastSummary
@@ -1049,15 +1099,25 @@ class CockpitRuntimeCoordinator(
         }
 
         val sel = _selectedAgentSessionFlow.value
-        if (sel != null && (sel.sessionId == sessionId || sel.sessionId.startsWith("pending_")) && sel.backend == backend) {
-            _selectedAgentSessionFlow.value = sel.copy(
+        val matchesSelected = sel != null && sel.backend == backend && (
+            sel.sessionId == sessionId ||
+                (previousSessionId.isNotBlank() && sel.sessionId == previousSessionId) ||
+                sel.sessionId.startsWith("pending_")
+            )
+        if (matchesSelected && sel != null) {
+            val updatedSel = sel.copy(
                 sessionId = sessionId.ifBlank { sel.sessionId },
                 status = status,
                 lastSummary = finalSummary.ifBlank { sel.lastSummary },
                 updatedAtMs = updatedAtMs
             )
+            _selectedAgentSessionFlow.value = updatedSel
             if (parsedStep != null) {
-                _selectedAgentStepsFlow.value = (_selectedAgentStepsFlow.value + parsedStep).takeLast(90)
+                _selectedAgentStepsFlow.value = (_selectedAgentStepsFlow.value + parsedStep).takeLast(140)
+            }
+            if (status == "completed" || status == "failed") {
+                refreshAgentSessions()
+                selectAndLoadAgentSession(updatedSel, preserveExistingStepsWhileLoading = true)
             }
         }
     }

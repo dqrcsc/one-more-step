@@ -159,12 +159,17 @@ object ProxyCryptoPrimitives {
 open class RawStreamTransport(
     private val input: InputStream,
     private val output: OutputStream,
-    private val closeHandle: AutoCloseable
+    private val closeHandle: AutoCloseable,
+    private val timeoutUpdater: ((Int) -> Unit)? = null
 ) : AutoCloseable {
     protected val buf = ByteArrayOutputStream()
     private var bufBytes = ByteArray(0)
     private var bufOffset = 0
     @Volatile private var closed = false
+
+    fun updateReadTimeoutMs(timeoutMs: Int) {
+        runCatching { timeoutUpdater?.invoke(timeoutMs) }
+    }
 
     protected fun bufferedSize(): Int = bufBytes.size - bufOffset
 
@@ -267,8 +272,9 @@ class SimpleObfsHttpTransport(
     closeHandle: AutoCloseable,
     private val obfsHost: String = "www.bing.com",
     private val obfsUri: String = "/",
-    private val port: Int = 80
-) : RawStreamTransport(input, output, closeHandle) {
+    private val port: Int = 80,
+    timeoutUpdater: ((Int) -> Unit)? = null
+) : RawStreamTransport(input, output, closeHandle, timeoutUpdater) {
     private var reqSent = false
     private var respStripped = false
     private val crlfCrlf = "\r\n\r\n".toByteArray(Charsets.US_ASCII)
@@ -333,8 +339,9 @@ class SimpleObfsTlsTransport(
     input: InputStream,
     output: OutputStream,
     closeHandle: AutoCloseable,
-    private val obfsHost: String = "www.bing.com"
-) : RawStreamTransport(input, output, closeHandle) {
+    private val obfsHost: String = "www.bing.com",
+    timeoutUpdater: ((Int) -> Unit)? = null
+) : RawStreamTransport(input, output, closeHandle, timeoutUpdater) {
     private var reqSent = false
     private var handshakeDone = false
     private var rawBuf = ByteArray(0)
@@ -488,12 +495,14 @@ class SimpleObfsTlsTransport(
 interface ProxyTunnel : AutoCloseable {
     fun read(): ByteArray
     fun write(data: ByteArray)
+    fun setReadTimeoutMs(timeoutMs: Int) {}
     override fun close()
 }
 
 open class DirectTunnel(protected val transport: RawStreamTransport) : ProxyTunnel {
     override fun read(): ByteArray = transport.readSome(32768)
     override fun write(data: ByteArray) = transport.writeAndFlush(data)
+    override fun setReadTimeoutMs(timeoutMs: Int) = transport.updateReadTimeoutMs(timeoutMs)
     override fun close() = transport.close()
 }
 
@@ -647,6 +656,8 @@ class SS2022Tunnel(
         return sOpen(transport.readExact(pLen + 16))
     }
 
+    override fun setReadTimeoutMs(timeoutMs: Int) = transport.updateReadTimeoutMs(timeoutMs)
+
     override fun close() = transport.close()
 }
 
@@ -738,6 +749,8 @@ class SSLegacyAeadTunnel(
         return sOpen(transport.readExact(pLen + 16))
     }
 
+    override fun setReadTimeoutMs(timeoutMs: Int) = transport.updateReadTimeoutMs(timeoutMs)
+
     override fun close() = transport.close()
 }
 
@@ -788,11 +801,11 @@ object ProxyTunnelConnector {
         targetPort: Int,
         initialPayload: ByteArray = ByteArray(0),
         connectTimeoutMs: Int = 6000,
-        readTimeoutMs: Int = 65000
+        readTimeoutMs: Int = 300000
     ): DirectTunnel {
         val dstIp = PoisonFreeDnsResolver.resolveHostFast(targetHost, connectTimeoutMs)
         val sock = openConfiguredTcpSocket(dstIp, targetPort, connectTimeoutMs, readTimeoutMs)
-        val transport = RawStreamTransport(sock.getInputStream(), sock.getOutputStream(), sock)
+        val transport = RawStreamTransport(sock.getInputStream(), sock.getOutputStream(), sock) { sock.soTimeout = it }
         if (initialPayload.isNotEmpty()) {
             try {
                 transport.writeAndFlush(initialPayload)
@@ -811,7 +824,7 @@ object ProxyTunnelConnector {
         initialPayload: ByteArray = ByteArray(0),
         clockOffsetSec: Int = 0,
         connectTimeoutMs: Int = 6000,
-        readTimeoutMs: Int = 65000
+        readTimeoutMs: Int = 6000
     ): ProxyTunnel {
         val srvIp = PoisonFreeDnsResolver.resolveHostFast(node.server, connectTimeoutMs)
         val baseSock = openConfiguredTcpSocket(srvIp, node.port, connectTimeoutMs, readTimeoutMs)
@@ -831,7 +844,9 @@ object ProxyTunnelConnector {
                     sslSock.sslParameters = params
                 }
                 sslSock.startHandshake()
-                val transport = RawStreamTransport(sslSock.inputStream, sslSock.outputStream, sslSock)
+                val transport = RawStreamTransport(sslSock.inputStream, sslSock.outputStream, sslSock) {
+                    sslSock.soTimeout = it
+                }
                 val trojan = TrojanTunnel(transport)
                 trojan.sendHandshake(node.password, targetHost, targetPort, initialPayload)
                 return trojan
@@ -841,17 +856,18 @@ object ProxyTunnelConnector {
             }
         }
 
+        val updater: (Int) -> Unit = { baseSock.soTimeout = it }
         val transport: RawStreamTransport = if (node.plugin == "obfs") {
             val mode = node.pluginOpts["mode"]?.lowercase() ?: "http"
             val obfsHost = node.pluginOpts["host"] ?: "www.bing.com"
             val obfsUri = node.pluginOpts["path"] ?: "/"
             if (mode == "tls") {
-                SimpleObfsTlsTransport(baseSock.getInputStream(), baseSock.getOutputStream(), baseSock, obfsHost)
+                SimpleObfsTlsTransport(baseSock.getInputStream(), baseSock.getOutputStream(), baseSock, obfsHost, updater)
             } else {
-                SimpleObfsHttpTransport(baseSock.getInputStream(), baseSock.getOutputStream(), baseSock, obfsHost, obfsUri, node.port)
+                SimpleObfsHttpTransport(baseSock.getInputStream(), baseSock.getOutputStream(), baseSock, obfsHost, obfsUri, node.port, updater)
             }
         } else {
-            RawStreamTransport(baseSock.getInputStream(), baseSock.getOutputStream(), baseSock)
+            RawStreamTransport(baseSock.getInputStream(), baseSock.getOutputStream(), baseSock, updater)
         }
 
         try {

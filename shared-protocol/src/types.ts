@@ -660,6 +660,7 @@ export interface AgentSessionContinueParams {
 export interface AgentSessionStreamEventParams {
   backend: AgentBackendType;
   sessionId: string;
+  previousSessionId?: string;
   status: "running" | "completed" | "failed";
   step?: AgentStepItem;
   finalSummary?: string;

@@ -200,45 +200,97 @@ object ModelCatalogRegistry {
         )
     )
 
+    private val DATE_SUFFIX_REGEX = Regex(
+        """(?:-\d{4}-\d{2}-\d{2}|-\d{2}-\d{4}|-\d{4}|-0\d-\d{2})(?:-[a-z]+)?$""",
+        RegexOption.IGNORE_CASE
+    )
+
     fun defaultRoleSelections(): Map<ModelRoleCategory, String> =
         ModelRoleCategory.values().associateWith { it.defaultSelection }
+
+    private val BUILTIN_KEYS: Set<String> by lazy {
+        BUILTIN_PRESETS.map { it.selectionKey }.toSet()
+    }
+
+    /**
+     * Returns true if a model ID is an outdated generation, a dated snapshot, or an experimental/preview
+     * variant that should be hidden from the user-facing model selector.
+     */
+    fun shouldHideLegacyOrDatedModel(providerId: String, rawModelId: String): Boolean {
+        val id = rawModelId.removePrefix("models/").trim()
+        if (id.isEmpty()) return true
+        if ("$providerId:$id" in BUILTIN_KEYS) return false
+
+        val low = id.lowercase()
+        if (DATE_SUFFIX_REGEX.containsMatchIn(low)) return true
+
+        val noisyMarkers = listOf(
+            "embedding", "moderation", "babbage", "davinci", "curie", "ada",
+            "-preview", "-exp", "-experimental", "-customtools", "-latest",
+            "-search-api", "-diarize", "-tts", "whisper", "tts-1", "dall-e",
+            "chatgpt-", "chat-latest", "aqa", "bison", "decision-", "robotics", "genie-"
+        )
+        if (noisyMarkers.any { low.contains(it) }) return true
+
+        if (providerId == "openai") {
+            // Hide pre-GPT-6 chat/reasoning generations and superseded early audio/image snapshots
+            val legacyOpenAiPrefixes = listOf(
+                "gpt-3", "gpt-4", "gpt-5", "o1", "o3", "o4",
+                "gpt-audio", "gpt-image-1", "gpt-image-2.5",
+                "gpt-realtime-1", "gpt-realtime-mini", "gpt-realtime-whisper", "gpt-realtime-translate"
+            )
+            if (legacyOpenAiPrefixes.any { low.startsWith(it) }) return true
+            if (low in setOf("gpt-image-2", "gpt-realtime", "gpt-realtime-2", "gpt-live-1")) return true
+        } else if (providerId == "gemini") {
+            val legacyGeminiPrefixes = listOf(
+                "gemini-1", "gemini-2", "gemini-pro", "gemini-flash",
+                "gemini-3-flash", "gemini-3.0", "gemini-3.6", "gemini-3.7",
+                "gemini-omni-1.0", "gemini-omni-1.1",
+                "lyria-1", "lyria-2", "lyria-3-clip", "lyria-3-pro",
+                "imagen-2", "imagen-3", "gemma-"
+            )
+            if (legacyGeminiPrefixes.any { low.startsWith(it) }) return true
+        }
+        return false
+    }
+
+    fun filterCleanCatalog(items: List<ModelCatalogItem>): List<ModelCatalogItem> =
+        items.filterNot { shouldHideLegacyOrDatedModel(it.providerId, it.modelId) }
 
     fun optionsForCategory(
         category: ModelRoleCategory,
         allItems: List<ModelCatalogItem>
     ): List<ModelCatalogItem> =
-        allItems.filter { category in it.categories }
+        filterCleanCatalog(allItems).filter { category in it.categories }
 
     /**
      * Classifies any newly released model ID returned by OpenAI `/v1/models` or Gemini `/v1beta/models`
-     * into functional categories while filtering out obsolete/embedding/internal endpoints.
+     * into functional categories while filtering out obsolete, dated, or preview endpoints.
      */
     fun classifyDiscoveredModel(providerId: String, rawModelId: String, displayNameHint: String = ""): ModelCatalogItem? {
         val id = rawModelId.removePrefix("models/").trim()
         val low = id.lowercase()
-        if (id.isEmpty()) return null
-
-        // Filter out deprecated, embedding, moderation, or non-generative endpoints
-        val blockedSubstrings = listOf(
-            "embedding", "moderation", "babbage", "davinci", "curie", "ada",
-            "gpt-3.5", "dall-e-2", "whisper-1", "tts-1", "gemini-1.0", "gemini-1.5", "gemini-2.0", "gemini-2.5",
-            "aqa", "imagen-2", "text-bison", "chat-bison", "decision-"
-        )
-        if (blockedSubstrings.any { low.contains(it) }) return null
+        if (id.isEmpty() || shouldHideLegacyOrDatedModel(providerId, id)) return null
 
         val cats = LinkedHashSet<ModelRoleCategory>()
         when {
-            low.contains("-tts") -> return null
-            low.contains("transcribe") -> cats.add(ModelRoleCategory.SPEECH_TRANSCRIBE)
+            low.contains("transcribe") -> {
+                cats.add(ModelRoleCategory.SPEECH_TRANSCRIBE)
+                if (low.contains("-live")) {
+                    cats.add(ModelRoleCategory.LIVE_WALK_TALK)
+                }
+            }
             low.contains("lyria") || low.contains("music") -> cats.add(ModelRoleCategory.MUSIC_GENERATION)
             low.contains("omni-") || low.contains("veo") || low.contains("video") -> cats.add(ModelRoleCategory.VIDEO_GENERATION)
             low.contains("gpt-image") || low.contains("banana") || low.endsWith("-image") || low.contains("imagen") ->
                 cats.add(ModelRoleCategory.IMAGE_GENERATION)
             low.contains("realtime") || low.contains("-live") -> {
                 cats.add(ModelRoleCategory.LIVE_WALK_TALK)
-                if (providerId == "gemini") cats.add(ModelRoleCategory.LIVE_GLASS_CAMERA)
+                if (providerId == "gemini" && !low.contains("transcribe")) {
+                    cats.add(ModelRoleCategory.LIVE_GLASS_CAMERA)
+                }
             }
-            providerId == "openai" && (low.startsWith("gpt-6") || low.startsWith("gpt-7") || low.startsWith("gpt-5") || low.startsWith("o3") || low.startsWith("o4") || low.startsWith("o5")) -> {
+            providerId == "openai" && (low.startsWith("gpt-6") || low.startsWith("gpt-7") || low.startsWith("o5")) -> {
                 cats.add(ModelRoleCategory.CHAT_PRIMARY)
                 cats.add(ModelRoleCategory.WECHAT_TRIAGE)
                 cats.add(ModelRoleCategory.VISION_UNDERSTANDING)
@@ -477,47 +529,70 @@ class CreativeMediaEngine(
     ): GeneratedMediaResult {
         val client = httpClientProvider()
         val hostRoot = provider.baseUrl.trimEnd('/').replace(Regex("/v1beta$|/v1$"), "")
+        val cleanModelId = modelId.removePrefix("models/").trim()
 
-        // Try Gemini Interactions v1 API first (supports Nano Banana 2.1, Gemini Omni 1.2 Flash video polling, and Lyria 3.5 music!)
-        val createUrl = "$hostRoot/v1/interactions"
-        val isAsyncVideo = expectedKind == "video"
-        val createBody = linkedMapOf<String, Any?>(
-            "model" to modelId,
-            "input" to prompt
-        )
-        if (isAsyncVideo) createBody["background"] = true
+        // Gemini Interactions v1beta API (`Api-Revision: 2026-05-20`) powers Lyria 3.5 music,
+        // Gemini Omni 1.2 Flash native sound+video, and Nano Banana image generation.
+        val createUrl = "$hostRoot/v1beta/interactions"
+        val createBody = linkedMapOf<String, Any?>("model" to cleanModelId)
+        when (expectedKind) {
+            "video" -> {
+                createBody["input"] = listOf(linkedMapOf("type" to "text", "text" to prompt))
+                createBody["response_format"] = linkedMapOf(
+                    "type" to "video",
+                    "aspect_ratio" to "16:9",
+                    "duration" to "5s"
+                )
+            }
+            "music" -> {
+                createBody["input"] = prompt
+                createBody["response_format"] = linkedMapOf("type" to "audio")
+            }
+            else -> {
+                createBody["input"] = prompt
+                createBody["response_modality_set"] = linkedMapOf("modalities" to listOf("image", "text"))
+            }
+        }
 
         val createReq = Request.Builder()
             .url(createUrl)
             .header("x-goog-api-key", provider.apiKey)
+            .header("Api-Revision", "2026-05-20")
             .post(MiniJson.stringify(createBody).toRequestBody(jsonMediaType))
             .build()
 
         var interactionObj: Map<String, Any?> = client.newCall(createReq).execute().use { resp ->
             val raw = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) {
-                // Fallback to classic generateContent for image models if /v1/interactions is unavailable on custom base URL
                 if (expectedKind == "image") {
-                    return generateGeminiClassicImageFallback(provider, modelId, prompt)
+                    return generateGeminiClassicImageFallback(provider, cleanModelId, prompt)
                 }
-                throw IOException("Gemini $expectedKind HTTP ${resp.code}: ${raw.take(260)}")
+                throw IOException(
+                    "Gemini ${if (expectedKind == "music") "写歌" else "视频生成"} " +
+                        ModelCatalogRegistry.formatProviderHttpError("Gemini", resp.code, raw)
+                )
             }
             MiniJson.parseObject(raw)
         }
 
         val interactionId = interactionObj["id"]?.toString().orEmpty()
         var pollCount = 0
-        while (interactionId.isNotBlank() && pollCount < 45) {
+        while (interactionId.isNotBlank() && pollCount < 60) {
             val status = interactionObj["status"]?.toString().orEmpty().lowercase()
             if (status in setOf("completed", "succeeded", "done") || status.isEmpty()) break
             if (status in setOf("failed", "cancelled", "error")) {
                 throw IOException("Gemini 创作任务失败 ($status): ${interactionObj["error"] ?: ""}")
             }
+            // If unary response already embedded steps/outputs media, extract immediately without extra polling
+            if (extractMediaFromInteraction(interactionObj, client, provider.apiKey, hostRoot, expectedKind) != null) {
+                break
+            }
             delay(3000L)
             pollCount++
             val pollReq = Request.Builder()
-                .url("$hostRoot/v1/interactions/$interactionId")
+                .url("$hostRoot/v1beta/interactions/$interactionId")
                 .header("x-goog-api-key", provider.apiKey)
+                .header("Api-Revision", "2026-05-20")
                 .get()
                 .build()
             interactionObj = client.newCall(pollReq).execute().use { r ->
@@ -527,18 +602,18 @@ class CreativeMediaEngine(
             }
         }
 
-        extractMediaFromInteraction(interactionObj, client, provider.apiKey, hostRoot)?.let { (mime, bytes, text) ->
+        extractMediaFromInteraction(interactionObj, client, provider.apiKey, hostRoot, expectedKind)?.let { (mime, bytes, text) ->
             return GeneratedMediaResult(
                 mediaKind = expectedKind,
                 mimeType = mime,
                 bytes = bytes,
-                modelUsed = modelId,
+                modelUsed = cleanModelId,
                 caption = text
             )
         }
 
         if (expectedKind == "image") {
-            return generateGeminiClassicImageFallback(provider, modelId, prompt)
+            return generateGeminiClassicImageFallback(provider, cleanModelId, prompt)
         }
         throw IOException("Gemini 未返回可解码的 $expectedKind 媒体数据")
     }
@@ -548,46 +623,79 @@ class CreativeMediaEngine(
         obj: Map<String, Any?>,
         client: OkHttpClient,
         apiKey: String,
-        hostRoot: String
+        hostRoot: String,
+        expectedKind: String = ""
     ): Triple<String, ByteArray, String>? {
         val textSb = StringBuilder()
+        var foundMedia: Pair<String, ByteArray>? = null
         val steps = (obj["steps"] as? List<*>) ?: (obj["outputs"] as? List<*>) ?: emptyList<Any?>()
         for (st in steps) {
             val sm = st as? Map<String, Any?> ?: continue
+            val stepType = sm["type"]?.toString().orEmpty()
+            if (stepType == "thought") continue
             val contentList = (sm["content"] as? List<*>) ?: listOf(sm)
             for (c in contentList) {
                 val cm = c as? Map<String, Any?> ?: continue
-                val cType = cm["type"]?.toString().orEmpty()
+                val cType = cm["type"]?.toString().orEmpty().lowercase()
                 if (cType == "text") {
-                    textSb.append(cm["text"]?.toString().orEmpty())
+                    val rawTxt = cm["text"]?.toString().orEmpty()
+                    // Strip internal Lyria instrumental structure markers like [[A0]] [[B1]] if standalone
+                    val cleanedTxt = rawTxt.replace(Regex("""\[\[[A-Z]\d+\]\]"""), "").trim()
+                    if (cleanedTxt.isNotEmpty()) {
+                        if (textSb.isNotEmpty()) textSb.append('\n')
+                        textSb.append(cleanedTxt)
+                    }
                 }
+                if (foundMedia != null) continue
+
                 val b64 = (cm["data"] ?: (cm["inline_data"] as? Map<*, *>)?.get("data")
                     ?: (cm["inlineData"] as? Map<*, *>)?.get("data"))?.toString().orEmpty()
-                val mime = (cm["mime_type"] ?: cm["mimeType"]
+                val rawMime = (cm["mime_type"] ?: cm["mimeType"]
                     ?: (cm["inline_data"] as? Map<*, *>)?.get("mime_type")
                     ?: (cm["inlineData"] as? Map<*, *>)?.get("mimeType"))?.toString().orEmpty()
-                if (b64.isNotBlank() && (mime.startsWith("image/") || mime.startsWith("video/") || mime.startsWith("audio/"))) {
-                    return Triple(mime, Base64.getDecoder().decode(b64), textSb.toString().trim())
+                val inferredMime = when {
+                    rawMime.isNotBlank() -> rawMime
+                    cType == "audio" || expectedKind == "music" -> "audio/mpeg"
+                    cType == "video" || expectedKind == "video" -> "video/mp4"
+                    cType == "image" || expectedKind == "image" -> "image/png"
+                    else -> ""
                 }
+                if (b64.isNotBlank() && (
+                        inferredMime.startsWith("image/") ||
+                            inferredMime.startsWith("video/") ||
+                            inferredMime.startsWith("audio/")
+                        )
+                ) {
+                    val cleanB64 = b64.replace("\n", "").replace("\r", "").trim()
+                    foundMedia = inferredMime to Base64.getDecoder().decode(cleanB64)
+                    continue
+                }
+
                 val fileUri = (cm["uri"] ?: cm["file_uri"] ?: (cm["file_data"] as? Map<*, *>)?.get("file_uri"))?.toString().orEmpty()
                 if (fileUri.isNotBlank()) {
-                    val dlUrl = if (fileUri.startsWith("http")) fileUri else "$hostRoot/v1beta/${fileUri.trimStart('/')}?alt=media"
+                    val dlUrl = when {
+                        fileUri.contains("alt=media") -> fileUri
+                        fileUri.startsWith("https://generativelanguage.googleapis.com/") && fileUri.contains("/files/") ->
+                            if (fileUri.contains(":download")) "$fileUri?alt=media" else "${fileUri.trimEnd('/')}:download?alt=media"
+                        fileUri.startsWith("http") -> fileUri
+                        else -> "$hostRoot/v1beta/${fileUri.trimStart('/')}:download?alt=media"
+                    }
                     val bytes = client.newCall(
                         Request.Builder().url(dlUrl).header("x-goog-api-key", apiKey).get().build()
-                    ).execute().use { r -> r.body?.bytes() }
+                    ).execute().use { r -> if (r.isSuccessful) r.body?.bytes() else null }
                     if (bytes != null && bytes.isNotEmpty()) {
                         val fallbackMime = when {
-                            mime.isNotBlank() -> mime
-                            dlUrl.contains("mp4") -> "video/mp4"
-                            dlUrl.contains("wav") || dlUrl.contains("mp3") -> "audio/mpeg"
+                            inferredMime.isNotBlank() -> inferredMime
+                            dlUrl.contains("mp4") || expectedKind == "video" -> "video/mp4"
+                            dlUrl.contains("wav") || dlUrl.contains("mp3") || expectedKind == "music" -> "audio/mpeg"
                             else -> "application/octet-stream"
                         }
-                        return Triple(fallbackMime, bytes, textSb.toString().trim())
+                        foundMedia = fallbackMime to bytes
                     }
                 }
             }
         }
-        return null
+        return foundMedia?.let { (m, b) -> Triple(m, b, textSb.toString().trim()) }
     }
 
     @Suppress("UNCHECKED_CAST")

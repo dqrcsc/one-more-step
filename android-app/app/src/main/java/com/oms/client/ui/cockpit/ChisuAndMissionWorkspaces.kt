@@ -40,11 +40,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -517,6 +519,7 @@ fun MissionHubWorkspaceView(
     val quotas by coordinator.agentQuotasFlow.collectAsState()
     val selectedSession by coordinator.selectedAgentSessionFlow.collectAsState()
     val selectedSteps by coordinator.selectedAgentStepsFlow.collectAsState()
+    val isLoadingDetail by coordinator.isLoadingAgentDetailFlow.collectAsState()
 
     var activeSubView by remember { mutableStateOf(HubSubView.AGENTS) }
     var backendFilter by remember { mutableStateOf("ALL") }
@@ -543,6 +546,7 @@ fun MissionHubWorkspaceView(
         AgentSessionDetailScreen(
             session = selectedSession!!,
             steps = selectedSteps,
+            isLoadingDetail = isLoadingDetail,
             macConnected = macConnected,
             onBack = { coordinator.closeSelectedAgentSession() },
             onRefresh = { coordinator.selectAndLoadAgentSession(selectedSession!!) },
@@ -1243,6 +1247,7 @@ private fun groupAgentTrajectorySteps(steps: List<RemoteAgentStepUi>): List<Traj
 private fun AgentSessionDetailScreen(
     session: RemoteAgentSessionUi,
     steps: List<RemoteAgentStepUi>,
+    isLoadingDetail: Boolean,
     macConnected: Boolean,
     onBack: () -> Unit,
     onRefresh: () -> Unit,
@@ -1252,6 +1257,13 @@ private fun AgentSessionDetailScreen(
     val palette = OmsTheme.colors
     var followUpText by remember { mutableStateOf("") }
     val groupedItems = remember(steps) { groupAgentTrajectorySteps(steps) }
+    val listState = rememberLazyListState()
+
+    LaunchedEffect(session.sessionId, groupedItems.size) {
+        if (groupedItems.isNotEmpty()) {
+            runCatching { listState.scrollToItem(groupedItems.lastIndex) }
+        }
+    }
 
     Column(modifier = Modifier.fillMaxSize().background(palette.canvas)) {
         // Minimalist Header
@@ -1283,7 +1295,7 @@ private fun AgentSessionDetailScreen(
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = "${if (session.backend == "codex") "Codex" else "Antigravity"} · ${session.projectDisplayName.ifBlank { session.workspacePath.substringAfterLast('/') }}",
+                        text = "${if (session.backend == "codex") "Codex" else "Antigravity"} · ${session.projectDisplayName.ifBlank { session.workspacePath.substringAfterLast('/') }} · 桌面同步可见",
                         color = palette.textTertiary,
                         fontSize = 11.5.sp,
                         maxLines = 1,
@@ -1314,50 +1326,121 @@ private fun AgentSessionDetailScreen(
 
         Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
 
-        // Grouped Trajectory Stream (User Bubble + Collapsible Tool Accordion + Editorial Summary)
-        LazyColumn(
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            items(
-                items = groupedItems,
-                key = {
-                    when (it) {
-                        is TrajectoryDisplayItem.SingleTurn -> "turn_${it.step.stepIndex}_${it.step.timestampMs}"
-                        is TrajectoryDisplayItem.ToolAccordionGroup -> it.groupKey
-                    }
+        if (isLoadingDetail && groupedItems.isEmpty()) {
+            Box(
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                contentAlignment = Alignment.Center
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    CircularProgressIndicator(
+                        color = palette.accent,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text("正在从 Mac 加载历史对话消息…", color = palette.textSecondary, fontSize = 13.5.sp)
                 }
-            ) { item ->
-                when (item) {
-                    is TrajectoryDisplayItem.SingleTurn -> {
-                        val st = item.step
-                        if (st.kind == "user") {
-                            Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
-                                Box(
-                                    modifier = Modifier
-                                        .widthIn(max = 300.dp)
-                                        .clip(RoundedCornerShape(20.dp, 20.dp, 5.dp, 20.dp))
-                                        .background(palette.userBubble)
-                                        .padding(horizontal = 15.dp, vertical = 10.dp)
-                                ) {
-                                    Text(st.detail.ifBlank { st.title }, color = palette.userBubbleText, fontSize = 15.sp, lineHeight = 22.sp)
-                                }
-                            }
-                        } else {
-                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                if (st.title.isNotBlank()) {
-                                    Text(st.title, color = palette.textTertiary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
-                                }
-                                IncrementalMarkdownView(markdown = st.detail)
-                            }
+            }
+        } else if (groupedItems.isEmpty()) {
+            Box(
+                modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 28.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = if (macConnected) "当前会话暂无历史消息记录，可在下方直接发送指令开始对话" else "未连通 Mac，恢复连接后可查看完整历史消息",
+                    color = palette.textTertiary,
+                    fontSize = 13.5.sp,
+                    lineHeight = 20.sp
+                )
+            }
+        } else {
+            // Grouped Trajectory Stream (User Bubble + Collapsible Tool Accordion + Editorial Summary)
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                contentPadding = PaddingValues(horizontal = 18.dp, vertical = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                items(
+                    items = groupedItems,
+                    key = {
+                        when (it) {
+                            is TrajectoryDisplayItem.SingleTurn -> "turn_${it.step.stepIndex}_${it.step.timestampMs}"
+                            is TrajectoryDisplayItem.ToolAccordionGroup -> it.groupKey
                         }
                     }
+                ) { item ->
+                    when (item) {
+                        is TrajectoryDisplayItem.SingleTurn -> {
+                            val st = item.step
+                            when (st.kind) {
+                                "user" -> {
+                                    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+                                        Box(
+                                            modifier = Modifier
+                                                .widthIn(max = 306.dp)
+                                                .clip(RoundedCornerShape(20.dp, 20.dp, 5.dp, 20.dp))
+                                                .background(palette.userBubble)
+                                                .padding(horizontal = 15.dp, vertical = 10.dp)
+                                        ) {
+                                            Text(st.detail.ifBlank { st.title }, color = palette.userBubbleText, fontSize = 15.sp, lineHeight = 22.sp)
+                                        }
+                                    }
+                                }
+                                "status" -> {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .background(palette.subtleSurface)
+                                            .padding(horizontal = 12.dp, vertical = 7.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Icon(OmsIcons.Sparkles, contentDescription = null, tint = palette.accent, modifier = Modifier.size(14.dp))
+                                        Text("${st.title} · ${st.detail}", color = palette.textSecondary, fontSize = 12.sp)
+                                    }
+                                }
+                                else -> {
+                                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        if (st.title.isNotBlank()) {
+                                            Text(st.title, color = palette.textTertiary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                                        }
+                                        IncrementalMarkdownView(markdown = st.detail)
+                                    }
+                                }
+                            }
+                        }
 
-                    is TrajectoryDisplayItem.ToolAccordionGroup -> {
-                        ToolStepAccordionView(steps = item.steps)
+                        is TrajectoryDisplayItem.ToolAccordionGroup -> {
+                            ToolStepAccordionView(steps = item.steps)
+                        }
                     }
                 }
+            }
+        }
+
+        if (session.status == "failed" && session.lastSummary.isNotBlank()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 4.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(palette.dangerSoft)
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(OmsIcons.Close, contentDescription = null, tint = palette.danger, modifier = Modifier.size(14.dp))
+                Text(
+                    text = session.lastSummary,
+                    color = palette.danger,
+                    fontSize = 12.sp,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
         }
 

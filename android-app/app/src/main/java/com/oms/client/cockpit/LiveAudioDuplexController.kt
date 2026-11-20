@@ -47,20 +47,30 @@ data class LiveVoiceUiState(
     val latestUserTranscript: String = "",
     val latestAssistantTranscript: String = "",
     val transcriptTurns: List<Pair<String, String>> = emptyList(),
+    val statusHint: String = "",
     val errorText: String? = null
 )
 
 /**
  * Milestone 4 (v2.0): Full-Duplex Hardware Audio + WebSocket Controller for:
- *  - Walk & Talk (`gpt-realtime-2.1` + AirPods / speakerphone + `[🇬🇧 English Only]` mode)
- *  - Google Glass Live Camera (`gemini-3.8-live` 1fps JPEG vision + bidirectional voice)
+ *  - Walk & Talk (`gpt-realtime-2.1` + AirPods / speakerphone + live `web_search` + `[🇬🇧 English Only]` mode)
+ *  - Google Glass Live Camera (`gemini-3.8-live` 1fps JPEG vision + bidirectional voice + Google Search)
  */
 class LiveAudioDuplexController(
     private val appContext: Context,
     httpClientProvider: () -> OkHttpClient,
-    runtimeConfigProvider: () -> EdgeAiRuntimeConfig
+    runtimeConfigProvider: () -> EdgeAiRuntimeConfig,
+    roleSelectionProvider: (com.oms.core.ai.ModelRoleCategory) -> String = { it.defaultSelection },
+    webSearchExecutor: (suspend (String) -> String)? = null,
+    onNodeHandshakeFailed: ((host: String, geoBlocked: Boolean) -> Unit)? = null
 ) {
-    private val engine = RealtimeVoiceSessionEngine(httpClientProvider, runtimeConfigProvider)
+    private val engine = RealtimeVoiceSessionEngine(
+        httpClientProvider = httpClientProvider,
+        runtimeConfigProvider = runtimeConfigProvider,
+        roleSelectionProvider = roleSelectionProvider,
+        webSearchExecutor = webSearchExecutor,
+        onNodeHandshakeFailed = onNodeHandshakeFailed
+    )
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val _stateFlow = MutableStateFlow(LiveVoiceUiState())
@@ -168,6 +178,10 @@ class LiveAudioDuplexController(
                     }
                     currentAssistantText.setLength(0)
                     _stateFlow.value = _stateFlow.value.copy(assistantSpeaking = false)
+                }
+
+                override fun onStatusHint(hint: String) {
+                    _stateFlow.value = _stateFlow.value.copy(statusHint = hint)
                 }
 
                 override fun onError(message: String) {

@@ -536,6 +536,8 @@ class SmartRegionRouter(
             val t0 = System.nanoTime()
             var tunnel: ProxyTunnel? = null
             try {
+                // Use fast connectTimeoutMs (default 6s) for initial handshake + first upstream ServerHello/HTTP byte,
+                // so a proxy node whose outbound link stalls fails over in ~6s instead of blocking for 65s!
                 tunnel = nodeConnector(node, targetHost, targetPort, initialPayload, clockOffsetSec, connectTimeoutMs)
                 val firstChunk = if (initialPayload.isNotEmpty()) {
                     val readBytes = tunnel.read()
@@ -546,6 +548,8 @@ class SmartRegionRouter(
                 } else {
                     ByteArray(0)
                 }
+                // Once tunnel handshake & first byte succeed, relax read timeout to 660s for SSE / Live WebSocket / Video gen
+                tunnel.setReadTimeoutMs(660_000)
                 val elapsedMs = (System.nanoTime() - t0) / 1_000_000.0
                 markSuccess(node, if (initialPayload.isNotEmpty()) elapsedMs else null)
                 lastUsedNodeByHost[cleanHost] = node

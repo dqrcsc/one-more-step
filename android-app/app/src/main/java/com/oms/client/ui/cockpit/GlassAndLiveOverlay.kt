@@ -28,8 +28,12 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -58,7 +62,9 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
@@ -71,10 +77,15 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.TextStyle
@@ -82,9 +93,12 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import com.oms.client.OmsApplication
 import com.oms.client.cockpit.CockpitRuntimeCoordinator
@@ -307,8 +321,18 @@ fun BotanicalGlassCameraModal(
             }
 
             if (resultCard != null) {
+                var zoomCameraPhoto by remember { mutableStateOf(false) }
+                if (zoomCameraPhoto && !lastSavedPath.isNullOrBlank()) {
+                    OmsZoomableImageLightbox(
+                        imagePath = lastSavedPath!!,
+                        titleHint = resultCard!!.chineseName,
+                        onDismiss = { zoomCameraPhoto = false }
+                    )
+                }
                 BotanicalSpecimenCardView(
                     card = resultCard!!,
+                    photoPath = lastSavedPath,
+                    onPreviewPhoto = if (!lastSavedPath.isNullOrBlank()) { _ -> zoomCameraPhoto = true } else null,
                     onSaveVault = {
                         scope.launch {
                             val liveSaved = coordinator.promoteSpecimenToVault(resultCard!!, lastSavedPath)
@@ -444,7 +468,10 @@ fun BotanicalSpecimenCardView(
     card: FieldGuideSpecimenCard,
     onSaveVault: () -> Unit,
     onFollowUp: (() -> Unit)? = null,
-    onRetake: (() -> Unit)? = null
+    onRetake: (() -> Unit)? = null,
+    photoPath: String? = null,
+    onPreviewPhoto: ((String) -> Unit)? = null,
+    maxHeight: Dp = 460.dp
 ) {
     val palette = OmsTheme.colors
     OmsSurfaceCard(
@@ -454,12 +481,55 @@ fun BotanicalSpecimenCardView(
         contentPadding = PaddingValues(16.dp),
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(max = 440.dp)
+            .heightIn(max = maxHeight)
     ) {
         Column(
             modifier = Modifier.verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
+            if (!photoPath.isNullOrBlank()) {
+                val bmp by produceState<ImageBitmap?>(initialValue = null, key1 = photoPath) {
+                    value = withContext(Dispatchers.IO) {
+                        runCatching {
+                            val f = File(photoPath)
+                            if (f.exists()) BitmapFactory.decodeFile(photoPath)?.asImageBitmap() else null
+                        }.getOrNull()
+                    }
+                }
+                if (bmp != null) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(176.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .border(0.6.dp, palette.hairline, RoundedCornerShape(14.dp))
+                            .clickable(enabled = onPreviewPhoto != null) { onPreviewPhoto?.invoke(photoPath) }
+                    ) {
+                        Image(
+                            bitmap = bmp!!,
+                            contentDescription = card.chineseName,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        if (onPreviewPhoto != null) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .padding(8.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(Color(0xAA090D16))
+                                    .padding(horizontal = 9.dp, vertical = 4.dp)
+                            ) {
+                                Icon(OmsIcons.Search, contentDescription = null, tint = Color.White, modifier = Modifier.size(12.5.dp))
+                                Text("点击放大查看原图", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                            }
+                        }
+                    }
+                }
+            }
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -535,6 +605,11 @@ fun BotanicalSpecimenCardView(
                 Text(card.lookalikeComparison, color = palette.textSecondary, fontSize = 13.sp, lineHeight = 19.5.sp)
             }
 
+            if (card.bloomAndHabitat.isNotBlank()) {
+                Text("花果期与生境", color = palette.accent, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold)
+                Text(card.bloomAndHabitat, color = palette.textSecondary, fontSize = 13.sp, lineHeight = 19.5.sp)
+            }
+
             if (card.safetyOrCareNote.isNotBlank()) {
                 Text("养护与提示：${card.safetyOrCareNote}", color = palette.textTertiary, fontSize = 12.5.sp, lineHeight = 19.sp)
             }
@@ -566,6 +641,119 @@ fun BotanicalSpecimenCardView(
                         onClick = onRetake
                     )
                 }
+            }
+        }
+    }
+}
+
+/**
+ * Full-screen Pinch-to-Zoom (`1x..4.5x`) + Double-Tap Zoom (`1x <-> 2.6x`) Lightbox for Specimen & Chat Images.
+ */
+@Composable
+fun OmsZoomableImageLightbox(
+    imagePath: String,
+    titleHint: String = "",
+    onDismiss: () -> Unit
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        val bmp by produceState<ImageBitmap?>(initialValue = null, key1 = imagePath) {
+            value = withContext(Dispatchers.IO) {
+                runCatching {
+                    val f = File(imagePath)
+                    if (f.exists()) BitmapFactory.decodeFile(imagePath)?.asImageBitmap() else null
+                }.getOrNull()
+            }
+        }
+        var scale by remember(imagePath) { mutableFloatStateOf(1f) }
+        var offsetX by remember(imagePath) { mutableFloatStateOf(0f) }
+        var offsetY by remember(imagePath) { mutableFloatStateOf(0f) }
+
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xF2050609))
+                .pointerInput(imagePath) {
+                    detectTapGestures(
+                        onDoubleTap = {
+                            if (scale > 1.08f) {
+                                scale = 1f
+                                offsetX = 0f
+                                offsetY = 0f
+                            } else {
+                                scale = 2.6f
+                            }
+                        },
+                        onTap = {
+                            if (scale <= 1.05f) onDismiss()
+                        }
+                    )
+                }
+                .pointerInput(imagePath) {
+                    detectTransformGestures { _, pan, zoom, _ ->
+                        val nextScale = (scale * zoom).coerceIn(1f, 4.5f)
+                        scale = nextScale
+                        if (nextScale <= 1.02f) {
+                            offsetX = 0f
+                            offsetY = 0f
+                        } else {
+                            val maxPanX = (size.width * (nextScale - 1f)) * 0.5f
+                            val maxPanY = (size.height * (nextScale - 1f)) * 0.5f
+                            offsetX = (offsetX + pan.x).coerceIn(-maxPanX, maxPanX)
+                            offsetY = (offsetY + pan.y).coerceIn(-maxPanY, maxPanY)
+                        }
+                    }
+                }
+        ) {
+            if (bmp != null) {
+                Image(
+                    bitmap = bmp!!,
+                    contentDescription = titleHint.ifBlank { "放大预览" },
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(12.dp)
+                        .graphicsLayer {
+                            scaleX = scale
+                            scaleY = scale
+                            translationX = offsetX
+                            translationY = offsetY
+                        }
+                )
+            } else {
+                CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(26.dp))
+            }
+
+            // Top Bar: Title + Reset Zoom + Close
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .fillMaxWidth()
+                    .statusBarsPadding()
+                    .padding(horizontal = 18.dp, vertical = 14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    if (titleHint.isNotBlank()) {
+                        Text(titleHint, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                    Text(
+                        text = if (scale > 1.08f) "缩放 ${String.format("%.1fx", scale)} · 双击还原" else "双指捏合或双击可放大查看细部",
+                        color = Color(0xB3FFFFFF),
+                        fontSize = 12.sp
+                    )
+                }
+                OmsCircleIconButton(
+                    icon = OmsIcons.Close,
+                    contentDescription = "关闭预览",
+                    containerColor = Color(0x44FFFFFF),
+                    contentColor = Color.White,
+                    onClick = onDismiss
+                )
             }
         }
     }
@@ -868,14 +1056,20 @@ fun LiveVoiceAndGlassModal(
 
                 Text(
                     text = when {
-                        liveState.isConnecting -> "正在建立低延迟语音通道…"
+                        liveState.statusHint.isNotBlank() -> liveState.statusHint
+                        liveState.isConnecting -> if (selectedMode == RealtimeBackendMode.GEMINI_GLASS_LIVE) {
+                            "正在建立低延迟视觉语音通道…"
+                        } else {
+                            "正在建立低延迟语音通道…"
+                        }
                         liveState.assistantSpeaking -> "讲述中 · 随时开口自然打断"
                         liveState.micMuted -> "麦克风已静音"
-                        else -> "正在聆听…"
+                        else -> "正在聆听 · 支持实时联网查询…"
                     },
-                    color = Color(0xB3FFFFFF),
+                    color = if (liveState.statusHint.isNotBlank()) Color(0xFF7DD3FC) else Color(0xB3FFFFFF),
                     fontSize = 13.5.sp,
-                    fontWeight = FontWeight.Medium
+                    fontWeight = FontWeight.Medium,
+                    textAlign = TextAlign.Center
                 )
 
                 liveState.errorText?.let { err ->

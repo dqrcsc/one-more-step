@@ -1,6 +1,8 @@
 package com.oms.client.ui.cockpit
 
+import android.content.Intent
 import android.graphics.BitmapFactory
+import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
@@ -16,6 +18,9 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -69,6 +74,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -114,6 +120,13 @@ enum class CockpitTab {
     MISSION_HUB
 }
 
+data class SearchJumpRequest(
+    val threadId: String,
+    val messageId: String,
+    val keyword: String,
+    val nonce: Long = System.nanoTime()
+)
+
 /**
  * v3.0 Root Flagship Shell (`对话 · 尺素 · 协同`), Form A Minimalist TopBar,
  * ChatGPT-Grade Gesture History Drawer, Ambient Status Pill, and Global Commute Mini-Player.
@@ -149,6 +162,7 @@ fun OmsCockpitRootScreen() {
     var showSpecimenGallery by remember { mutableStateOf(false) }
 
     var searchQuery by remember { mutableStateOf("") }
+    var pendingSearchJump by remember { mutableStateOf<SearchJumpRequest?>(null) }
     var chatPrefillDraft by remember { mutableStateOf("") }
     var agentPrefillDraft by remember { mutableStateOf("") }
     var renamingThread by remember { mutableStateOf<ChatThreadModel?>(null) }
@@ -375,7 +389,13 @@ fun OmsCockpitRootScreen() {
                                         cornerRadius = 13.dp,
                                         contentPadding = PaddingValues(11.dp),
                                         onClick = {
+                                            val kw = searchQuery.trim()
                                             coordinator.chatRepo.selectThread(hit.threadId)
+                                            pendingSearchJump = SearchJumpRequest(
+                                                threadId = hit.threadId,
+                                                messageId = hit.messageId,
+                                                keyword = kw
+                                            )
                                             currentTab = CockpitTab.CHAT
                                             scope.launch { drawerState.close() }
                                         },
@@ -596,6 +616,8 @@ fun OmsCockpitRootScreen() {
                                 coordinator = coordinator,
                                 prefillDraft = chatPrefillDraft,
                                 onConsumePrefillDraft = { chatPrefillDraft = "" },
+                                searchJumpRequest = pendingSearchJump,
+                                onConsumeSearchJump = { pendingSearchJump = null },
                                 onOpenBotanicalCamera = { showBotanicalCamera = true },
                                 onOpenLiveVoice = { glass ->
                                     liveModalInitialGlass = glass
@@ -1123,9 +1145,28 @@ private fun SpecimenFieldGuideGalleryModal(
     onDismiss: () -> Unit,
     onAskInChat: (FieldGuideSpecimenCard) -> Unit
 ) {
+    val context = LocalContext.current
     val palette = OmsTheme.colors
-    BackHandler { onDismiss() }
+    val scope = rememberCoroutineScope()
     val specimens = remember { coordinator.chatRepo.loadRecentSpecimens(limit = 60) }
+    var selectedDetail by remember { mutableStateOf<Pair<FieldGuideSpecimenCard, String?>?>(null) }
+    var zoomLightboxTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
+
+    BackHandler {
+        when {
+            zoomLightboxTarget != null -> zoomLightboxTarget = null
+            selectedDetail != null -> selectedDetail = null
+            else -> onDismiss()
+        }
+    }
+
+    zoomLightboxTarget?.let { (path, title) ->
+        OmsZoomableImageLightbox(
+            imagePath = path,
+            titleHint = title,
+            onDismiss = { zoomLightboxTarget = null }
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -1134,74 +1175,462 @@ private fun SpecimenFieldGuideGalleryModal(
             .statusBarsPadding()
             .navigationBarsPadding()
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            OmsCircleIconButton(OmsIcons.ArrowLeft, "返回", onClick = onDismiss)
-            Text("随身博物图鉴册 (${specimens.size})", color = palette.textPrimary, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
-        }
-
-        if (specimens.isEmpty()) {
-            Column(
-                modifier = Modifier.fillMaxSize().padding(32.dp),
-                verticalArrangement = Arrangement.Center,
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Icon(OmsIcons.Leaf, null, tint = palette.textTertiary, modifier = Modifier.size(32.dp))
-                Spacer(modifier = Modifier.height(12.dp))
-                Text("尚未收录博物标本", color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(modifier = Modifier.height(6.dp))
-                Text("在对话页打开「博物镜头」拍摄植物或展品，鉴定卡将自动沉淀于此", color = palette.textTertiary, fontSize = 13.sp)
+        if (selectedDetail != null) {
+            val (card, photoPath) = selectedDetail!!
+            val capturedDateLabel = remember(card.capturedAtIso) {
+                card.capturedAtIso.substringBefore('T').takeIf { it.isNotBlank() } ?: "近期拍摄标本"
             }
-        } else {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+
+            // Detail Header Bar
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(palette.topBar)
+                    .padding(horizontal = 14.dp, vertical = 9.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                items(items = specimens, key = { it.first.specimenId.ifBlank { it.first.chineseName + it.first.capturedAtIso } }) { (card, photoPath) ->
-                    OmsSurfaceCard(cornerRadius = 18.dp, modifier = Modifier.fillMaxWidth()) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                            if (!photoPath.isNullOrBlank()) {
-                                val bmp by produceState<ImageBitmap?>(initialValue = null, key1 = photoPath) {
-                                    value = withContext(Dispatchers.IO) {
-                                        runCatching {
-                                            val f = File(photoPath)
-                                            if (f.exists()) BitmapFactory.decodeFile(photoPath)?.asImageBitmap() else null
-                                        }.getOrNull()
-                                    }
-                                }
-                                if (bmp != null) {
-                                    Image(
-                                        bitmap = bmp!!,
-                                        contentDescription = card.chineseName,
-                                        contentScale = ContentScale.Crop,
-                                        modifier = Modifier.size(64.dp).clip(RoundedCornerShape(12.dp))
-                                    )
-                                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    OmsCircleIconButton(
+                        icon = OmsIcons.ArrowLeft,
+                        contentDescription = "返回图鉴列表",
+                        onClick = { selectedDetail = null }
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = card.chineseName,
+                            color = palette.textPrimary,
+                            fontSize = 16.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = "$capturedDateLabel · 随身博物标本档案",
+                            color = palette.textTertiary,
+                            fontSize = 11.5.sp,
+                            maxLines = 1
+                        )
+                    }
+                }
+
+                if (!photoPath.isNullOrBlank()) {
+                    OmsSecondaryButton(
+                        label = "放大原图",
+                        icon = OmsIcons.Search,
+                        height = 33.dp,
+                        onClick = { zoomLightboxTarget = photoPath to card.chineseName }
+                    )
+                }
+            }
+
+            Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
+
+            // Full Museum Specimen Plate Scroll
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 18.dp, vertical = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                if (!photoPath.isNullOrBlank()) {
+                    val heroBmp by produceState<ImageBitmap?>(initialValue = null, key1 = photoPath) {
+                        value = withContext(Dispatchers.IO) {
+                            runCatching {
+                                val f = File(photoPath)
+                                if (f.exists()) BitmapFactory.decodeFile(photoPath)?.asImageBitmap() else null
+                            }.getOrNull()
+                        }
+                    }
+                    if (heroBmp != null) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(250.dp)
+                                .clip(RoundedCornerShape(20.dp))
+                                .border(0.7.dp, palette.strongBorder, RoundedCornerShape(20.dp))
+                                .clickable { zoomLightboxTarget = photoPath to card.chineseName }
+                        ) {
+                            Image(
+                                bitmap = heroBmp!!,
+                                contentDescription = card.chineseName,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .padding(12.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(Color(0xB8090D16))
+                                    .padding(horizontal = 11.dp, vertical = 6.dp)
+                            ) {
+                                Icon(OmsIcons.Search, contentDescription = null, tint = Color.White, modifier = Modifier.size(13.5.dp))
+                                Text("点击全屏双指缩放查验细部", color = Color.White, fontSize = 11.5.sp, fontWeight = FontWeight.Medium)
                             }
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(card.chineseName, color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                                if (card.latinName.isNotBlank()) {
-                                    Text(card.latinName, color = palette.textSecondary, fontSize = 12.5.sp, fontStyle = FontStyle.Italic)
-                                }
-                                if (card.familyGenus.isNotBlank()) {
-                                    Text(card.familyGenus, color = palette.textTertiary, fontSize = 11.5.sp)
-                                }
+                        }
+                    }
+                }
+
+                // Taxonomy Title & Confidence Block
+                OmsSurfaceCard(
+                    cornerRadius = 18.dp,
+                    contentPadding = PaddingValues(16.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.Top
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(card.chineseName, color = palette.textPrimary, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                            if (card.latinName.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(3.dp))
+                                Text(
+                                    text = card.latinName,
+                                    color = palette.textSecondary,
+                                    fontSize = 14.5.sp,
+                                    fontFamily = FontFamily.Serif,
+                                    fontStyle = FontStyle.Italic
+                                )
                             }
-                            OmsSecondaryButton(
-                                label = "追问",
-                                height = 32.dp,
-                                onClick = { onAskInChat(card) }
+                        }
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(palette.successSoft)
+                                .padding(horizontal = 10.dp, vertical = 5.dp)
+                        ) {
+                            Text(
+                                text = "${card.confidencePercent}% 吻合",
+                                color = palette.success,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
                             )
                         }
-                        if (card.oneLineSummary.isNotBlank()) {
+                    }
+
+                    if (card.familyGenus.isNotBlank() || card.commonAliases.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = listOfNotNull(
+                                card.familyGenus.takeIf { it.isNotBlank() }?.let { "科属：$it" },
+                                card.commonAliases.takeIf { it.isNotBlank() }?.let { "俗名/别名：$it" }
+                            ).joinToString("  ·  "),
+                            color = palette.textTertiary,
+                            fontSize = 12.5.sp
+                        )
+                    }
+
+                    if (card.oneLineSummary.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Text(
+                            text = card.oneLineSummary,
+                            color = palette.textPrimary,
+                            fontSize = 15.sp,
+                            lineHeight = 23.sp
+                        )
+                    }
+                }
+
+                // Detailed Morphology & Comparison Sections
+                if (card.keyMorphology.isNotEmpty()) {
+                    OmsSurfaceCard(cornerRadius = 18.dp, contentPadding = PaddingValues(16.dp), modifier = Modifier.fillMaxWidth()) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Icon(OmsIcons.Leaf, contentDescription = null, tint = palette.accent, modifier = Modifier.size(16.dp))
+                            Text("核心形态鉴定特征", color = palette.textPrimary, fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        card.keyMorphology.forEach { item ->
+                            Text(
+                                text = "•  $item",
+                                color = palette.textSecondary,
+                                fontSize = 14.sp,
+                                lineHeight = 22.sp,
+                                modifier = Modifier.padding(vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
+
+                if (card.lookalikeComparison.isNotBlank()) {
+                    OmsSurfaceCard(cornerRadius = 18.dp, contentPadding = PaddingValues(16.dp), modifier = Modifier.fillMaxWidth()) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Icon(OmsIcons.Sparkles, contentDescription = null, tint = palette.warning, modifier = Modifier.size(16.dp))
+                            Text("易混近似种辨析", color = palette.textPrimary, fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(card.lookalikeComparison, color = palette.textSecondary, fontSize = 14.sp, lineHeight = 22.sp)
+                    }
+                }
+
+                if (card.bloomAndHabitat.isNotBlank() || card.safetyOrCareNote.isNotBlank()) {
+                    OmsSurfaceCard(cornerRadius = 18.dp, contentPadding = PaddingValues(16.dp), modifier = Modifier.fillMaxWidth()) {
+                        if (card.bloomAndHabitat.isNotBlank()) {
+                            Text("花果期与生境分布", color = palette.accent, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold)
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(card.bloomAndHabitat, color = palette.textSecondary, fontSize = 14.sp, lineHeight = 21.5.sp)
+                        }
+                        if (card.bloomAndHabitat.isNotBlank() && card.safetyOrCareNote.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
+                            Spacer(modifier = Modifier.height(12.dp))
+                        }
+                        if (card.safetyOrCareNote.isNotBlank()) {
+                            Text("养护要点与安全提示", color = palette.success, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold)
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(card.safetyOrCareNote, color = palette.textSecondary, fontSize = 14.sp, lineHeight = 21.5.sp)
+                        }
+                    }
+                }
+
+                if (card.sources.isNotEmpty()) {
+                    OmsSurfaceCard(cornerRadius = 16.dp, contentPadding = PaddingValues(14.dp), modifier = Modifier.fillMaxWidth()) {
+                        Text("参考检索来源", color = palette.textTertiary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        card.sources.forEach { src ->
+                            Text(
+                                text = "↗  ${src.title.ifBlank { src.uri }}",
+                                color = palette.accent,
+                                fontSize = 12.5.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        runCatching {
+                                            context.startActivity(
+                                                Intent(Intent.ACTION_VIEW, Uri.parse(src.uri))
+                                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            )
+                                        }
+                                    }
+                                    .padding(vertical = 3.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Bottom Action Bar: Save to Vault + Ask Follow-up in Chat
+            Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(palette.topBar)
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OmsSecondaryButton(
+                    label = "同步至知识库",
+                    icon = OmsIcons.Bookmark,
+                    height = 40.dp,
+                    modifier = Modifier.weight(1f),
+                    onClick = {
+                        scope.launch {
+                            val ok = coordinator.promoteSpecimenToVault(card, photoPath)
+                            OmsFeedbackController.show(
+                                if (ok) "已归档至 Mac 知识库 FieldGuide" else "已加入同步队列，连上 Mac 后自动归档",
+                                OmsToastKind.SUCCESS
+                            )
+                        }
+                    }
+                )
+                OmsPrimaryButton(
+                    label = "带着标本追问",
+                    icon = OmsIcons.Sparkles,
+                    height = 40.dp,
+                    modifier = Modifier.weight(1f),
+                    onClick = { onAskInChat(card) }
+                )
+            }
+        } else {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OmsCircleIconButton(OmsIcons.ArrowLeft, "返回", onClick = onDismiss)
+                Column {
+                    Text("随身博物图鉴册 (${specimens.size})", color = palette.textPrimary, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                    Text("点选缩略图可双指放大原图 · 点选卡片查阅完整鉴定档案", color = palette.textTertiary, fontSize = 11.5.sp)
+                }
+            }
+
+            if (specimens.isEmpty()) {
+                Column(
+                    modifier = Modifier.fillMaxSize().padding(32.dp),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(OmsIcons.Leaf, null, tint = palette.textTertiary, modifier = Modifier.size(32.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text("尚未收录博物标本", color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text("在对话页打开「博物镜头」拍摄植物或展品，鉴定卡将自动沉淀于此", color = palette.textTertiary, fontSize = 13.sp)
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    items(
+                        items = specimens,
+                        key = { it.first.specimenId.ifBlank { it.first.chineseName + it.first.capturedAtIso } }
+                    ) { (card, photoPath) ->
+                        OmsSurfaceCard(
+                            cornerRadius = 18.dp,
+                            onClick = { selectedDetail = card to photoPath },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(13.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (!photoPath.isNullOrBlank()) {
+                                    val bmp by produceState<ImageBitmap?>(initialValue = null, key1 = photoPath) {
+                                        value = withContext(Dispatchers.IO) {
+                                            runCatching {
+                                                val f = File(photoPath)
+                                                if (f.exists()) BitmapFactory.decodeFile(photoPath)?.asImageBitmap() else null
+                                            }.getOrNull()
+                                        }
+                                    }
+                                    if (bmp != null) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(82.dp)
+                                                .clip(RoundedCornerShape(14.dp))
+                                                .border(0.6.dp, palette.hairline, RoundedCornerShape(14.dp))
+                                                .clickable { zoomLightboxTarget = photoPath to card.chineseName }
+                                        ) {
+                                            Image(
+                                                bitmap = bmp!!,
+                                                contentDescription = card.chineseName,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+                                            Box(
+                                                contentAlignment = Alignment.Center,
+                                                modifier = Modifier
+                                                    .align(Alignment.BottomEnd)
+                                                    .padding(4.dp)
+                                                    .size(20.dp)
+                                                    .clip(CircleShape)
+                                                    .background(Color(0xAD090D16))
+                                            ) {
+                                                Icon(
+                                                    imageVector = OmsIcons.Search,
+                                                    contentDescription = "放大原图",
+                                                    tint = Color.White,
+                                                    modifier = Modifier.size(11.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = card.chineseName,
+                                            color = palette.textPrimary,
+                                            fontSize = 16.5.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .background(palette.successSoft)
+                                                .padding(horizontal = 7.dp, vertical = 2.dp)
+                                        ) {
+                                            Text(
+                                                text = "${card.confidencePercent}%",
+                                                color = palette.success,
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                        }
+                                    }
+                                    if (card.latinName.isNotBlank()) {
+                                        Text(
+                                            text = card.latinName,
+                                            color = palette.textSecondary,
+                                            fontSize = 12.5.sp,
+                                            fontFamily = FontFamily.Serif,
+                                            fontStyle = FontStyle.Italic,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    if (card.familyGenus.isNotBlank()) {
+                                        Text(card.familyGenus, color = palette.textTertiary, fontSize = 11.5.sp, maxLines = 1)
+                                    }
+                                    if (card.oneLineSummary.isNotBlank()) {
+                                        Text(
+                                            text = card.oneLineSummary,
+                                            color = palette.textSecondary,
+                                            fontSize = 12.5.sp,
+                                            lineHeight = 18.sp,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
                             Spacer(modifier = Modifier.height(8.dp))
-                            Text(card.oneLineSummary, color = palette.textSecondary, fontSize = 13.sp, lineHeight = 19.sp)
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        text = "查看完整形态特征与养护档案",
+                                        color = palette.accent,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Icon(
+                                        imageVector = OmsIcons.ChevronRight,
+                                        contentDescription = null,
+                                        tint = palette.accent,
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                }
+                                OmsSecondaryButton(
+                                    label = "追问",
+                                    height = 30.dp,
+                                    onClick = { onAskInChat(card) }
+                                )
+                            }
                         }
                     }
                 }

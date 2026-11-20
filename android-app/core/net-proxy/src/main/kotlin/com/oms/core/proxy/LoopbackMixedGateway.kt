@@ -123,7 +123,7 @@ class LoopbackMixedGateway(
 
             val first = input.read()
             if (first < 0) return
-            client.soTimeout = 90_000
+            client.soTimeout = 660_000
 
             val routed = if (first == 0x05) {
                 handleSocks5(client, input, output)
@@ -427,6 +427,25 @@ class OmsProxyManager(
         runCatching { sharedProxiedClient?.connectionPool?.evictAll() }
     }
 
+    /**
+     * Marks the active proxy node for `host` as failed or AI-geo-blocked (e.g. when a WebSocket
+     * handshake is rejected with Close 1007/1008 or times out waiting for setupComplete) so the very
+     * next retry routes through a clean candidate node.
+     */
+    fun penalizeActiveNodeForHost(host: String, geoBlocked: Boolean = false) {
+        val cleanHost = host.trim().lowercase()
+        val badNode = gateway.findActiveNodeForHost(cleanHost)
+            ?: router.lastUsedNodeForHost(cleanHost)
+            ?: router.bestNode
+            ?: return
+        if (geoBlocked) {
+            router.markAiGeoBlocked(badNode)
+        } else {
+            router.markFailure(badNode)
+        }
+        evictStaleConnections(badNode)
+    }
+
     fun setRoutingPolicyAndEvict(mode: String, pinnedKey: String? = router.pinnedNodeKey) {
         router.setRoutingPolicy(mode, pinnedKey)
         evictStaleConnections()
@@ -510,10 +529,7 @@ class OmsProxyManager(
         return collected.size
     }
 
-    fun getOrCreateOkHttpClient(
-        connectTimeoutSec: Long = 15,
-        readTimeoutSec: Long = 90
-    ): OkHttpClient {
+    private fun ensureBaseProxiedClient(): OkHttpClient {
         sharedProxiedClient?.let { return it }
         synchronized(this) {
             sharedProxiedClient?.let { return it }
@@ -579,14 +595,30 @@ class OmsProxyManager(
                 .proxySelector(selector)
                 .proxyAuthenticator(auth)
                 .addInterceptor(geoFailoverInterceptor)
-                .connectTimeout(connectTimeoutSec, TimeUnit.SECONDS)
-                .readTimeout(readTimeoutSec, TimeUnit.SECONDS)
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(90, TimeUnit.SECONDS)
                 .writeTimeout(30, TimeUnit.SECONDS)
-                .pingInterval(25, TimeUnit.SECONDS)
+                .pingInterval(15, TimeUnit.SECONDS)
                 .build()
             sharedProxiedClient = client
             return client
         }
+    }
+
+    fun getOrCreateOkHttpClient(
+        connectTimeoutSec: Long = 15,
+        readTimeoutSec: Long = 90,
+        writeTimeoutSec: Long = 30
+    ): OkHttpClient {
+        val base = ensureBaseProxiedClient()
+        if (connectTimeoutSec == 15L && readTimeoutSec == 90L && writeTimeoutSec == 30L) {
+            return base
+        }
+        return base.newBuilder()
+            .connectTimeout(connectTimeoutSec, TimeUnit.SECONDS)
+            .readTimeout(readTimeoutSec, TimeUnit.SECONDS)
+            .writeTimeout(writeTimeoutSec, TimeUnit.SECONDS)
+            .build()
     }
 
     /**

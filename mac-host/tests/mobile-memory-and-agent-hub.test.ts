@@ -494,4 +494,236 @@ describe("Milestone 2 & 3: MobileMemoryMirror + AgentSessionHub", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  test("Codex response_item history, step compaction, active-writer auto-fork, and Antigravity Desktop<->CLI sync", async () => {
+    const { Database } = await import("bun:sqlite");
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oms-hub-v32-"));
+    const omsHome = path.join(tmpDir, "oms");
+    const codexRoot = path.join(tmpDir, "codex");
+    const codexSessDir = path.join(codexRoot, "sessions", "2026", "11", "20");
+    const agyDesktopRoot = path.join(tmpDir, "agy_desktop");
+    const agyDesktopBrain = path.join(agyDesktopRoot, "brain");
+    const agyDesktopConv = path.join(agyDesktopRoot, "conversations");
+    const agyCliRoot = path.join(tmpDir, "agy_cli");
+    const projDir = path.join(tmpDir, "work_repo");
+
+    for (const d of [omsHome, codexSessDir, agyDesktopBrain, agyDesktopConv, agyCliRoot, projDir]) {
+      fs.mkdirSync(d, { recursive: true });
+    }
+
+    // 1. Seed Codex rollout using `response_item` user/assistant messages + 30 tool calls (verifying history isn't evicted!)
+    const rolloutLines: string[] = [
+      JSON.stringify({ type: "session_meta", payload: { id: "019e-codex-locked", cwd: projDir } }),
+      JSON.stringify({
+        type: "response_item",
+        timestamp: "2026-11-20T10:00:00Z",
+        payload: { type: "message", role: "user", content: [{ type: "input_text", text: "第一轮桌面端提问：分析订单模块" }] },
+      }),
+      JSON.stringify({
+        type: "response_item",
+        timestamp: "2026-11-20T10:00:05Z",
+        payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "第一轮回复：已完成订单模块梳理。" }] },
+      }),
+    ];
+    for (let i = 0; i < 35; i++) {
+      rolloutLines.push(
+        JSON.stringify({
+          type: "response_item",
+          timestamp: "2026-11-20T10:01:00Z",
+          payload: { type: "function_call", name: `read_file_${i}`, arguments: "{}" },
+        })
+      );
+    }
+    rolloutLines.push(
+      JSON.stringify({
+        type: "response_item",
+        timestamp: "2026-11-20T10:02:00Z",
+        payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "第二轮回复：共检查 35 个文件。" }] },
+      })
+    );
+    fs.writeFileSync(path.join(codexSessDir, "rollout-019e-codex-locked.jsonl"), rolloutLines.join("\n") + "\n");
+
+    // Seed Codex state_5.sqlite + .codex-global-state.json so Desktop metadata & sidebar project sync can be verified
+    const cdb = new Database(path.join(codexRoot, "state_5.sqlite"));
+    cdb.exec(`
+      CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+      CREATE TABLE project_roots (project_id TEXT NOT NULL, path TEXT NOT NULL);
+      CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, title TEXT, cwd TEXT, source TEXT, thread_source TEXT, originator TEXT, project_id TEXT, preview TEXT, updated_at INTEGER, archived INTEGER DEFAULT 0, agent_role TEXT);
+    `);
+    cdb.run("INSERT INTO projects VALUES ('proj_work', '核心业务库')");
+    cdb.run("INSERT INTO project_roots VALUES ('proj_work', ?)", [projDir]);
+    cdb.run("INSERT INTO threads VALUES ('019e-codex-forked', '订单模块分析', '', ?, 'exec', NULL, NULL, NULL, '', 1795180000, 0, NULL)", [projDir]);
+    cdb.close();
+
+    fs.writeFileSync(
+      path.join(codexRoot, ".codex-global-state.json"),
+      JSON.stringify({
+        "local-projects": {
+          "local-proj-work-001": {
+            id: "local-proj-work-001",
+            name: "核心业务库",
+            rootPaths: [projDir],
+          },
+        },
+        "thread-project-assignments": {},
+        "thread-project-membership-host-ids": {},
+      }),
+      "utf8"
+    );
+
+    // 2. Seed Antigravity Desktop `.db` + `brain` conversation (`conv-desktop-99`)
+    const ddb = new Database(path.join(agyDesktopConv, "conv-desktop-99.db"));
+    ddb.exec("CREATE TABLE trajectory_meta (trajectory_id TEXT PRIMARY KEY); INSERT INTO trajectory_meta VALUES ('conv-desktop-99');");
+    ddb.close();
+    const dLogs = path.join(agyDesktopBrain, "conv-desktop-99", ".system_generated", "logs");
+    fs.mkdirSync(dLogs, { recursive: true });
+    fs.writeFileSync(
+      path.join(dLogs, "transcript.jsonl"),
+      JSON.stringify({
+        type: "USER_INPUT",
+        created_at: "2026-11-20T11:00:00Z",
+        content: `<user_information>\nCommand Working Directory: ${projDir}\n</user_information>\n<USER_REQUEST>桌面端 Antigravity 原始提问</USER_REQUEST>`,
+      }) + "\n"
+    );
+
+    const rpcMethodsReceived: string[] = [];
+    const hub = new AgentSessionHub({
+      omsHomeDir: omsHome,
+      codexSessionsDir: path.join(codexRoot, "sessions"),
+      agyBrainDir: agyDesktopBrain,
+      agyCliDir: agyCliRoot,
+      defaultWorkspacePath: projDir,
+      appServerSpawner: () => {
+        const emitter = new EventEmitter() as ChildProcess;
+        const stdin = new PassThrough();
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        (emitter as any).stdin = stdin;
+        (emitter as any).stdout = stdout;
+        (emitter as any).stderr = stderr;
+        (emitter as any).kill = () => {
+          stdout.end();
+          emitter.emit("close", 0);
+          return true;
+        };
+
+        const rl = (awaitImportReadline => awaitImportReadline)(stdin);
+        let buf = "";
+        stdin.on("data", (chunk: Buffer) => {
+          buf += chunk.toString("utf8");
+          const lines = buf.split("\n");
+          buf = lines.pop() || "";
+          for (const l of lines) {
+            if (!l.trim()) continue;
+            const req = JSON.parse(l);
+            if (req.method) rpcMethodsReceived.push(req.method);
+            if (req.method === "initialize") {
+              expect(req.params?.clientInfo?.name).toBe("vscode");
+              stdout.write(JSON.stringify({ id: req.id, result: {} }) + "\n");
+            } else if (req.method === "thread/resume") {
+              // Simulate Codex Desktop active writer lock (-32600)!
+              stdout.write(
+                JSON.stringify({
+                  id: req.id,
+                  error: { code: -32600, message: "thread 019e-codex-locked already has an active writer" },
+                }) + "\n"
+              );
+            } else if (req.method === "thread/fork") {
+              stdout.write(JSON.stringify({ id: req.id, result: { thread: { id: "019e-codex-forked", source: "vscode" } } }) + "\n");
+            } else if (req.method === "turn/start") {
+              stdout.write(JSON.stringify({ id: req.id, result: {} }) + "\n");
+              stdout.write(
+                JSON.stringify({
+                  method: "item/completed",
+                  params: {
+                    threadId: "019e-codex-forked",
+                    item: { type: "agentMessage", id: "item_1", text: "已通过自动派生会话完成接续修改！" },
+                  },
+                }) + "\n"
+              );
+              stdout.write(
+                JSON.stringify({
+                  method: "turn/completed",
+                  params: { threadId: "019e-codex-forked", turn: { id: "turn_1", status: "completed", error: null } },
+                }) + "\n"
+              );
+            }
+          }
+        });
+        void rl;
+        return emitter;
+      },
+    });
+
+    try {
+      // Verify 3a: Codex response_item messages & compaction
+      const codexDetail = hub.getSessionDetail("codex", "019e-codex-locked");
+      expect(codexDetail.steps.some((s) => s.kind === "user" && s.detail.includes("第一轮桌面端提问"))).toBe(true);
+      expect(codexDetail.steps.some((s) => s.kind === "assistant" && s.detail.includes("第一轮回复"))).toBe(true);
+      expect(codexDetail.steps.some((s) => s.kind === "assistant" && s.detail.includes("第二轮回复"))).toBe(true);
+      expect(codexDetail.steps.some((s) => s.title === "已折叠早期步骤")).toBe(true);
+
+      // Verify 3b & 3c (Codex): Resume locked desktop thread -> auto-forks & links to project with source = 'vscode'
+      const streamEvents: any[] = [];
+      hub.on("session_event", (ev) => streamEvents.push(ev));
+
+      hub.continueSession({
+        clientRequestId: "req_lock_test",
+        backend: "codex",
+        sessionId: "019e-codex-locked",
+        prompt: "继续生成小红书配图",
+        workspacePath: projDir,
+      });
+
+      await new Promise((r) => setTimeout(r, 260));
+      expect(rpcMethodsReceived).toEqual(["initialize", "initialized", "thread/resume", "thread/fork", "turn/start"]);
+      expect(streamEvents.some((e) => e.sessionId === "019e-codex-forked" && e.status === "completed")).toBe(true);
+
+      // Alias lookup: querying the old sessionId resolves seamlessly to the forked thread!
+      const aliasedDetail = hub.getSessionDetail("codex", "019e-codex-locked");
+      expect(aliasedDetail.session.sessionId).toBe("019e-codex-forked");
+      expect(aliasedDetail.steps.some((s) => s.detail.includes("已通过自动派生会话完成接续修改"))).toBe(true);
+
+      const checkDb = new Database(path.join(codexRoot, "state_5.sqlite"), { readonly: true });
+      const row = checkDb
+        .query("SELECT source, thread_source, originator, name, project_id FROM threads WHERE id = '019e-codex-forked'")
+        .get() as any;
+      checkDb.close();
+      expect(row?.source).toBe("vscode");
+      expect(row?.thread_source).toBe("user");
+      expect(row?.originator).toBe("Codex Desktop");
+      expect(row?.name).toContain("（手机接续）");
+      expect(row?.project_id).toBe("proj_work");
+
+      const globalState = JSON.parse(fs.readFileSync(path.join(codexRoot, ".codex-global-state.json"), "utf8"));
+      expect(globalState["thread-project-assignments"]?.["019e-codex-forked"]).toEqual({
+        projectKind: "local",
+        projectId: "local-proj-work-001",
+      });
+      expect(globalState["thread-project-membership-host-ids"]?.["019e-codex-forked"]).toBe("local");
+
+      // Verify 3b & 3c (Antigravity): Desktop -> CLI snapshot before resume, and CLI -> Desktop sync after new conversation!
+      hub.prepareAgySessionForCliResume("conv-desktop-99");
+      expect(fs.existsSync(path.join(agyCliRoot, "conversations", "conv-desktop-99.db"))).toBe(true);
+      expect(fs.existsSync(path.join(agyCliRoot, "brain", "conv-desktop-99", ".system_generated", "logs", "transcript.jsonl"))).toBe(true);
+
+      // Simulate `agy` creating a brand-new conversation `conv-mobile-new-77` in `agy_cli`
+      const startedMs = Date.now();
+      fs.mkdirSync(path.join(agyCliRoot, "conversations"), { recursive: true });
+      const newCliDb = new Database(path.join(agyCliRoot, "conversations", "conv-mobile-new-77.db"));
+      newCliDb.exec("CREATE TABLE trajectory_meta (trajectory_id TEXT PRIMARY KEY); INSERT INTO trajectory_meta VALUES ('conv-mobile-new-77');");
+      newCliDb.close();
+      const newCliLogs = path.join(agyCliRoot, "brain", "conv-mobile-new-77", ".system_generated", "logs");
+      fs.mkdirSync(newCliLogs, { recursive: true });
+      fs.writeFileSync(path.join(newCliLogs, "transcript.jsonl"), JSON.stringify({ type: "USER_INPUT", content: "<USER_REQUEST>手机新建 Antigravity 会话</USER_REQUEST>" }) + "\n");
+
+      const syncedUuid = hub.syncAgyCliSessionToDesktop("pending_1234", startedMs, projDir, "手机新建会话");
+      expect(syncedUuid).toBe("conv-mobile-new-77");
+      expect(fs.existsSync(path.join(agyDesktopConv, "conv-mobile-new-77.db"))).toBe(true);
+      expect(fs.existsSync(path.join(agyDesktopBrain, "conv-mobile-new-77", ".system_generated", "logs", "transcript.jsonl"))).toBe(true);
+    } finally {
+      hub.stopAll();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

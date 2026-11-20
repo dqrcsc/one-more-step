@@ -1,5 +1,15 @@
 # Changelog · 更新日志
 
+## 3.2.0 - 2026-11-20 · 实时视频快速故障转移、Live 语音联网查询、双脑桌面双向同步与接续自愈、AI 写歌/视频修复、模型去噪、检索消息精准定位与博物图鉴详情升级
+
+- **实时视频与 Live 语音握手稳定性升级 (`ProxyTunnels`、`SmartRegionRouter`、`OmsProxyManager` & `RealtimeVoiceProtocol`)**：将代理节点首包握手超时从 `65s` 收敛至 `6s`（首包连通后再放宽至 `660s` 流式长超时），修复个别节点出站黑洞导致 OkHttp 客户端超时早于代理换线的问题；修复 `OmsProxyManager` 单例客户端吞掉自定义 `readTimeout`（WebSocket 现采用 `0s` 无空闲读超时 + `15s` Ping）；补齐 `WebSocketListener.onClosing` 关闭帧回执、`9s` `setupComplete` 看门狗及握手失败自动驱逐坏节点重连机制。
+- **Live 全双工实时语音挂载联网搜索 (`RealtimeVoiceProtocol` & `CockpitRuntimeCoordinator`)**：为默认散步语音（OpenAI `gpt-realtime-2.1`）注册 `web_search` 实时函数工具并异步处理 `response.function_call_arguments.done`，结合 `DualLlmEngine` 搜索接地回传实时天气、新闻、股价等最新事实并继续语音播报；同步强化 Gemini 3.8 Live 的 Google Search 实时核查指令。
+- **Mac Codex & Antigravity 历史消息完整还原、桌面锁自动派生接续与双端双向可见 (`AgentSessionHub` & `AgentSessionDetailScreen`)**：补齐 Codex `response_item`（`user` / `assistant`）历史消息提取与超大转录文件中段对话扫描，新增 `compactTrajectorySteps` 步骤压缩器防止长轮次工具调用冲掉历史提问与回复；Codex 自动优先选用 `Codex.app` 内置新版 CLI 走官方 `codex app-server` JSON-RPC 协议（同步写入 `source = 'vscode'`、`thread_source = 'user'`、`originator = 'Codex Desktop'`、`project_id` 与 `.codex-global-state.json` 本地项目归属，遇桌面活跃占用 `-32600 already has an active writer` 时自动携带完整上下文 `thread/fork` 派生接续并追加 `（手机接续）` 标题区分及 `codex://threads/<id>` 提示）；Antigravity 增加 `--dangerously-skip-permissions` 与 `~/.gemini/antigravity` ↔ `~/.gemini/antigravity-cli` `.db` + `brain` 原子双向快照桥接，根治 `trajectory not found` 并让手机新建/接续会话同步呈现在 Mac `Antigravity.app` 桌面端。
+- **Google 写歌 (`lyria-3.5`) 与视频生成 (`gemini-omni-1.2-flash`) 全面修复 (`CreativeMediaEngine` & `ChatWorkspaceView`)**：切换至官方 `/v1beta/interactions`（携带 `Api-Revision: 2026-05-20` 与 `600s` 超时），移除对模型交互非法的 `background: true`，补齐 `response_format`（音频 `{"type":"audio"}`、视频 `{"type":"video","aspect_ratio":"16:9","duration":"5s"}`），并在对话流内新增专属音乐播放卡片与提取首帧封面的有声视频预览卡片。
+- **OpenAI & Google 模型列表去噪精简 (`ModelCatalogRegistry` & `EdgeSecureStore`)**：自动隐藏带日期快照后缀（`-YYYY-MM-DD` / `-MM-YYYY`）、`-preview` / `-exp` 测试后缀及早期跨代旧模型（`gpt-4*`、`gpt-5*`、`o1/o3/o4`、`gemini-2.*`、`gemini-omni-1.1*`、`lyria-3-pro*` 等），启动加载缓存时同步清洗历史残留项。
+- **会话全文检索自动滚动定位与关键词高亮 (`CockpitShell` & `ChatWorkspaceView`)**：点击侧边抽屉检索结果后自动解除底部跟随锁定，精准滚动至命中消息所在行并展示 `检索命中 ·「关键词」` 强调边框。
+- **随身博物图鉴册全屏缩放看原图与完整档案页升级 (`SpecimenFieldGuideGalleryModal` & `OmsZoomableImageLightbox`)**：新增通用 `1x–4.5x` 双指捏合/双击缩放原图灯箱，图鉴册升级为「缩略图直点放大 + 卡片点击进入完整标本详情页」，完整呈现英雄大图、拉丁学名、科属别名、核心形态鉴别特征、近似种辨析、花果期生境、养护提示、参考来源及一键同步知识库与追问操作栏。
+
 ## 3.1.0 - 2026-11-20 · 双脑项目会话标题精准对齐、Live 响度与实时镜头视觉修复、双擎联网搜索打通与配额重置看板
 
 - **Codex & Antigravity 官方 SQLite 会话标题与命名项目深度对齐 (`AgentSessionHub` & `MissionHubWorkspaceView`)**：直连解析 `~/.codex/state_*.sqlite`（`threads.name`、`projects` + `project_roots`、`session_index.jsonl`）与 `~/.gemini/antigravity/conversation_summaries.db`，完整还原桌面端精炼会话标题与用户自定义中文项目名；修复超长首行 `.jsonl` 标题为空及 `<user_information>` 路径正则误匹配源码问题，手机端新增横向项目快筛胶囊栏与醒目项目名徽章。

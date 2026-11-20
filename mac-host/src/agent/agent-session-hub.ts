@@ -1,9 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { EventEmitter } from "node:events";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import readline from "node:readline";
 import { Database } from "bun:sqlite";
 import type {
@@ -33,8 +33,10 @@ export interface AgentSessionHubOptions {
   omsHomeDir: string;
   codexSessionsDir?: string;
   agyBrainDir?: string;
+  agyCliDir?: string;
   defaultWorkspacePath?: string;
   cliSpawner?: CliSpawnerFn;
+  appServerSpawner?: () => ChildProcess;
 }
 
 interface ManagedTaskState {
@@ -44,22 +46,27 @@ interface ManagedTaskState {
 }
 
 /**
- * Milestone 3 (v2.0): Mac Heavy-Brain Hub (`AgentSessionHub`).
+ * Milestone 3 (v2.0+): Mac Heavy-Brain Hub (`AgentSessionHub`).
  *
  * 1) Discovers & parses live desktop/CLI trajectories for BOTH:
- *    - OpenAI Codex (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`)
- *    - Google Antigravity (`~/.gemini/antigravity/brain/<id>/.system_generated/logs/transcript.jsonl`)
- * 2) Dispatches new tasks & continues existing sessions (`codex exec resume` / `agy --conversation`)
- *    streaming structured `AgentSessionStreamEventParams` back to the Xiaomi phone in real time!
+ *    - OpenAI Codex (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` + `state_*.sqlite`)
+ *    - Google Antigravity (`~/.gemini/antigravity/brain/<id>` + `~/.gemini/antigravity-cli/brain/<id>`)
+ * 2) Dispatches new tasks & continues existing sessions:
+ *    - Codex via `codex app-server` JSON-RPC (`source = 'vscode'` for live Codex Desktop visibility + automatic `thread/fork` when locked by an active Desktop writer)
+ *    - Antigravity via `agy --dangerously-skip-permissions` with bidirectional `.db` + `brain/` Desktop store synchronization so mobile-created & mobile-continued sessions appear directly in Antigravity Desktop.
  */
 export class AgentSessionHub extends EventEmitter {
   private readonly hubDir: string;
   private readonly statePath: string;
   private readonly codexSessionsDir: string;
   private readonly agyBrainDir: string;
+  private readonly agyCliDir: string;
   private readonly defaultWorkspacePath: string;
+  private readonly hasCustomCliSpawner: boolean;
   private readonly cliSpawner: CliSpawnerFn;
+  private readonly appServerSpawner?: () => ChildProcess;
   private readonly managedTasks = new Map<string, ManagedTaskState>();
+  private readonly sessionAliases = new Map<string, string>();
   private readonly fileSummaryCache = new Map<
     string,
     { mtimeMs: number; size: number; summary: AgentSessionSummary | null }
@@ -74,19 +81,36 @@ export class AgentSessionHub extends EventEmitter {
     this.statePath = path.join(this.hubDir, "mobile_sessions.json");
     this.codexSessionsDir = opts.codexSessionsDir || path.join(os.homedir(), ".codex", "sessions");
     this.agyBrainDir = opts.agyBrainDir || path.join(os.homedir(), ".gemini", "antigravity", "brain");
+    this.agyCliDir = opts.agyCliDir || path.join(os.homedir(), ".gemini", "antigravity-cli");
     this.defaultWorkspacePath = opts.defaultWorkspacePath || process.cwd();
+    this.hasCustomCliSpawner = Boolean(opts.cliSpawner);
+    this.appServerSpawner = opts.appServerSpawner;
     this.cliSpawner =
       opts.cliSpawner ||
       ((spec) =>
         spawn(spec.command, spec.args, {
           cwd: spec.cwd,
-          env: {
-            ...process.env,
-            PATH: `${os.homedir()}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}`,
-          },
+          env: this.buildSpawnEnv(),
           stdio: ["ignore", "pipe", "pipe"],
         }));
     this.loadPersistedTasks();
+  }
+
+  private buildSpawnEnv(): NodeJS.ProcessEnv {
+    const home = os.homedir();
+    const extraPaths = [
+      path.join(home, ".local", "bin"),
+      path.join(home, ".bun", "bin"),
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+      "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS",
+      "/usr/bin",
+      "/bin",
+    ];
+    return {
+      ...process.env,
+      PATH: `${extraPaths.join(":")}:${process.env.PATH || ""}`,
+    };
   }
 
   public listSessions(limit = 24): AgentSessionSummary[] {
@@ -273,7 +297,84 @@ export class AgentSessionHub extends EventEmitter {
     };
   }
 
-  public getSessionDetail(backend: AgentBackendType, sessionId: string): AgentSessionDetailResult {
+  private resolveAliasedSessionId(backend: AgentBackendType, sessionId: string): string {
+    let cur = sessionId;
+    for (let i = 0; i < 4; i++) {
+      const next = this.sessionAliases.get(`${backend}:${cur}`);
+      if (!next || next === cur) break;
+      cur = next;
+    }
+    return cur;
+  }
+
+  /**
+   * Preserves all recent User & Assistant conversation turns (up to `maxDialogueTurns`)
+   * while capping consecutive intermediate tool/thinking steps between turns (`maxToolsPerTurn`),
+   * ensuring long tool-heavy sessions never evict historical dialogue messages on mobile!
+   */
+  public compactTrajectorySteps(
+    rawSteps: AgentStepItem[],
+    maxDialogueTurns = 60,
+    maxToolsPerTurn = 6
+  ): AgentStepItem[] {
+    if (rawSteps.length === 0) return [];
+    const dialogueIndices: number[] = [];
+    for (let i = 0; i < rawSteps.length; i++) {
+      const k = rawSteps[i].kind;
+      if (k === "user" || k === "assistant" || k === "status") {
+        dialogueIndices.push(i);
+      }
+    }
+
+    const startIdx =
+      dialogueIndices.length > maxDialogueTurns
+        ? dialogueIndices[dialogueIndices.length - maxDialogueTurns]
+        : 0;
+
+    const out: AgentStepItem[] = [];
+    let toolBuf: AgentStepItem[] = [];
+    const flushTools = () => {
+      if (toolBuf.length === 0) return;
+      if (toolBuf.length > maxToolsPerTurn) {
+        const omitted = toolBuf.length - maxToolsPerTurn;
+        const firstTs = toolBuf[0].timestampMs;
+        out.push({
+          stepIndex: 0,
+          kind: "tool",
+          title: `已折叠早期步骤`,
+          detail: `省略前 ${omitted} 步中间工具调用与思考过程`,
+          timestampMs: firstTs,
+        });
+        for (const t of toolBuf.slice(-maxToolsPerTurn)) {
+          out.push({ ...t });
+        }
+      } else {
+        for (const t of toolBuf) {
+          out.push({ ...t });
+        }
+      }
+      toolBuf = [];
+    };
+
+    for (let i = startIdx; i < rawSteps.length; i++) {
+      const st = rawSteps[i];
+      if (st.kind === "tool" || st.kind === "thinking") {
+        toolBuf.push(st);
+      } else {
+        flushTools();
+        out.push({ ...st });
+      }
+    }
+    flushTools();
+
+    return out.map((s, idx) => ({
+      ...s,
+      stepIndex: idx + 1,
+    }));
+  }
+
+  public getSessionDetail(backend: AgentBackendType, rawSessionId: string): AgentSessionDetailResult {
+    const sessionId = this.resolveAliasedSessionId(backend, rawSessionId);
     const managed = this.managedTasks.get(`${backend}:${sessionId}`);
     const diskDetail =
       backend === "codex"
@@ -281,26 +382,43 @@ export class AgentSessionHub extends EventEmitter {
         : this.readAgySessionDetail(sessionId);
 
     if (managed && diskDetail) {
-      // Merge disk trajectory steps if richer, while preserving live running status from managed child
-      const useSteps = diskDetail.steps.length >= managed.steps.length ? diskDetail.steps : managed.steps;
+      const lastDiskTs = diskDetail.steps.length > 0 ? diskDetail.steps[diskDetail.steps.length - 1].timestampMs : 0;
+      const liveTail = managed.child
+        ? managed.steps.filter((s) => s.timestampMs > lastDiskTs)
+        : [];
+      const merged =
+        diskDetail.steps.some((s) => s.kind === "user" || s.kind === "assistant")
+          ? [...diskDetail.steps, ...liveTail]
+          : managed.steps.length >= diskDetail.steps.length
+            ? managed.steps
+            : diskDetail.steps;
+
       return {
         session: {
           ...diskDetail.session,
-          status: managed.summary.status === "running" ? "running" : diskDetail.session.status,
+          status:
+            managed.summary.status === "running"
+              ? "running"
+              : managed.summary.status === "failed" && managed.summary.updatedAtMs >= diskDetail.session.updatedAtMs
+                ? "failed"
+                : diskDetail.session.status,
           origin: managed.summary.origin,
           lastSummary: managed.summary.lastSummary || diskDetail.session.lastSummary,
         },
-        steps: useSteps.slice(-80),
+        steps: this.compactTrajectorySteps(merged),
       };
     }
     if (managed) {
       return {
         session: { ...managed.summary },
-        steps: managed.steps.slice(-80),
+        steps: this.compactTrajectorySteps(managed.steps),
       };
     }
     if (diskDetail) {
-      return diskDetail;
+      return {
+        session: diskDetail.session,
+        steps: this.compactTrajectorySteps(diskDetail.steps),
+      };
     }
     throw new Error(`未找到会话 ${backend}:${sessionId}`);
   }
@@ -328,6 +446,14 @@ export class AgentSessionHub extends EventEmitter {
       timestampMs: now,
     };
 
+    if (params.backend === "codex" && (!this.hasCustomCliSpawner || this.appServerSpawner)) {
+      return this.launchCodexAppServerSession(summary, [initialStep], {
+        mode: "start",
+        workspace,
+        prompt: params.prompt,
+      });
+    }
+
     const spec: SpawnedCliSpec =
       params.backend === "codex"
         ? {
@@ -346,7 +472,9 @@ export class AgentSessionHub extends EventEmitter {
           }
         : {
             command: "agy",
-            args: ["--print", params.prompt, "--output-format", "stream-json"],
+            args: this.hasCustomCliSpawner
+              ? ["--print", params.prompt, "--output-format", "stream-json"]
+              : ["--dangerously-skip-permissions", "--print", params.prompt, "--output-format", "stream-json"],
             cwd: workspace,
           };
 
@@ -354,9 +482,10 @@ export class AgentSessionHub extends EventEmitter {
   }
 
   public continueSession(params: AgentSessionContinueParams): AgentSessionSummary {
+    const targetSessionId = this.resolveAliasedSessionId(params.backend, params.sessionId);
     const existingDetail = (() => {
       try {
-        return this.getSessionDetail(params.backend, params.sessionId);
+        return this.getSessionDetail(params.backend, targetSessionId);
       } catch {
         return null;
       }
@@ -377,7 +506,7 @@ export class AgentSessionHub extends EventEmitter {
     priorSteps.push(userStep);
 
     const summary: AgentSessionSummary = {
-      sessionId: params.sessionId,
+      sessionId: targetSessionId,
       backend: params.backend,
       origin: existingDetail?.session.origin || "desktop",
       title: existingDetail?.session.title || params.prompt.slice(0, 60),
@@ -388,30 +517,54 @@ export class AgentSessionHub extends EventEmitter {
       canContinue: true,
     };
 
+    if (params.backend === "codex" && (!this.hasCustomCliSpawner || this.appServerSpawner)) {
+      return this.launchCodexAppServerSession(summary, priorSteps, {
+        mode: "resume",
+        resumeThreadId: targetSessionId,
+        workspace,
+        prompt: params.prompt,
+      });
+    }
+
+    if (params.backend === "agy" && !this.hasCustomCliSpawner) {
+      this.prepareAgySessionForCliResume(targetSessionId);
+    }
+
     const spec: SpawnedCliSpec =
       params.backend === "codex"
         ? {
             command: "codex",
-            args: ["exec", "resume", params.sessionId, "--skip-git-repo-check", "--json", params.prompt],
+            args: ["exec", "resume", targetSessionId, "--skip-git-repo-check", "--json", params.prompt],
             cwd: workspace,
           }
         : {
             command: "agy",
-            args: [
-              "--conversation",
-              params.sessionId,
-              "--print",
-              params.prompt,
-              "--output-format",
-              "stream-json",
-            ],
+            args: this.hasCustomCliSpawner
+              ? [
+                  "--conversation",
+                  targetSessionId,
+                  "--print",
+                  params.prompt,
+                  "--output-format",
+                  "stream-json",
+                ]
+              : [
+                  "--dangerously-skip-permissions",
+                  "--conversation",
+                  targetSessionId,
+                  "--print",
+                  params.prompt,
+                  "--output-format",
+                  "stream-json",
+                ],
             cwd: workspace,
           };
 
     return this.launchManagedProcess(summary, priorSteps, spec);
   }
 
-  public cancelSession(backend: AgentBackendType, sessionId: string): boolean {
+  public cancelSession(backend: AgentBackendType, rawSessionId: string): boolean {
+    const sessionId = this.resolveAliasedSessionId(backend, rawSessionId);
     const key = `${backend}:${sessionId}`;
     const state = this.managedTasks.get(key);
     if (!state || !state.child) return false;
@@ -448,11 +601,722 @@ export class AgentSessionHub extends EventEmitter {
     }
   }
 
+  /**
+   * Prefers Codex Desktop's bundled CLI (`ChatGPT.app` / `Codex.app`) when installed on macOS
+   * so schema columns (`thread_source`, paginated history, etc.) stay 100% aligned with `Codex.app`,
+   * falling back to `codex` on PATH.
+   */
+  public resolveCodexCliExecutable(): string {
+    const envBin = (process.env.OMS_CODEX_BIN || "").trim();
+    if (envBin && fs.existsSync(envBin)) return envBin;
+    if (process.platform === "darwin" && process.env.OMS_TEST_ISOLATION !== "1") {
+      const desktopCandidates = [
+        "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        "/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        path.join(os.homedir(), "Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"),
+        path.join(os.homedir(), "Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"),
+      ];
+      for (const binPath of desktopCandidates) {
+        try {
+          if (fs.existsSync(binPath)) return binPath;
+        } catch {
+          // ignore
+        }
+      }
+    }
+    return "codex";
+  }
+
+  private formatMobileForkTitle(baseTitle: string): string {
+    const cleaned = baseTitle
+      .trim()
+      .replace(/\s*[（(]手机接续[）)]\s*$/u, "")
+      .trim();
+    const core = (cleaned || "Codex 会话").slice(0, 72);
+    return `${core}（手机接续）`;
+  }
+
+  private launchCodexAppServerSession(
+    initialSummary: AgentSessionSummary,
+    initialSteps: AgentStepItem[],
+    opts: {
+      mode: "start" | "resume";
+      resumeThreadId?: string;
+      workspace: string;
+      prompt: string;
+    }
+  ): AgentSessionSummary {
+    const initialId = initialSummary.sessionId;
+    let currentKey = `codex:${initialId}`;
+    const prev = this.managedTasks.get(currentKey);
+    if (prev?.child) {
+      throw new Error(`该会话正在运行中 (${initialId})，请等待当前轮次完成或先停止`);
+    }
+
+    const state: ManagedTaskState = {
+      summary: initialSummary,
+      steps: initialSteps,
+      child: null,
+    };
+    this.managedTasks.set(currentKey, state);
+
+    let child: ChildProcess;
+    try {
+      const codexBin = this.resolveCodexCliExecutable();
+      child = this.appServerSpawner
+        ? this.appServerSpawner()
+        : spawn(codexBin, ["app-server"], {
+            cwd: opts.workspace,
+            env: this.buildSpawnEnv(),
+            stdio: ["pipe", "pipe", "pipe"],
+          });
+    } catch (err) {
+      state.summary.status = "failed";
+      state.summary.lastSummary = `启动 codex app-server 失败: ${(err as Error).message}`;
+      this.persistTasks();
+      return { ...state.summary };
+    }
+    state.child = child;
+
+    let lastPreviousSessionId: string | undefined;
+    const rekeySessionId = (realId: string) => {
+      const trimmed = realId.trim();
+      if (!trimmed || trimmed === state.summary.sessionId) return;
+      const oldId = state.summary.sessionId;
+      lastPreviousSessionId = oldId;
+      this.sessionAliases.set(`codex:${oldId}`, trimmed);
+      this.managedTasks.delete(currentKey);
+      state.summary.sessionId = trimmed;
+      currentKey = `codex:${trimmed}`;
+      this.managedTasks.set(currentKey, state);
+    };
+
+    const sendRpc = (payload: Record<string, any>) => {
+      if (child.stdin && !child.stdin.destroyed) {
+        try {
+          child.stdin.write(JSON.stringify(payload) + "\n");
+        } catch {
+          // ignore broken pipe
+        }
+      }
+    };
+
+    const pushAndEmitStep = (step: AgentStepItem) => {
+      state.steps.push(step);
+      state.summary.lastSummary = `${step.title}: ${step.detail}`.slice(0, 140);
+      state.summary.updatedAtMs = Date.now();
+      this.emitStreamEvent({
+        backend: "codex",
+        sessionId: state.summary.sessionId,
+        previousSessionId: lastPreviousSessionId,
+        status: "running",
+        step,
+        updatedAtMs: state.summary.updatedAtMs,
+      });
+    };
+
+    let turnCompletedHandled = false;
+    let activeThreadId = opts.resumeThreadId || "";
+    let forkedFromLockedDesktop = false;
+
+    const startTurnOnThread = (threadId: string) => {
+      activeThreadId = threadId;
+      rekeySessionId(threadId);
+      // Eagerly link desktop metadata & fork display title so Codex.app shows the right name/project even mid-run
+      this.linkCodexThreadToWorkspaceProject(
+        threadId,
+        opts.workspace,
+        state.summary.title,
+        forkedFromLockedDesktop
+      );
+      sendRpc({
+        id: 4,
+        method: "turn/start",
+        params: {
+          threadId,
+          cwd: opts.workspace,
+          approvalPolicy: "never",
+          input: [{ type: "text", text: opts.prompt, text_elements: [] }],
+        },
+      });
+    };
+
+    if (child.stdout) {
+      const rl = readline.createInterface({ input: child.stdout });
+      rl.on("line", (line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        let msg: Record<string, any>;
+        try {
+          msg = JSON.parse(trimmed);
+        } catch {
+          return;
+        }
+
+        // 1. JSON-RPC Responses (`id === 1 | 2 | 3 | 4`)
+        if (typeof msg.id === "number") {
+          if (msg.id === 1) {
+            if (msg.error) {
+              state.summary.status = "failed";
+              state.summary.lastSummary = `Codex 初始化失败: ${msg.error.message || "unknown"}`;
+              try { child.kill("SIGTERM"); } catch {}
+              return;
+            }
+            sendRpc({ method: "initialized" });
+            if (opts.mode === "start") {
+              sendRpc({
+                id: 2,
+                method: "thread/start",
+                params: {
+                  cwd: opts.workspace,
+                  approvalPolicy: "never",
+                  sandbox: "workspace-write",
+                },
+              });
+            } else {
+              sendRpc({
+                id: 2,
+                method: "thread/resume",
+                params: {
+                  threadId: opts.resumeThreadId,
+                  cwd: opts.workspace,
+                  approvalPolicy: "never",
+                  sandbox: "workspace-write",
+                  excludeTurns: true,
+                },
+              });
+            }
+            return;
+          }
+
+          if (msg.id === 2) {
+            if (msg.error) {
+              const errMsg = String(msg.error.message || "");
+              // If the session is currently held open by Codex Desktop (`already has an active writer`),
+              // automatically fork with full conversation history into a new `source = 'vscode'` Desktop thread!
+              if (opts.mode === "resume" && opts.resumeThreadId) {
+                pushAndEmitStep({
+                  stepIndex: state.steps.length + 1,
+                  kind: "status",
+                  title: "桌面活跃会话派生接续",
+                  detail: "原会话正在 Mac Codex 桌面端打开占用，已自动携带完整上下文派生接续会话",
+                  timestampMs: Date.now(),
+                });
+                sendRpc({
+                  id: 3,
+                  method: "thread/fork",
+                  params: {
+                    threadId: opts.resumeThreadId,
+                    cwd: opts.workspace,
+                    approvalPolicy: "never",
+                    sandbox: "workspace-write",
+                  },
+                });
+                return;
+              }
+              state.summary.status = "failed";
+              state.summary.lastSummary = `Codex 启动会话失败: ${errMsg}`;
+              try { child.kill("SIGTERM"); } catch {}
+              return;
+            }
+            const tId = String(msg.result?.thread?.id || opts.resumeThreadId || "");
+            if (tId) startTurnOnThread(tId);
+            return;
+          }
+
+          if (msg.id === 3) {
+            if (msg.error) {
+              state.summary.status = "failed";
+              state.summary.lastSummary = `Codex 派生会话失败: ${msg.error.message || "unknown"}`;
+              try { child.kill("SIGTERM"); } catch {}
+              return;
+            }
+            const forkedId = String(msg.result?.thread?.id || "");
+            if (forkedId) {
+              forkedFromLockedDesktop = true;
+              state.summary.title = this.formatMobileForkTitle(state.summary.title);
+              pushAndEmitStep({
+                stepIndex: state.steps.length + 1,
+                kind: "status",
+                title: "已创建手机接续会话",
+                detail: `「${state.summary.title}」已在桌面库建立；在 Mac Codex 按 ⌘R 刷新或打开 codex://threads/${forkedId} 即可同步查看`,
+                timestampMs: Date.now(),
+              });
+              startTurnOnThread(forkedId);
+            }
+            return;
+          }
+
+          if (msg.id === 4 && msg.error) {
+            state.summary.status = "failed";
+            state.summary.lastSummary = `Codex 提交轮次失败: ${msg.error.message || "unknown"}`;
+            try { child.kill("SIGTERM"); } catch {}
+            return;
+          }
+          return;
+        }
+
+        // 2. JSON-RPC Streaming Server Notifications
+        const method = String(msg.method || "");
+        const p = (msg.params || {}) as Record<string, any>;
+        if (typeof p.threadId === "string" && p.threadId.length >= 8) {
+          rekeySessionId(p.threadId);
+          activeThreadId = p.threadId;
+        }
+
+        if (method === "item/started" && p.item) {
+          const item = p.item as Record<string, any>;
+          if (item.type === "commandExecution") {
+            pushAndEmitStep({
+              stepIndex: state.steps.length + 1,
+              kind: "tool",
+              title: "执行终端命令",
+              detail: String(item.command || "").slice(0, 320),
+              timestampMs: Date.now(),
+            });
+          } else if (item.type === "mcpToolCall") {
+            pushAndEmitStep({
+              stepIndex: state.steps.length + 1,
+              kind: "tool",
+              title: `MCP · ${item.server || ""}/${item.tool || ""}`,
+              detail: JSON.stringify(item.arguments || {}).slice(0, 300),
+              timestampMs: Date.now(),
+            });
+          }
+        } else if (method === "item/completed" && p.item) {
+          const item = p.item as Record<string, any>;
+          if (item.type === "agentMessage") {
+            const text = String(item.text || "").trim();
+            if (text) {
+              pushAndEmitStep({
+                stepIndex: state.steps.length + 1,
+                kind: "assistant",
+                title: "Codex 回复",
+                detail: text.slice(0, 2400),
+                timestampMs: Date.now(),
+              });
+            }
+          } else if (item.type === "reasoning") {
+            const parts = Array.isArray(item.summary) && item.summary.length > 0 ? item.summary : item.content;
+            const text = Array.isArray(parts) ? parts.join("\n").trim() : String(parts || "").trim();
+            if (text) {
+              pushAndEmitStep({
+                stepIndex: state.steps.length + 1,
+                kind: "thinking",
+                title: "思考推演",
+                detail: text.slice(0, 500),
+                timestampMs: Date.now(),
+              });
+            }
+          } else if (item.type === "commandExecution") {
+            const out = String(item.aggregatedOutput || item.command || "").trim();
+            pushAndEmitStep({
+              stepIndex: state.steps.length + 1,
+              kind: "tool",
+              title: `命令完成 (exit=${item.exitCode ?? 0})`,
+              detail: out.slice(0, 400),
+              timestampMs: Date.now(),
+            });
+          } else if (item.type === "fileChange" && Array.isArray(item.changes)) {
+            const files = item.changes.map((c: any) => c?.path || "").filter(Boolean).join(", ");
+            if (files) {
+              pushAndEmitStep({
+                stepIndex: state.steps.length + 1,
+                kind: "tool",
+                title: "代码修改",
+                detail: files.slice(0, 360),
+                timestampMs: Date.now(),
+              });
+            }
+          }
+        } else if (method === "turn/completed") {
+          turnCompletedHandled = true;
+          const turnErr = p.turn?.error;
+          if (turnErr) {
+            state.summary.status = "failed";
+            state.summary.lastSummary = `Codex 执行中止: ${turnErr.message || JSON.stringify(turnErr).slice(0, 120)}`;
+          } else {
+            state.summary.status = "completed";
+            const lastAssistant = [...state.steps].reverse().find((s) => s.kind === "assistant");
+            if (lastAssistant) {
+              state.summary.lastSummary = lastAssistant.detail.slice(0, 160);
+            }
+          }
+          try { child.stdin?.end(); } catch {}
+          setTimeout(() => {
+            try { child.kill("SIGTERM"); } catch {}
+          }, 180);
+        }
+      });
+    }
+
+    let stderrBuf = "";
+    if (child.stderr) {
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderrBuf = (stderrBuf + chunk.toString("utf8")).slice(-2000);
+      });
+    }
+
+    child.on("error", (err) => {
+      state.child = null;
+      state.summary.status = "failed";
+      state.summary.lastSummary = `Codex 执行异常: ${err.message}`;
+      state.summary.updatedAtMs = Date.now();
+      this.persistTasks();
+      this.emitStreamEvent({
+        backend: "codex",
+        sessionId: state.summary.sessionId,
+        previousSessionId: lastPreviousSessionId,
+        status: "failed",
+        finalSummary: state.summary.lastSummary,
+        updatedAtMs: state.summary.updatedAtMs,
+      });
+    });
+
+    child.on("close", (code) => {
+      state.child = null;
+      if (!turnCompletedHandled && state.summary.status === "running") {
+        const ok = code === 0;
+        state.summary.status = ok ? "completed" : "failed";
+        if (!ok && stderrBuf.trim()) {
+          state.summary.lastSummary = `退出码 ${code}: ${stderrBuf.trim().split("\n").pop()?.slice(0, 140)}`;
+        }
+      }
+      if (activeThreadId) {
+        this.linkCodexThreadToWorkspaceProject(
+          activeThreadId,
+          opts.workspace,
+          state.summary.title,
+          forkedFromLockedDesktop
+        );
+      }
+      state.summary.updatedAtMs = Date.now();
+      this.persistTasks();
+      this.emitStreamEvent({
+        backend: "codex",
+        sessionId: state.summary.sessionId,
+        previousSessionId: lastPreviousSessionId,
+        status: state.summary.status === "completed" ? "completed" : "failed",
+        finalSummary: state.summary.lastSummary,
+        updatedAtMs: state.summary.updatedAtMs,
+      });
+    });
+
+    // Kick off JSON-RPC handshake identifying as `vscode` so Codex Desktop (`Codex.app`) displays the thread in its sidebar!
+    sendRpc({
+      id: 1,
+      method: "initialize",
+      params: {
+        clientInfo: { name: "vscode", title: "Codex Desktop", version: "1.0.0" },
+        capabilities: { experimentalApi: true },
+      },
+    });
+
+    this.persistTasks();
+    return { ...state.summary };
+  }
+
+  /**
+   * Ensures a mobile-created or mobile-forked Codex thread has `source = 'vscode'`, `thread_source = 'user'`,
+   * `originator = 'Codex Desktop'`, clean `name` (with `（手机接续）` on forked threads), and matching
+   * `project_id` + `.codex-global-state.json` `thread-project-assignments` so it groups cleanly inside `Codex.app`.
+   */
+  private linkCodexThreadToWorkspaceProject(
+    threadId: string,
+    workspacePath: string,
+    titleHint: string,
+    forceNameUpdate = false
+  ): void {
+    const codexRoot = path.dirname(this.codexSessionsDir);
+    if (!fs.existsSync(codexRoot)) return;
+    const normWs = workspacePath.trim().replace(/\/+$/, "");
+    const cleanTitle = titleHint.trim().slice(0, 120);
+
+    // 1. Update `~/.codex/state_*.sqlite`
+    try {
+      const stateDbs = fs
+        .readdirSync(codexRoot)
+        .filter((n) => /^state_\d+\.sqlite$/i.test(n))
+        .sort((a, b) => Number(b.match(/\d+/)?.[0] || 0) - Number(a.match(/\d+/)?.[0] || 0));
+      if (stateDbs.length > 0) {
+        const dbPath = path.join(codexRoot, stateDbs[0]);
+        const db = new Database(dbPath);
+        try {
+          db.exec("PRAGMA busy_timeout = 1500;");
+          let projId: string | null = null;
+          try {
+            const row = db
+              .query("SELECT project_id FROM project_roots WHERE rtrim(path, '/') = ? LIMIT 1")
+              .get(normWs) as { project_id?: string } | null;
+            projId = row?.project_id || null;
+          } catch {}
+
+          const colRows = db.query("PRAGMA table_info(threads)").all() as Array<{ name?: string }>;
+          const cols = new Set(colRows.map((c) => String(c.name || "")));
+
+          const setClauses: string[] = [
+            "source = CASE WHEN source = 'exec' OR COALESCE(source, '') = '' THEN 'vscode' ELSE source END",
+          ];
+          const params: any[] = [];
+
+          if (cols.has("project_id")) {
+            setClauses.push("project_id = COALESCE(project_id, ?)");
+            params.push(projId);
+          }
+          if (cols.has("title")) {
+            setClauses.push("title = CASE WHEN COALESCE(title, '') = '' THEN ? ELSE title END");
+            params.push(cleanTitle);
+          }
+          if (cols.has("name") && cleanTitle) {
+            if (forceNameUpdate) {
+              setClauses.push("name = ?");
+              params.push(cleanTitle);
+            } else {
+              setClauses.push("name = CASE WHEN COALESCE(name, '') = '' THEN ? ELSE name END");
+              params.push(cleanTitle);
+            }
+          }
+          if (cols.has("thread_source")) {
+            setClauses.push("thread_source = CASE WHEN COALESCE(thread_source, '') = '' THEN 'user' ELSE thread_source END");
+          }
+          if (cols.has("originator")) {
+            setClauses.push("originator = CASE WHEN COALESCE(originator, '') = '' THEN 'Codex Desktop' ELSE originator END");
+          }
+
+          params.push(threadId);
+          db.query(`UPDATE threads SET ${setClauses.join(", ")} WHERE id = ?`).run(...params);
+        } finally {
+          db.close();
+        }
+      }
+    } catch {
+      // ignore if locked
+    }
+
+    // 2. Register project membership in `~/.codex/.codex-global-state.json` if present (used by Codex.app sidebar)
+    try {
+      const globalStatePath = path.join(codexRoot, ".codex-global-state.json");
+      if (!fs.existsSync(globalStatePath) || !normWs) return;
+      const raw = fs.readFileSync(globalStatePath, "utf8");
+      const stateObj = JSON.parse(raw) as Record<string, any>;
+      const localProjects = stateObj["local-projects"];
+      if (!localProjects || typeof localProjects !== "object") return;
+
+      let matchedLocalProjId: string | null = null;
+      for (const [lpId, lpVal] of Object.entries(localProjects)) {
+        const roots = Array.isArray((lpVal as any)?.rootPaths) ? (lpVal as any).rootPaths : [];
+        if (roots.some((r: unknown) => typeof r === "string" && r.trim().replace(/\/+$/, "") === normWs)) {
+          matchedLocalProjId = lpId;
+          break;
+        }
+      }
+      if (!matchedLocalProjId) return;
+
+      const assignments =
+        stateObj["thread-project-assignments"] && typeof stateObj["thread-project-assignments"] === "object"
+          ? stateObj["thread-project-assignments"]
+          : {};
+      const memberships =
+        stateObj["thread-project-membership-host-ids"] &&
+        typeof stateObj["thread-project-membership-host-ids"] === "object"
+          ? stateObj["thread-project-membership-host-ids"]
+          : {};
+
+      let changed = false;
+      if (!assignments[threadId]) {
+        assignments[threadId] = { projectKind: "local", projectId: matchedLocalProjId };
+        stateObj["thread-project-assignments"] = assignments;
+        changed = true;
+      }
+      if (!memberships[threadId]) {
+        memberships[threadId] = "local";
+        stateObj["thread-project-membership-host-ids"] = memberships;
+        changed = true;
+      }
+      if (changed) {
+        const tmpPath = `${globalStatePath}.oms_${process.pid}_${Date.now()}.tmp`;
+        fs.writeFileSync(tmpPath, JSON.stringify(stateObj), "utf8");
+        fs.renameSync(tmpPath, globalStatePath);
+      }
+    } catch {
+      // ignore global state race
+    }
+  }
+
+  private copyDirRecursiveNewest(srcDir: string, dstDir: string): void {
+    if (!fs.existsSync(srcDir)) return;
+    fs.mkdirSync(dstDir, { recursive: true });
+    for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+      const sPath = path.join(srcDir, entry.name);
+      const dPath = path.join(dstDir, entry.name);
+      if (entry.isDirectory()) {
+        this.copyDirRecursiveNewest(sPath, dPath);
+      } else if (entry.isFile()) {
+        try {
+          const sStat = fs.statSync(sPath);
+          const dExists = fs.existsSync(dPath);
+          if (!dExists || sStat.mtimeMs >= fs.statSync(dPath).mtimeMs || sStat.size !== fs.statSync(dPath).size) {
+            fs.copyFileSync(sPath, dPath);
+          }
+        } catch {
+          // ignore individual file race
+        }
+      }
+    }
+  }
+
+  private snapshotSqliteDatabaseSafely(srcDbPath: string, dstDbPath: string): boolean {
+    if (!fs.existsSync(srcDbPath)) return false;
+    const dstDir = path.dirname(dstDbPath);
+    fs.mkdirSync(dstDir, { recursive: true });
+    const tmpPath = path.join(dstDir, `.${path.basename(dstDbPath)}.oms_${Date.now()}.tmp`);
+    try {
+      const escapedTmp = tmpPath.replace(/'/g, "''");
+      const srcDb = new Database(srcDbPath, { readonly: true });
+      try {
+        srcDb.exec("PRAGMA busy_timeout = 1500;");
+        srcDb.exec(`VACUUM INTO '${escapedTmp}';`);
+      } finally {
+        srcDb.close();
+      }
+      for (const sfx of ["-wal", "-shm"]) {
+        try {
+          if (fs.existsSync(dstDbPath + sfx)) fs.unlinkSync(dstDbPath + sfx);
+        } catch {}
+      }
+      fs.renameSync(tmpPath, dstDbPath);
+      return true;
+    } catch {
+      try {
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      } catch {}
+      try {
+        fs.copyFileSync(srcDbPath, dstDbPath);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+
+  /**
+   * Before running `agy --conversation <id>`, ensures Desktop conversations living in
+   * `~/.gemini/antigravity/{conversations,brain}` are mirrored into `~/.gemini/antigravity-cli/{conversations,brain}`
+   * so `agy` CLI never fails with `trajectory not found`.
+   */
+  public prepareAgySessionForCliResume(conversationId: string): void {
+    const desktopRoot = path.dirname(this.agyBrainDir);
+    const desktopDb = path.join(desktopRoot, "conversations", `${conversationId}.db`);
+    const cliDb = path.join(this.agyCliDir, "conversations", `${conversationId}.db`);
+
+    if (fs.existsSync(desktopDb)) {
+      const needSync =
+        !fs.existsSync(cliDb) ||
+        fs.statSync(desktopDb).mtimeMs >= fs.statSync(cliDb).mtimeMs;
+      if (needSync) {
+        this.snapshotSqliteDatabaseSafely(desktopDb, cliDb);
+      }
+    }
+
+    const desktopBrain = path.join(this.agyBrainDir, conversationId);
+    const cliBrain = path.join(this.agyCliDir, "brain", conversationId);
+    if (fs.existsSync(desktopBrain)) {
+      this.copyDirRecursiveNewest(desktopBrain, cliBrain);
+    }
+  }
+
+  /**
+   * After `agy` finishes (either `startSession` or `continueSession`), discovers any newly minted
+   * conversation UUID in `~/.gemini/antigravity-cli/` and atomically syncs both `<id>.db` and `brain/<id>`
+   * back into `~/.gemini/antigravity/` so Antigravity Desktop (`Antigravity.app`) watches & displays it!
+   */
+  public syncAgyCliSessionToDesktop(
+    knownSessionId: string,
+    startedAtMs: number,
+    workspacePath: string,
+    titleHint: string
+  ): string {
+    let realId = knownSessionId;
+    const cliConvDir = path.join(this.agyCliDir, "conversations");
+
+    if ((!realId || realId.startsWith("pending_")) && fs.existsSync(cliConvDir)) {
+      try {
+        const recent = fs
+          .readdirSync(cliConvDir)
+          .filter((f) => f.endsWith(".db") && !f.startsWith("."))
+          .map((f) => {
+            const full = path.join(cliConvDir, f);
+            return { id: path.basename(f, ".db"), mtimeMs: fs.statSync(full).mtimeMs };
+          })
+          .filter((x) => x.mtimeMs >= startedAtMs - 3000)
+          .sort((a, b) => b.mtimeMs - a.mtimeMs);
+        if (recent.length > 0) {
+          realId = recent[0].id;
+        }
+      } catch {}
+    }
+
+    if (!realId || realId.startsWith("pending_")) return knownSessionId;
+
+    const desktopRoot = path.dirname(this.agyBrainDir);
+    const cliBrain = path.join(this.agyCliDir, "brain", realId);
+    const desktopBrain = path.join(this.agyBrainDir, realId);
+    if (fs.existsSync(cliBrain)) {
+      this.copyDirRecursiveNewest(cliBrain, desktopBrain);
+    }
+
+    const cliDb = path.join(cliConvDir, `${realId}.db`);
+    const desktopConvDir = path.join(desktopRoot, "conversations");
+    const desktopDb = path.join(desktopConvDir, `${realId}.db`);
+
+    if (fs.existsSync(cliDb)) {
+      let lockedByDesktop = false;
+      if (fs.existsSync(desktopDb) && process.env.OMS_TEST_ISOLATION !== "1") {
+        try {
+          const r = spawnSync("lsof", ["-t", desktopDb], { encoding: "utf8", timeout: 1500 });
+          if (r.status === 0 && (r.stdout || "").trim().length > 0) {
+            lockedByDesktop = true;
+          }
+        } catch {}
+      }
+      if (!lockedByDesktop) {
+        this.snapshotSqliteDatabaseSafely(cliDb, desktopDb);
+      }
+    }
+
+    // Also upsert conversation_summaries.db if present & unlocked so offline/desktop metadata is immediate
+    const summaryDbPath = path.join(desktopRoot, "conversation_summaries.db");
+    if (fs.existsSync(summaryDbPath)) {
+      try {
+        const db = new Database(summaryDbPath);
+        try {
+          db.exec("PRAGMA busy_timeout = 1200;");
+          const wsUri = JSON.stringify([pathToFileURL(workspacePath).href]);
+          const nowIso = new Date().toISOString().replace("T", " ").replace("Z", "");
+          db.query(
+            `UPDATE conversation_summaries
+             SET last_modified_time = ?,
+                 workspace_uris = CASE WHEN COALESCE(workspace_uris, '[]') = '[]' THEN ? ELSE workspace_uris END,
+                 title = CASE WHEN COALESCE(title, '') = '' THEN ? ELSE title END
+             WHERE conversation_id = ?`
+          ).run(nowIso, wsUri, titleHint.slice(0, 80), realId);
+        } finally {
+          db.close();
+        }
+      } catch {
+        // Antigravity Desktop's own summaries_store directory watcher reconciles automatically when running
+      }
+    }
+
+    return realId;
+  }
+
   private launchManagedProcess(
     initialSummary: AgentSessionSummary,
     initialSteps: AgentStepItem[],
     spec: SpawnedCliSpec
   ): AgentSessionSummary {
+    const startedAtMs = Date.now();
     let currentKey = `${initialSummary.backend}:${initialSummary.sessionId}`;
     const prev = this.managedTasks.get(currentKey);
     if (prev?.child) {
@@ -477,9 +1341,13 @@ export class AgentSessionHub extends EventEmitter {
     }
     state.child = child;
 
+    let lastPreviousSessionId: string | undefined;
     const rekeySessionId = (realId: string) => {
       const trimmed = realId.trim();
       if (!trimmed || trimmed === state.summary.sessionId) return;
+      const oldId = state.summary.sessionId;
+      lastPreviousSessionId = oldId;
+      this.sessionAliases.set(`${state.summary.backend}:${oldId}`, trimmed);
       this.managedTasks.delete(currentKey);
       state.summary.sessionId = trimmed;
       currentKey = `${state.summary.backend}:${trimmed}`;
@@ -499,6 +1367,7 @@ export class AgentSessionHub extends EventEmitter {
           this.emitStreamEvent({
             backend: state.summary.backend,
             sessionId: state.summary.sessionId,
+            previousSessionId: lastPreviousSessionId,
             status: "running",
             step: parsedStep,
             updatedAtMs: state.summary.updatedAtMs,
@@ -523,6 +1392,7 @@ export class AgentSessionHub extends EventEmitter {
       this.emitStreamEvent({
         backend: state.summary.backend,
         sessionId: state.summary.sessionId,
+        previousSessionId: lastPreviousSessionId,
         status: "failed",
         finalSummary: state.summary.lastSummary,
         updatedAtMs: state.summary.updatedAtMs,
@@ -535,6 +1405,24 @@ export class AgentSessionHub extends EventEmitter {
       if (state.summary.status === "running") {
         state.summary.status = ok ? "completed" : "failed";
       }
+      if (state.summary.backend === "agy" && !this.hasCustomCliSpawner) {
+        const syncedId = this.syncAgyCliSessionToDesktop(
+          state.summary.sessionId,
+          startedAtMs,
+          state.summary.workspacePath,
+          state.summary.title
+        );
+        if (syncedId && syncedId !== state.summary.sessionId) {
+          rekeySessionId(syncedId);
+        }
+      } else if (state.summary.backend === "codex" && !this.hasCustomCliSpawner && !state.summary.sessionId.startsWith("pending_")) {
+        this.linkCodexThreadToWorkspaceProject(
+          state.summary.sessionId,
+          state.summary.workspacePath,
+          state.summary.title
+        );
+      }
+
       if (!ok && stderrBuf.trim()) {
         state.summary.lastSummary = `退出码 ${code}: ${stderrBuf.trim().split("\n").pop()?.slice(0, 140)}`;
       } else if (ok && state.steps.length > 0) {
@@ -548,6 +1436,7 @@ export class AgentSessionHub extends EventEmitter {
       this.emitStreamEvent({
         backend: state.summary.backend,
         sessionId: state.summary.sessionId,
+        previousSessionId: lastPreviousSessionId,
         status: state.summary.status === "completed" ? "completed" : "failed",
         finalSummary: state.summary.lastSummary,
         updatedAtMs: state.summary.updatedAtMs,
@@ -675,7 +1564,8 @@ export class AgentSessionHub extends EventEmitter {
   private readJsonlBoundedLines(
     filePath: string,
     headBytes: number,
-    tailBytes: number
+    tailBytes: number,
+    preserveMiddleDialogue = false
   ): string[] {
     const st = fs.statSync(filePath);
     if (st.size <= 0) return [];
@@ -722,9 +1612,44 @@ export class AgentSessionHub extends EventEmitter {
       }
 
       const tailOffset = Math.max(consumedHeadEnd, st.size - tailBytes);
+      const middleDialogueLines: string[] = [];
+
+      // When loading full conversation history (`includeSteps = true`), scan the skipped middle gap
+      // in bounded 512KB chunks (up to 32MB) keeping ONLY user/assistant message lines so memory stays tiny!
+      if (preserveMiddleDialogue && tailOffset > consumedHeadEnd && tailOffset - consumedHeadEnd <= 32 * 1024 * 1024) {
+        const chunkBuf = Buffer.allocUnsafe(512 * 1024);
+        let carry = "";
+        let offset = consumedHeadEnd;
+        let droppedFirstFragment = false;
+        while (offset < tailOffset) {
+          const toRead = Math.min(chunkBuf.length, tailOffset - offset);
+          const n = fs.readSync(fd, chunkBuf, 0, toRead, offset);
+          if (n <= 0) break;
+          offset += n;
+          const text = carry + chunkBuf.subarray(0, n).toString("utf8");
+          const parts = text.split(/\r?\n/);
+          carry = parts.pop() || "";
+          for (const line of parts) {
+            if (!droppedFirstFragment) {
+              droppedFirstFragment = true;
+              if (!line.startsWith("{")) continue;
+            }
+            if (
+              line.includes('"USER_INPUT"') ||
+              line.includes('"user_message"') ||
+              line.includes('"agent_message"') ||
+              (line.includes('"PLANNER_RESPONSE"') && line.includes('"content":"') && !line.includes('"content":""')) ||
+              (line.includes('"type":"message"') && (line.includes('"role":"user"') || line.includes('"role":"assistant"')))
+            ) {
+              middleDialogueLines.push(line);
+            }
+          }
+        }
+      }
+
       const actualTailLen = Math.max(0, st.size - tailOffset);
       if (actualTailLen === 0) {
-        return headLines.filter(Boolean);
+        return [...headLines, ...middleDialogueLines].filter(Boolean);
       }
 
       const tailBuf = Buffer.allocUnsafe(actualTailLen);
@@ -737,6 +1662,9 @@ export class AgentSessionHub extends EventEmitter {
 
       const combined: string[] = [];
       for (const l of headLines) {
+        if (l) combined.push(l);
+      }
+      for (const l of middleDialogueLines) {
         if (l) combined.push(l);
       }
       for (const l of tailLines) {
@@ -1145,14 +2073,17 @@ export class AgentSessionHub extends EventEmitter {
     try {
       const lines = this.readJsonlBoundedLines(
         filePath,
-        includeSteps ? 512 * 1024 : 384 * 1024,
-        includeSteps ? 1536 * 1024 : 384 * 1024
+        includeSteps ? 1536 * 1024 : 384 * 1024,
+        includeSteps ? 4096 * 1024 : 384 * 1024,
+        includeSteps
       );
       const fileMatch = path.basename(filePath).match(/([0-9a-f]{8}-[0-9a-f-]{27})/i);
       let sessionId = fileMatch ? fileMatch[1] : path.basename(filePath, ".jsonl");
       let workspacePath = this.defaultWorkspacePath;
       let title = "";
       let lastSummary = "";
+      let lastPushedUser = "";
+      let lastPushedAssistant = "";
       const steps: AgentStepItem[] = [];
 
       for (const line of lines) {
@@ -1175,14 +2106,28 @@ export class AgentSessionHub extends EventEmitter {
             if (msg && (!title || title.startsWith("# AGENTS") || title.startsWith("<"))) {
               title = msg.slice(0, 64);
             }
-            if (includeSteps && msg) {
-              steps.push({ stepIndex: steps.length + 1, kind: "user", title: "用户指令", detail: msg.slice(0, 600), timestampMs: ts });
+            if (includeSteps && msg && msg !== lastPushedUser) {
+              lastPushedUser = msg;
+              steps.push({
+                stepIndex: steps.length + 1,
+                kind: "user",
+                title: "用户指令",
+                detail: msg.slice(0, 1200),
+                timestampMs: ts,
+              });
             }
           } else if (pt === "agent_message" && obj.payload.message) {
             const msg = String(obj.payload.message).trim();
             lastSummary = msg.replace(/\s+/g, " ").slice(0, 140);
-            if (includeSteps) {
-              steps.push({ stepIndex: steps.length + 1, kind: "assistant", title: "Codex", detail: msg.slice(0, 1200), timestampMs: ts });
+            if (includeSteps && msg && msg !== lastPushedAssistant) {
+              lastPushedAssistant = msg;
+              steps.push({
+                stepIndex: steps.length + 1,
+                kind: "assistant",
+                title: "Codex",
+                detail: msg.slice(0, 2400),
+                timestampMs: ts,
+              });
             }
           } else if (pt === "agent_reasoning" && obj.payload.text && includeSteps) {
             steps.push({
@@ -1203,18 +2148,45 @@ export class AgentSessionHub extends EventEmitter {
               detail: String(p.arguments || "").slice(0, 300),
               timestampMs: ts,
             });
-          } else if (p.type === "message" && p.role === "user" && Array.isArray(p.content) && !title) {
+          } else if (p.type === "message" && p.role === "user" && Array.isArray(p.content)) {
+            const userTexts: string[] = [];
             for (const c of p.content) {
               if (typeof c?.text !== "string") continue;
               const cleaned = this.cleanBoilerplatePrompt(c.text);
-              if (cleaned) {
-                title = cleaned.slice(0, 64);
-                break;
+              if (cleaned) userTexts.push(cleaned);
+            }
+            const combinedUser = userTexts.join("\n").trim();
+            if (combinedUser) {
+              if (!title) title = combinedUser.slice(0, 64);
+              if (includeSteps && combinedUser !== lastPushedUser) {
+                lastPushedUser = combinedUser;
+                steps.push({
+                  stepIndex: steps.length + 1,
+                  kind: "user",
+                  title: "用户指令",
+                  detail: combinedUser.slice(0, 1200),
+                  timestampMs: ts,
+                });
               }
             }
           } else if (p.type === "message" && p.role === "assistant" && Array.isArray(p.content)) {
-            const textPart = p.content.find((c: any) => typeof c?.text === "string");
-            if (textPart?.text) lastSummary = String(textPart.text).replace(/\s+/g, " ").trim().slice(0, 140);
+            const assistantTexts = p.content
+              .filter((c: any) => typeof c?.text === "string" && c.text.trim().length > 0)
+              .map((c: any) => String(c.text).trim());
+            const combinedAssistant = assistantTexts.join("\n\n").trim();
+            if (combinedAssistant) {
+              lastSummary = combinedAssistant.replace(/\s+/g, " ").slice(0, 140);
+              if (includeSteps && combinedAssistant !== lastPushedAssistant) {
+                lastPushedAssistant = combinedAssistant;
+                steps.push({
+                  stepIndex: steps.length + 1,
+                  kind: "assistant",
+                  title: "Codex",
+                  detail: combinedAssistant.slice(0, 2400),
+                  timestampMs: ts,
+                });
+              }
+            }
           }
         }
       }
@@ -1240,41 +2212,61 @@ export class AgentSessionHub extends EventEmitter {
         updatedAtMs: Math.floor(mtimeMs),
         canContinue: true,
       };
-      return { session: summary, steps: steps.slice(-80) };
+      return { session: summary, steps: includeSteps ? this.compactTrajectorySteps(steps) : [] };
     } catch {
       return null;
     }
   }
 
+  private getAgyBrainSearchDirs(): string[] {
+    const dirs = [this.agyBrainDir];
+    const cliBrain = path.join(this.agyCliDir, "brain");
+    const isDefaultHome =
+      process.env.OMS_TEST_ISOLATION !== "1" &&
+      path.resolve(this.agyBrainDir) ===
+        path.resolve(path.join(os.homedir(), ".gemini", "antigravity", "brain"));
+    if ((isDefaultHome || !this.hasCustomCliSpawner) && path.resolve(cliBrain) !== path.resolve(this.agyBrainDir)) {
+      if (fs.existsSync(cliBrain)) dirs.push(cliBrain);
+    }
+    return dirs;
+  }
+
   private scanAgySessions(maxCount: number): AgentSessionSummary[] {
     const agyMetaMap = this.loadAgySummaryMetadata();
-    if (!fs.existsSync(this.agyBrainDir) && agyMetaMap.size === 0) return [];
-    let entries: fs.Dirent[] = [];
-    try {
-      if (fs.existsSync(this.agyBrainDir)) {
-        entries = fs.readdirSync(this.agyBrainDir, { withFileTypes: true });
-      }
-    } catch {
-      entries = [];
-    }
-    const candidates: Array<{ convId: string; transcriptPath: string; mtimeMs: number; size: number }> = [];
-    for (const e of entries) {
-      if (!e.isDirectory() || e.name.startsWith(".")) continue;
-      const meta = agyMetaMap.get(e.name);
-      if (meta && (meta.killed || meta.nestingDepth > 0)) {
+    const brainDirs = this.getAgyBrainSearchDirs();
+    if (brainDirs.every((d) => !fs.existsSync(d)) && agyMetaMap.size === 0) return [];
+
+    const bestByConvId = new Map<string, { convId: string; transcriptPath: string; mtimeMs: number; size: number }>();
+    for (const bDir of brainDirs) {
+      if (!fs.existsSync(bDir)) continue;
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(bDir, { withFileTypes: true });
+      } catch {
         continue;
       }
-      const tp = path.join(this.agyBrainDir, e.name, ".system_generated", "logs", "transcript.jsonl");
-      if (fs.existsSync(tp)) {
-        try {
-          const st = fs.statSync(tp);
-          candidates.push({ convId: e.name, transcriptPath: tp, mtimeMs: st.mtimeMs, size: st.size });
-        } catch {
-          // ignore
+      for (const e of entries) {
+        if (!e.isDirectory() || e.name.startsWith(".")) continue;
+        const meta = agyMetaMap.get(e.name);
+        if (meta && (meta.killed || meta.nestingDepth > 0)) {
+          continue;
+        }
+        const tp = path.join(bDir, e.name, ".system_generated", "logs", "transcript.jsonl");
+        if (fs.existsSync(tp)) {
+          try {
+            const st = fs.statSync(tp);
+            const prev = bestByConvId.get(e.name);
+            if (!prev || st.mtimeMs >= prev.mtimeMs) {
+              bestByConvId.set(e.name, { convId: e.name, transcriptPath: tp, mtimeMs: st.mtimeMs, size: st.size });
+            }
+          } catch {
+            // ignore
+          }
         }
       }
     }
-    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    const candidates = Array.from(bestByConvId.values()).sort((a, b) => b.mtimeMs - a.mtimeMs);
     const out: AgentSessionSummary[] = [];
     for (const c of candidates.slice(0, maxCount)) {
       const cached = this.fileSummaryCache.get(c.transcriptPath);
@@ -1334,11 +2326,23 @@ export class AgentSessionHub extends EventEmitter {
   }
 
   private readAgySessionDetail(conversationId: string): AgentSessionDetailResult | null {
-    const tp = path.join(this.agyBrainDir, conversationId, ".system_generated", "logs", "transcript.jsonl");
-    if (!fs.existsSync(tp)) return null;
+    let bestTp = "";
+    let bestMtimeMs = -1;
+    for (const bDir of this.getAgyBrainSearchDirs()) {
+      const candidate = path.join(bDir, conversationId, ".system_generated", "logs", "transcript.jsonl");
+      if (fs.existsSync(candidate)) {
+        try {
+          const st = fs.statSync(candidate);
+          if (st.mtimeMs >= bestMtimeMs) {
+            bestMtimeMs = st.mtimeMs;
+            bestTp = candidate;
+          }
+        } catch {}
+      }
+    }
+    if (!bestTp) return null;
     try {
-      const mtimeMs = fs.statSync(tp).mtimeMs;
-      const detail = this.parseAgyTranscript(conversationId, tp, mtimeMs, true);
+      const detail = this.parseAgyTranscript(conversationId, bestTp, bestMtimeMs, true);
       if (!detail) return null;
       const agyMetaMap = this.loadAgySummaryMetadata();
       detail.session = this.enrichAgySessionWithMeta(detail.session, agyMetaMap.get(conversationId));
@@ -1357,8 +2361,9 @@ export class AgentSessionHub extends EventEmitter {
     try {
       const lines = this.readJsonlBoundedLines(
         transcriptPath,
-        includeSteps ? 512 * 1024 : 384 * 1024,
-        includeSteps ? 1536 * 1024 : 384 * 1024
+        includeSteps ? 1536 * 1024 : 384 * 1024,
+        includeSteps ? 4096 * 1024 : 384 * 1024,
+        includeSteps
       );
       let title = "";
       let lastSummary = "";
@@ -1397,7 +2402,7 @@ export class AgentSessionHub extends EventEmitter {
                 stepIndex: steps.length + 1,
                 kind: "user",
                 title: "用户请求",
-                detail: cleanUser.slice(0, 600),
+                detail: cleanUser.slice(0, 1200),
                 timestampMs: ts,
               });
             }
@@ -1434,7 +2439,7 @@ export class AgentSessionHub extends EventEmitter {
                 stepIndex: steps.length + 1,
                 kind: "assistant",
                 title: "Antigravity 回复",
-                detail: content.trim().slice(0, 1200),
+                detail: content.trim().slice(0, 2400),
                 timestampMs: ts,
               });
             }
@@ -1462,7 +2467,7 @@ export class AgentSessionHub extends EventEmitter {
           updatedAtMs: Math.floor(mtimeMs),
           canContinue: true,
         },
-        steps: steps.slice(-80),
+        steps: includeSteps ? this.compactTrajectorySteps(steps) : [],
       };
     } catch {
       return null;
@@ -1935,11 +2940,21 @@ export class AgentSessionHub extends EventEmitter {
       if (!Array.isArray(parsed?.tasks)) return;
       for (const item of parsed.tasks) {
         if (!item?.summary?.sessionId || !item?.summary?.backend) continue;
+        // Skip legacy failed resume attempts caused by pre-v3.2 CLI path/writer errors so clean desktop sessions aren't masked
+        const oldLast = String(item.summary.lastSummary || "");
+        if (
+          item.summary.status === "failed" &&
+          (oldLast.includes("trajectory not found") || oldLast.includes("already has an active writer"))
+        ) {
+          continue;
+        }
         const summary: AgentSessionSummary = {
           ...item.summary,
           status: item.summary.status === "running" ? "idle" : item.summary.status,
         };
-        const steps: AgentStepItem[] = Array.isArray(item.steps) ? item.steps.slice(-60) : [];
+        const steps: AgentStepItem[] = Array.isArray(item.steps)
+          ? this.compactTrajectorySteps(item.steps)
+          : [];
         this.managedTasks.set(`${summary.backend}:${summary.sessionId}`, {
           summary,
           steps,
@@ -1957,7 +2972,7 @@ export class AgentSessionHub extends EventEmitter {
         .slice(-30)
         .map((st) => ({
           summary: st.summary,
-          steps: st.steps.slice(-50),
+          steps: this.compactTrajectorySteps(st.steps),
         }));
       const tmp = `${this.statePath}.tmp`;
       fs.writeFileSync(tmp, JSON.stringify({ tasks }, null, 2), "utf8");

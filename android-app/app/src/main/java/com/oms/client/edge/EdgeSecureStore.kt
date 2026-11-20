@@ -446,7 +446,13 @@ class EdgeSecureStore(context: Context) {
             val map = MiniJson.parseObject(raw)
             for (cat in ModelRoleCategory.values()) {
                 val v = map[cat.name]?.toString()?.trim().orEmpty()
-                if (v.isNotEmpty()) defaults[cat] = v
+                if (v.isNotEmpty()) {
+                    val prov = v.substringBefore(':', "")
+                    val mod = v.substringAfter(':', v)
+                    if (!ModelCatalogRegistry.shouldHideLegacyOrDatedModel(prov, mod)) {
+                        defaults[cat] = v
+                    }
+                }
             }
         }
         return defaults
@@ -484,7 +490,8 @@ class EdgeSecureStore(context: Context) {
                     isLiveDiscovered = m["isLiveDiscovered"] == true
                 )
             }
-            (if (parsed.isNotEmpty()) parsed else ModelCatalogRegistry.BUILTIN_PRESETS) to refreshedAt
+            val cleaned = ModelCatalogRegistry.filterCleanCatalog(parsed)
+            (if (cleaned.isNotEmpty()) cleaned else ModelCatalogRegistry.BUILTIN_PRESETS) to refreshedAt
         }.getOrDefault(ModelCatalogRegistry.BUILTIN_PRESETS to refreshedAt)
     }
 
