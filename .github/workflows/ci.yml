@@ -26,7 +26,7 @@ jobs:
         run: bun run typecheck
 
       - name: Run unit & E2E test suite
-        run: bun test
+        run: bun run test && bun run test:wx
 
   android-test:
     name: Android Unit Tests (Gradle)
