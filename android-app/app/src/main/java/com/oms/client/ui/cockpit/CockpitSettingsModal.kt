@@ -1088,7 +1088,9 @@ private fun DeviceAndPermissionsPane(coordinator: CockpitRuntimeCoordinator) {
         // 4. Verified OTA Version Management Card
         item {
             OmsSurfaceCard(modifier = Modifier.fillMaxWidth()) {
-                val isReadyOta = otaState is OtaUiState.ReadyToInstall || otaState is OtaUiState.InstallerLaunched
+                val isReadyOta = otaState is OtaUiState.ReadyToInstall ||
+                    otaState is OtaUiState.InstallerLaunched ||
+                    otaState is OtaUiState.NeedsInstallPermission
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -1114,7 +1116,9 @@ private fun DeviceAndPermissionsPane(coordinator: CockpitRuntimeCoordinator) {
                 OmsPrimaryButton(
                     label = when {
                         otaState is OtaUiState.Downloading -> "正在下载更新…"
+                        otaState is OtaUiState.NeedsInstallPermission -> "授权并安装已就绪更新"
                         isReadyOta -> "立即安装已就绪更新"
+                        otaState is OtaUiState.UpdateAvailable -> "立即更新至 v${(otaState as OtaUiState.UpdateAvailable).ota.remoteVersionName}"
                         checkingOta -> "正在查询更新…"
                         else -> "检查新版本"
                     },

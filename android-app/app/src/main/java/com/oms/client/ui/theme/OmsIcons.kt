@@ -869,4 +869,49 @@ object OmsIcons {
             }
         }
     }
+
+    val LayoutGrid: ImageVector by lazy {
+        strokeIcon("LayoutGrid") {
+            linePath {
+                moveTo(4.5f, 4.5f); horizontalLineTo(10f); verticalLineTo(10f); horizontalLineTo(4.5f); close()
+                moveTo(14f, 4.5f); horizontalLineTo(19.5f); verticalLineTo(10f); horizontalLineTo(14f); close()
+                moveTo(4.5f, 14f); horizontalLineTo(10f); verticalLineTo(19.5f); horizontalLineTo(4.5f); close()
+                moveTo(14f, 14f); horizontalLineTo(19.5f); verticalLineTo(19.5f); horizontalLineTo(14f); close()
+            }
+        }
+    }
+
+    val Smartphone: ImageVector by lazy {
+        strokeIcon("Smartphone") {
+            linePath {
+                moveTo(7.5f, 3.5f)
+                horizontalLineTo(16.5f)
+                curveTo(17.6f, 3.5f, 18.5f, 4.4f, 18.5f, 5.5f)
+                verticalLineTo(18.5f)
+                curveTo(18.5f, 19.6f, 17.6f, 20.5f, 16.5f, 20.5f)
+                horizontalLineTo(7.5f)
+                curveTo(6.4f, 20.5f, 5.5f, 19.6f, 5.5f, 18.5f)
+                verticalLineTo(5.5f)
+                curveTo(5.5f, 4.4f, 6.4f, 3.5f, 7.5f, 3.5f)
+                close()
+                moveTo(11f, 17.2f); horizontalLineTo(13f)
+            }
+        }
+    }
+
+    val MessageCircle: ImageVector by lazy {
+        strokeIcon("MessageCircle") {
+            linePath {
+                moveTo(20f, 11.5f)
+                curveTo(20f, 15.64f, 16.42f, 19f, 12f, 19f)
+                curveTo(10.6f, 19f, 9.28f, 18.66f, 8.13f, 18.06f)
+                lineTo(4f, 19.5f)
+                lineTo(5.32f, 15.96f)
+                curveTo(4.48f, 14.68f, 4f, 13.15f, 4f, 11.5f)
+                curveTo(4f, 7.36f, 7.58f, 4f, 12f, 4f)
+                curveTo(16.42f, 4f, 20f, 7.36f, 20f, 11.5f)
+                close()
+            }
+        }
+    }
 }

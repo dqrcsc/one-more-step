@@ -1,5 +1,13 @@
 # Changelog · 更新日志
 
+## 3.5.0 - 2026-11-22 · 四栏旗舰工作台架构、IDE 级项目树侧边栏与按项目协同分组、常驻 Web 应用舱与 OTA 横幅容错
+
+- **底部四栏旗舰架构与沉浸式自动收起 (`CockpitShell`)**：升级根壳层为 `工作台 · 尺素 · 协同 · 应用舱` 底部四栏导航 + 极简情境顶栏；进入深层沉浸页面（对话详情流、尺素双文档阅读器、协同会话详情、网页浏览态）或弹出输入法时自动收起底部导航栏，释放全屏视口。
+- **独立「工作台」全能力首页 (`WorkbenchHomeView` & `ChatWorkspaceView`)**：解耦工作台首页与对话消息流，聚合今日秘书简报与活记忆入口、条件式实时动态提醒（待审批敏感操作 / 运行中 Mac Agent，平静时 0px）、未闭环事项与主动建议、可折叠 3×4 全能力平铺矩阵以及最近对话/协同/尺素一键续接条。
+- **IDE 级可折叠项目树侧边栏与协同按项目聚合 (`CockpitNavigationDrawer`、`ChisuAndMissionWorkspaces` & `EdgeSecureStore`)**：新增扁平可折叠 Mac 项目会话树抽屉与协同工作区按项目分组视图（独立持久化项目展开态与分组偏好），直观呈现各仓库运行状态、活跃时间与双脑配额摘要。
+- **常驻「应用舱」一级工作区 (`WebAppHubWorkspace` & `WebAppHubState`)**：将内嵌 Web 应用舱提升为第四个一级底部标签，跨 Tab 切换持久保留活跃 WebView 实例、Cookie 登录态与滚动位置，无感衔接 `✦ 问秘书` 页面伴读与一键存入知识库。
+- **OTA 顶部横幅回退提示补齐 (`CockpitShell` & `CockpitSettingsModal`)**：补齐后台静默预下载偶发失败（`OtaUiState.Error`）及待开启未知来源安装权限（`OtaUiState.NeedsInstallPermission`）时的顶部提示胶囊展示与一键重试/授权入口，防止新版本提示静默消失。
+
 ## 3.4.0 - 2026-11-21 · 双速自动演化活记忆、全机原生超级工具集与内嵌 Web 应用舱（AI 伴读网页）
 
 - **双速持续自动演化记忆 (`CockpitAiServices.distillMemoryEvolution` & `SecretaryCore.evolveMemoryFromDialogue`)**：升级后台记忆蒸馏引擎为「快层近期焦点（Working Memory）+ 慢层长期画像自动提炼（Profile Evolution）+ 隐性待办捕获（Implicit Open Loops）」，每 3 轮非无痕对话静默演进一次；Mac 端 `SecretaryCore` 支持去重增强（`observations++`）、上限清理且**永不自动驱逐用户手动编辑的长期记忆**，透明可控。

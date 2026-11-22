@@ -649,4 +649,41 @@ class EdgeSecureStore(context: Context) {
         }
         prefs.edit().putString("pinned_web_apps_v1", arr.toString()).apply()
     }
+
+    // =========================================================================
+    // v3.5 Layout Preferences (Workbench Matrix, Project Tree Fold, Mission Grouping)
+    // =========================================================================
+
+    fun isWorkbenchMatrixExpanded(): Boolean =
+        prefs.getBoolean("ui_workbench_matrix_expanded_v1", true)
+
+    fun setWorkbenchMatrixExpanded(expanded: Boolean) {
+        prefs.edit().putBoolean("ui_workbench_matrix_expanded_v1", expanded).apply()
+    }
+
+    fun isMissionGroupedByProject(): Boolean =
+        prefs.getBoolean("ui_mission_grouped_by_project_v1", true)
+
+    fun setMissionGroupedByProject(grouped: Boolean) {
+        prefs.edit().putBoolean("ui_mission_grouped_by_project_v1", grouped).apply()
+    }
+
+    fun loadExpandedProjectPaths(scopeKey: String): Set<String>? {
+        val raw = prefs.getString("ui_expanded_projects_${scopeKey}_v1", null) ?: return null
+        return runCatching {
+            val arr = org.json.JSONArray(raw)
+            buildSet {
+                for (i in 0 until arr.length()) {
+                    val v = arr.optString(i, "").trim()
+                    if (v.isNotEmpty()) add(v)
+                }
+            }
+        }.getOrNull()
+    }
+
+    fun saveExpandedProjectPaths(scopeKey: String, paths: Set<String>) {
+        val arr = org.json.JSONArray()
+        paths.forEach { arr.put(it) }
+        prefs.edit().putString("ui_expanded_projects_${scopeKey}_v1", arr.toString()).apply()
+    }
 }

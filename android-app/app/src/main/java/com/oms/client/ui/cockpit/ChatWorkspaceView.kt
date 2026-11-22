@@ -143,12 +143,27 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
+data class ChatLaunchAction(
+    val deepThinking: Boolean? = null,
+    val forceWebSearch: Boolean? = null,
+    val creativeCategory: ModelRoleCategory? = null,
+    val openPlusSheet: Boolean = false,
+    val prefillText: String? = null,
+    val sendImmediately: Boolean = false,
+    val nonce: Long = System.nanoTime()
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatWorkspaceView(
     coordinator: CockpitRuntimeCoordinator,
+    isWorkbenchHome: Boolean = false,
+    showBottomNavBar: Boolean = false,
+    onEnterChatThread: () -> Unit = {},
     prefillDraft: String,
     onConsumePrefillDraft: () -> Unit,
+    launchAction: ChatLaunchAction? = null,
+    onConsumeLaunchAction: () -> Unit = {},
     searchJumpRequest: SearchJumpRequest? = null,
     onConsumeSearchJump: () -> Unit = {},
     onOpenBotanicalCamera: () -> Unit,
@@ -156,7 +171,8 @@ fun ChatWorkspaceView(
     onEscalateToMacAgent: (promptSummary: String) -> Unit,
     onSwitchTab: (CockpitTab) -> Unit = {},
     onOpenVaultDoc: (relPath: String) -> Unit = {},
-    onOpenWebAppHub: (url: String?, title: String?) -> Unit = { _, _ -> }
+    onOpenWebAppHub: (url: String?, title: String?) -> Unit = { _, _ -> },
+    workbenchContent: (@Composable (shortModelTag: String) -> Unit)? = null
 ) {
     val context = LocalContext.current
     val palette = OmsTheme.colors
@@ -195,6 +211,40 @@ fun ChatWorkspaceView(
         if (prefillDraft.isNotBlank()) {
             inputText = prefillDraft
             onConsumePrefillDraft()
+        }
+    }
+
+    LaunchedEffect(launchAction?.nonce) {
+        val act = launchAction ?: return@LaunchedEffect
+        onConsumeLaunchAction()
+        if (act.openPlusSheet) {
+            showPlusSheet = true
+            return@LaunchedEffect
+        }
+        act.deepThinking?.let { deepThinking = it }
+        act.forceWebSearch?.let { forceWebSearch = it }
+        creativeCategory = act.creativeCategory
+        if (!act.prefillText.isNullOrBlank()) {
+            if (act.sendImmediately) {
+                if (isWorkbenchHome && messages.isNotEmpty()) {
+                    coordinator.chatRepo.createNewThread(incognito = false)
+                }
+                onEnterChatThread()
+                coordinator.vibrateTick()
+                coordinator.sendChatTurn(
+                    userText = act.prefillText.trim(),
+                    deepThinking = act.deepThinking ?: deepThinking,
+                    forceWebSearch = act.forceWebSearch ?: forceWebSearch
+                )
+            } else {
+                inputText = act.prefillText
+                if (isWorkbenchHome) onEnterChatThread()
+            }
+        } else if (act.creativeCategory != null || act.deepThinking == true || act.forceWebSearch == true) {
+            if (isWorkbenchHome && messages.isNotEmpty()) {
+                coordinator.chatRepo.createNewThread(incognito = false)
+            }
+            onEnterChatThread()
         }
     }
 
@@ -386,6 +436,12 @@ fun ChatWorkspaceView(
         attachedPreviewBitmap = null
         autoFollowPinned = true
         coordinator.vibrateTick()
+        if (isWorkbenchHome) {
+            if (messages.isNotEmpty()) {
+                coordinator.chatRepo.createNewThread(incognito = false)
+            }
+            onEnterChatThread()
+        }
         if (activeCreative != null) {
             creativeCategory = null
             coordinator.sendCreativeTurn(activeCreative, txt)
@@ -430,8 +486,8 @@ fun ChatWorkspaceView(
 
     Box(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Subtle Incognito Banner
-            AnimatedVisibility(visible = activeThread?.incognito == true) {
+            // Subtle Incognito Banner (only inside active Chat Thread)
+            AnimatedVisibility(visible = !isWorkbenchHome && activeThread?.incognito == true) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -455,41 +511,82 @@ fun ChatWorkspaceView(
                 }
             }
 
-            // Main Conversation Stage
+            // Main Stage: Workbench Home OR Focused Chat Thread
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                if (messages.isEmpty() && !streaming.isStreaming) {
-                    val secretaryBrief by coordinator.secretaryBriefFlow.collectAsState()
-                    val isRefreshingBrief by coordinator.isRefreshingBriefFlow.collectAsState()
-                    EmptyChatWelcomeHero(
-                        shortModelName = shortModelTag,
-                        brief = secretaryBrief,
-                        isRefreshingBrief = isRefreshingBrief,
-                        onRefreshBrief = { coordinator.refreshSecretaryBrief() },
-                        onAddCommitment = { title, due -> coordinator.addCommitment(title, due) },
-                        onToggleCommitment = { id -> coordinator.toggleCommitment(id) },
-                        onSaveProfile = { items -> coordinator.saveSecretaryProfile(items) },
-                        onDismissNudge = { id -> coordinator.dismissSecretaryNudge(id) },
-                        onTriggerNudge = { nudge ->
-                            when (nudge.actionType) {
-                                "open_chisu" -> onSwitchTab(CockpitTab.CHISU)
-                                "open_missions" -> onSwitchTab(CockpitTab.MISSION_HUB)
-                                "open_vault_doc" -> onOpenVaultDoc(nudge.actionPayload)
-                                else -> {
-                                    val p = nudge.actionPayload.ifBlank { nudge.title }
-                                    coordinator.sendChatTurn(p, deepThinking = false, forceWebSearch = false)
-                                }
+                if (isWorkbenchHome && workbenchContent != null) {
+                    workbenchContent(shortModelTag)
+                } else if (messages.isEmpty() && !streaming.isStreaming) {
+                    if (workbenchContent != null) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(horizontal = 28.dp),
+                            verticalArrangement = Arrangement.Center,
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(52.dp)
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(palette.accentSoft)
+                            ) {
+                                Icon(
+                                    imageVector = OmsIcons.Sparkles,
+                                    contentDescription = null,
+                                    tint = palette.accent,
+                                    modifier = Modifier.size(24.dp)
+                                )
                             }
-                        },
-                        onQuickPrompt = { prompt, deep, search ->
-                            deepThinking = deep
-                            forceWebSearch = search
-                            coordinator.sendChatTurn(prompt, deepThinking = deep, forceWebSearch = search)
-                        },
-                        onOpenBotanicalCamera = onOpenBotanicalCamera,
-                        onOpenLiveVoice = { onOpenLiveVoice(false) },
-                        onOpenMacDrop = { showPlusSheet = true },
-                        onOpenWebAppHub = { onOpenWebAppHub(null, null) }
-                    )
+                            Spacer(modifier = Modifier.height(14.dp))
+                            Text(
+                                text = if (activeThread?.incognito == true) "开启无痕对话" else "随身秘书已就绪",
+                                color = palette.textPrimary,
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "$shortModelTag · 支持深度思考、实时联网、手机日程闹钟与多模态生图",
+                                color = palette.textTertiary,
+                                fontSize = 12.5.sp,
+                                lineHeight = 19.sp
+                            )
+                        }
+                    } else {
+                        val secretaryBrief by coordinator.secretaryBriefFlow.collectAsState()
+                        val isRefreshingBrief by coordinator.isRefreshingBriefFlow.collectAsState()
+                        EmptyChatWelcomeHero(
+                            shortModelName = shortModelTag,
+                            brief = secretaryBrief,
+                            isRefreshingBrief = isRefreshingBrief,
+                            onRefreshBrief = { coordinator.refreshSecretaryBrief() },
+                            onAddCommitment = { title, due -> coordinator.addCommitment(title, due) },
+                            onToggleCommitment = { id -> coordinator.toggleCommitment(id) },
+                            onSaveProfile = { items -> coordinator.saveSecretaryProfile(items) },
+                            onDismissNudge = { id -> coordinator.dismissSecretaryNudge(id) },
+                            onTriggerNudge = { nudge ->
+                                when (nudge.actionType) {
+                                    "open_chisu" -> onSwitchTab(CockpitTab.CHISU)
+                                    "open_missions" -> onSwitchTab(CockpitTab.MISSION_HUB)
+                                    "open_vault_doc" -> onOpenVaultDoc(nudge.actionPayload)
+                                    else -> {
+                                        val p = nudge.actionPayload.ifBlank { nudge.title }
+                                        coordinator.sendChatTurn(p, deepThinking = false, forceWebSearch = false)
+                                    }
+                                }
+                            },
+                            onQuickPrompt = { prompt, deep, search ->
+                                deepThinking = deep
+                                forceWebSearch = search
+                                coordinator.sendChatTurn(prompt, deepThinking = deep, forceWebSearch = search)
+                            },
+                            onOpenBotanicalCamera = onOpenBotanicalCamera,
+                            onOpenLiveVoice = { onOpenLiveVoice(false) },
+                            onOpenMacDrop = { showPlusSheet = true },
+                            onOpenWebAppHub = { onOpenWebAppHub(null, null) }
+                        )
+                    }
                 } else {
                     val lastAssistantId = remember(messages) {
                         messages.lastOrNull { it.role == "assistant" }?.messageId
@@ -543,7 +640,7 @@ fun ChatWorkspaceView(
 
                 // Floating Circular Jump-to-Bottom Button (ChatGPT / Gemini style)
                 androidx.compose.animation.AnimatedVisibility(
-                    visible = !isAtBottom && (messages.isNotEmpty() || streaming.isStreaming),
+                    visible = !isWorkbenchHome && !isAtBottom && (messages.isNotEmpty() || streaming.isStreaming),
                     enter = scaleIn(spring(stiffness = 550f)) + fadeIn(tween(140)),
                     exit = scaleOut(tween(120)) + fadeOut(tween(120)),
                     modifier = Modifier
@@ -582,9 +679,14 @@ fun ChatWorkspaceView(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .navigationBarsPadding()
+                    .then(if (!showBottomNavBar) Modifier.navigationBarsPadding() else Modifier)
                     .imePadding()
-                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                    .padding(
+                        start = 12.dp,
+                        end = 12.dp,
+                        top = 6.dp,
+                        bottom = if (showBottomNavBar) 8.dp else 8.dp
+                    )
                     .shadow(
                         elevation = if (palette.isDark) 3.dp else 7.dp,
                         shape = pillShape,

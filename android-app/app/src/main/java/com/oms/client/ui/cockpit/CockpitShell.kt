@@ -31,6 +31,8 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -55,9 +57,11 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -71,8 +75,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -122,7 +128,8 @@ import java.util.Calendar
 enum class CockpitTab {
     CHAT,
     CHISU,
-    MISSION_HUB
+    MISSION_HUB,
+    WEB_APPS
 }
 
 data class SearchJumpRequest(
@@ -133,13 +140,17 @@ data class SearchJumpRequest(
 )
 
 /**
- * v3.0 Root Flagship Shell (`对话 · 尺素 · 协同`), Form A Minimalist TopBar,
- * ChatGPT-Grade Gesture History Drawer, Ambient Status Pill, and Global Commute Mini-Player.
+ * v3.5 Root Flagship Shell:
+ * - Minimalist Contextual Top Bar + Bottom 4-Tab Bar (`工作台 · 尺素 · 协同 · 应用舱`)
+ * - Auto-hiding Bottom Bar on deep immersive screens (Chat Thread, Chisu Reader, Agent Detail, Active WebView)
+ * - IDE-Grade Unified Navigation Drawer (Flat Collapsible Mac Project Tree + Chat History)
+ * - Decoupled Full-Capability Workbench Home (`工作台`) + 120Hz Floating Pill Composer
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OmsCockpitRootScreen() {
     val context = LocalContext.current
+    val density = LocalDensity.current
     val palette = OmsTheme.colors
     val app = OmsApplication.instance ?: return
     val coordinator = app.cockpitCoordinator
@@ -152,7 +163,15 @@ fun OmsCockpitRootScreen() {
     val standbyLease by app.wechatStandby.leaseStateFlow.collectAsState()
     val threads by coordinator.chatRepo.threadsFlow.collectAsState()
     val activeThreadId by coordinator.chatRepo.activeThreadIdFlow.collectAsState()
+    val activeMessages by coordinator.chatRepo.activeMessagesFlow.collectAsState()
+    val agentProjects by coordinator.agentProjectsFlow.collectAsState()
     val agentSessions by coordinator.agentSessionsFlow.collectAsState()
+    val agentQuotas by coordinator.agentQuotasFlow.collectAsState()
+    val selectedAgentSession by coordinator.selectedAgentSessionFlow.collectAsState()
+    val activeChisuDetail by coordinator.activeChisuDetailFlow.collectAsState()
+    val chisuArticles by coordinator.chisuArticlesFlow.collectAsState()
+    val secretaryBrief by coordinator.secretaryBriefFlow.collectAsState()
+    val isRefreshingBrief by coordinator.isRefreshingBriefFlow.collectAsState()
     val otaState by app.transportClient.otaStateFlow.collectAsState()
     val isSpeakingTts by NotificationExecutor.isSpeakingFlow.collectAsState()
     val speakingTtsText by NotificationExecutor.speakingTextFlow.collectAsState()
@@ -162,6 +181,12 @@ fun OmsCockpitRootScreen() {
     val isLoadingVaultDoc by coordinator.isLoadingVaultDocFlow.collectAsState()
 
     var currentTab by remember { mutableStateOf(CockpitTab.CHAT) }
+    var isChatThreadOpen by remember { mutableStateOf(false) }
+    val webAppHubState = remember { WebAppHubState() }
+    DisposableEffect(Unit) {
+        onDispose { webAppHubState.destroyWebView() }
+    }
+
     var showBotanicalCamera by remember { mutableStateOf(false) }
     var showLiveVoiceModal by remember { mutableStateOf(false) }
     var liveModalInitialGlass by remember { mutableStateOf(false) }
@@ -169,14 +194,18 @@ fun OmsCockpitRootScreen() {
     var initialSettingsTab by remember { mutableStateOf(SettingsStudioTab.APPEARANCE) }
     var showQuickThemeSheet by remember { mutableStateOf(false) }
     var showSpecimenGallery by remember { mutableStateOf(false) }
-    var showWebAppHub by remember { mutableStateOf(false) }
-    var webAppInitialUrl by remember { mutableStateOf<String?>(null) }
-    var webAppInitialTitle by remember { mutableStateOf<String?>(null) }
 
     var searchQuery by remember { mutableStateOf("") }
+    var drawerFocusSearchNonce by remember { mutableLongStateOf(0L) }
     var pendingSearchJump by remember { mutableStateOf<SearchJumpRequest?>(null) }
     var chatPrefillDraft by remember { mutableStateOf("") }
+    var chatLaunchAction by remember { mutableStateOf<ChatLaunchAction?>(null) }
     var agentPrefillDraft by remember { mutableStateOf("") }
+    var missionDispatchProjectPath by remember { mutableStateOf("") }
+    var missionDispatchNonce by remember { mutableLongStateOf(0L) }
+    var missionSubViewTarget by remember { mutableStateOf<String?>(null) }
+    var missionSubViewNonce by remember { mutableLongStateOf(0L) }
+    var webAppAddDialogNonce by remember { mutableLongStateOf(0L) }
     var renamingThread by remember { mutableStateOf<ChatThreadModel?>(null) }
     var renameInput by remember { mutableStateOf("") }
 
@@ -190,20 +219,20 @@ fun OmsCockpitRootScreen() {
         }
     }
 
-    // Predictive Back Gesture handling for Drawer and Secondary Tabs
-    BackHandler(enabled = drawerState.isOpen) {
-        scope.launch { drawerState.close() }
+    val activeThread = remember(threads, activeThreadId) {
+        threads.firstOrNull { it.threadId == activeThreadId }
     }
-    BackHandler(enabled = !drawerState.isOpen && currentTab != CockpitTab.CHAT) {
-        currentTab = CockpitTab.CHAT
+    val mergedChisuPreview = remember(chisuArticles, streamItems) {
+        ChisuDocumentParser.mergeChisuLibrary(chisuArticles, streamItems)
     }
 
     val pendingApprovalsCount = remember(streamItems) {
         streamItems.count { it.itemType == "APPROVAL" && it.syncStatus == "PENDING_APPROVAL" }
     }
-    val runningAgentsCount = remember(agentSessions) {
-        agentSessions.count { it.status == "running" }
+    val runningAgents = remember(agentSessions) {
+        agentSessions.filter { it.status == "running" }
     }
+    val runningAgentsCount = runningAgents.size
 
     val connectionDotColor = when {
         activeTier != "DISCONNECTED" -> palette.success
@@ -212,437 +241,146 @@ fun OmsCockpitRootScreen() {
         else -> palette.warning
     }
 
+    // Immersive state detection: hide bottom bar on deep views or when IME keyboard is open
+    val isDeepChisuReader = currentTab == CockpitTab.CHISU && activeChisuDetail != null
+    val isDeepAgentDetail = currentTab == CockpitTab.MISSION_HUB && selectedAgentSession != null
+    val isDeepWebBrowser = currentTab == CockpitTab.WEB_APPS && webAppHubState.isBrowsing
+    val isTopLevelHome = when (currentTab) {
+        CockpitTab.CHAT -> !isChatThreadOpen
+        CockpitTab.CHISU -> activeChisuDetail == null
+        CockpitTab.MISSION_HUB -> selectedAgentSession == null
+        CockpitTab.WEB_APPS -> !webAppHubState.isBrowsing
+    }
+    val isImeVisible = WindowInsets.ime.getBottom(density) > 0
+    val showBottomBar = isTopLevelHome && !isImeVisible
+    val hideShellTopBar = isDeepChisuReader || isDeepAgentDetail || isDeepWebBrowser
+
+    // Predictive Back Gesture Hierarchy: Drawer -> Chat Thread -> Secondary Tab -> System Exit
+    BackHandler(enabled = drawerState.isOpen) {
+        scope.launch { drawerState.close() }
+    }
+    BackHandler(enabled = !drawerState.isOpen && currentTab == CockpitTab.CHAT && isChatThreadOpen) {
+        isChatThreadOpen = false
+    }
+    BackHandler(enabled = !drawerState.isOpen && currentTab != CockpitTab.CHAT) {
+        currentTab = CockpitTab.CHAT
+        isChatThreadOpen = false
+    }
+
+    fun openChatWithPrefill(text: String) {
+        chatPrefillDraft = text
+        currentTab = CockpitTab.CHAT
+        isChatThreadOpen = true
+    }
+
+    fun openWebAppUrl(url: String?, title: String?) {
+        if (!url.isNullOrBlank()) {
+            webAppHubState.openUrl(url, title.orEmpty())
+        }
+        currentTab = CockpitTab.WEB_APPS
+    }
+
     Box(modifier = Modifier.fillMaxSize().background(palette.canvas)) {
         ModalNavigationDrawer(
             drawerState = drawerState,
             drawerContent = {
-                ModalDrawerSheet(
-                    drawerContainerColor = palette.drawer,
-                    drawerContentColor = palette.textPrimary,
-                    modifier = Modifier.width(308.dp)
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxHeight()
-                            .statusBarsPadding()
-                            .navigationBarsPadding()
-                            .padding(horizontal = 14.dp, vertical = 12.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        // 1. Top Search Pill + 1-Tap Incognito Button
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(40.dp)
-                                    .clip(RoundedCornerShape(20.dp))
-                                    .background(palette.subtleSurface)
-                                    .border(0.6.dp, palette.hairline, RoundedCornerShape(20.dp))
-                                    .padding(horizontal = 12.dp)
-                            ) {
-                                Icon(
-                                    imageVector = OmsIcons.Search,
-                                    contentDescription = null,
-                                    tint = palette.textTertiary,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Box(modifier = Modifier.weight(1f)) {
-                                    if (searchQuery.isEmpty()) {
-                                        Text("搜索对话、尺素与个人知识库…", color = palette.textTertiary, fontSize = 13.5.sp)
-                                    }
-                                    BasicTextField(
-                                        value = searchQuery,
-                                        onValueChange = { searchQuery = it },
-                                        singleLine = true,
-                                        textStyle = TextStyle(color = palette.textPrimary, fontSize = 13.5.sp),
-                                        cursorBrush = SolidColor(palette.accent),
-                                        modifier = Modifier.fillMaxWidth()
-                                    )
-                                }
-                                if (searchQuery.isNotEmpty()) {
-                                    OmsCircleIconButton(
-                                        icon = OmsIcons.Close,
-                                        contentDescription = "清空",
-                                        size = 24.dp,
-                                        iconSize = 13.dp,
-                                        contentColor = palette.textTertiary,
-                                        onClick = { searchQuery = "" }
-                                    )
-                                }
-                            }
-
-                            OmsCircleIconButton(
-                                icon = OmsIcons.Incognito,
-                                contentDescription = "开启无痕对话",
-                                size = 40.dp,
-                                iconSize = 19.dp,
-                                containerColor = palette.subtleSurface,
-                                borderColor = palette.hairline,
-                                onClick = {
-                                    coordinator.chatRepo.createNewThread(incognito = true, initialTitle = "无痕对话")
-                                    currentTab = CockpitTab.CHAT
-                                    scope.launch { drawerState.close() }
-                                }
-                            )
-                        }
-
-                        // 2. Quick Curated Library (应用舱 + 博物图鉴 + 日夜模式)
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(7.dp)
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(38.dp)
-                                    .omsBounceClick(scaleDown = 0.96f, shape = RoundedCornerShape(12.dp)) {
-                                        scope.launch { drawerState.close() }
-                                        webAppInitialUrl = null
-                                        webAppInitialTitle = null
-                                        showWebAppHub = true
-                                    }
-                                    .background(palette.accentSoft, RoundedCornerShape(12.dp))
-                                    .border(0.6.dp, palette.accent.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
-                                    .padding(horizontal = 10.dp)
-                            ) {
-                                Icon(OmsIcons.Globe, contentDescription = null, tint = palette.accent, modifier = Modifier.size(15.5.dp))
-                                Text("应用舱", color = palette.textPrimary, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                            }
-
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(38.dp)
-                                    .omsBounceClick(scaleDown = 0.96f, shape = RoundedCornerShape(12.dp)) {
-                                        scope.launch { drawerState.close() }
-                                        showSpecimenGallery = true
-                                    }
-                                    .background(palette.cardSurface, RoundedCornerShape(12.dp))
-                                    .border(0.6.dp, palette.hairline, RoundedCornerShape(12.dp))
-                                    .padding(horizontal = 10.dp)
-                            ) {
-                                Icon(OmsIcons.Leaf, contentDescription = null, tint = palette.accent, modifier = Modifier.size(15.5.dp))
-                                Text("图鉴册", color = palette.textPrimary, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, maxLines = 1)
-                            }
-
-                            // 1-Tap Appearance Mode Cycle (`跟随 / 素昼 / 玄夜`)
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(5.dp),
-                                modifier = Modifier
-                                    .height(38.dp)
-                                    .omsBounceClick(scaleDown = 0.95f, shape = RoundedCornerShape(12.dp)) {
-                                        coordinator.vibrateTick()
-                                        OmsThemeController.cycleAppearanceMode(context)
-                                    }
-                                    .background(palette.cardSurface, RoundedCornerShape(12.dp))
-                                    .border(0.6.dp, palette.hairline, RoundedCornerShape(12.dp))
-                                    .padding(horizontal = 10.dp)
-                            ) {
-                                Icon(
-                                    imageVector = if (palette.isDark) OmsIcons.Moon else OmsIcons.Sun,
-                                    contentDescription = "切换日夜模式",
-                                    tint = palette.accent,
-                                    modifier = Modifier.size(15.dp)
-                                )
-                                Text(themeSettings.mode.label, color = palette.textSecondary, fontSize = 11.5.sp, fontWeight = FontWeight.Medium)
-                            }
-                        }
-
-                        // 5-Palette Quick Swatch Strip right inside Drawer!
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(palette.subtleSurface)
-                                .padding(horizontal = 10.dp, vertical = 7.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("主题", color = palette.textTertiary, fontSize = 11.5.sp, fontWeight = FontWeight.Medium)
-                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                                OmsThemeStyle.entries.forEach { st ->
-                                    val isSel = themeSettings.style == st
-                                    Box(
-                                        contentAlignment = Alignment.Center,
-                                        modifier = Modifier
-                                            .size(22.dp)
-                                            .omsBounceClick(scaleDown = 0.85f, shape = CircleShape) {
-                                                coordinator.vibrateTick()
-                                                OmsThemeController.setThemeStyle(context, st)
-                                            }
-                                            .border(
-                                                width = if (isSel) 1.8.dp else 0.7.dp,
-                                                color = if (isSel) palette.accent else palette.strongBorder,
-                                                shape = CircleShape
-                                            )
-                                            .padding(2.5.dp)
-                                            .clip(CircleShape)
-                                            .background(if (palette.isDark) st.swatchDark else st.swatchLight)
-                                    ) {
-                                        Box(
-                                            modifier = Modifier
-                                                .size(7.dp)
-                                                .clip(CircleShape)
-                                                .background(st.swatchAccent)
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        // 3. Omni-Search Results (Local Chat + Mac Full-Vault FTS5 & Chisu) OR Grouped Conversation History
-                        LaunchedEffect(searchQuery, activeTier) {
-                            val q = searchQuery.trim()
-                            if (q.length < 2) {
-                                coordinator.searchOmniContext("")
-                            } else {
-                                delay(260L)
-                                coordinator.searchOmniContext(q)
-                            }
-                        }
-
-                        if (searchQuery.isNotBlank()) {
-                            val hits = remember(searchQuery, threads) {
-                                coordinator.chatRepo.searchGlobalMessages(searchQuery, limit = 15)
-                            }
-                            Row(
-                                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "对话 ${hits.size} 条 · 知识库/尺素 ${omniSearchHits.size} 条",
-                                    color = palette.textTertiary,
-                                    fontSize = 11.5.sp
-                                )
-                                if (isOmniSearching) {
-                                    Text("检索中…", color = palette.accent, fontSize = 11.sp)
-                                }
-                            }
-                            LazyColumn(
-                                modifier = Modifier.weight(1f),
-                                verticalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                if (omniSearchHits.isNotEmpty()) {
-                                    item(key = "sec_omni_remote") {
-                                        Text(
-                                            text = "个人知识库、书库与尺素",
-                                            color = palette.textTertiary,
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            modifier = Modifier.padding(start = 4.dp, top = 2.dp, bottom = 2.dp)
-                                        )
-                                    }
-                                    items(
-                                        items = omniSearchHits,
-                                        key = { "omni_${it.source}_${it.pathOrRef}" }
-                                    ) { hit ->
-                                        OmsSurfaceCard(
-                                            cornerRadius = 13.dp,
-                                            contentPadding = PaddingValues(11.dp),
-                                            onClick = {
-                                                if (hit.source == "chisu" && (hit.articleId != null || hit.turnId != null)) {
-                                                    coordinator.openChisuArticle(
-                                                        ChisuArticleItemUi(
-                                                            stableKey = hit.turnId?.let { "turn_$it" } ?: "wx_${hit.articleId ?: 0}",
-                                                            articleId = hit.articleId,
-                                                            turnId = hit.turnId,
-                                                            entryKind = if (hit.turnId != null) "turn" else "article",
-                                                            title = hit.title,
-                                                            createdAtMs = System.currentTimeMillis()
-                                                        )
-                                                    )
-                                                    currentTab = CockpitTab.CHISU
-                                                    scope.launch { drawerState.close() }
-                                                } else if (hit.source == "vault" && hit.pathOrRef.isNotBlank()) {
-                                                    coordinator.openVaultDoc(hit.pathOrRef)
-                                                    scope.launch { drawerState.close() }
-                                                }
-                                            },
-                                            modifier = Modifier.fillMaxWidth()
-                                        ) {
-                                            Row(
-                                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                Text(
-                                                    text = hit.category.ifBlank { if (hit.source == "chisu") "尺素" else "知识库" },
-                                                    color = palette.accent,
-                                                    fontSize = 10.5.sp,
-                                                    fontWeight = FontWeight.SemiBold,
-                                                    modifier = Modifier
-                                                        .clip(RoundedCornerShape(5.dp))
-                                                        .background(palette.accentSoft)
-                                                        .padding(horizontal = 5.dp, vertical = 1.dp)
-                                                )
-                                                Text(
-                                                    text = hit.title,
-                                                    color = palette.textPrimary,
-                                                    fontSize = 12.5.sp,
-                                                    fontWeight = FontWeight.SemiBold,
-                                                    maxLines = 1,
-                                                    overflow = TextOverflow.Ellipsis,
-                                                    modifier = Modifier.weight(1f)
-                                                )
-                                            }
-                                            if (hit.snippet.isNotBlank()) {
-                                                Spacer(modifier = Modifier.height(3.dp))
-                                                Text(
-                                                    text = hit.snippet,
-                                                    color = palette.textSecondary,
-                                                    fontSize = 11.5.sp,
-                                                    maxLines = 2,
-                                                    overflow = TextOverflow.Ellipsis
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                                if (hits.isNotEmpty()) {
-                                    item(key = "sec_local_chat_hits") {
-                                        Text(
-                                            text = "手机历史对话",
-                                            color = palette.textTertiary,
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            modifier = Modifier.padding(start = 4.dp, top = 6.dp, bottom = 2.dp)
-                                        )
-                                    }
-                                    items(items = hits, key = { it.messageId }) { hit ->
-                                        OmsSurfaceCard(
-                                            cornerRadius = 13.dp,
-                                            contentPadding = PaddingValues(11.dp),
-                                            onClick = {
-                                                val kw = searchQuery.trim()
-                                                coordinator.chatRepo.selectThread(hit.threadId)
-                                                pendingSearchJump = SearchJumpRequest(
-                                                    threadId = hit.threadId,
-                                                    messageId = hit.messageId,
-                                                    keyword = kw
-                                                )
-                                                currentTab = CockpitTab.CHAT
-                                                scope.launch { drawerState.close() }
-                                            },
-                                            modifier = Modifier.fillMaxWidth()
-                                        ) {
-                                            Text(hit.threadTitle, color = palette.accent, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold)
-                                            Spacer(modifier = Modifier.height(2.dp))
-                                            Text(hit.snippet, color = palette.textSecondary, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            val groupedThreads = remember(threads) { groupThreadsByRecency(threads) }
-                            LazyColumn(
-                                modifier = Modifier.weight(1f),
-                                verticalArrangement = Arrangement.spacedBy(2.dp)
-                            ) {
-                                groupedThreads.forEach { (sectionTitle, sectionItems) ->
-                                    item(key = "sec_$sectionTitle") {
-                                        Text(
-                                            text = sectionTitle,
-                                            color = palette.textTertiary,
-                                            fontSize = 11.5.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            modifier = Modifier.padding(start = 8.dp, top = 10.dp, bottom = 4.dp)
-                                        )
-                                    }
-                                    items(items = sectionItems, key = { it.threadId }) { thr ->
-                                        DrawerThreadItemRow(
-                                            thread = thr,
-                                            selected = thr.threadId == activeThreadId,
-                                            onSelect = {
-                                                coordinator.chatRepo.selectThread(thr.threadId)
-                                                currentTab = CockpitTab.CHAT
-                                                scope.launch { drawerState.close() }
-                                            },
-                                            onTogglePin = { coordinator.chatRepo.togglePinThread(thr.threadId) },
-                                            onRename = {
-                                                renamingThread = thr
-                                                renameInput = thr.title
-                                            },
-                                            onDelete = { coordinator.chatRepo.deleteThread(thr.threadId) }
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
-
-                        // 4. Minimalist Drawer Footer (Status + Settings Studio Button)
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 2.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(9.dp),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .omsBounceClick(scaleDown = 0.97f, shape = RoundedCornerShape(12.dp)) {
-                                        scope.launch { drawerState.close() }
-                                        initialSettingsTab = SettingsStudioTab.SYSTEM_PAIRING
-                                        showSettingsModal = true
-                                    }
-                                    .padding(vertical = 4.dp, horizontal = 4.dp)
-                            ) {
-                                Box(
-                                    contentAlignment = Alignment.Center,
-                                    modifier = Modifier
-                                        .size(32.dp)
-                                        .clip(CircleShape)
-                                        .background(palette.accentSoft)
-                                ) {
-                                    Icon(OmsIcons.Sparkles, contentDescription = null, tint = palette.accent, modifier = Modifier.size(16.dp))
-                                }
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text("青简 · 咫尺", color = palette.textPrimary, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold)
-                                    val sub = when {
-                                        activeTier == "LAN_WS" -> "Mac 局域网直连在线"
-                                        activeTier == "WAN_WEBRTC" -> "Mac 跨网远程在线"
-                                        activeTier == "BT_RFCOMM" -> "Mac 蓝牙近场在线"
-                                        standbyLease == StandbyLeaseState.ACTIVE_POLLING -> "手机接管尺素轮询中"
-                                        else -> "随身独立云端模式"
-                                    }
-                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                                        Box(modifier = Modifier.size(5.5.dp).background(connectionDotColor, CircleShape))
-                                        Text(sub, color = palette.textTertiary, fontSize = 11.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    }
-                                }
-                            }
-
-                            OmsCircleIconButton(
-                                icon = OmsIcons.Sliders,
-                                contentDescription = "打开偏好设置",
-                                size = 38.dp,
-                                iconSize = 18.5.dp,
-                                containerColor = palette.subtleSurface,
-                                borderColor = palette.hairline,
-                                onClick = {
-                                    scope.launch { drawerState.close() }
-                                    initialSettingsTab = SettingsStudioTab.APPEARANCE
-                                    showSettingsModal = true
-                                }
-                            )
-                        }
+                CockpitUnifiedDrawerSheet(
+                    coordinator = coordinator,
+                    currentTab = currentTab,
+                    isChatThreadOpen = isChatThreadOpen,
+                    activeTier = activeTier,
+                    standbyLease = standbyLease,
+                    connectionDotColor = connectionDotColor,
+                    themeSettings = themeSettings,
+                    threads = threads,
+                    activeThreadId = activeThreadId,
+                    agentProjects = agentProjects,
+                    agentSessions = agentSessions,
+                    agentQuotas = agentQuotas,
+                    omniSearchHits = omniSearchHits,
+                    isOmniSearching = isOmniSearching,
+                    searchQuery = searchQuery,
+                    onSearchQueryChange = { searchQuery = it },
+                    focusSearchNonce = drawerFocusSearchNonce,
+                    onOpenWorkbench = {
+                        currentTab = CockpitTab.CHAT
+                        isChatThreadOpen = false
+                        scope.launch { drawerState.close() }
+                    },
+                    onSelectTab = { target ->
+                        currentTab = target
+                        scope.launch { drawerState.close() }
+                    },
+                    onOpenSpecimenGallery = {
+                        scope.launch { drawerState.close() }
+                        showSpecimenGallery = true
+                    },
+                    onOpenDropzone = {
+                        missionSubViewTarget = "DROPZONE"
+                        missionSubViewNonce = System.nanoTime()
+                        currentTab = CockpitTab.MISSION_HUB
+                        scope.launch { drawerState.close() }
+                    },
+                    onStartIncognitoChat = {
+                        coordinator.chatRepo.createNewThread(incognito = true, initialTitle = "无痕对话")
+                        currentTab = CockpitTab.CHAT
+                        isChatThreadOpen = true
+                        scope.launch { drawerState.close() }
+                    },
+                    onStartNewChat = {
+                        coordinator.chatRepo.createNewThread(incognito = false)
+                        currentTab = CockpitTab.CHAT
+                        isChatThreadOpen = true
+                        scope.launch { drawerState.close() }
+                    },
+                    onSelectThread = { thr ->
+                        coordinator.chatRepo.selectThread(thr.threadId)
+                        currentTab = CockpitTab.CHAT
+                        isChatThreadOpen = true
+                        scope.launch { drawerState.close() }
+                    },
+                    onRenameThread = { thr ->
+                        renamingThread = thr
+                        renameInput = thr.title
+                    },
+                    onSelectSearchChatHit = { threadId, messageId, keyword ->
+                        coordinator.chatRepo.selectThread(threadId)
+                        pendingSearchJump = SearchJumpRequest(
+                            threadId = threadId,
+                            messageId = messageId,
+                            keyword = keyword
+                        )
+                        currentTab = CockpitTab.CHAT
+                        isChatThreadOpen = true
+                        scope.launch { drawerState.close() }
+                    },
+                    onSelectChisuHit = { article ->
+                        coordinator.openChisuArticle(article)
+                        currentTab = CockpitTab.CHISU
+                        scope.launch { drawerState.close() }
+                    },
+                    onSelectVaultDocHit = { relPath ->
+                        coordinator.openVaultDoc(relPath)
+                        scope.launch { drawerState.close() }
+                    },
+                    onSelectAgentSession = { sess ->
+                        coordinator.selectAndLoadAgentSession(sess)
+                        currentTab = CockpitTab.MISSION_HUB
+                        scope.launch { drawerState.close() }
+                    },
+                    onDispatchForProject = { projectPath ->
+                        coordinator.closeSelectedAgentSession()
+                        missionDispatchProjectPath = projectPath
+                        missionDispatchNonce = System.nanoTime()
+                        currentTab = CockpitTab.MISSION_HUB
+                        scope.launch { drawerState.close() }
+                    },
+                    onOpenSettings = { tab ->
+                        scope.launch { drawerState.close() }
+                        initialSettingsTab = tab
+                        showSettingsModal = true
                     }
-                }
+                )
             }
         ) {
             Column(
@@ -651,81 +389,216 @@ fun OmsCockpitRootScreen() {
                     .background(palette.canvas)
             ) {
                 // =================================================================
-                // Top 52dp Minimalist App Bar (Form A: Menu | 对话·尺素·协同 | Dot + NewChat)
+                // Top Contextual Header Bar (Collapses cleanly on deep screens!)
                 // =================================================================
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(palette.topBar)
-                        .statusBarsPadding()
-                        .padding(horizontal = 12.dp, vertical = 7.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    // Left: Vector Menu Button
-                    OmsCircleIconButton(
-                        icon = OmsIcons.Menu,
-                        contentDescription = "打开历史与记忆抽屉",
-                        size = 38.dp,
-                        iconSize = 20.dp,
-                        onClick = { scope.launch { drawerState.open() } }
+                if (hideShellTopBar) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(palette.topBar)
+                            .statusBarsPadding()
                     )
-
-                    // Center: Silky Sliding 3-Domain Switcher (Zero Emoji!)
-                    val hubDot = when {
+                } else {
+                    val drawerBadgeColor = when {
                         pendingApprovalsCount > 0 -> palette.warning
                         runningAgentsCount > 0 -> palette.success
                         else -> null
                     }
-                    OmsSlidingSegmentedBar(
-                        items = listOf(
-                            OmsSegmentItem(CockpitTab.CHAT, "对话"),
-                            OmsSegmentItem(CockpitTab.CHISU, "尺素"),
-                            OmsSegmentItem(CockpitTab.MISSION_HUB, "协同", dotColor = hubDot)
-                        ),
-                        selected = currentTab,
-                        onSelect = { chosen ->
-                            coordinator.vibrateTick()
-                            currentTab = chosen
-                        },
-                        height = 35.dp,
-                        modifier = Modifier.width(204.dp)
-                    )
-
-                    // Right: Subtle Ambient Status Orb + 1-Tap New Chat Button
                     Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(2.dp)
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(palette.topBar)
+                            .statusBarsPadding()
+                            .padding(horizontal = 12.dp, vertical = 7.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        OmsCircleIconButton(
-                            icon = OmsIcons.Palette,
-                            contentDescription = "主题与连接速览",
-                            size = 36.dp,
-                            iconSize = 18.dp,
-                            contentColor = palette.textSecondary,
-                            badgeColor = connectionDotColor,
-                            onClick = { showQuickThemeSheet = true }
-                        )
+                        if (currentTab == CockpitTab.CHAT && isChatThreadOpen) {
+                            // Chat Thread Immersive Top Bar: [←] [Thread Title] [☰] [✎]
+                            OmsCircleIconButton(
+                                icon = OmsIcons.ArrowLeft,
+                                contentDescription = "返回工作台",
+                                size = 38.dp,
+                                iconSize = 19.dp,
+                                onClick = { isChatThreadOpen = false }
+                            )
 
-                        OmsCircleIconButton(
-                            icon = OmsIcons.NewChat,
-                            contentDescription = "开启新对话",
-                            size = 38.dp,
-                            iconSize = 19.dp,
-                            contentColor = palette.textPrimary,
-                            onClick = {
-                                coordinator.vibrateTick()
-                                coordinator.chatRepo.createNewThread(incognito = false)
-                                currentTab = CockpitTab.CHAT
+                            val threadTitle = remember(activeThread?.title) {
+                                activeThread?.title?.removePrefix("🕵️ ")?.trim()?.ifBlank { "新对话" } ?: "新对话"
                             }
-                        )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(horizontal = 8.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable {
+                                        activeThread?.let {
+                                            renamingThread = it
+                                            renameInput = it.title
+                                        }
+                                    }
+                                    .padding(horizontal = 6.dp, vertical = 5.dp)
+                            ) {
+                                if (activeThread?.incognito == true) {
+                                    Icon(OmsIcons.Incognito, null, tint = palette.textTertiary, modifier = Modifier.size(15.dp))
+                                }
+                                Text(
+                                    text = threadTitle,
+                                    color = palette.textPrimary,
+                                    fontSize = 15.5.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                OmsCircleIconButton(
+                                    icon = OmsIcons.Menu,
+                                    contentDescription = "打开项目与历史侧边栏",
+                                    size = 36.dp,
+                                    iconSize = 18.5.dp,
+                                    badgeColor = drawerBadgeColor,
+                                    onClick = { scope.launch { drawerState.open() } }
+                                )
+                                OmsCircleIconButton(
+                                    icon = OmsIcons.NewChat,
+                                    contentDescription = "开启新对话",
+                                    size = 38.dp,
+                                    iconSize = 19.dp,
+                                    contentColor = palette.textPrimary,
+                                    onClick = {
+                                        coordinator.vibrateTick()
+                                        coordinator.chatRepo.createNewThread(incognito = false)
+                                        isChatThreadOpen = true
+                                    }
+                                )
+                            }
+                        } else {
+                            // Top-Level Domain Header: [☰] [Contextual Title + Status] [Actions]
+                            OmsCircleIconButton(
+                                icon = OmsIcons.Menu,
+                                contentDescription = "打开项目与历史侧边栏",
+                                size = 38.dp,
+                                iconSize = 20.dp,
+                                badgeColor = drawerBadgeColor,
+                                onClick = { scope.launch { drawerState.open() } }
+                            )
+
+                            val (domainTitle, domainSub) = when (currentTab) {
+                                CockpitTab.CHAT -> "青简 · 工作台" to when {
+                                    activeTier == "LAN_WS" -> "Mac 局域网直连"
+                                    activeTier == "WAN_WEBRTC" -> "Mac 远程在线"
+                                    activeTier == "BT_RFCOMM" -> "Mac 蓝牙在线"
+                                    standbyLease == StandbyLeaseState.ACTIVE_POLLING -> "手机值守中"
+                                    else -> "随身云端模式"
+                                }
+                                CockpitTab.CHISU -> "尺素 · 伴读" to "${mergedChisuPreview.size} 篇已收录"
+                                CockpitTab.MISSION_HUB -> "双脑 · 协同" to if (runningAgentsCount > 0) {
+                                    "$runningAgentsCount 个任务运行中"
+                                } else {
+                                    "${agentProjects.size} 个项目 · ${agentSessions.size} 会话"
+                                }
+                                CockpitTab.WEB_APPS -> "青简 · 应用舱" to "内嵌网页与 AI 伴读"
+                            }
+
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(6.5.dp)
+                                            .clip(CircleShape)
+                                            .background(connectionDotColor)
+                                    )
+                                    Text(
+                                        text = domainTitle,
+                                        color = palette.textPrimary,
+                                        fontSize = 15.5.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1
+                                    )
+                                }
+                                Text(
+                                    text = domainSub,
+                                    color = palette.textTertiary,
+                                    fontSize = 11.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                if (currentTab == CockpitTab.CHAT) {
+                                    OmsCircleIconButton(
+                                        icon = OmsIcons.Search,
+                                        contentDescription = "全局检索对话与知识库",
+                                        size = 36.dp,
+                                        iconSize = 17.5.dp,
+                                        contentColor = palette.textSecondary,
+                                        onClick = {
+                                            drawerFocusSearchNonce = System.nanoTime()
+                                            scope.launch { drawerState.open() }
+                                        }
+                                    )
+                                }
+                                OmsCircleIconButton(
+                                    icon = OmsIcons.Palette,
+                                    contentDescription = "主题与连接速览",
+                                    size = 36.dp,
+                                    iconSize = 18.dp,
+                                    contentColor = palette.textSecondary,
+                                    badgeColor = connectionDotColor,
+                                    onClick = { showQuickThemeSheet = true }
+                                )
+                                if (currentTab == CockpitTab.WEB_APPS) {
+                                    OmsCircleIconButton(
+                                        icon = OmsIcons.Plus,
+                                        contentDescription = "添加网页应用",
+                                        size = 38.dp,
+                                        iconSize = 19.dp,
+                                        contentColor = palette.textPrimary,
+                                        onClick = { webAppAddDialogNonce = System.nanoTime() }
+                                    )
+                                } else {
+                                    OmsCircleIconButton(
+                                        icon = OmsIcons.NewChat,
+                                        contentDescription = "开启新对话",
+                                        size = 38.dp,
+                                        iconSize = 19.dp,
+                                        contentColor = palette.textPrimary,
+                                        onClick = {
+                                            coordinator.vibrateTick()
+                                            if (activeMessages.isNotEmpty() || activeThread?.incognito == true) {
+                                                coordinator.chatRepo.createNewThread(incognito = false)
+                                            }
+                                            currentTab = CockpitTab.CHAT
+                                            isChatThreadOpen = true
+                                        }
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
 
                 // Zero-Ops Global Ambient Status Pill (0px when healthy!)
                 GlobalAmbientStatusBanner(
                     isGuiEmergencyStopped = isGuiEmergencyStopped,
-                    pendingApprovalsCount = if (currentTab == CockpitTab.MISSION_HUB) 0 else pendingApprovalsCount,
+                    pendingApprovalsCount = if (currentTab == CockpitTab.MISSION_HUB || (currentTab == CockpitTab.CHAT && !isChatThreadOpen)) 0 else pendingApprovalsCount,
                     otaState = otaState,
                     onResumeGui = {
                         OmsAccessibilityService.instance?.resumeFromPhoneUi()
@@ -750,8 +623,13 @@ fun OmsCockpitRootScreen() {
                         when (tab) {
                             CockpitTab.CHAT -> ChatWorkspaceView(
                                 coordinator = coordinator,
+                                isWorkbenchHome = !isChatThreadOpen,
+                                showBottomNavBar = showBottomBar,
+                                onEnterChatThread = { isChatThreadOpen = true },
                                 prefillDraft = chatPrefillDraft,
                                 onConsumePrefillDraft = { chatPrefillDraft = "" },
+                                launchAction = chatLaunchAction,
+                                onConsumeLaunchAction = { chatLaunchAction = null },
                                 searchJumpRequest = pendingSearchJump,
                                 onConsumeSearchJump = { pendingSearchJump = null },
                                 onOpenBotanicalCamera = { showBotanicalCamera = true },
@@ -765,10 +643,82 @@ fun OmsCockpitRootScreen() {
                                 },
                                 onSwitchTab = { targetTab -> currentTab = targetTab },
                                 onOpenVaultDoc = { relPath -> coordinator.openVaultDoc(relPath) },
-                                onOpenWebAppHub = { url, title ->
-                                    webAppInitialUrl = url
-                                    webAppInitialTitle = title
-                                    showWebAppHub = true
+                                onOpenWebAppHub = { url, title -> openWebAppUrl(url, title) },
+                                workbenchContent = { shortModelTag ->
+                                    val latestNonEmptyThread = remember(threads) {
+                                        threads.firstOrNull { !it.incognito && it.title != "新对话" } ?: threads.firstOrNull()
+                                    }
+                                    WorkbenchHomeView(
+                                        shortModelName = shortModelTag,
+                                        brief = secretaryBrief,
+                                        isRefreshingBrief = isRefreshingBrief,
+                                        pendingApprovalsCount = pendingApprovalsCount,
+                                        runningAgents = runningAgents,
+                                        recentThread = latestNonEmptyThread,
+                                        latestAgentSession = agentSessions.firstOrNull(),
+                                        recentChisuArticles = mergedChisuPreview,
+                                        onRefreshBrief = { coordinator.refreshSecretaryBrief() },
+                                        onAddCommitment = { title, due -> coordinator.addCommitment(title, due) },
+                                        onToggleCommitment = { id -> coordinator.toggleCommitment(id) },
+                                        onSaveProfile = { items -> coordinator.saveSecretaryProfile(items) },
+                                        onDismissNudge = { id -> coordinator.dismissSecretaryNudge(id) },
+                                        onTriggerNudge = { nudge ->
+                                            when (nudge.actionType) {
+                                                "open_chisu" -> currentTab = CockpitTab.CHISU
+                                                "open_missions" -> currentTab = CockpitTab.MISSION_HUB
+                                                "open_vault_doc" -> coordinator.openVaultDoc(nudge.actionPayload)
+                                                else -> {
+                                                    val p = nudge.actionPayload.ifBlank { nudge.title }
+                                                    chatLaunchAction = ChatLaunchAction(prefillText = p, sendImmediately = true)
+                                                }
+                                            }
+                                        },
+                                        onOpenLiveVoice = { glass ->
+                                            liveModalInitialGlass = glass
+                                            showLiveVoiceModal = true
+                                        },
+                                        onOpenBotanicalCamera = { showBotanicalCamera = true },
+                                        onOpenSpecimenGallery = { showSpecimenGallery = true },
+                                        onLaunchDeepThinking = {
+                                            chatLaunchAction = ChatLaunchAction(deepThinking = true)
+                                        },
+                                        onLaunchCreativeMode = { cat ->
+                                            chatLaunchAction = ChatLaunchAction(
+                                                deepThinking = false,
+                                                forceWebSearch = false,
+                                                creativeCategory = cat
+                                            )
+                                        },
+                                        onPrefillPhoneCommand = { prompt, sendNow ->
+                                            chatLaunchAction = ChatLaunchAction(
+                                                prefillText = prompt,
+                                                sendImmediately = sendNow
+                                            )
+                                        },
+                                        onOpenMacDrop = {
+                                            chatLaunchAction = ChatLaunchAction(openPlusSheet = true)
+                                        },
+                                        onOpenOmniSearch = {
+                                            drawerFocusSearchNonce = System.nanoTime()
+                                            scope.launch { drawerState.open() }
+                                        },
+                                        onOpenMacDispatch = {
+                                            coordinator.closeSelectedAgentSession()
+                                            missionDispatchProjectPath = ""
+                                            missionDispatchNonce = System.nanoTime()
+                                            currentTab = CockpitTab.MISSION_HUB
+                                        },
+                                        onOpenApprovals = { currentTab = CockpitTab.MISSION_HUB },
+                                        onResumeThread = { thr ->
+                                            coordinator.chatRepo.selectThread(thr.threadId)
+                                            isChatThreadOpen = true
+                                        },
+                                        onOpenAgentSession = { sess ->
+                                            coordinator.selectAndLoadAgentSession(sess)
+                                            currentTab = CockpitTab.MISSION_HUB
+                                        },
+                                        onOpenChisuTab = { currentTab = CockpitTab.CHISU }
+                                    )
                                 }
                             )
 
@@ -777,8 +727,9 @@ fun OmsCockpitRootScreen() {
                                 macConnected = activeTier != "DISCONNECTED",
                                 streamItems = streamItems,
                                 onDiscussArticleInChat = { title, cleanBody ->
-                                    chatPrefillDraft = "请结合这篇尺素文章《${title.ifBlank { "文章" }}》帮我进一步深入分析：\n${cleanBody.take(1800)}"
-                                    currentTab = CockpitTab.CHAT
+                                    openChatWithPrefill(
+                                        "请结合这篇尺素文章《${title.ifBlank { "文章" }}》帮我进一步深入分析：\n${cleanBody.take(1800)}"
+                                    )
                                 },
                                 onSendArticleToMacAgent = { title, cleanBody ->
                                     agentPrefillDraft = "请根据尺素文章《${title.ifBlank { "文章" }}》中的核心启发，在对应项目中设计原型或写入知识库深读笔记：\n${cleanBody.take(2200)}"
@@ -791,7 +742,47 @@ fun OmsCockpitRootScreen() {
                                 macConnected = activeTier != "DISCONNECTED",
                                 streamItems = streamItems,
                                 prefillAgentPrompt = agentPrefillDraft,
-                                onConsumePrefillAgentPrompt = { agentPrefillDraft = "" }
+                                onConsumePrefillAgentPrompt = { agentPrefillDraft = "" },
+                                externalDispatchProjectPath = missionDispatchProjectPath,
+                                externalDispatchNonce = missionDispatchNonce,
+                                externalSubViewTarget = missionSubViewTarget,
+                                externalSubViewNonce = missionSubViewNonce
+                            )
+
+                            CockpitTab.WEB_APPS -> WebAppHubWorkspace(
+                                state = webAppHubState,
+                                openAddDialogNonce = webAppAddDialogNonce,
+                                onAskSecretaryWithPage = { pageTitle, pageUrl, body ->
+                                    openChatWithPrefill(
+                                        buildString {
+                                            appendLine("请作为我的随身秘书，帮我提炼这篇网页的核心要点并结合我的知识库给出建议：")
+                                            appendLine("- 标题：$pageTitle")
+                                            appendLine("- 链接：$pageUrl")
+                                            if (body.isNotBlank()) {
+                                                appendLine()
+                                                append(body.take(2600))
+                                            }
+                                        }
+                                    )
+                                },
+                                onSavePageToVault = { pageTitle, pageUrl, body ->
+                                    val md = buildString {
+                                        appendLine("# $pageTitle")
+                                        appendLine()
+                                        appendLine("- **来源链接**：$pageUrl")
+                                        appendLine()
+                                        append(body.ifBlank { pageUrl })
+                                    }
+                                    app.transportClient.submitItemToMacOrQueue(
+                                        intentTag = "pkb_vault",
+                                        itemType = "TEXT",
+                                        title = pageTitle.take(60),
+                                        textContent = md,
+                                        voiceTranscript = null,
+                                        fileUri = null
+                                    )
+                                    OmsFeedbackController.show("已推送网页内容至 Mac 知识库收件箱", OmsToastKind.SUCCESS)
+                                }
                             )
                         }
                     }
@@ -810,6 +801,33 @@ fun OmsCockpitRootScreen() {
                             onStop = { NotificationExecutor.stopSpeaking(context) }
                         )
                     }
+                }
+
+                // =================================================================
+                // Sleek 4-Domain Bottom Navigation Bar (Auto-hides on immersive views!)
+                // =================================================================
+                AnimatedVisibility(
+                    visible = showBottomBar,
+                    enter = expandVertically(tween(180)) + fadeIn(tween(150)),
+                    exit = shrinkVertically(tween(140)) + fadeOut(tween(110))
+                ) {
+                    val missionDotColor = when {
+                        pendingApprovalsCount > 0 -> palette.warning
+                        runningAgentsCount > 0 -> palette.success
+                        else -> null
+                    }
+                    CockpitBottomNavBar(
+                        currentTab = currentTab,
+                        missionDotColor = missionDotColor,
+                        webAppActiveDot = webAppHubState.isBrowsing,
+                        onSelectTab = { chosen ->
+                            coordinator.vibrateTick()
+                            if (chosen == CockpitTab.CHAT) {
+                                isChatThreadOpen = false
+                            }
+                            currentTab = chosen
+                        }
+                    )
                 }
             }
         }
@@ -876,9 +894,10 @@ fun OmsCockpitRootScreen() {
                                 height = 34.dp,
                                 onClick = {
                                     val clean = ChisuDocumentParser.parse(doc.markdown, fallbackTitle = doc.title).bodyMarkdown
-                                    chatPrefillDraft = "请结合我知识库里的《${doc.title}》（${doc.relPath}）帮我深入分析与延展：\n${clean.take(1800)}"
                                     coordinator.closeVaultDoc()
-                                    currentTab = CockpitTab.CHAT
+                                    openChatWithPrefill(
+                                        "请结合我知识库里的《${doc.title}》（${doc.relPath}）帮我深入分析与延展：\n${clean.take(1800)}"
+                                    )
                                 }
                             )
                         }
@@ -930,46 +949,6 @@ fun OmsCockpitRootScreen() {
                 }
             }
         }
-    }
-
-    // In-App Embedded Web App Workspace (应用舱)
-    if (showWebAppHub) {
-        WebAppHubModal(
-            initialUrl = webAppInitialUrl,
-            initialTitle = webAppInitialTitle,
-            onDismiss = { showWebAppHub = false },
-            onAskSecretaryWithPage = { pageTitle, pageUrl, body ->
-                showWebAppHub = false
-                chatPrefillDraft = buildString {
-                    appendLine("请作为我的随身秘书，帮我提炼这篇网页的核心要点并结合我的知识库给出建议：")
-                    appendLine("- 标题：$pageTitle")
-                    appendLine("- 链接：$pageUrl")
-                    if (body.isNotBlank()) {
-                        appendLine()
-                        append(body.take(2600))
-                    }
-                }
-                currentTab = CockpitTab.CHAT
-            },
-            onSavePageToVault = { pageTitle, pageUrl, body ->
-                val md = buildString {
-                    appendLine("# $pageTitle")
-                    appendLine()
-                    appendLine("- **来源链接**：$pageUrl")
-                    appendLine()
-                    append(body.ifBlank { pageUrl })
-                }
-                app.transportClient.submitItemToMacOrQueue(
-                    intentTag = "pkb_vault",
-                    itemType = "TEXT",
-                    title = pageTitle.take(60),
-                    textContent = md,
-                    voiceTranscript = null,
-                    fileUri = null
-                )
-                OmsFeedbackController.show("已推送网页内容至 Mac 知识库收件箱", OmsToastKind.SUCCESS)
-            }
-        )
     }
 
     // Rename Thread Dialog
@@ -1116,8 +1095,7 @@ fun OmsCockpitRootScreen() {
                 onDismiss = { showSpecimenGallery = false },
                 onAskInChat = { card ->
                     showSpecimenGallery = false
-                    chatPrefillDraft = "关于《${card.chineseName}》（${card.latinName}），我还想请教："
-                    currentTab = CockpitTab.CHAT
+                    openChatWithPrefill("关于《${card.chineseName}》（${card.latinName}），我还想请教：")
                 }
             )
         }
@@ -1134,8 +1112,7 @@ fun OmsCockpitRootScreen() {
                 onDismiss = { showBotanicalCamera = false },
                 onAskFollowUpInChat = { card ->
                     showBotanicalCamera = false
-                    chatPrefillDraft = "关于《${card.chineseName}》（${card.latinName}），我还想了解："
-                    currentTab = CockpitTab.CHAT
+                    openChatWithPrefill("关于《${card.chineseName}》（${card.latinName}），我还想了解：")
                 }
             )
         }
@@ -1167,6 +1144,8 @@ fun OmsCockpitRootScreen() {
                                 autoTitleFromFirstUserTurn = false
                             )
                             coordinator.flushPendingSyncToMac()
+                            currentTab = CockpitTab.CHAT
+                            isChatThreadOpen = true
                         }
                     }
                 }
@@ -1190,7 +1169,93 @@ fun OmsCockpitRootScreen() {
 }
 
 @Composable
-private fun DrawerThreadItemRow(
+private fun CockpitBottomNavBar(
+    currentTab: CockpitTab,
+    missionDotColor: Color?,
+    webAppActiveDot: Boolean,
+    onSelectTab: (CockpitTab) -> Unit
+) {
+    val palette = OmsTheme.colors
+    data class NavEntry(
+        val tab: CockpitTab,
+        val label: String,
+        val icon: ImageVector,
+        val badgeDot: Color? = null
+    )
+    val items = listOf(
+        NavEntry(CockpitTab.CHAT, "工作台", OmsIcons.LayoutGrid),
+        NavEntry(CockpitTab.CHISU, "尺素", OmsIcons.BookOpen),
+        NavEntry(CockpitTab.MISSION_HUB, "协同", OmsIcons.Bolt, badgeDot = missionDotColor),
+        NavEntry(CockpitTab.WEB_APPS, "应用舱", OmsIcons.Globe, badgeDot = if (webAppActiveDot) palette.accent else null)
+    )
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(palette.topBar)
+            .navigationBarsPadding()
+    ) {
+        Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 5.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            items.forEach { entry ->
+                val selected = currentTab == entry.tab
+                val tint = if (selected) palette.accent else palette.textTertiary
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(3.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .omsBounceClick(scaleDown = 0.94f, shape = RoundedCornerShape(14.dp)) {
+                            onSelectTab(entry.tab)
+                        }
+                        .padding(vertical = 3.dp)
+                ) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .width(46.dp)
+                            .height(27.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(if (selected) palette.accentSoft else Color.Transparent)
+                    ) {
+                        Icon(
+                            imageVector = entry.icon,
+                            contentDescription = entry.label,
+                            tint = tint,
+                            modifier = Modifier.size(18.5.dp)
+                        )
+                        if (entry.badgeDot != null) {
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(top = 3.dp, end = 8.dp)
+                                    .size(6.5.dp)
+                                    .clip(CircleShape)
+                                    .background(entry.badgeDot)
+                            )
+                        }
+                    }
+                    Text(
+                        text = entry.label,
+                        color = tint,
+                        fontSize = 10.8.sp,
+                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                        maxLines = 1
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun DrawerThreadItemRow(
     thread: ChatThreadModel,
     selected: Boolean,
     onSelect: () -> Unit,
@@ -1298,7 +1363,9 @@ private fun GlobalAmbientStatusBanner(
     val readyOta = when (otaState) {
         is OtaUiState.ReadyToInstall -> otaState.ota
         is OtaUiState.InstallerLaunched -> otaState.ota
+        is OtaUiState.NeedsInstallPermission -> otaState.ota
         is OtaUiState.UpdateAvailable -> otaState.ota
+        is OtaUiState.Error -> otaState.ota
         else -> null
     }
 
@@ -1357,6 +1424,14 @@ private fun GlobalAmbientStatusBanner(
             }
 
             readyOta != null -> {
+                val (bannerTitle, actionLabel) = when (otaState) {
+                    is OtaUiState.ReadyToInstall, is OtaUiState.InstallerLaunched ->
+                        "新版本 v${readyOta.remoteVersionName} 已就绪" to "安装"
+                    is OtaUiState.NeedsInstallPermission ->
+                        "新版本 v${readyOta.remoteVersionName} 待开启安装权限" to "去开启"
+                    else ->
+                        "发现新版本 v${readyOta.remoteVersionName}" to "更新"
+                }
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1370,10 +1445,10 @@ private fun GlobalAmbientStatusBanner(
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.weight(1f)) {
                         Icon(OmsIcons.Bolt, null, tint = palette.success, modifier = Modifier.size(15.dp))
-                        Text("新版本 v${readyOta.remoteVersionName} 已就绪", color = palette.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                        Text(bannerTitle, color = palette.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
                     }
                     OmsPrimaryButton(
-                        label = "安装",
+                        label = actionLabel,
                         height = 29.dp,
                         containerColor = palette.success,
                         contentColor = Color.White,
@@ -1938,7 +2013,7 @@ private fun SpecimenFieldGuideGalleryModal(
     }
 }
 
-private fun groupThreadsByRecency(threads: List<ChatThreadModel>): List<Pair<String, List<ChatThreadModel>>> {
+internal fun groupThreadsByRecency(threads: List<ChatThreadModel>): List<Pair<String, List<ChatThreadModel>>> {
     val pinned = threads.filter { it.pinned }
     val unpinned = threads.filter { !it.pinned }
 
