@@ -455,16 +455,23 @@ export class MobileMemoryMirror {
     const dateStr = new Date(params.createdAtMs || Date.now()).toISOString().slice(0, 10);
     const safeStem = this.sanitizeFileName(params.slugHint || params.title || params.kind);
 
-    if (!params.itemId?.trim()) throw new Error("Promotion itemId is required");
+    const rejectPromotion = (message: string): never => {
+      const err = new Error(message) as Error & { code?: number };
+      err.code = -32602;
+      throw err;
+    };
+
+    if (!params.itemId?.trim()) rejectPromotion("Promotion itemId is required");
     const image = params.jpegBase64?.trim() ? Buffer.from(params.jpegBase64, "base64") : undefined;
-    if (image && image.length > 4 * 1024 * 1024) throw new Error("Promotion image exceeds 4 MiB");
+    if (image && image.length > 4 * 1024 * 1024) rejectPromotion("Promotion image exceeds 4 MiB");
+    // Exclude volatile request timestamp `createdAtMs` so re-promoting the same specimen/card idempotently succeeds.
     const digest = crypto.createHash("sha256").update(JSON.stringify([
       vaultRoot, params.kind, params.title, params.slugHint || "", params.markdownContent || "",
-      params.createdAtMs || 0, params.imageFileName || "", image?.toString("base64") || ""
+      params.imageFileName || "", image?.toString("base64") || ""
     ])).digest("hex");
     const previous = this.db.query("SELECT digest, result_json FROM vault_promotions WHERE item_id = ?")
       .get(params.itemId) as {digest: string; result_json: string} | null;
-    if (previous && previous.digest !== digest) throw new Error("Promotion itemId already used with different content");
+    if (previous && previous.digest !== digest) rejectPromotion("Promotion itemId already used with different content");
     let result: MemoryPromoteVaultResult;
     if (previous) {
       result = JSON.parse(previous.result_json);
@@ -485,7 +492,7 @@ export class MobileMemoryMirror {
     }
     const writeOnce = (target: string, bytes: Buffer) => {
       if (fs.existsSync(target)) {
-        if (!fs.readFileSync(target).equals(bytes)) throw new Error("Promoted file was modified; refusing to overwrite");
+        if (!fs.readFileSync(target).equals(bytes)) rejectPromotion("Promoted file was modified; refusing to overwrite");
         return;
       }
       const tmp = `${target}.${crypto.randomUUID()}.tmp`;

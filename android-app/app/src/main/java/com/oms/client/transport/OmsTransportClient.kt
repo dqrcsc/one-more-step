@@ -910,6 +910,7 @@ class OmsTransportClient(
             return
         }
         lanWebSocket?.let { closeSecureSource(FrameSource("LAN_WS", it, null), "Switched active Mac") }
+        activeBleGatt?.let { closeSecureSource(FrameSource("BT_RFCOMM", null, it), "Switched active Mac") }
         wanWebSocket?.let { closeSecureSource(FrameSource("WAN_WEBRTC", it, null), "Switched active Mac") }
         _activeTierFlow.value = "DISCONNECTED"
         val switched = repo.switchActiveMac(macId)
@@ -1872,7 +1873,7 @@ class OmsTransportClient(
             secureLinks.remove(source)
         }
         if (link != null) synchronized(link.lock) {
-            if (wasCurrent && reason !in setOf("Connection replaced", "Pairing attempt replaced", "Re-pair completed")) {
+            if (wasCurrent && reason !in setOf("Connection replaced", "Pairing attempt replaced", "Re-pair completed", "Switched active Mac")) {
                 val event = when {
                     reason == "Secure protocol validation failed" || reason == "Text frames are not supported" -> ConnectionDiagnostics.Event.SECURITY_REJECTED
                     reason.contains("timed out") || reason == "Secure handshake expired or connection replaced" -> ConnectionDiagnostics.Event.HANDSHAKE_TIMEOUT

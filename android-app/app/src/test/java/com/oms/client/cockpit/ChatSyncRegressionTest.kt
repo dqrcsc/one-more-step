@@ -122,4 +122,34 @@ class ChatSyncRegressionTest {
         assertTrue(repo.listPendingVaultPromotions("macB").isEmpty())
         repo.close()
     }
+
+    @Test fun permanentRejectionEvictsPoisonPillWithoutBlockingSubsequentOrLegacyPromotions() = runBlocking {
+        val repo = repository()
+        // Legacy row without itemId inside payload_json, followed by a poison pill (-32602), followed by a valid promotion
+        repo.enqueuePendingVaultPromotion("legacy-no-id", JSONObject().put("title", "Legacy"), "macA")
+        repo.enqueuePendingVaultPromotion("poison-pill", JSONObject().put("itemId", "poison-pill").put("title", "Conflict"), "macA")
+        repo.enqueuePendingVaultPromotion("healthy-next", JSONObject().put("itemId", "healthy-next").put("title", "Healthy"), "macA")
+
+        val deliveredIds = mutableListOf<String>()
+        val queue = ChatSyncQueue.withOutcome(repo, { "macA" }, { true }) { method, payload, _ ->
+            if (method == "chat.sync.batch") {
+                return@withOutcome SyncSendOutcome.DELIVERED
+            }
+            assertEquals("memory.promote_vault", method)
+            val id = payload.optString("itemId")
+            assertTrue("wire payload must carry itemId", id.isNotBlank())
+            if (id == "poison-pill") {
+                ChatSyncQueue.classifyHostRpcResponse(
+                    JSONObject().put("error", JSONObject().put("code", -32602).put("message", "Promotion itemId already used with different content"))
+                )
+            } else {
+                deliveredIds.add(id)
+                ChatSyncQueue.classifyHostRpcResponse(JSONObject().put("ok", true))
+            }
+        }
+        queue.flush()
+        assertEquals(listOf("legacy-no-id", "healthy-next"), deliveredIds)
+        assertTrue(repo.listPendingVaultPromotions("macA").isEmpty())
+        repo.close()
+    }
 }

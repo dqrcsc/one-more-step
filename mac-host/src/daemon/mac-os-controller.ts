@@ -661,9 +661,9 @@ export class MacOsController {
       }
 
       case "unlock": {
-        // Policy B: LAN_WS / BT_RFCOMM unlocks immediately in 1 tap; WAN_WEBRTC requires phone biometric verification!
+        // Policy B: LAN_WS / BT_RFCOMM / LOCAL_IPC unlocks immediately; WAN_WEBRTC requires phone biometric verification!
         // Fail closed for unknown origins. A client hint cannot downgrade WAN to LAN.
-        const needsConfirmation = !["LAN_WS", "BT_RFCOMM"].includes(effectiveTier);
+        const needsConfirmation = !["LAN_WS", "BT_RFCOMM", "LOCAL_IPC"].includes(effectiveTier);
         const scope = ctx.requestConnectionId || "local-ipc";
         for (const [key, value] of this.unlockChallenges) {
           if (value.expiresAt <= Date.now()) this.unlockChallenges.delete(key);

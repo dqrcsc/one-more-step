@@ -1510,7 +1510,7 @@ export class OmsDaemon {
         } catch (err: any) {
           reply({
             error: {
-              code: -32000,
+              code: typeof err?.code === "number" ? err.code : -32000,
               message: err?.message || "Failed handling phone request",
             },
           });
@@ -3009,7 +3009,11 @@ export class OmsDaemon {
       case "mac.control.execute": {
         return await this.macControl.execute(
           params as unknown as MacControlExecuteParams,
-          this.buildMacControlContext()
+          {
+            ...this.buildMacControlContext(),
+            activeTier: "LOCAL_IPC",
+            requestConnectionId: "local-ipc",
+          }
         );
       }
 

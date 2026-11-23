@@ -1,5 +1,11 @@
 # Changelog · 更新日志
 
+## 3.6.5 - 2026-11-23 · 收藏队列防毒丸阻塞、本机 IPC 解锁恢复与切机蓝牙清理
+
+- **博物图鉴重复入库幂等与离线队列防毒丸阻塞 (`mobile-memory-mirror`、`oms-daemon`、`ChatSyncQueue` & `CockpitRuntimeCoordinator`)**：计算知识库收藏幂等摘要时剔除易变的 `createdAtMs`，复用图鉴卡固定生成时间，并对参数非法/内容冲突透传 `-32602` 错误码；Android 同步队列自动淘汰确定性拒绝条目且不阻塞后续待发记录，同时为旧版无 `payload.itemId` 条目自动补齐 `itemId`。
+- **恢复本机 CLI 解锁通路 (`oms-daemon`、`mac-os-controller` & `cli`)**：受保护的本地 Unix Socket IPC 入口显式标记 `LOCAL_IPC` 放行，修复手机离线或处于跨网连接时 `oms mac-ctl unlock` 被误判为跨网请求的问题，同时继续拦截远端伪造的 `LOCAL_IPC` 提示。
+- **多 Mac 切换同步清理蓝牙连接 (`OmsTransportClient`)**：`switchToPairedMac` 切换目标电脑时同步关闭 `activeBleGatt`（`BT_RFCOMM`），避免残留旧电脑近场连接或误报断连告警。
+
 ## 3.6.4 - 2026-11-23 · 远程控制与同步可靠性修复
 
 本版修复本轮诊断的 11 项问题。自动回归已通过，真机验收尚未完成。

@@ -19,7 +19,7 @@ test("WAN ignores forged hints and consumes only current connection's unexpired 
     const context = { macId: "m", macName: "M", activeTier: "WAN_WEBRTC", requestConnectionId: "wan1",
       stayAwakeEnabled: false, onSetStayAwake: (v: boolean) => v };
     await ctl.execute({ action: "lock" }, context);
-    for (const hint of ["LAN_WS", "BT_RFCOMM", "invalid", ""]) {
+    for (const hint of ["LAN_WS", "BT_RFCOMM", "LOCAL_IPC", "invalid", ""]) {
       expect((await ctl.execute({ action: "unlock", transportTierHint: hint, biometricVerified: true }, context)).requiresBiometric).toBe(true);
     }
     let challenge = (await ctl.execute({ action: "unlock" }, context)).unlockChallenge;
@@ -49,6 +49,20 @@ test("phone request origin overrides the daemon's preferred LAN tier", async () 
       method: "mac.control.execute", params: {action: "unlock", transportTierHint: "LAN_WS"}
     }, resolve, {tier: "WAN_WEBRTC", connectionId: "fixture"}));
     expect(res.result.requiresBiometric).toBe(true);
+
+    // Local Unix-socket IPC (`oms mac-ctl unlock`) remains trusted even when phone is DISCONNECTED or on WAN.
+    (daemon.session as any).getActiveTier = () => "DISCONNECTED";
+    await daemon.handleIpcAction("mac.control.set_unlock_password", { password: "fixture-password" });
+    await daemon.handleIpcAction("mac.control.execute", { action: "lock" });
+    const localUnlock = await daemon.handleIpcAction("mac.control.execute", { action: "unlock" });
+    expect(localUnlock.ok).toBe(true);
+    expect(localUnlock.requiresBiometric).toBeUndefined();
+
+    // Deterministic vault promotion rejection propagates JSON-RPC code -32602 over phoneRequest.
+    const badProm: any = await new Promise(resolve => daemon.session.emit("phoneRequest", {
+      method: "memory.promote_vault", params: { itemId: "", kind: "chat_highlight", title: "T", markdownContent: "M" }
+    }, resolve, { tier: "LAN_WS", connectionId: "fixture" }));
+    expect(badProm.error?.code).toBe(-32602);
   } finally { await daemon.stop(); if (old === undefined) delete process.env.OMS_TEST_ISOLATION; else process.env.OMS_TEST_ISOLATION = old; }
 });
 
@@ -92,6 +106,8 @@ test("vault promotion is durable/idempotent, repairs reserved files and refuses 
   const input = {itemId: "same", kind: "botanical_specimen" as const, title: "Title", markdownContent: "Body", jpegBase64: "aW1hZ2U=", createdAtMs: 1};
   const first = mirror.promoteToVault(input);
   expect(mirror.promoteToVault(input)).toEqual(first);
+  // Re-tapping save on the same specimen card with a newer timestamp stays idempotent.
+  expect(mirror.promoteToVault({...input, createdAtMs: 999_999})).toEqual(first);
   expect(() => mirror.promoteToVault({...input, markdownContent: "changed"})).toThrow("different content");
   mirror.close();
   // Simulate a crash after reservation/image but before the note is committed.

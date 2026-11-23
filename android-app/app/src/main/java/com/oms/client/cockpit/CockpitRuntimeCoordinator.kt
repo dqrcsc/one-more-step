@@ -226,10 +226,18 @@ class CockpitRuntimeCoordinator(
     private val transportClient: OmsTransportClient
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val chatSync = ChatSyncQueue(chatRepo, { currentMacId() },
-        { transportClient.activeTierFlow.value != "DISCONNECTED" }) { method, payload, macId ->
-        transportClient.callHostRpc(method, payload, if (method == "chat.sync.batch") 8000L else 10_000L, macId)
-            ?.optBoolean("ok", false) == true
+    private val chatSync = ChatSyncQueue.withOutcome(
+        chatRepo,
+        { currentMacId() },
+        { transportClient.activeTierFlow.value != "DISCONNECTED" }
+    ) { method, payload, macId ->
+        val resp = transportClient.callHostRpc(
+            method,
+            payload,
+            if (method == "chat.sync.batch") 8000L else 10_000L,
+            macId
+        )
+        ChatSyncQueue.classifyHostRpcResponse(resp)
     }
     private val macScope = MacRequestScope().apply { switchTo(streamRepo.getPairedMac()?.macId.orEmpty()) }
     private var detailJob: Job? = null
@@ -935,6 +943,9 @@ class CockpitRuntimeCoordinator(
     suspend fun promoteSpecimenToVault(card: FieldGuideSpecimenCard, imageLocalPath: String?): Boolean =
         withContext(Dispatchers.IO) {
             val itemId = card.specimenId.ifBlank { "spec_${OmsFrameProtocol.generateUuidV7().takeLast(10)}" }
+            val capturedMs = runCatching {
+                SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US).parse(card.capturedAtIso)?.time
+            }.getOrNull() ?: System.currentTimeMillis()
             val jpegB64 = imageLocalPath?.let { p ->
                 runCatching {
                     val f = File(p)
@@ -950,7 +961,7 @@ class CockpitRuntimeCoordinator(
                 put("slugHint", card.latinName.ifBlank { card.chineseName })
                 put("markdownContent", card.toVaultMarkdown())
                 if (!jpegB64.isNullOrBlank()) put("jpegBase64", jpegB64)
-                put("createdAtMs", System.currentTimeMillis())
+                put("createdAtMs", capturedMs)
             }
             sendOrQueueVaultPromotion(itemId, payload)
         }
@@ -958,13 +969,20 @@ class CockpitRuntimeCoordinator(
     private suspend fun sendOrQueueVaultPromotion(itemId: String, payload: JSONObject): Boolean {
         val targetMac = currentMacId()
         if (transportClient.activeTierFlow.value != "DISCONNECTED") {
-            val ok = runCatching {
+            val outcome = runCatching {
                 val res = transportClient.callHostRpc("memory.promote_vault", payload, 10_000L, targetMac)
-                res?.optBoolean("ok", false) == true
-            }.getOrDefault(false)
-            if (ok) {
-                vibrateConfirm()
-                return true
+                ChatSyncQueue.classifyHostRpcResponse(res)
+            }.getOrDefault(SyncSendOutcome.RETRY_LATER)
+            when (outcome) {
+                SyncSendOutcome.DELIVERED -> {
+                    vibrateConfirm()
+                    return true
+                }
+                SyncSendOutcome.REJECTED_PERMANENT -> {
+                    vibrateTick()
+                    return false
+                }
+                SyncSendOutcome.RETRY_LATER -> Unit
             }
         }
         chatRepo.enqueuePendingVaultPromotion(itemId, payload, targetMac)

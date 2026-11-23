@@ -1363,7 +1363,7 @@ async function main() {
         const res = await ipc.call("mac.control.execute", { action: "request_accessibility" });
         console.log(JSON.stringify(res, null, 2));
       } else if (op === "wake" || op === "lock" || op === "unlock") {
-        const res = await ipc.call("mac.control.execute", { action: op, transportTierHint: "LAN_WS" });
+        const res = await ipc.call("mac.control.execute", { action: op });
         console.log(JSON.stringify(res, null, 2));
       } else if (op === "open") {
         const target = positional.slice(1).join(" ").trim();
