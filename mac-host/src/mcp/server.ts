@@ -17,10 +17,32 @@ const OMS_MCP_VERSION = loadPackageVersion();
 
 /**
  * Module 07: Standard MCP Server (`one-more-step-mcp`) over stdio
- * Exposes 13 Tools & 3 Resources to Codex, Antigravity, OpenCode, and Claude Code.
+ * Exposes 13 Tools & 4 Resources to Codex, Antigravity, OpenCode, and Claude Code.
  */
 
-export const OMS_MCP_TOOLS = [
+export interface OmsMcpToolAnnotations {
+  title: string;
+  readOnlyHint: boolean;
+  destructiveHint: boolean;
+  idempotentHint: boolean;
+  openWorldHint: boolean;
+}
+
+export interface OmsMcpToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: {
+    type: "object";
+    properties: Record<string, unknown>;
+    required?: string[];
+  };
+  annotations: OmsMcpToolAnnotations;
+}
+
+const SUPPORTED_MCP_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"] as const;
+const DEFAULT_MCP_PROTOCOL_VERSION = "2025-03-26";
+
+export const OMS_MCP_TOOLS: OmsMcpToolDefinition[] = [
   {
     name: "phone_inbox_latest",
     description:
@@ -51,6 +73,13 @@ export const OMS_MCP_TOOLS = [
         },
       },
     },
+    annotations: {
+      title: "查询手机投递收件箱",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
   },
   {
     name: "phone_media_recent",
@@ -70,6 +99,13 @@ export const OMS_MCP_TOOLS = [
           description: "可选：仅查询最近 N 分钟内拍摄或截屏的媒体",
         },
       },
+    },
+    annotations: {
+      title: "列出手机近期相册与截图",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
   },
   {
@@ -95,6 +131,13 @@ export const OMS_MCP_TOOLS = [
         },
       },
       required: ["sourceUriOrPath"],
+    },
+    annotations: {
+      title: "拉取手机文件到 Mac",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
   },
   {
@@ -123,6 +166,13 @@ export const OMS_MCP_TOOLS = [
         },
       },
     },
+    annotations: {
+      title: "推送内容到手机时间流",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
   },
   {
     name: "phone_clipboard_sync",
@@ -144,6 +194,13 @@ export const OMS_MCP_TOOLS = [
         },
       },
       required: ["action"],
+    },
+    annotations: {
+      title: "双向同步手机剪贴板",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
   },
   {
@@ -177,6 +234,13 @@ export const OMS_MCP_TOOLS = [
       },
       required: ["hour", "minute"],
     },
+    annotations: {
+      title: "设置手机原生系统闹钟",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
   },
   {
     name: "phone_calendar_manage",
@@ -207,6 +271,13 @@ export const OMS_MCP_TOOLS = [
         eventId: { type: "number", description: "delete_event 时要删除的日程 ID" },
       },
       required: ["action"],
+    },
+    annotations: {
+      title: "查询或管理手机系统日历",
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
     },
   },
   {
@@ -264,6 +335,13 @@ export const OMS_MCP_TOOLS = [
       },
       required: ["title", "body"],
     },
+    annotations: {
+      title: "发送手机分级通知与语音播报",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
   },
   {
     name: "phone_request_approval",
@@ -284,6 +362,13 @@ export const OMS_MCP_TOOLS = [
       },
       required: ["title", "summary"],
     },
+    annotations: {
+      title: "发起手机远程交互审批",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
   },
   {
     name: "phone_presence_status",
@@ -298,6 +383,13 @@ export const OMS_MCP_TOOLS = [
           description: "是否强制向手机发起实时状态刷新",
         },
       },
+    },
+    annotations: {
+      title: "查询手机在场与全维遥测状态",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
   },
   {
@@ -452,6 +544,13 @@ export const OMS_MCP_TOOLS = [
       },
       required: ["action"],
     },
+    annotations: {
+      title: "远程控制手机系统与通话",
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
   },
   {
     name: "phone_gui_observe",
@@ -471,6 +570,13 @@ export const OMS_MCP_TOOLS = [
           description: "截图中是否自动绘制 #1, #2 控件边框与角标",
         },
       },
+    },
+    annotations: {
+      title: "观察手机前台无障碍界面树",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
     },
   },
   {
@@ -513,6 +619,13 @@ export const OMS_MCP_TOOLS = [
         },
       },
       required: ["action"],
+    },
+    annotations: {
+      title: "执行手机无障碍 GUI 动作",
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
     },
   },
 ];
@@ -564,12 +677,19 @@ export class OmsMcpServer {
 
     try {
       switch (req.method) {
-        case "initialize":
+        case "initialize": {
+          const requestedVersion =
+            typeof req.params?.protocolVersion === "string" ? req.params.protocolVersion : "";
+          const negotiatedVersion = (
+            SUPPORTED_MCP_PROTOCOL_VERSIONS as readonly string[]
+          ).includes(requestedVersion)
+            ? requestedVersion
+            : DEFAULT_MCP_PROTOCOL_VERSION;
           return {
             jsonrpc: "2.0",
             id: req.id,
             result: {
-              protocolVersion: "2024-11-05",
+              protocolVersion: negotiatedVersion,
               capabilities: {
                 tools: {},
                 resources: {},
@@ -580,6 +700,7 @@ export class OmsMcpServer {
               },
             },
           };
+        }
 
         case "ping":
           return { jsonrpc: "2.0", id: req.id, result: {} };
