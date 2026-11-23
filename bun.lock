@@ -11,7 +11,7 @@
     },
     "mac-host": {
       "name": "@oms/mac-host",
-      "version": "1.6.5",
+      "version": "3.6.4",
       "bin": {
         "oms": "./src/cli/index.ts",
         "omsd": "./src/daemon/main.ts",
@@ -22,11 +22,11 @@
     },
     "shared-protocol": {
       "name": "@oms/shared-protocol",
-      "version": "1.6.5",
+      "version": "3.6.4",
     },
     "wechat-context": {
       "name": "@oms/wechat-context",
-      "version": "1.6.5",
+      "version": "2.1.1",
       "bin": {
         "wx-ctx": "./src/cli.ts",
       },
