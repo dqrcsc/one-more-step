@@ -721,6 +721,204 @@ describe("Milestone 2 & 3: MobileMemoryMirror + AgentSessionHub", () => {
       expect(syncedUuid).toBe("conv-mobile-new-77");
       expect(fs.existsSync(path.join(agyDesktopConv, "conv-mobile-new-77.db"))).toBe(true);
       expect(fs.existsSync(path.join(agyDesktopBrain, "conv-mobile-new-77", ".system_generated", "logs", "transcript.jsonl"))).toBe(true);
+      expect(fs.existsSync(path.join(agyCliRoot, "conversations", "conv-mobile-new-77.db"))).toBe(false);
+    } finally {
+      hub.stopAll();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("Desktop visibility regression: unregistered workspace auto-project creation, Antigravity metadata/pbtxt/CLI-duplicate cleanup, lock-safe fork, and structured stream-json parsing", async () => {
+    const { Database } = await import("bun:sqlite");
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oms-desktop-vis-"));
+    const omsHome = path.join(tmpDir, "oms");
+    const codexRoot = path.join(tmpDir, "codex");
+    const codexSessDir = path.join(codexRoot, "sessions", "2026", "11", "22");
+    const geminiRoot = path.join(tmpDir, "gemini");
+    const agyDesktopRoot = path.join(geminiRoot, "antigravity");
+    const agyDesktopBrain = path.join(agyDesktopRoot, "brain");
+    const agyDesktopConv = path.join(agyDesktopRoot, "conversations");
+    const agyDesktopAnn = path.join(agyDesktopRoot, "annotations");
+    const agyCliRoot = path.join(geminiRoot, "antigravity-cli");
+    const unregisteredRepo = path.join(tmpDir, "x_project", "poem");
+
+    for (const d of [
+      omsHome,
+      codexSessDir,
+      agyDesktopBrain,
+      agyDesktopConv,
+      agyDesktopAnn,
+      path.join(agyCliRoot, "conversations"),
+      unregisteredRepo,
+      path.join(unregisteredRepo, ".git"),
+    ]) {
+      fs.mkdirSync(d, { recursive: true });
+    }
+
+    // 1. Seed Codex `state_5.sqlite` where `originator` is `'vscode'` and `poem` has NO project yet
+    const cdb = new Database(path.join(codexRoot, "state_5.sqlite"));
+    cdb.exec(`
+      CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}', position INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
+      CREATE TABLE project_roots (project_id TEXT NOT NULL, position INTEGER NOT NULL, path TEXT NOT NULL);
+      CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, title TEXT, cwd TEXT, source TEXT, thread_source TEXT, originator TEXT, project_id TEXT, updated_at INTEGER, archived INTEGER DEFAULT 0, agent_role TEXT);
+    `);
+    cdb.run(
+      "INSERT INTO threads VALUES ('01a1-poem-new', '', '获取最新代码', ?, 'vscode', NULL, 'vscode', NULL, 1795216469, 0, NULL)",
+      [unregisteredRepo]
+    );
+    cdb.close();
+
+    fs.writeFileSync(
+      path.join(codexRoot, ".codex-global-state.json"),
+      JSON.stringify({
+        "electron-renderer-content-owner": "owner123",
+        "electron-owner-value:electron-saved-workspace-roots:owner123": [],
+        "local-projects": {},
+        "project-order": [],
+        "thread-project-assignments": {},
+        "thread-project-membership-host-ids": {},
+      }),
+      "utf8"
+    );
+
+    const hub = new AgentSessionHub({
+      omsHomeDir: omsHome,
+      codexSessionsDir: path.join(codexRoot, "sessions"),
+      agyBrainDir: agyDesktopBrain,
+      agyCliDir: agyCliRoot,
+      defaultWorkspacePath: unregisteredRepo,
+      cliSpawner: () => {
+        const emitter = new EventEmitter() as ChildProcess;
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        (emitter as any).stdout = stdout;
+        (emitter as any).stderr = stderr;
+        (emitter as any).kill = () => true;
+        queueMicrotask(() => {
+          stdout.write(
+            JSON.stringify({
+              type: "assistant",
+              conversation_id: "b7a4b44b-5a7c-45e2-866e-fa9ca48acbbb",
+              content: [{ type: "text", text: "结构化数组消息已正确提取，完整保留 Markdown 正文！" }],
+            }) + "\n"
+          );
+          stdout.write(
+            JSON.stringify({
+              type: "RESULT",
+              conversation_id: "b7a4b44b-5a7c-45e2-866e-fa9ca48acbbb",
+              result: { usage: { output_tokens: 42 } },
+            }) + "\n"
+          );
+          stdout.end();
+          emitter.emit("close", 0);
+        });
+        return emitter;
+      },
+    });
+
+    try {
+      // Test A: Codex unregistered workspace auto-creates project & overwrites originator 'vscode' -> 'Codex Desktop'
+      hub.linkCodexThreadToWorkspaceProject("01a1-poem-new", unregisteredRepo, "获取最新代码优化项");
+      const verifyCdb = new Database(path.join(codexRoot, "state_5.sqlite"), { readonly: true });
+      const createdProj = verifyCdb
+        .query("SELECT p.id, p.name, r.path FROM projects p JOIN project_roots r ON p.id = r.project_id")
+        .get() as any;
+      const updatedThread = verifyCdb
+        .query("SELECT originator, thread_source, project_id, name FROM threads WHERE id = '01a1-poem-new'")
+        .get() as any;
+      verifyCdb.close();
+
+      expect(createdProj?.name).toBe("poem");
+      expect(createdProj?.path).toBe(unregisteredRepo);
+      expect(updatedThread?.originator).toBe("Codex Desktop");
+      expect(updatedThread?.thread_source).toBe("user");
+      expect(updatedThread?.project_id).toBe(createdProj?.id);
+      expect(updatedThread?.name).toBe("获取最新代码优化项");
+
+      const gs = JSON.parse(fs.readFileSync(path.join(codexRoot, ".codex-global-state.json"), "utf8"));
+      expect(gs["electron-owner-value:electron-saved-workspace-roots:owner123"]).toContain(unregisteredRepo);
+      expect(gs["thread-project-assignments"]?.["01a1-poem-new"]?.projectKind).toBe("local");
+
+      // Test B: Antigravity new CLI conversation with empty trajectory_metadata_blob & source=0 gets normalized, titled, and CLI duplicate removed
+      const newConvId = "b7a4b44b-5a7c-45e2-866e-fa9ca48acbbb";
+      const cliDbPath = path.join(agyCliRoot, "conversations", `${newConvId}.db`);
+      const cliDb = new Database(cliDbPath);
+      cliDb.exec(`
+        CREATE TABLE trajectory_meta (trajectory_id TEXT PRIMARY KEY, cascade_id TEXT, trajectory_type INTEGER, source INTEGER);
+        CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
+        CREATE TABLE steps (idx INTEGER PRIMARY KEY);
+        INSERT INTO trajectory_meta VALUES ('traj-1', '${newConvId}', 0, 0);
+        INSERT INTO trajectory_metadata_blob VALUES ('main', X'');
+        INSERT INTO steps VALUES (1), (2), (3);
+      `);
+      cliDb.close();
+
+      const syncedId = hub.syncAgyCliSessionToDesktop(newConvId, Date.now(), unregisteredRepo, "移动端布局升级方案");
+      expect(syncedId).toBe(newConvId);
+      expect(fs.existsSync(cliDbPath)).toBe(false);
+
+      const agyProjectsDir = path.join(geminiRoot, "config", "projects");
+      const projFiles = fs.readdirSync(agyProjectsDir).filter((f) => f.endsWith(".json"));
+      expect(projFiles.length).toBe(1);
+      const createdAgyProj = JSON.parse(fs.readFileSync(path.join(agyProjectsDir, projFiles[0]), "utf8"));
+      expect(createdAgyProj.name).toBe("poem");
+
+      const desktopDb = new Database(path.join(agyDesktopConv, `${newConvId}.db`), { readonly: true });
+      const tm = desktopDb.query("SELECT * FROM trajectory_meta").get() as any;
+      const blobRow = desktopDb.query("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'").get() as any;
+      desktopDb.close();
+      expect(tm?.trajectory_type).toBe(4);
+      expect(tm?.source).toBe(1);
+      const blobBuf = Buffer.from(blobRow.data);
+      expect(blobBuf.includes(createdAgyProj.id)).toBe(true);
+      expect(blobBuf.includes("poem")).toBe(true);
+
+      const pbtxt = fs.readFileSync(path.join(agyDesktopAnn, `${newConvId}.pbtxt`), "utf8");
+      expect(pbtxt).toContain('title:"移动端布局升级方案"');
+
+      // Test C: Antigravity locked Desktop conversation forks cleanly without overwriting original Desktop DB or losing original title
+      const lockedConvId = "80c08884-6fc4-4b73-8547-b51e68ca1d1d";
+      fs.writeFileSync(path.join(agyDesktopAnn, `${lockedConvId}.pbtxt`), 'title:"OMS App Redesign Proposal" last_user_view_time:{seconds:1795000000 nanos:0}', "utf8");
+      const origDesktopDbPath = path.join(agyDesktopConv, `${lockedConvId}.db`);
+      const origDb = new Database(origDesktopDbPath);
+      origDb.exec("CREATE TABLE steps (idx INTEGER PRIMARY KEY); INSERT INTO steps VALUES (1);");
+      origDb.close();
+
+      const resumedCliDbPath = path.join(agyCliRoot, "conversations", `${lockedConvId}.db`);
+      const resDb = new Database(resumedCliDbPath);
+      resDb.exec(`
+        CREATE TABLE trajectory_meta (trajectory_id TEXT PRIMARY KEY, cascade_id TEXT, trajectory_type INTEGER, source INTEGER);
+        CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
+        CREATE TABLE steps (idx INTEGER PRIMARY KEY);
+        INSERT INTO trajectory_meta VALUES ('traj-locked', '${lockedConvId}', 4, 17);
+        INSERT INTO trajectory_metadata_blob VALUES ('main', X'');
+        INSERT INTO steps VALUES (1), (2), (3), (4);
+      `);
+      resDb.close();
+
+      const forkedAgyId = hub.syncAgyCliSessionToDesktop(lockedConvId, Date.now(), unregisteredRepo, "继续追问", true);
+      expect(forkedAgyId).not.toBe(lockedConvId);
+      expect(fs.existsSync(resumedCliDbPath)).toBe(false);
+      const forkedPbtxt = fs.readFileSync(path.join(agyDesktopAnn, `${forkedAgyId}.pbtxt`), "utf8");
+      expect(forkedPbtxt).toContain("OMS App Redesign Proposal（手机接续）");
+      const forkedDb = new Database(path.join(agyDesktopConv, `${forkedAgyId}.db`), { readonly: true });
+      expect((forkedDb.query("SELECT count(*) AS c FROM steps").get() as any)?.c).toBe(4);
+      expect((forkedDb.query("SELECT cascade_id, source FROM trajectory_meta").get() as any)).toEqual({
+        cascade_id: forkedAgyId,
+        source: 1,
+      });
+      forkedDb.close();
+
+      // Test D: Structured stream-json content extracts clean text (never `[object Object]`)
+      hub.startSession({
+        clientRequestId: "req_obj_test",
+        backend: "agy",
+        prompt: "测试结构化输出",
+      });
+      await new Promise((r) => setTimeout(r, 40));
+      const detail = hub.getSessionDetail("agy", newConvId);
+      expect(detail.session.lastSummary).toContain("结构化数组消息已正确提取");
+      expect(detail.session.lastSummary).not.toContain("[object Object]");
     } finally {
       hub.stopAll();
       fs.rmSync(tmpDir, { recursive: true, force: true });

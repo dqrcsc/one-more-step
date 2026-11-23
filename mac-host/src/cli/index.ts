@@ -256,6 +256,7 @@ const HELP_SECTIONS: Record<string, string> = {
                                                 在指定工作区后台拉起新的 Codex 或 Antigravity 任务会话
   oms agents resume <codex|agy> <sessionId> <prompt>
                                                 按原 session_id / conversation_id 跨端多轮接续追问已有会话
+  oms agents sync                               修复并同步移动端历史会话至 Codex / Antigravity 桌面端可见状态
   oms agents cancel <codex|agy> <sessionId>     中止正在运行的受管 Agent 会话
   oms mcp                                       以标准 stdio 模式启动 MCP Server（暴露 13 个 Tools 与 3 个 Resources）`,
 };
@@ -1181,6 +1182,9 @@ async function main() {
       if (op === "projects") {
         const res = await ipc.call("agent.sessions.list", { limit: Number(flags.limit || 20) }, 10000);
         console.log(JSON.stringify({ projects: res.projects || [] }, null, 2));
+      } else if (op === "sync" || op === "reconcile" || op === "repair") {
+        const res = await ipc.call("agent.sessions.reconcile", {}, 15000);
+        console.log(JSON.stringify(res, null, 2));
       } else if (op === "quotas" || op === "quota") {
         const res = await ipc.call("agent.quotas", {}, 10000);
         console.log(JSON.stringify(res, null, 2));
@@ -1199,10 +1203,14 @@ async function main() {
         console.log(JSON.stringify(res, null, 2));
       } else if (op === "start" || op === "run") {
         const backend = ((flags.backend as string) || "codex").toLowerCase() === "agy" ? "agy" : "codex";
-        const cwd = typeof flags.cwd === "string" ? path.resolve(flags.cwd) : process.cwd();
+        const workspacePath = typeof flags.cwd === "string" ? path.resolve(flags.cwd) : process.cwd();
         const prompt = (typeof flags.prompt === "string" ? flags.prompt : "") || positional.slice(1).join(" ").trim();
         if (!prompt) throw new Error("Usage: oms agents start [--backend codex|agy] [--cwd <dir>] <prompt>");
-        const res = await ipc.call("agent.session.start", { backend, cwd, prompt }, 15000);
+        const res = await ipc.call(
+          "agent.session.start",
+          { clientRequestId: `cli_${Date.now()}`, backend, workspacePath, prompt },
+          15000
+        );
         console.log(JSON.stringify(res, null, 2));
       } else if (op === "resume" || op === "continue") {
         const backend = (positional[1] || (flags.backend as string) || "codex").toLowerCase() === "agy" ? "agy" : "codex";
@@ -1214,10 +1222,11 @@ async function main() {
         const res = await ipc.call(
           "agent.session.continue",
           {
+            clientRequestId: `cli_${Date.now()}`,
             backend,
             sessionId,
             prompt,
-            cwd: typeof flags.cwd === "string" ? path.resolve(flags.cwd) : undefined,
+            workspacePath: typeof flags.cwd === "string" ? path.resolve(flags.cwd) : undefined,
           },
           15000
         );

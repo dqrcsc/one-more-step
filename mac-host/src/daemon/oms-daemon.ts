@@ -2812,6 +2812,10 @@ export class OmsDaemon {
         return this.agentHub.getWorkspaceCatalog(Number(params.limit) || 48);
       }
 
+      case "agent.sessions.reconcile": {
+        return { ok: true, ...this.agentHub.reconcileDesktopVisibility() };
+      }
+
       case "agent.quotas": {
         return this.agentHub.getQuotasSnapshot();
       }

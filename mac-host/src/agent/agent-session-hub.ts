@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -43,6 +44,7 @@ interface ManagedTaskState {
   summary: AgentSessionSummary;
   steps: AgentStepItem[];
   child: ChildProcess | null;
+  cancelHook?: (() => void) | null;
 }
 
 /**
@@ -52,8 +54,11 @@ interface ManagedTaskState {
  *    - OpenAI Codex (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` + `state_*.sqlite`)
  *    - Google Antigravity (`~/.gemini/antigravity/brain/<id>` + `~/.gemini/antigravity-cli/brain/<id>`)
  * 2) Dispatches new tasks & continues existing sessions:
- *    - Codex via `codex app-server` JSON-RPC (`source = 'vscode'` for live Codex Desktop visibility + automatic `thread/fork` when locked by an active Desktop writer)
- *    - Antigravity via `agy --dangerously-skip-permissions` with bidirectional `.db` + `brain/` Desktop store synchronization so mobile-created & mobile-continued sessions appear directly in Antigravity Desktop.
+ *    - Codex via `codex app-server` (`project/list` + `project/create` + `thread/queue/add` + `codex://threads/wake/<id>`
+ *      when Codex Desktop is live so turns execute in-place inside `ChatGPT.app`, falling back to direct `turn/start` / `thread/fork`)
+ *    - Antigravity via `agy --project <projectId> --add-dir <workspace>` with Desktop trajectory metadata normalization,
+ *      `annotations/<id>.pbtxt` title preservation, lock-safe active-pane fork promotion, and CLI duplicate cleanup so
+ *      mobile-created & mobile-continued sessions appear natively in `Antigravity.app`.
  */
 export class AgentSessionHub extends EventEmitter {
   private readonly hubDir: string;
@@ -94,6 +99,17 @@ export class AgentSessionHub extends EventEmitter {
           stdio: ["ignore", "pipe", "pipe"],
         }));
     this.loadPersistedTasks();
+    if (
+      process.env.OMS_TEST_ISOLATION !== "1" &&
+      !this.hasCustomCliSpawner &&
+      !this.appServerSpawner
+    ) {
+      try {
+        this.reconcileDesktopVisibility();
+      } catch {
+        // ignore startup repair errors
+      }
+    }
   }
 
   private buildSpawnEnv(): NodeJS.ProcessEnv {
@@ -383,9 +399,10 @@ export class AgentSessionHub extends EventEmitter {
 
     if (managed && diskDetail) {
       const lastDiskTs = diskDetail.steps.length > 0 ? diskDetail.steps[diskDetail.steps.length - 1].timestampMs : 0;
-      const liveTail = managed.child
-        ? managed.steps.filter((s) => s.timestampMs > lastDiskTs)
-        : [];
+      const liveTail =
+        managed.child || managed.cancelHook
+          ? managed.steps.filter((s) => s.timestampMs > lastDiskTs)
+          : [];
       const merged =
         diskDetail.steps.some((s) => s.kind === "user" || s.kind === "assistant")
           ? [...diskDetail.steps, ...liveTail]
@@ -454,6 +471,11 @@ export class AgentSessionHub extends EventEmitter {
       });
     }
 
+    const agyProjectId =
+      params.backend === "agy" && !this.hasCustomCliSpawner
+        ? this.resolveOrCreateAgyProjectForWorkspace(workspace)
+        : "";
+
     const spec: SpawnedCliSpec =
       params.backend === "codex"
         ? {
@@ -474,7 +496,16 @@ export class AgentSessionHub extends EventEmitter {
             command: "agy",
             args: this.hasCustomCliSpawner
               ? ["--print", params.prompt, "--output-format", "stream-json"]
-              : ["--dangerously-skip-permissions", "--print", params.prompt, "--output-format", "stream-json"],
+              : [
+                  "--dangerously-skip-permissions",
+                  ...(agyProjectId ? ["--project", agyProjectId] : []),
+                  "--add-dir",
+                  workspace,
+                  "--print",
+                  params.prompt,
+                  "--output-format",
+                  "stream-json",
+                ],
             cwd: workspace,
           };
 
@@ -526,7 +557,9 @@ export class AgentSessionHub extends EventEmitter {
       });
     }
 
+    let agyProjectId = "";
     if (params.backend === "agy" && !this.hasCustomCliSpawner) {
+      agyProjectId = this.resolveOrCreateAgyProjectForWorkspace(workspace);
       this.prepareAgySessionForCliResume(targetSessionId);
     }
 
@@ -550,6 +583,9 @@ export class AgentSessionHub extends EventEmitter {
                 ]
               : [
                   "--dangerously-skip-permissions",
+                  ...(agyProjectId ? ["--project", agyProjectId] : []),
+                  "--add-dir",
+                  workspace,
                   "--conversation",
                   targetSessionId,
                   "--print",
@@ -567,16 +603,26 @@ export class AgentSessionHub extends EventEmitter {
     const sessionId = this.resolveAliasedSessionId(backend, rawSessionId);
     const key = `${backend}:${sessionId}`;
     const state = this.managedTasks.get(key);
-    if (!state || !state.child) return false;
-    try {
-      state.child.kill("SIGTERM");
-    } catch {
-      // ignore
+    if (!state || (!state.child && !state.cancelHook)) return false;
+    if (state.cancelHook) {
+      try {
+        state.cancelHook();
+      } catch {
+        // ignore
+      }
+      state.cancelHook = null;
+    }
+    if (state.child) {
+      try {
+        state.child.kill("SIGTERM");
+      } catch {
+        // ignore
+      }
+      state.child = null;
     }
     state.summary.status = "failed";
     state.summary.lastSummary = "⏹ 已由手机端中止任务";
     state.summary.updatedAtMs = Date.now();
-    state.child = null;
     this.persistTasks();
     this.emitStreamEvent({
       backend,
@@ -590,6 +636,14 @@ export class AgentSessionHub extends EventEmitter {
 
   public stopAll(): void {
     for (const [, st] of this.managedTasks) {
+      if (st.cancelHook) {
+        try {
+          st.cancelHook();
+        } catch {
+          // ignore
+        }
+        st.cancelHook = null;
+      }
       if (st.child) {
         try {
           st.child.kill("SIGTERM");
@@ -627,13 +681,339 @@ export class AgentSessionHub extends EventEmitter {
     return "codex";
   }
 
-  private formatMobileForkTitle(baseTitle: string): string {
+  private formatMobileForkTitle(baseTitle: string, fallbackLabel = "会话"): string {
     const cleaned = baseTitle
       .trim()
       .replace(/\s*[（(]手机接续[）)]\s*$/u, "")
       .trim();
-    const core = (cleaned || "Codex 会话").slice(0, 72);
+    const core = (cleaned || fallbackLabel).slice(0, 72);
     return `${core}（手机接续）`;
+  }
+
+  private openSqliteReadonlyWithWal(dbPath: string): Database {
+    try {
+      return new Database(dbPath, { readonly: true });
+    } catch {
+      return new Database(`file:${dbPath}?immutable=1`, { readonly: true });
+    }
+  }
+
+  private isCodexDesktopAppRunning(): boolean {
+    if (
+      process.platform !== "darwin" ||
+      process.env.OMS_TEST_ISOLATION === "1" ||
+      this.hasCustomCliSpawner ||
+      Boolean(this.appServerSpawner)
+    ) {
+      return false;
+    }
+    try {
+      const r = spawnSync("pgrep", ["-x", "ChatGPT"], { encoding: "utf8", timeout: 800 });
+      if (r.status === 0 && (r.stdout || "").trim().length > 0) return true;
+      const r2 = spawnSync("pgrep", ["-x", "Codex"], { encoding: "utf8", timeout: 800 });
+      return r2.status === 0 && (r2.stdout || "").trim().length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private wakeCodexDesktopThread(threadId: string): void {
+    if (process.platform !== "darwin" || process.env.OMS_TEST_ISOLATION === "1") return;
+    try {
+      const p = spawn("open", ["-g", `codex://threads/wake/${encodeURIComponent(threadId)}`], {
+        stdio: "ignore",
+        detached: true,
+      });
+      p.unref();
+    } catch {
+      // ignore
+    }
+  }
+
+  private ensureCodexWorkspaceRegisteredWithDesktop(workspacePath: string): void {
+    if (process.platform !== "darwin" || process.env.OMS_TEST_ISOLATION === "1") return;
+    const normWs = workspacePath.trim().replace(/\/+$/, "");
+    if (!normWs || !fs.existsSync(normWs)) return;
+    const codexRoot = path.dirname(this.codexSessionsDir);
+    const gsPath = path.join(codexRoot, ".codex-global-state.json");
+    let alreadyRegistered = false;
+    try {
+      if (fs.existsSync(gsPath)) {
+        const gs = JSON.parse(fs.readFileSync(gsPath, "utf8")) as Record<string, any>;
+        const localProjects = gs["local-projects"];
+        if (localProjects && typeof localProjects === "object") {
+          for (const lpVal of Object.values(localProjects)) {
+            const roots = Array.isArray((lpVal as any)?.rootPaths) ? (lpVal as any).rootPaths : [];
+            if (roots.some((r: unknown) => typeof r === "string" && r.trim().replace(/\/+$/, "") === normWs)) {
+              alreadyRegistered = true;
+              break;
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    if (!alreadyRegistered && this.isCodexDesktopAppRunning() && fs.existsSync("/Applications/ChatGPT.app")) {
+      try {
+        const p = spawn("open", ["-g", "-a", "/Applications/ChatGPT.app", normWs], {
+          stdio: "ignore",
+          detached: true,
+        });
+        p.unref();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private findCodexRolloutFilePath(sessionId: string): string | null {
+    if (!sessionId || !fs.existsSync(this.codexSessionsDir)) return null;
+    let found: string | null = null;
+    const walk = (dir: string, depth: number) => {
+      if (depth > 4 || found) return;
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) walk(full, depth + 1);
+        else if (e.isFile() && e.name.includes(sessionId) && e.name.endsWith(".jsonl")) {
+          found = full;
+          return;
+        }
+      }
+    };
+    walk(this.codexSessionsDir, 0);
+    return found;
+  }
+
+  private isCodexQueuedItemPending(threadId: string, queuedSubmissionId: string): boolean {
+    const codexRoot = path.dirname(this.codexSessionsDir);
+    const qDbPath = path.join(codexRoot, "queue_1.sqlite");
+    if (!fs.existsSync(qDbPath)) return false;
+    try {
+      const db = this.openSqliteReadonlyWithWal(qDbPath);
+      try {
+        const row = db
+          .query("SELECT 1 AS ok FROM queued_items WHERE thread_id = ? AND id = ? LIMIT 1")
+          .get(threadId, queuedSubmissionId);
+        return Boolean(row);
+      } finally {
+        db.close();
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  private watchWokenCodexDesktopTurn(
+    state: ManagedTaskState,
+    threadId: string,
+    queuedSubmissionId: string,
+    initialRolloutOffset: number,
+    lastPreviousSessionId: string | undefined,
+    opts: {
+      mode: "start" | "resume";
+      workspace: string;
+      prompt: string;
+    },
+    pushAndEmitStep: (step: AgentStepItem) => void
+  ): void {
+    const watchStartedAt = Date.now();
+    let rolloutPath = this.findCodexRolloutFilePath(threadId);
+    let readOffset = initialRolloutOffset;
+    let wokenConfirmed = false;
+    let finished = false;
+    let lastEmittedAssistant = "";
+
+    const cleanup = () => {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      state.cancelHook = null;
+    };
+
+    const finalize = (status: "completed" | "failed", summaryOverride?: string) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      state.summary.status = status;
+      if (summaryOverride) {
+        state.summary.lastSummary = summaryOverride;
+      } else if (status === "completed") {
+        const lastAssistant = [...state.steps].reverse().find((s) => s.kind === "assistant");
+        if (lastAssistant) {
+          state.summary.lastSummary = lastAssistant.detail.slice(0, 160);
+        }
+      }
+      this.linkCodexThreadToWorkspaceProject(threadId, opts.workspace, state.summary.title);
+      state.summary.updatedAtMs = Date.now();
+      this.persistTasks();
+      this.emitStreamEvent({
+        backend: "codex",
+        sessionId: state.summary.sessionId,
+        previousSessionId: lastPreviousSessionId,
+        status,
+        finalSummary: state.summary.lastSummary,
+        updatedAtMs: state.summary.updatedAtMs,
+      });
+    };
+
+    let timer: ReturnType<typeof setInterval> | null = setInterval(() => {
+      if (finished) return;
+      try {
+        if (!rolloutPath) {
+          rolloutPath = this.findCodexRolloutFilePath(threadId);
+        }
+        if (rolloutPath && fs.existsSync(rolloutPath)) {
+          const st = fs.statSync(rolloutPath);
+          if (st.size > readOffset) {
+            wokenConfirmed = true;
+            const fd = fs.openSync(rolloutPath, "r");
+            try {
+              const toRead = Math.min(st.size - readOffset, 1024 * 1024);
+              const buf = Buffer.allocUnsafe(toRead);
+              const n = fs.readSync(fd, buf, 0, toRead, readOffset);
+              if (n > 0) {
+                const slice = buf.subarray(0, n);
+                const lastNl = slice.lastIndexOf(0x0a);
+                if (lastNl >= 0) {
+                  readOffset += lastNl + 1;
+                  const lines = slice
+                    .subarray(0, lastNl)
+                    .toString("utf8")
+                    .split(/\r?\n/)
+                    .filter(Boolean);
+                  for (const line of lines) {
+                    let obj: any;
+                    try {
+                      obj = JSON.parse(line);
+                    } catch {
+                      continue;
+                    }
+                    const now = Date.now();
+                    if (obj.type === "event_msg" && obj.payload) {
+                      const pt = String(obj.payload.type || "");
+                      if (pt === "agent_reasoning" && obj.payload.text) {
+                        const txt = String(obj.payload.text).trim();
+                        if (txt) {
+                          pushAndEmitStep({
+                            stepIndex: state.steps.length + 1,
+                            kind: "thinking",
+                            title: "思考推演",
+                            detail: txt.slice(0, 500),
+                            timestampMs: now,
+                          });
+                        }
+                      } else if (pt === "agent_message" && obj.payload.message) {
+                        const txt = String(obj.payload.message).trim();
+                        if (txt && txt !== lastEmittedAssistant) {
+                          lastEmittedAssistant = txt;
+                          pushAndEmitStep({
+                            stepIndex: state.steps.length + 1,
+                            kind: "assistant",
+                            title: "Codex 回复",
+                            detail: txt.slice(0, 2400),
+                            timestampMs: now,
+                          });
+                        }
+                      } else if (pt === "task_complete") {
+                        const finalMsg =
+                          typeof obj.payload.last_agent_message === "string"
+                            ? obj.payload.last_agent_message.trim()
+                            : "";
+                        if (finalMsg && finalMsg !== lastEmittedAssistant) {
+                          lastEmittedAssistant = finalMsg;
+                          pushAndEmitStep({
+                            stepIndex: state.steps.length + 1,
+                            kind: "assistant",
+                            title: "Codex 回复",
+                            detail: finalMsg.slice(0, 2400),
+                            timestampMs: now,
+                          });
+                        }
+                        finalize("completed");
+                        return;
+                      } else if (pt === "turn_aborted") {
+                        finalize(
+                          "failed",
+                          `Codex 轮次已中止: ${String(obj.payload.reason || "interrupted").slice(0, 100)}`
+                        );
+                        return;
+                      }
+                    } else if (obj.type === "response_item" && obj.payload) {
+                      const p = obj.payload;
+                      if (p.type === "function_call" || p.type === "custom_tool_call") {
+                        pushAndEmitStep({
+                          stepIndex: state.steps.length + 1,
+                          kind: "tool",
+                          title: String(p.name || p.type || "调用工具"),
+                          detail: String(p.arguments || p.input || "").slice(0, 320),
+                          timestampMs: now,
+                        });
+                      } else if (p.type === "message" && p.role === "assistant" && Array.isArray(p.content)) {
+                        const txt = p.content
+                          .filter((c: any) => typeof c?.text === "string" && c.text.trim())
+                          .map((c: any) => String(c.text).trim())
+                          .join("\n\n")
+                          .trim();
+                        if (txt && txt !== lastEmittedAssistant) {
+                          lastEmittedAssistant = txt;
+                          pushAndEmitStep({
+                            stepIndex: state.steps.length + 1,
+                            kind: "assistant",
+                            title: "Codex 回复",
+                            detail: txt.slice(0, 2400),
+                            timestampMs: now,
+                          });
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            } finally {
+              try {
+                fs.closeSync(fd);
+              } catch {}
+            }
+          }
+        }
+
+        if (!wokenConfirmed) {
+          const stillQueued = this.isCodexQueuedItemPending(threadId, queuedSubmissionId);
+          if (!stillQueued) {
+            wokenConfirmed = true;
+          } else if (Date.now() - watchStartedAt >= 4500) {
+            // Desktop app did not dequeue within 4.5s — seamlessly fall back to direct app-server execution
+            finished = true;
+            cleanup();
+            this.launchCodexAppServerSession(state.summary, state.steps, {
+              mode: "resume",
+              resumeThreadId: threadId,
+              workspace: opts.workspace,
+              prompt: opts.prompt,
+              allowDesktopWake: false,
+              clearQueuedSubmissionId: queuedSubmissionId,
+            });
+            return;
+          }
+        }
+      } catch {
+        // ignore transient file race
+      }
+    }, 350);
+
+    state.cancelHook = () => {
+      finished = true;
+      cleanup();
+    };
   }
 
   private launchCodexAppServerSession(
@@ -644,19 +1024,40 @@ export class AgentSessionHub extends EventEmitter {
       resumeThreadId?: string;
       workspace: string;
       prompt: string;
+      allowDesktopWake?: boolean;
+      clearQueuedSubmissionId?: string;
     }
   ): AgentSessionSummary {
     const initialId = initialSummary.sessionId;
     let currentKey = `codex:${initialId}`;
     const prev = this.managedTasks.get(currentKey);
-    if (prev?.child) {
+    if (prev?.child || prev?.cancelHook) {
       throw new Error(`该会话正在运行中 (${initialId})，请等待当前轮次完成或先停止`);
     }
+
+    const useDesktopLiveWake =
+      opts.allowDesktopWake !== false && this.isCodexDesktopAppRunning();
+
+    const preWakeRolloutPath =
+      opts.mode === "resume" && opts.resumeThreadId
+        ? this.findCodexRolloutFilePath(opts.resumeThreadId)
+        : null;
+    const preWakeRolloutOffset =
+      preWakeRolloutPath && fs.existsSync(preWakeRolloutPath)
+        ? (() => {
+            try {
+              return fs.statSync(preWakeRolloutPath).size;
+            } catch {
+              return 0;
+            }
+          })()
+        : 0;
 
     const state: ManagedTaskState = {
       summary: initialSummary,
       steps: initialSteps,
       child: null,
+      cancelHook: null,
     };
     this.managedTasks.set(currentKey, state);
 
@@ -716,12 +1117,98 @@ export class AgentSessionHub extends EventEmitter {
     };
 
     let turnCompletedHandled = false;
+    let handedOffToDesktopWake = false;
+    let queuedWakeSubmissionId = "";
+    let wakeStartRolloutOffset = preWakeRolloutOffset;
     let activeThreadId = opts.resumeThreadId || "";
     let forkedFromLockedDesktop = false;
+    let resolvedProjectId: string | null = null;
+    const normWs = opts.workspace.trim().replace(/\/+$/, "");
+
+    const dispatchAfterProjectReady = () => {
+      if (opts.clearQueuedSubmissionId && opts.resumeThreadId) {
+        sendRpc({
+          id: 19,
+          method: "thread/queue/delete",
+          params: {
+            threadId: opts.resumeThreadId,
+            queuedSubmissionId: opts.clearQueuedSubmissionId,
+          },
+        });
+      }
+
+      if (useDesktopLiveWake && opts.mode === "resume" && opts.resumeThreadId) {
+        activeThreadId = opts.resumeThreadId;
+        rekeySessionId(opts.resumeThreadId);
+        if (resolvedProjectId) {
+          sendRpc({
+            id: 13,
+            method: "thread/metadata/update",
+            params: { threadId: opts.resumeThreadId, projectId: resolvedProjectId },
+          });
+        }
+        sendRpc({
+          id: 20,
+          method: "thread/queue/add",
+          params: {
+            threadId: opts.resumeThreadId,
+            input: [{ type: "text", text: opts.prompt, text_elements: [] }],
+            clientUserMessageId: crypto.randomUUID(),
+          },
+        });
+        return;
+      }
+
+      if (opts.mode === "start") {
+        const startParams: Record<string, any> = {
+          cwd: opts.workspace,
+          approvalPolicy: "never",
+          sandbox: "workspace-write",
+        };
+        if (!this.appServerSpawner) {
+          startParams.historyMode = "paginated";
+          startParams.threadSource = "user";
+          if (resolvedProjectId) startParams.projectId = resolvedProjectId;
+        }
+        sendRpc({
+          id: 2,
+          method: "thread/start",
+          params: startParams,
+        });
+      } else {
+        sendRpc({
+          id: 2,
+          method: "thread/resume",
+          params: {
+            threadId: opts.resumeThreadId,
+            cwd: opts.workspace,
+            approvalPolicy: "never",
+            sandbox: "workspace-write",
+            excludeTurns: true,
+          },
+        });
+      }
+    };
 
     const startTurnOnThread = (threadId: string) => {
       activeThreadId = threadId;
       rekeySessionId(threadId);
+      if (!this.appServerSpawner) {
+        if (resolvedProjectId) {
+          sendRpc({
+            id: 13,
+            method: "thread/metadata/update",
+            params: { threadId, projectId: resolvedProjectId },
+          });
+        }
+        if (opts.mode === "start" || forkedFromLockedDesktop) {
+          sendRpc({
+            id: 12,
+            method: "thread/name/set",
+            params: { threadId, name: state.summary.title.slice(0, 120) },
+          });
+        }
+      }
       // Eagerly link desktop metadata & fork display title so Codex.app shows the right name/project even mid-run
       this.linkCodexThreadToWorkspaceProject(
         threadId,
@@ -729,6 +1216,26 @@ export class AgentSessionHub extends EventEmitter {
         state.summary.title,
         forkedFromLockedDesktop
       );
+
+      if (useDesktopLiveWake && opts.mode === "start") {
+        const createdRollout = this.findCodexRolloutFilePath(threadId);
+        if (createdRollout && fs.existsSync(createdRollout)) {
+          try {
+            wakeStartRolloutOffset = fs.statSync(createdRollout).size;
+          } catch {}
+        }
+        sendRpc({
+          id: 20,
+          method: "thread/queue/add",
+          params: {
+            threadId,
+            input: [{ type: "text", text: opts.prompt, text_elements: [] }],
+            clientUserMessageId: crypto.randomUUID(),
+          },
+        });
+        return;
+      }
+
       sendRpc({
         id: 4,
         method: "turn/start",
@@ -753,7 +1260,7 @@ export class AgentSessionHub extends EventEmitter {
           return;
         }
 
-        // 1. JSON-RPC Responses (`id === 1 | 2 | 3 | 4`)
+        // 1. JSON-RPC Responses
         if (typeof msg.id === "number") {
           if (msg.id === 1) {
             if (msg.error) {
@@ -763,43 +1270,114 @@ export class AgentSessionHub extends EventEmitter {
               return;
             }
             sendRpc({ method: "initialized" });
-            if (opts.mode === "start") {
-              sendRpc({
-                id: 2,
-                method: "thread/start",
-                params: {
-                  cwd: opts.workspace,
-                  approvalPolicy: "never",
-                  sandbox: "workspace-write",
-                },
-              });
+            if (this.appServerSpawner) {
+              dispatchAfterProjectReady();
             } else {
               sendRpc({
-                id: 2,
-                method: "thread/resume",
-                params: {
-                  threadId: opts.resumeThreadId,
-                  cwd: opts.workspace,
-                  approvalPolicy: "never",
-                  sandbox: "workspace-write",
-                  excludeTurns: true,
-                },
+                id: 10,
+                method: "project/list",
+                params: { cursor: null, limit: 100 },
               });
             }
+            return;
+          }
+
+          if (msg.id === 10) {
+            if (!msg.error && Array.isArray(msg.result?.data)) {
+              for (const proj of msg.result.data) {
+                const roots = Array.isArray(proj?.roots) ? proj.roots : [];
+                const matched = roots.some((r: any) => {
+                  const pStr = typeof r === "string" ? r : r?.path;
+                  return typeof pStr === "string" && pStr.trim().replace(/\/+$/, "") === normWs;
+                });
+                if (matched && proj?.id) {
+                  resolvedProjectId = String(proj.id);
+                  break;
+                }
+              }
+            }
+            if (!resolvedProjectId && normWs) {
+              sendRpc({
+                id: 11,
+                method: "project/create",
+                params: {
+                  name: path.basename(normWs) || "workspace",
+                  roots: [{ path: normWs }],
+                  idempotencyKey: `oms-proj:${normWs}`,
+                },
+              });
+              return;
+            }
+            dispatchAfterProjectReady();
+            return;
+          }
+
+          if (msg.id === 11) {
+            const createdId = msg.result?.project?.id || msg.result?.id;
+            if (typeof createdId === "string" && createdId) {
+              resolvedProjectId = createdId;
+            }
+            dispatchAfterProjectReady();
+            return;
+          }
+
+          if (msg.id === 20) {
+            if (msg.error || !msg.result?.queuedSubmission?.id) {
+              // Queueing unsupported or failed — fall back immediately to direct execution
+              if (opts.mode === "start" && activeThreadId) {
+                sendRpc({
+                  id: 4,
+                  method: "turn/start",
+                  params: {
+                    threadId: activeThreadId,
+                    cwd: opts.workspace,
+                    approvalPolicy: "never",
+                    input: [{ type: "text", text: opts.prompt, text_elements: [] }],
+                  },
+                });
+              } else {
+                sendRpc({
+                  id: 2,
+                  method: "thread/resume",
+                  params: {
+                    threadId: opts.resumeThreadId,
+                    cwd: opts.workspace,
+                    approvalPolicy: "never",
+                    sandbox: "workspace-write",
+                    excludeTurns: true,
+                  },
+                });
+              }
+              return;
+            }
+
+            queuedWakeSubmissionId = String(msg.result.queuedSubmission.id);
+            handedOffToDesktopWake = true;
+            this.ensureCodexWorkspaceRegisteredWithDesktop(opts.workspace);
+            this.linkCodexThreadToWorkspaceProject(
+              activeThreadId,
+              opts.workspace,
+              state.summary.title,
+              false
+            );
+            try { child.stdin?.end(); } catch {}
+            setTimeout(() => {
+              try { child.kill("SIGTERM"); } catch {}
+            }, 60);
             return;
           }
 
           if (msg.id === 2) {
             if (msg.error) {
               const errMsg = String(msg.error.message || "");
-              // If the session is currently held open by Codex Desktop (`already has an active writer`),
+              // If the session is currently held open by another non-Desktop writer (`already has an active writer`),
               // automatically fork with full conversation history into a new `source = 'vscode'` Desktop thread!
               if (opts.mode === "resume" && opts.resumeThreadId) {
                 pushAndEmitStep({
                   stepIndex: state.steps.length + 1,
                   kind: "status",
-                  title: "桌面活跃会话派生接续",
-                  detail: "原会话正在 Mac Codex 桌面端打开占用，已自动携带完整上下文派生接续会话",
+                  title: "活跃会话派生接续",
+                  detail: "原会话正在其他终端占用写入锁，已自动携带完整上下文派生接续会话",
                   timestampMs: Date.now(),
                 });
                 sendRpc({
@@ -810,6 +1388,7 @@ export class AgentSessionHub extends EventEmitter {
                     cwd: opts.workspace,
                     approvalPolicy: "never",
                     sandbox: "workspace-write",
+                    ...(this.appServerSpawner ? {} : { threadSource: "user", excludeTurns: true }),
                   },
                 });
                 return;
@@ -834,12 +1413,12 @@ export class AgentSessionHub extends EventEmitter {
             const forkedId = String(msg.result?.thread?.id || "");
             if (forkedId) {
               forkedFromLockedDesktop = true;
-              state.summary.title = this.formatMobileForkTitle(state.summary.title);
+              state.summary.title = this.formatMobileForkTitle(state.summary.title, "Codex 会话");
               pushAndEmitStep({
                 stepIndex: state.steps.length + 1,
                 kind: "status",
                 title: "已创建手机接续会话",
-                detail: `「${state.summary.title}」已在桌面库建立；在 Mac Codex 按 ⌘R 刷新或打开 codex://threads/${forkedId} 即可同步查看`,
+                detail: `「${state.summary.title}」已在桌面库建立；打开 codex://threads/${forkedId} 即可同步查看`,
                 timestampMs: Date.now(),
               });
               startTurnOnThread(forkedId);
@@ -958,6 +1537,7 @@ export class AgentSessionHub extends EventEmitter {
     }
 
     child.on("error", (err) => {
+      if (handedOffToDesktopWake) return;
       state.child = null;
       state.summary.status = "failed";
       state.summary.lastSummary = `Codex 执行异常: ${err.message}`;
@@ -975,6 +1555,28 @@ export class AgentSessionHub extends EventEmitter {
 
     child.on("close", (code) => {
       state.child = null;
+      if (handedOffToDesktopWake && activeThreadId && queuedWakeSubmissionId) {
+        // Writer lock released — wake ChatGPT.app's live app-server to run the queued turn in-place!
+        this.linkCodexThreadToWorkspaceProject(
+          activeThreadId,
+          opts.workspace,
+          state.summary.title,
+          false
+        );
+        this.wakeCodexDesktopThread(activeThreadId);
+        this.watchWokenCodexDesktopTurn(
+          state,
+          activeThreadId,
+          queuedWakeSubmissionId,
+          wakeStartRolloutOffset,
+          lastPreviousSessionId,
+          { mode: opts.mode, workspace: opts.workspace, prompt: opts.prompt },
+          pushAndEmitStep
+        );
+        this.persistTasks();
+        return;
+      }
+
       if (!turnCompletedHandled && state.summary.status === "running") {
         const ok = code === 0;
         state.summary.status = ok ? "completed" : "failed";
@@ -1002,7 +1604,7 @@ export class AgentSessionHub extends EventEmitter {
       });
     });
 
-    // Kick off JSON-RPC handshake identifying as `vscode` so Codex Desktop (`Codex.app`) displays the thread in its sidebar!
+    // Kick off JSON-RPC handshake identifying as `vscode` so Codex Desktop (`ChatGPT.app`) displays the thread in its sidebar!
     sendRpc({
       id: 1,
       method: "initialize",
@@ -1017,11 +1619,12 @@ export class AgentSessionHub extends EventEmitter {
   }
 
   /**
-   * Ensures a mobile-created or mobile-forked Codex thread has `source = 'vscode'`, `thread_source = 'user'`,
-   * `originator = 'Codex Desktop'`, clean `name` (with `（手机接续）` on forked threads), and matching
-   * `project_id` + `.codex-global-state.json` `thread-project-assignments` so it groups cleanly inside `Codex.app`.
+   * Ensures a mobile-created, mobile-continued, or mobile-forked Codex thread has:
+   * - a registered workspace project in `projects` + `project_roots` (`state_*.sqlite`)
+   * - `source = 'vscode'`, `thread_source = 'user'`, `originator = 'Codex Desktop'`, matching `project_id`, and clean `name`
+   * - `.codex-global-state.json` `local-projects` + `thread-project-assignments` when Codex Desktop is offline
    */
-  private linkCodexThreadToWorkspaceProject(
+  public linkCodexThreadToWorkspaceProject(
     threadId: string,
     workspacePath: string,
     titleHint: string,
@@ -1031,8 +1634,10 @@ export class AgentSessionHub extends EventEmitter {
     if (!fs.existsSync(codexRoot)) return;
     const normWs = workspacePath.trim().replace(/\/+$/, "");
     const cleanTitle = titleHint.trim().slice(0, 120);
+    const projDisplayName = path.basename(normWs) || "workspace";
+    let sqliteProjId: string | null = null;
 
-    // 1. Update `~/.codex/state_*.sqlite`
+    // 1. Update `~/.codex/state_*.sqlite` (ensuring `projects` + `project_roots` entry exists!)
     try {
       const stateDbs = fs
         .readdirSync(codexRoot)
@@ -1043,13 +1648,49 @@ export class AgentSessionHub extends EventEmitter {
         const db = new Database(dbPath);
         try {
           db.exec("PRAGMA busy_timeout = 1500;");
-          let projId: string | null = null;
-          try {
-            const row = db
-              .query("SELECT project_id FROM project_roots WHERE rtrim(path, '/') = ? LIMIT 1")
-              .get(normWs) as { project_id?: string } | null;
-            projId = row?.project_id || null;
-          } catch {}
+          if (normWs) {
+            try {
+              const row = db
+                .query("SELECT project_id FROM project_roots WHERE rtrim(path, '/') = ? LIMIT 1")
+                .get(normWs) as { project_id?: string } | null;
+              sqliteProjId = row?.project_id || null;
+              if (!sqliteProjId) {
+                const pCols = new Set(
+                  (db.query("PRAGMA table_info(projects)").all() as Array<{ name?: string }>).map((c) =>
+                    String(c.name || "")
+                  )
+                );
+                const rCols = new Set(
+                  (db.query("PRAGMA table_info(project_roots)").all() as Array<{ name?: string }>).map((c) =>
+                    String(c.name || "")
+                  )
+                );
+                if (pCols.has("id") && pCols.has("name") && rCols.has("project_id") && rCols.has("path")) {
+                  const newPid = crypto.randomUUID();
+                  const nowMs = Date.now();
+                  if (pCols.has("position") && pCols.has("created_at_ms") && pCols.has("updated_at_ms")) {
+                    const maxPosRow = db.query("SELECT COALESCE(MAX(position), -1) + 1 AS nextPos FROM projects").get() as {
+                      nextPos?: number;
+                    } | null;
+                    const nextPos = Number(maxPosRow?.nextPos ?? 0);
+                    db.query(
+                      "INSERT INTO projects (id, name, metadata, position, created_at_ms, updated_at_ms) VALUES (?, ?, '{}', ?, ?, ?)"
+                    ).run(newPid, projDisplayName, nextPos, nowMs, nowMs);
+                  } else {
+                    db.query("INSERT INTO projects (id, name) VALUES (?, ?)").run(newPid, projDisplayName);
+                  }
+                  if (rCols.has("position")) {
+                    db.query("INSERT INTO project_roots (project_id, position, path) VALUES (?, 0, ?)").run(newPid, normWs);
+                  } else {
+                    db.query("INSERT INTO project_roots (project_id, path) VALUES (?, ?)").run(newPid, normWs);
+                  }
+                  sqliteProjId = newPid;
+                }
+              }
+            } catch {
+              // projects table optional on minimal schemas
+            }
+          }
 
           const colRows = db.query("PRAGMA table_info(threads)").all() as Array<{ name?: string }>;
           const cols = new Set(colRows.map((c) => String(c.name || "")));
@@ -1061,7 +1702,7 @@ export class AgentSessionHub extends EventEmitter {
 
           if (cols.has("project_id")) {
             setClauses.push("project_id = COALESCE(project_id, ?)");
-            params.push(projId);
+            params.push(sqliteProjId);
           }
           if (cols.has("title")) {
             setClauses.push("title = CASE WHEN COALESCE(title, '') = '' THEN ? ELSE title END");
@@ -1080,7 +1721,9 @@ export class AgentSessionHub extends EventEmitter {
             setClauses.push("thread_source = CASE WHEN COALESCE(thread_source, '') = '' THEN 'user' ELSE thread_source END");
           }
           if (cols.has("originator")) {
-            setClauses.push("originator = CASE WHEN COALESCE(originator, '') = '' THEN 'Codex Desktop' ELSE originator END");
+            setClauses.push(
+              "originator = CASE WHEN originator IN ('vscode', 'exec', 'codex_exec') OR COALESCE(originator, '') = '' THEN 'Codex Desktop' ELSE originator END"
+            );
           }
 
           params.push(threadId);
@@ -1093,16 +1736,20 @@ export class AgentSessionHub extends EventEmitter {
       // ignore if locked
     }
 
-    // 2. Register project membership in `~/.codex/.codex-global-state.json` if present (used by Codex.app sidebar)
+    // 2. Register project & thread membership in `~/.codex/.codex-global-state.json` when Codex Desktop is not actively owning it in RAM
+    if (this.isCodexDesktopAppRunning()) return;
     try {
       const globalStatePath = path.join(codexRoot, ".codex-global-state.json");
       if (!fs.existsSync(globalStatePath) || !normWs) return;
       const raw = fs.readFileSync(globalStatePath, "utf8");
       const stateObj = JSON.parse(raw) as Record<string, any>;
-      const localProjects = stateObj["local-projects"];
-      if (!localProjects || typeof localProjects !== "object") return;
+      const localProjects =
+        stateObj["local-projects"] && typeof stateObj["local-projects"] === "object"
+          ? stateObj["local-projects"]
+          : {};
 
       let matchedLocalProjId: string | null = null;
+      let changed = false;
       for (const [lpId, lpVal] of Object.entries(localProjects)) {
         const roots = Array.isArray((lpVal as any)?.rootPaths) ? (lpVal as any).rootPaths : [];
         if (roots.some((r: unknown) => typeof r === "string" && r.trim().replace(/\/+$/, "") === normWs)) {
@@ -1110,7 +1757,41 @@ export class AgentSessionHub extends EventEmitter {
           break;
         }
       }
-      if (!matchedLocalProjId) return;
+
+      if (!matchedLocalProjId) {
+        const hashHex = crypto.createHash("md5").update(normWs).digest("hex");
+        matchedLocalProjId = `local-${hashHex}`;
+        const nowMs = Date.now();
+        localProjects[matchedLocalProjId] = {
+          id: matchedLocalProjId,
+          name: projDisplayName,
+          rootPaths: [normWs],
+          createdAt: nowMs,
+          updatedAt: nowMs,
+        };
+        stateObj["local-projects"] = localProjects;
+        if (Array.isArray(stateObj["project-order"]) && !stateObj["project-order"].includes(matchedLocalProjId)) {
+          stateObj["project-order"] = [matchedLocalProjId, ...stateObj["project-order"]];
+        }
+        if (sqliteProjId) {
+          const mapByHost =
+            stateObj["app-server-project-id-by-legacy-project-id-by-host"] &&
+            typeof stateObj["app-server-project-id-by-legacy-project-id-by-host"] === "object"
+              ? stateObj["app-server-project-id-by-legacy-project-id-by-host"]
+              : {};
+          const hostKey = `local:${codexRoot}`;
+          mapByHost[hostKey] = { ...(mapByHost[hostKey] || {}), [matchedLocalProjId]: sqliteProjId };
+          stateObj["app-server-project-id-by-legacy-project-id-by-host"] = mapByHost;
+        }
+        const owner = stateObj["electron-renderer-content-owner"];
+        if (typeof owner === "string" && owner) {
+          const wsOptKey = `electron-owner-value:electron-saved-workspace-roots:${owner}`;
+          if (Array.isArray(stateObj[wsOptKey]) && !stateObj[wsOptKey].includes(normWs)) {
+            stateObj[wsOptKey] = [...stateObj[wsOptKey], normWs];
+          }
+        }
+        changed = true;
+      }
 
       const assignments =
         stateObj["thread-project-assignments"] && typeof stateObj["thread-project-assignments"] === "object"
@@ -1122,7 +1803,6 @@ export class AgentSessionHub extends EventEmitter {
           ? stateObj["thread-project-membership-host-ids"]
           : {};
 
-      let changed = false;
       if (!assignments[threadId]) {
         assignments[threadId] = { projectKind: "local", projectId: matchedLocalProjId };
         stateObj["thread-project-assignments"] = assignments;
@@ -1200,9 +1880,253 @@ export class AgentSessionHub extends EventEmitter {
   }
 
   /**
+   * Resolves (or creates) an Antigravity project JSON in `<geminiRoot>/config/projects/<uuid>.json`
+   * matching `workspacePath`, ensuring every mobile Antigravity conversation binds to a valid `projectId`
+   * in `Antigravity.app`'s project-grouped sidebar.
+   */
+  public resolveOrCreateAgyProjectForWorkspace(workspacePath: string): string {
+    const normWs = (workspacePath || this.defaultWorkspacePath).trim().replace(/\/+$/, "");
+    if (!normWs || !path.isAbsolute(normWs)) return "";
+    const targetUri = pathToFileURL(normWs).href.replace(/\/+$/, "");
+    const desktopRoot = path.dirname(this.agyBrainDir);
+    const geminiRoot = path.dirname(desktopRoot);
+    const projectsDir = path.join(geminiRoot, "config", "projects");
+
+    try {
+      if (fs.existsSync(projectsDir)) {
+        for (const f of fs.readdirSync(projectsDir)) {
+          if (!f.endsWith(".json") || f === "default-cli-project.json" || f === "outside-of-project.json") {
+            continue;
+          }
+          try {
+            const parsed = JSON.parse(fs.readFileSync(path.join(projectsDir, f), "utf8"));
+            const resources = Array.isArray(parsed?.projectResources?.resources)
+              ? parsed.projectResources.resources
+              : [];
+            const matched = resources.some(
+              (r: any) =>
+                typeof r?.folderUri === "string" && r.folderUri.trim().replace(/\/+$/, "") === targetUri
+            );
+            if (matched && typeof parsed?.id === "string" && parsed.id) {
+              return parsed.id;
+            }
+          } catch {}
+        }
+      }
+
+      fs.mkdirSync(projectsDir, { recursive: true });
+      const newProjId = crypto.randomUUID();
+      const projDoc = {
+        id: newProjId,
+        name: path.basename(normWs) || "workspace",
+        projectResources: {
+          resources: [{ folderUri: targetUri }],
+        },
+        permissionGrants: {
+          v2Migrated: true,
+        },
+        settings: {},
+        isWorkspaceOnly: false,
+      };
+      const targetFile = path.join(projectsDir, `${newProjId}.json`);
+      const tmpFile = `${targetFile}.oms_${process.pid}_${Date.now()}.tmp`;
+      fs.writeFileSync(tmpFile, JSON.stringify(projDoc, null, 2) + "\n", "utf8");
+      fs.renameSync(tmpFile, targetFile);
+      return newProjId;
+    } catch {
+      return "";
+    }
+  }
+
+  private encodeProtobufVarint(val: bigint | number): Buffer {
+    let n = typeof val === "bigint" ? val : BigInt(Math.max(0, Math.floor(val)));
+    const bytes: number[] = [];
+    while (n >= 0x80n) {
+      bytes.push(Number(n & 0x7fn) | 0x80);
+      n >>= 7n;
+    }
+    bytes.push(Number(n));
+    return Buffer.from(bytes);
+  }
+
+  private encodeProtobufBytesField(fieldNo: number, payload: Buffer | string): Buffer {
+    const buf = typeof payload === "string" ? Buffer.from(payload, "utf8") : payload;
+    const tag = this.encodeProtobufVarint((fieldNo << 3) | 2);
+    const len = this.encodeProtobufVarint(buf.length);
+    return Buffer.concat([tag, len, buf]);
+  }
+
+  private encodeAgyTrajectoryMetadataProto(opts: {
+    conversationId: string;
+    workspacePath: string;
+    projectId: string;
+    createdAtMs: number;
+  }): Buffer {
+    const normWs = opts.workspacePath.trim().replace(/\/+$/, "");
+    const folderUri = pathToFileURL(normWs).href.replace(/\/+$/, "");
+    const wsParts: Buffer[] = [this.encodeProtobufBytesField(1, folderUri)];
+    if (fs.existsSync(path.join(normWs, ".git"))) {
+      wsParts.push(this.encodeProtobufBytesField(2, folderUri));
+    }
+    const wsInfoMsg = Buffer.concat(wsParts);
+
+    const secs = BigInt(Math.floor(opts.createdAtMs / 1000));
+    const nanos = BigInt((opts.createdAtMs % 1000) * 1_000_000);
+    const tsMsg = Buffer.concat([
+      this.encodeProtobufVarint((1 << 3) | 0),
+      this.encodeProtobufVarint(secs),
+      ...(nanos > 0n
+        ? [this.encodeProtobufVarint((2 << 3) | 0), this.encodeProtobufVarint(nanos)]
+        : []),
+    ]);
+
+    const fields: Buffer[] = [
+      this.encodeProtobufBytesField(1, wsInfoMsg),
+      this.encodeProtobufBytesField(2, tsMsg),
+      this.encodeProtobufBytesField(3, crypto.randomUUID()),
+      this.encodeProtobufBytesField(6, opts.conversationId),
+      this.encodeProtobufBytesField(7, folderUri),
+    ];
+    if (opts.projectId) {
+      fields.push(this.encodeProtobufBytesField(18, opts.projectId));
+    }
+    return Buffer.concat(fields);
+  }
+
+  private normalizeAgyTrajectoryDatabase(
+    dbPath: string,
+    sourceConversationId: string,
+    targetConversationId: string,
+    workspacePath: string,
+    projectId: string
+  ): void {
+    if (!fs.existsSync(dbPath)) return;
+    const normWs = workspacePath.trim().replace(/\/+$/, "");
+    const folderUri = normWs && path.isAbsolute(normWs) ? pathToFileURL(normWs).href.replace(/\/+$/, "") : "";
+
+    const db = new Database(dbPath);
+    try {
+      db.exec("PRAGMA busy_timeout = 1500;");
+      const tmCols = new Set(
+        (db.query("PRAGMA table_info(trajectory_meta)").all() as Array<{ name?: string }>).map((c) =>
+          String(c.name || "")
+        )
+      );
+      if (tmCols.has("cascade_id") && tmCols.has("trajectory_type") && tmCols.has("source")) {
+        db.query("UPDATE trajectory_meta SET cascade_id = ?, trajectory_type = 4, source = 1").run(
+          targetConversationId
+        );
+      } else if (tmCols.has("trajectory_id") && targetConversationId !== sourceConversationId) {
+        db.query("UPDATE trajectory_meta SET trajectory_id = ?").run(targetConversationId);
+      }
+
+      db.exec(
+        'CREATE TABLE IF NOT EXISTS trajectory_metadata_blob (id TEXT DEFAULT "main", data BLOB, PRIMARY KEY (id));'
+      );
+      const existingRow = db
+        .query("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'")
+        .get() as { data?: Uint8Array | null } | null;
+      let blobBuf: Buffer = existingRow?.data ? Buffer.from(existingRow.data) : Buffer.alloc(0);
+
+      if (
+        blobBuf.length > 0 &&
+        targetConversationId !== sourceConversationId &&
+        sourceConversationId.length === targetConversationId.length
+      ) {
+        const replacedStr = blobBuf.toString("latin1").split(sourceConversationId).join(targetConversationId);
+        blobBuf = Buffer.from(replacedStr, "latin1");
+      }
+
+      const hasWorkspace = folderUri ? blobBuf.includes(folderUri) : true;
+      const hasProject = projectId ? blobBuf.includes(projectId) : true;
+      if (blobBuf.length === 0 || !hasWorkspace || !hasProject) {
+        blobBuf = this.encodeAgyTrajectoryMetadataProto({
+          conversationId: targetConversationId,
+          workspacePath: normWs || this.defaultWorkspacePath,
+          projectId,
+          createdAtMs: Date.now(),
+        });
+      }
+
+      db.query("INSERT OR REPLACE INTO trajectory_metadata_blob (id, data) VALUES ('main', ?)").run(blobBuf);
+    } finally {
+      db.close();
+    }
+  }
+
+  private readAgyAnnotationTitle(desktopRoot: string, conversationId: string): string {
+    const pbtxtPath = path.join(desktopRoot, "annotations", `${conversationId}.pbtxt`);
+    if (!fs.existsSync(pbtxtPath)) return "";
+    try {
+      const raw = fs.readFileSync(pbtxtPath, "utf8");
+      const m = raw.match(/title:\s*"((?:\\.|[^"\\])*)"/);
+      return m?.[1] ? m[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\").trim() : "";
+    } catch {
+      return "";
+    }
+  }
+
+  private ensureAgyAnnotationPbtxt(
+    desktopRoot: string,
+    conversationId: string,
+    titleHint: string,
+    overwriteExisting = false
+  ): void {
+    const cleanTitle = this.compactHumanTitle(titleHint) || titleHint.trim().slice(0, 64);
+    if (!cleanTitle) return;
+    const annDir = path.join(desktopRoot, "annotations");
+    const pbtxtPath = path.join(annDir, `${conversationId}.pbtxt`);
+    try {
+      fs.mkdirSync(annDir, { recursive: true });
+      if (fs.existsSync(pbtxtPath) && !overwriteExisting) {
+        // Touch mtime so Antigravity's annotations watcher re-applies preserved Desktop title after CLI DB removal
+        const nowDate = new Date();
+        fs.utimesSync(pbtxtPath, nowDate, nowDate);
+        return;
+      }
+      const escaped = cleanTitle
+        .replace(/\\/g, "\\\\")
+        .replace(/"/g, '\\"')
+        .replace(/[\r\n]+/g, " ")
+        .trim();
+      const secs = Math.floor(Date.now() / 1000);
+      const content = `title:"${escaped}" last_user_view_time:{seconds:${secs} nanos:0}`;
+      const tmp = `${pbtxtPath}.oms_${process.pid}_${Date.now()}.tmp`;
+      fs.writeFileSync(tmp, content, "utf8");
+      fs.renameSync(tmp, pbtxtPath);
+    } catch {
+      // ignore annotation write race
+    }
+  }
+
+  private removeAgyCliDuplicateDb(cliDbPath: string): void {
+    for (const sfx of ["", "-wal", "-shm"]) {
+      try {
+        if (fs.existsSync(cliDbPath + sfx)) {
+          fs.unlinkSync(cliDbPath + sfx);
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private isFileHeldOpenByProcess(filePath: string): boolean {
+    if (!fs.existsSync(filePath) || process.env.OMS_TEST_ISOLATION === "1") return false;
+    try {
+      const candidates = [filePath];
+      if (fs.existsSync(filePath + "-wal")) candidates.push(filePath + "-wal");
+      const r = spawnSync("lsof", ["-t", ...candidates], { encoding: "utf8", timeout: 1500 });
+      return r.status === 0 && (r.stdout || "").trim().length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Before running `agy --conversation <id>`, ensures Desktop conversations living in
    * `~/.gemini/antigravity/{conversations,brain}` are mirrored into `~/.gemini/antigravity-cli/{conversations,brain}`
-   * so `agy` CLI never fails with `trajectory not found`.
+   * (capturing live `.db-wal` frames via `VACUUM INTO`) so `agy` CLI never fails with `trajectory not found`.
    */
   public prepareAgySessionForCliResume(conversationId: string): void {
     const desktopRoot = path.dirname(this.agyBrainDir);
@@ -1210,9 +2134,13 @@ export class AgentSessionHub extends EventEmitter {
     const cliDb = path.join(this.agyCliDir, "conversations", `${conversationId}.db`);
 
     if (fs.existsSync(desktopDb)) {
+      const desktopWal = `${desktopDb}-wal`;
+      const effectiveDesktopMtime = Math.max(
+        fs.statSync(desktopDb).mtimeMs,
+        fs.existsSync(desktopWal) ? fs.statSync(desktopWal).mtimeMs : 0
+      );
       const needSync =
-        !fs.existsSync(cliDb) ||
-        fs.statSync(desktopDb).mtimeMs >= fs.statSync(cliDb).mtimeMs;
+        !fs.existsSync(cliDb) || effectiveDesktopMtime >= fs.statSync(cliDb).mtimeMs;
       if (needSync) {
         this.snapshotSqliteDatabaseSafely(desktopDb, cliDb);
       }
@@ -1226,15 +2154,20 @@ export class AgentSessionHub extends EventEmitter {
   }
 
   /**
-   * After `agy` finishes (either `startSession` or `continueSession`), discovers any newly minted
-   * conversation UUID in `~/.gemini/antigravity-cli/` and atomically syncs both `<id>.db` and `brain/<id>`
-   * back into `~/.gemini/antigravity/` so Antigravity Desktop (`Antigravity.app`) watches & displays it!
+   * After `agy` finishes (either `startSession` or `continueSession`), promotes the conversation
+   * from `~/.gemini/antigravity-cli/` into `~/.gemini/antigravity/`:
+   * - Binds valid `projectId` + `workspaceUris` + Desktop `trajectory_meta` (`trajectory_type = 4, source = 1`)
+   * - Preserves or creates `annotations/<id>.pbtxt` so `Antigravity.app` displays the human title
+   * - Forks cleanly to a fresh Desktop UUID if `<id>.db` is currently held open in an active `Antigravity.app` pane
+   * - Removes the duplicate `<id>.db` from `antigravity-cli/conversations/` so `Antigravity.app`'s CLI directory watcher
+   *   never overrides `source` back to `CORTEX_TRAJECTORY_SOURCE_CLI`!
    */
   public syncAgyCliSessionToDesktop(
     knownSessionId: string,
     startedAtMs: number,
     workspacePath: string,
-    titleHint: string
+    titleHint: string,
+    forceDesktopFork = false
   ): string {
     let realId = knownSessionId;
     const cliConvDir = path.join(this.agyCliDir, "conversations");
@@ -1258,48 +2191,86 @@ export class AgentSessionHub extends EventEmitter {
 
     if (!realId || realId.startsWith("pending_")) return knownSessionId;
 
+    const normWs = this.resolveWorkspace(workspacePath);
+    const agyProjectId = this.resolveOrCreateAgyProjectForWorkspace(normWs);
     const desktopRoot = path.dirname(this.agyBrainDir);
     const cliBrain = path.join(this.agyCliDir, "brain", realId);
-    const desktopBrain = path.join(this.agyBrainDir, realId);
-    if (fs.existsSync(cliBrain)) {
-      this.copyDirRecursiveNewest(cliBrain, desktopBrain);
-    }
-
+    const origDesktopBrain = path.join(this.agyBrainDir, realId);
     const cliDb = path.join(cliConvDir, `${realId}.db`);
     const desktopConvDir = path.join(desktopRoot, "conversations");
-    const desktopDb = path.join(desktopConvDir, `${realId}.db`);
+    const origDesktopDb = path.join(desktopConvDir, `${realId}.db`);
+
+    const lockedByDesktop = forceDesktopFork || this.isFileHeldOpenByProcess(origDesktopDb);
+    const finalId = lockedByDesktop && fs.existsSync(origDesktopDb) ? crypto.randomUUID() : realId;
+    const targetDesktopDb = path.join(desktopConvDir, `${finalId}.db`);
+    const targetDesktopBrain = path.join(this.agyBrainDir, finalId);
+
+    if (finalId !== realId && fs.existsSync(origDesktopBrain)) {
+      this.copyDirRecursiveNewest(origDesktopBrain, targetDesktopBrain);
+    }
+    if (fs.existsSync(cliBrain)) {
+      this.copyDirRecursiveNewest(cliBrain, targetDesktopBrain);
+    }
+
+    const baseTitle =
+      this.readAgyAnnotationTitle(desktopRoot, realId) ||
+      this.compactHumanTitle(titleHint) ||
+      titleHint.trim().slice(0, 64) ||
+      `Antigravity · ${path.basename(normWs)}`;
 
     if (fs.existsSync(cliDb)) {
-      let lockedByDesktop = false;
-      if (fs.existsSync(desktopDb) && process.env.OMS_TEST_ISOLATION !== "1") {
-        try {
-          const r = spawnSync("lsof", ["-t", desktopDb], { encoding: "utf8", timeout: 1500 });
-          if (r.status === 0 && (r.stdout || "").trim().length > 0) {
-            lockedByDesktop = true;
-          }
-        } catch {}
+      try {
+        this.normalizeAgyTrajectoryDatabase(cliDb, realId, finalId, normWs, agyProjectId);
+      } catch {
+        // ignore schema edge cases on minimal mock DBs
       }
-      if (!lockedByDesktop) {
-        this.snapshotSqliteDatabaseSafely(cliDb, desktopDb);
+      const snapOk = this.snapshotSqliteDatabaseSafely(cliDb, targetDesktopDb);
+      if (snapOk) {
+        this.removeAgyCliDuplicateDb(cliDb);
       }
     }
 
-    // Also upsert conversation_summaries.db if present & unlocked so offline/desktop metadata is immediate
+    if (finalId !== realId) {
+      this.ensureAgyAnnotationPbtxt(
+        desktopRoot,
+        finalId,
+        this.formatMobileForkTitle(baseTitle, "Antigravity 会话"),
+        true
+      );
+    } else {
+      this.ensureAgyAnnotationPbtxt(desktopRoot, finalId, baseTitle, false);
+    }
+
+    // Also update conversation_summaries.db when unlocked so offline/test metadata is immediate
     const summaryDbPath = path.join(desktopRoot, "conversation_summaries.db");
-    if (fs.existsSync(summaryDbPath)) {
+    if (fs.existsSync(summaryDbPath) && !this.isFileHeldOpenByProcess(summaryDbPath)) {
       try {
         const db = new Database(summaryDbPath);
         try {
           db.exec("PRAGMA busy_timeout = 1200;");
-          const wsUri = JSON.stringify([pathToFileURL(workspacePath).href]);
-          const nowIso = new Date().toISOString().replace("T", " ").replace("Z", "");
-          db.query(
-            `UPDATE conversation_summaries
+          const wsUri = JSON.stringify([pathToFileURL(normWs).href.replace(/\/+$/, "")]);
+          const nowIso = new Date().toISOString().replace("T", " ").replace("Z", "+00:00");
+          const sumCols = new Set(
+            (db.query("PRAGMA table_info(conversation_summaries)").all() as Array<{ name?: string }>).map(
+              (c) => String(c.name || "")
+            )
+          );
+          const extraClauses = [
+            sumCols.has("project_id")
+              ? "project_id = CASE WHEN COALESCE(project_id, '') = '' THEN ? ELSE project_id END"
+              : "",
+            sumCols.has("source") ? "source = ''" : "",
+          ].filter(Boolean);
+          const sql = `UPDATE conversation_summaries
              SET last_modified_time = ?,
-                 workspace_uris = CASE WHEN COALESCE(workspace_uris, '[]') = '[]' THEN ? ELSE workspace_uris END,
+                 workspace_uris = CASE WHEN COALESCE(workspace_uris, '') IN ('', '[]') THEN ? ELSE workspace_uris END,
                  title = CASE WHEN COALESCE(title, '') = '' THEN ? ELSE title END
-             WHERE conversation_id = ?`
-          ).run(nowIso, wsUri, titleHint.slice(0, 80), realId);
+                 ${extraClauses.length > 0 ? ", " + extraClauses.join(", ") : ""}
+             WHERE conversation_id = ?`;
+          const runArgs: any[] = [nowIso, wsUri, baseTitle.slice(0, 80)];
+          if (sumCols.has("project_id")) runArgs.push(agyProjectId);
+          runArgs.push(finalId);
+          db.query(sql).run(...runArgs);
         } finally {
           db.close();
         }
@@ -1308,7 +2279,97 @@ export class AgentSessionHub extends EventEmitter {
       }
     }
 
-    return realId;
+    return finalId;
+  }
+
+  /**
+   * Idempotently repairs historical mobile-created & mobile-continued sessions so both
+   * `ChatGPT.app` (Codex Desktop) and `Antigravity.app` surface previously orphaned sessions immediately.
+   */
+  public reconcileDesktopVisibility(): { repairedCodex: number; repairedAgy: number } {
+    let repairedCodex = 0;
+    let repairedAgy = 0;
+    let tasksDirty = false;
+
+    const desktopRoot = path.dirname(this.agyBrainDir);
+    const desktopConvDir = path.join(desktopRoot, "conversations");
+    const cliConvDir = path.join(this.agyCliDir, "conversations");
+
+    // 1. Reconcile tracked mobile tasks (Codex projects/originators/fork titles + Antigravity CLI->Desktop promotion + [object Object] cleanup)
+    for (const [, st] of this.managedTasks) {
+      const s = st.summary;
+      if (!s.sessionId || s.sessionId.startsWith("pending_")) continue;
+
+      if (s.backend === "codex") {
+        let isForked = false;
+        const rp = this.findCodexRolloutFilePath(s.sessionId);
+        if (rp && fs.existsSync(rp)) {
+          try {
+            const firstLine = this.readJsonlBoundedLines(rp, 16 * 1024, 0)[0];
+            if (firstLine) {
+              const meta = JSON.parse(firstLine);
+              if (meta?.type === "session_meta" && meta?.payload?.forked_from_id) {
+                isForked = true;
+              }
+            }
+          } catch {}
+        }
+        if (isForked && !/[（(]手机接续[）)]$/u.test(s.title)) {
+          s.title = this.formatMobileForkTitle(s.title, "Codex 会话");
+          tasksDirty = true;
+        }
+        this.linkCodexThreadToWorkspaceProject(s.sessionId, s.workspacePath, s.title, isForked);
+        repairedCodex += 1;
+      } else if (s.backend === "agy") {
+        const syncedId = this.syncAgyCliSessionToDesktop(
+          s.sessionId,
+          0,
+          s.workspacePath,
+          s.title
+        );
+        if (syncedId && syncedId !== s.sessionId) {
+          this.sessionAliases.set(`agy:${s.sessionId}`, syncedId);
+          s.sessionId = syncedId;
+          tasksDirty = true;
+        }
+        // Clean legacy `[object Object]` step/summary artifacts from disk transcript
+        if (
+          s.lastSummary.includes("[object Object]") ||
+          st.steps.some((step) => step.detail.includes("[object Object]"))
+        ) {
+          const disk = this.readAgySessionDetail(s.sessionId);
+          if (disk && disk.steps.length > 0) {
+            st.steps = disk.steps;
+            s.lastSummary = disk.session.lastSummary;
+            tasksDirty = true;
+          }
+        }
+        repairedAgy += 1;
+      }
+    }
+
+    // 2. Also remove any leftover duplicate `<id>.db` in `antigravity-cli/conversations/` that already exists in `antigravity/conversations/`
+    if (fs.existsSync(cliConvDir) && fs.existsSync(desktopConvDir)) {
+      try {
+        for (const f of fs.readdirSync(cliConvDir)) {
+          if (!f.endsWith(".db") || f.startsWith(".")) continue;
+          const convId = path.basename(f, ".db");
+          const dDb = path.join(desktopConvDir, f);
+          const cDb = path.join(cliConvDir, f);
+          if (!fs.existsSync(dDb)) continue;
+          const disk = this.readAgySessionDetail(convId);
+          const ws = disk?.session.workspacePath || this.defaultWorkspacePath;
+          const title = disk?.session.title || "";
+          this.syncAgyCliSessionToDesktop(convId, 0, ws, title);
+          if (!fs.existsSync(cDb)) repairedAgy += 1;
+        }
+      } catch {}
+    }
+
+    if (tasksDirty) {
+      this.persistTasks();
+    }
+    return { repairedCodex, repairedAgy };
   }
 
   private launchManagedProcess(
@@ -1319,7 +2380,7 @@ export class AgentSessionHub extends EventEmitter {
     const startedAtMs = Date.now();
     let currentKey = `${initialSummary.backend}:${initialSummary.sessionId}`;
     const prev = this.managedTasks.get(currentKey);
-    if (prev?.child) {
+    if (prev?.child || prev?.cancelHook) {
       throw new Error(`该会话正在运行中 (${initialSummary.sessionId})，请等待当前轮次完成或先停止`);
     }
 
@@ -1327,6 +2388,7 @@ export class AgentSessionHub extends EventEmitter {
       summary: initialSummary,
       steps: initialSteps,
       child: null,
+      cancelHook: null,
     };
     this.managedTasks.set(currentKey, state);
 
@@ -1406,13 +2468,17 @@ export class AgentSessionHub extends EventEmitter {
         state.summary.status = ok ? "completed" : "failed";
       }
       if (state.summary.backend === "agy" && !this.hasCustomCliSpawner) {
+        const beforeSyncId = state.summary.sessionId;
         const syncedId = this.syncAgyCliSessionToDesktop(
           state.summary.sessionId,
           startedAtMs,
           state.summary.workspacePath,
           state.summary.title
         );
-        if (syncedId && syncedId !== state.summary.sessionId) {
+        if (syncedId && syncedId !== beforeSyncId) {
+          if (!beforeSyncId.startsWith("pending_")) {
+            state.summary.title = this.formatMobileForkTitle(state.summary.title, "Antigravity 会话");
+          }
           rekeySessionId(syncedId);
         }
       } else if (state.summary.backend === "codex" && !this.hasCustomCliSpawner && !state.summary.sessionId.startsWith("pending_")) {
@@ -1445,6 +2511,41 @@ export class AgentSessionHub extends EventEmitter {
 
     this.persistTasks();
     return { ...state.summary };
+  }
+
+  private extractAgyStreamText(obj: Record<string, any>): string {
+    const unwrapVal = (val: unknown): string => {
+      if (typeof val === "string") return val.trim();
+      if (Array.isArray(val)) {
+        return val
+          .map((item) => {
+            if (typeof item === "string") return item;
+            if (item && typeof item === "object" && typeof (item as any).text === "string") {
+              return (item as any).text;
+            }
+            return "";
+          })
+          .filter(Boolean)
+          .join("\n")
+          .trim();
+      }
+      if (val && typeof val === "object") {
+        const rec = val as Record<string, unknown>;
+        for (const k of ["text", "content", "result", "response", "output"]) {
+          if (rec[k] !== undefined && rec[k] !== val) {
+            const inner = unwrapVal(rec[k]);
+            if (inner) return inner;
+          }
+        }
+      }
+      return "";
+    };
+
+    for (const candidate of [obj.content, obj.text, obj.message, obj.result]) {
+      const extracted = unwrapVal(candidate);
+      if (extracted) return extracted;
+    }
+    return "";
   }
 
   private parseCliStreamLine(
@@ -1528,8 +2629,15 @@ export class AgentSessionHub extends EventEmitter {
             timestampMs: now,
           };
         }
-        const text = String(obj.content || obj.text || obj.result || "").trim();
-        if (text && (type.includes("assistant") || type.includes("RESULT") || type.includes("PLANNER") || type === "message" || !type)) {
+        const text = this.extractAgyStreamText(obj);
+        if (
+          text &&
+          (type.toLowerCase().includes("assistant") ||
+            type.toUpperCase().includes("RESULT") ||
+            type.toUpperCase().includes("PLANNER") ||
+            type === "message" ||
+            !type)
+        ) {
           return {
             stepIndex: nextIndex,
             kind: "assistant",
@@ -1740,7 +2848,7 @@ export class AgentSessionHub extends EventEmitter {
         });
       if (stateDbs.length > 0) {
         const dbPath = path.join(codexRoot, stateDbs[0]);
-        const db = new Database(`file:${dbPath}?immutable=1`, { readonly: true });
+        const db = this.openSqliteReadonlyWithWal(dbPath);
         try {
           const pRows = db
             .query(
@@ -1870,7 +2978,7 @@ export class AgentSessionHub extends EventEmitter {
     for (const dbPath of dbCandidates) {
       if (!fs.existsSync(dbPath)) continue;
       try {
-        const db = new Database(`file:${dbPath}?immutable=1`, { readonly: true });
+        const db = this.openSqliteReadonlyWithWal(dbPath);
         try {
           const rows = db
             .query(
@@ -2140,12 +3248,12 @@ export class AgentSessionHub extends EventEmitter {
           }
         } else if (obj.type === "response_item" && obj.payload) {
           const p = obj.payload;
-          if (p.type === "function_call" && includeSteps) {
+          if ((p.type === "function_call" || p.type === "custom_tool_call") && includeSteps) {
             steps.push({
               stepIndex: steps.length + 1,
               kind: "tool",
-              title: `${p.name || "tool"}`,
-              detail: String(p.arguments || "").slice(0, 300),
+              title: `${p.name || p.type || "tool"}`,
+              detail: String(p.arguments || p.input || "").slice(0, 300),
               timestampMs: ts,
             });
           } else if (p.type === "message" && p.role === "user" && Array.isArray(p.content)) {
@@ -2310,8 +3418,10 @@ export class AgentSessionHub extends EventEmitter {
         ? session.workspacePath
         : "";
     const ws = (meta?.workspacePath || validDiskWs || this.defaultWorkspacePath).trim().replace(/\/+$/, "");
+    const annTitle = this.readAgyAnnotationTitle(path.dirname(this.agyBrainDir), session.sessionId);
     const preferredTitle =
       meta?.title?.trim() ||
+      annTitle ||
       this.compactHumanTitle(session.title) ||
       `Antigravity · ${ws ? path.basename(ws) : session.sessionId.slice(0, 8)}`;
 
