@@ -2952,6 +2952,7 @@ class OmsTransportClient(
                         }
                     }
                 }
+                metaObj.put("sourceMacId", secureLinks[source]?.config?.macId.orEmpty())
                 repo.upsertStreamItem(StreamItemModel(streamId, "MAC_TO_PHONE", if (enableTts) "COMMUTE_READER" else "FILE",
                     intentTag, transfer.header.optString("title", fileName), preview, null,
                     Uri.fromFile(savedFile).toString(), null, "DELIVERED",
@@ -3411,16 +3412,20 @@ class OmsTransportClient(
     suspend fun callHostRpc(
         method: String,
         params: JSONObject,
-        timeoutMs: Long = 20_000L
+        timeoutMs: Long = 20_000L,
+        expectedMacId: String? = null
     ): JSONObject? {
         val activeSrc = runCatching { activeSource() }.getOrNull() ?: return null
+        if (expectedMacId != null && secureLinks[activeSrc]?.config?.macId != expectedMacId) return null
         val rpcReq = JSONObject()
             .put("jsonrpc", "2.0")
             .put("id", "edge_${UUID.randomUUID()}")
             .put("method", method)
             .put("params", params)
         val effectiveTimeout = if (activeSrc.tier == "BT_RFCOMM") maxOf(timeoutMs, 15_000L) else timeoutMs
-        val resp = runCatching { requestHost(rpcReq, activeSrc, effectiveTimeout) }.getOrNull() ?: return null
+        val resp = try { requestHost(rpcReq, activeSrc, effectiveTimeout) }
+            catch (cancel: CancellationException) { throw cancel }
+            catch (_: Exception) { return null }
         return resp.optJSONObject("result") ?: resp
     }
 

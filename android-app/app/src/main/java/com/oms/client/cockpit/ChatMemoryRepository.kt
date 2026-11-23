@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 
 data class ChatThreadModel(
     val threadId: String,
@@ -55,6 +56,9 @@ data class ChatFtsHit(
 /**
  * Milestone 2 (v2.0): SQLite + FTS4 Full-Text Store for Silky Mobile Chat & 3-Tier Memory Funnel.
  */
+data class ChatSyncBatch(val payload: JSONObject, val macId: String,
+    val threads: Map<String, String>, val messages: Map<String, String>)
+
 class ChatMemoryRepository(context: Context) :
     SQLiteOpenHelper(context.applicationContext, "oms_cockpit_v2.db", null, DB_VERSION) {
 
@@ -89,6 +93,7 @@ class ChatMemoryRepository(context: Context) :
                 pinned INTEGER NOT NULL DEFAULT 0,
                 incognito INTEGER NOT NULL DEFAULT 0,
                 synced_to_mac INTEGER NOT NULL DEFAULT 0,
+                revision TEXT NOT NULL DEFAULT '',
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             )
@@ -109,10 +114,12 @@ class ChatMemoryRepository(context: Context) :
                 image_local_path TEXT,
                 status TEXT NOT NULL DEFAULT 'DONE',
                 synced_to_mac INTEGER NOT NULL DEFAULT 0,
+                revision TEXT NOT NULL DEFAULT '',
                 created_at_ms INTEGER NOT NULL
             )
             """.trimIndent()
         )
+        db.execSQL("CREATE TABLE IF NOT EXISTS chat_sync_receipts (mac_id TEXT NOT NULL, kind TEXT NOT NULL, item_id TEXT NOT NULL, revision TEXT NOT NULL, PRIMARY KEY(mac_id, kind, item_id))")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_chat_threads_upd ON chat_threads(pinned DESC, updated_at_ms DESC)")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_chat_messages_tid ON chat_messages(thread_id, created_at_ms ASC)")
         db.execSQL(
@@ -129,6 +136,7 @@ class ChatMemoryRepository(context: Context) :
             """
             CREATE TABLE IF NOT EXISTS pending_vault_promotions (
                 item_id TEXT PRIMARY KEY,
+                mac_id TEXT NOT NULL DEFAULT '',
                 payload_json TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL
             )
@@ -137,7 +145,18 @@ class ChatMemoryRepository(context: Context) :
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE chat_threads ADD COLUMN revision TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE chat_messages ADD COLUMN revision TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE pending_vault_promotions ADD COLUMN mac_id TEXT NOT NULL DEFAULT ''")
+        }
         onCreate(db)
+    }
+
+    @Synchronized
+    fun bindLegacyPromotions(macId: String) {
+        if (macId.isBlank()) return
+        writableDatabase.execSQL("UPDATE pending_vault_promotions SET mac_id = ? WHERE mac_id = ''", arrayOf(macId))
     }
 
     @Synchronized
@@ -158,6 +177,7 @@ class ChatMemoryRepository(context: Context) :
             put("title", model.title)
             put("pinned", 0)
             put("incognito", if (incognito) 1 else 0)
+            put("revision", UUID.randomUUID().toString())
             put("synced_to_mac", if (incognito) 1 else 0)
             put("created_at_ms", now)
             put("updated_at_ms", now)
@@ -178,6 +198,7 @@ class ChatMemoryRepository(context: Context) :
         val cur = _threadsFlow.value.firstOrNull { it.threadId == threadId } ?: return
         val cv = ContentValues().apply {
             put("pinned", if (cur.pinned) 0 else 1)
+            put("revision", UUID.randomUUID().toString())
             put("synced_to_mac", if (cur.incognito) 1 else 0)
         }
         writableDatabase.update("chat_threads", cv, "thread_id = ?", arrayOf(threadId))
@@ -191,6 +212,7 @@ class ChatMemoryRepository(context: Context) :
         val cur = _threadsFlow.value.firstOrNull { it.threadId == threadId } ?: return
         val cv = ContentValues().apply {
             put("title", cleaned)
+            put("revision", UUID.randomUUID().toString())
             put("synced_to_mac", if (cur.incognito) 1 else 0)
         }
         writableDatabase.update("chat_threads", cv, "thread_id = ?", arrayOf(threadId))
@@ -248,6 +270,7 @@ class ChatMemoryRepository(context: Context) :
             put("specimen_json", msg.specimenCard?.let(::encodeSpecimen).orEmpty())
             put("image_local_path", msg.imageLocalPath)
             put("status", msg.status)
+            put("revision", UUID.randomUUID().toString())
             put("synced_to_mac", if (isIncognito || msg.syncedToMac) 1 else 0)
             put("created_at_ms", msg.createdAtMs)
         }
@@ -265,6 +288,7 @@ class ChatMemoryRepository(context: Context) :
 
         val threadCv = ContentValues().apply {
             put("updated_at_ms", maxOf(System.currentTimeMillis(), msg.createdAtMs))
+            put("revision", UUID.randomUUID().toString())
             if (!isIncognito) put("synced_to_mac", 0)
             if (autoTitleFromFirstUserTurn && msg.role == "user" && msg.content.isNotBlank() &&
                 (thread?.title == "新对话" || thread?.title == "🕵️ 无痕对话")
@@ -459,103 +483,89 @@ class ChatMemoryRepository(context: Context) :
         prefs.edit().putString("local_working_memory_json", arr.toString()).apply()
     }
 
-    fun exportUnsyncedBatch(maxMessages: Int = 40): Pair<JSONObject, Pair<List<String>, List<String>>>? {
-        val threadIds = ArrayList<String>()
+    @Synchronized
+    fun exportUnsyncedBatch(macId: String, maxMessages: Int = 40): ChatSyncBatch? {
+        require(macId.isNotBlank())
+        val db = readableDatabase
+        val threads = linkedMapOf<String, String>()
+        val messages = linkedMapOf<String, String>()
         val threadsJson = JSONArray()
-        readableDatabase.rawQuery(
-            """
-            SELECT thread_id, title, pinned, incognito, created_at_ms, updated_at_ms
-            FROM chat_threads
-            WHERE incognito = 0 AND synced_to_mac = 0
-            LIMIT 25
-            """.trimIndent(),
-            null
-        ).use { c ->
-            while (c.moveToNext()) {
-                val tid = c.getString(0)
-                threadIds.add(tid)
-                threadsJson.put(
-                    JSONObject().apply {
-                        put("threadId", tid)
-                        put("title", c.getString(1))
-                        put("pinned", c.getInt(2) == 1)
-                        put("incognito", false)
-                        put("createdAtMs", c.getLong(4))
-                        put("updatedAtMs", c.getLong(5))
-                    }
-                )
+        val messagesJson = JSONArray()
+        fun appendThread(id: String) {
+            if (threads.containsKey(id)) return
+            db.rawQuery("SELECT thread_id,title,pinned,created_at_ms,updated_at_ms,revision FROM chat_threads WHERE thread_id=? AND incognito=0", arrayOf(id)).use { c ->
+                if (c.moveToFirst()) {
+                    threads[id] = c.getString(5)
+                    threadsJson.put(JSONObject().put("threadId", id).put("title", c.getString(1))
+                        .put("pinned", c.getInt(2) == 1).put("incognito", false)
+                        .put("createdAtMs", c.getLong(3)).put("updatedAtMs", c.getLong(4)))
+                }
             }
         }
-
-        val msgIds = ArrayList<String>()
-        val msgsJson = JSONArray()
-        readableDatabase.rawQuery(
-            """
-            SELECT m.message_id, m.thread_id, m.role, m.content, m.reasoning, m.model_used, m.sources_json, m.created_at_ms
-            FROM chat_messages m
-            JOIN chat_threads t ON t.thread_id = m.thread_id
-            WHERE t.incognito = 0 AND m.status = 'DONE' AND m.synced_to_mac = 0
-            ORDER BY m.created_at_ms ASC
-            LIMIT ?
-            """.trimIndent(),
-            arrayOf(maxMessages.toString())
-        ).use { c ->
+        db.rawQuery("""
+            SELECT t.thread_id FROM chat_threads t WHERE t.incognito=0 AND NOT EXISTS
+            (SELECT 1 FROM chat_sync_receipts r WHERE r.mac_id=? AND r.kind='thread' AND r.item_id=t.thread_id AND r.revision=t.revision)
+            ORDER BY t.created_at_ms LIMIT 25
+        """.trimIndent(), arrayOf(macId)).use { c -> while (c.moveToNext()) appendThread(c.getString(0)) }
+        db.rawQuery("""
+            SELECT m.message_id,m.thread_id,m.role,m.content,m.reasoning,m.model_used,m.sources_json,m.created_at_ms,m.revision
+            FROM chat_messages m JOIN chat_threads t ON t.thread_id=m.thread_id
+            WHERE t.incognito=0 AND m.status='DONE' AND NOT EXISTS
+            (SELECT 1 FROM chat_sync_receipts r WHERE r.mac_id=? AND r.kind='message' AND r.item_id=m.message_id AND r.revision=m.revision)
+            ORDER BY m.created_at_ms LIMIT ?
+        """.trimIndent(), arrayOf(macId, maxMessages.coerceIn(1, 100).toString())).use { c ->
             while (c.moveToNext()) {
-                val mid = c.getString(0)
-                msgIds.add(mid)
-                msgsJson.put(
-                    JSONObject().apply {
-                        put("messageId", mid)
-                        put("threadId", c.getString(1))
-                        put("role", c.getString(2))
-                        put("content", c.getString(3))
-                        put("reasoning", c.getString(4))
-                        put("modelUsed", c.getString(5))
-                        put("sourcesJson", c.getString(6))
-                        put("createdAtMs", c.getLong(7))
-                    }
-                )
+                val id = c.getString(0)
+                messages[id] = c.getString(8)
+                appendThread(c.getString(1))
+                messagesJson.put(JSONObject().put("messageId", id).put("threadId", c.getString(1))
+                    .put("role", c.getString(2)).put("content", c.getString(3)).put("reasoning", c.getString(4))
+                    .put("modelUsed", c.getString(5)).put("sourcesJson", c.getString(6)).put("createdAtMs", c.getLong(7)))
             }
         }
-
-        if (threadIds.isEmpty() && msgIds.isEmpty()) return null
-        val payload = JSONObject().apply {
-            put("threads", threadsJson)
-            put("messages", msgsJson)
-            val wm = getLocalWorkingMemory()
-            if (wm.isNotEmpty()) put("workingMemoryItems", JSONArray(wm))
-            put("syncedAtMs", System.currentTimeMillis())
-        }
-        return payload to (threadIds to msgIds)
+        if (threads.isEmpty() && messages.isEmpty()) return null
+        val payload = JSONObject().put("threads", threadsJson).put("messages", messagesJson)
+            .put("syncedAtMs", System.currentTimeMillis())
+        val wm = getLocalWorkingMemory()
+        if (wm.isNotEmpty()) payload.put("workingMemoryItems", JSONArray(wm))
+        return ChatSyncBatch(payload, macId, threads, messages)
     }
 
     @Synchronized
-    fun markBatchSynced(threadIds: List<String>, messageIds: List<String>) {
+    fun markBatchSynced(batch: ChatSyncBatch) {
         val db = writableDatabase
-        val cv = ContentValues().apply { put("synced_to_mac", 1) }
-        for (tid in threadIds) {
-            db.update("chat_threads", cv, "thread_id = ?", arrayOf(tid))
-        }
-        for (mid in messageIds) {
-            db.update("chat_messages", cv, "message_id = ?", arrayOf(mid))
-        }
+        db.beginTransaction()
+        try {
+            for ((kind, records) in listOf("thread" to batch.threads, "message" to batch.messages)) {
+                val table = if (kind == "thread") "chat_threads" else "chat_messages"
+                val column = if (kind == "thread") "thread_id" else "message_id"
+                for ((id, revision) in records) {
+                    // Check the exported revision before recording a receipt: an old ACK cannot acknowledge a new edit.
+                    db.execSQL("INSERT OR REPLACE INTO chat_sync_receipts(mac_id,kind,item_id,revision) SELECT ?,?,?,revision FROM $table WHERE $column=? AND revision=?",
+                        arrayOf(batch.macId, kind, id, id, revision))
+                    db.execSQL("UPDATE $table SET synced_to_mac=1 WHERE $column=? AND revision=?", arrayOf(id, revision))
+                }
+            }
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
     }
 
     @Synchronized
-    fun enqueuePendingVaultPromotion(itemId: String, payload: JSONObject) {
+    fun enqueuePendingVaultPromotion(itemId: String, payload: JSONObject, macId: String) {
         val cv = ContentValues().apply {
             put("item_id", itemId)
+            put("mac_id", macId)
             put("payload_json", payload.toString())
             put("created_at_ms", System.currentTimeMillis())
         }
         writableDatabase.insertWithOnConflict("pending_vault_promotions", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
     }
 
-    fun listPendingVaultPromotions(): List<Pair<String, JSONObject>> {
+    fun listPendingVaultPromotions(macId: String): List<Pair<String, JSONObject>> {
         val out = ArrayList<Pair<String, JSONObject>>()
         readableDatabase.rawQuery(
-            "SELECT item_id, payload_json FROM pending_vault_promotions ORDER BY created_at_ms ASC LIMIT 20",
-            null
+            "SELECT item_id, payload_json FROM pending_vault_promotions WHERE mac_id=? ORDER BY created_at_ms ASC LIMIT 20",
+            arrayOf(macId)
         ).use { c ->
             while (c.moveToNext()) {
                 val id = c.getString(0)
@@ -567,8 +577,8 @@ class ChatMemoryRepository(context: Context) :
     }
 
     @Synchronized
-    fun removePendingVaultPromotion(itemId: String) {
-        writableDatabase.delete("pending_vault_promotions", "item_id = ?", arrayOf(itemId))
+    fun removePendingVaultPromotion(itemId: String, payload: JSONObject, macId: String) {
+        writableDatabase.delete("pending_vault_promotions", "item_id = ? AND payload_json = ? AND mac_id = ?", arrayOf(itemId, payload.toString(), macId))
     }
 
     private fun refreshThreads() {
@@ -781,6 +791,6 @@ class ChatMemoryRepository(context: Context) :
     }.getOrNull()
 
     private companion object {
-        private const val DB_VERSION = 1
+        private const val DB_VERSION = 2
     }
 }

@@ -33,6 +33,7 @@ import com.oms.core.proxy.ProxyNodeStatusView
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -225,6 +226,17 @@ class CockpitRuntimeCoordinator(
     private val transportClient: OmsTransportClient
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val chatSync = ChatSyncQueue(chatRepo, { currentMacId() },
+        { transportClient.activeTierFlow.value != "DISCONNECTED" }) { method, payload, macId ->
+        transportClient.callHostRpc(method, payload, if (method == "chat.sync.batch") 8000L else 10_000L, macId)
+            ?.optBoolean("ok", false) == true
+    }
+    private val macScope = MacRequestScope().apply { switchTo(streamRepo.getPairedMac()?.macId.orEmpty()) }
+    private var detailJob: Job? = null
+    private val detailGeneration = java.util.concurrent.atomic.AtomicLong(0)
+    private val catalogGeneration = java.util.concurrent.atomic.AtomicLong(0)
+    private fun currentMacId() = streamRepo.getPairedMac()?.macId.orEmpty()
+    private fun accepts(ticket: MacRequestScope.Ticket) = macScope.accepts(ticket) && currentMacId() == ticket.macId
     val aiServices = CockpitAiServices({ proxyManager.getOrCreateOkHttpClient() }, llmEngine)
     val botanicalAnalyzer = BotanicalGlassAnalyzer(llmEngine)
 
@@ -371,18 +383,14 @@ class CockpitRuntimeCoordinator(
         llmEngine.roleOverrides = roleSel
         refreshProxyUiState()
 
-        edgeStore.loadCachedWorkspaceCatalogJson()?.let { raw ->
-            runCatching { applyWorkspaceCatalogJson(JSONObject(raw)) }
-        }
-        edgeStore.loadCachedChisuCatalogJson()?.let { raw ->
-            runCatching { applyChisuArticlesCatalogJson(JSONObject(raw)) }
-        }
+        loadCachedCatalogForMac(currentMacId())
         loadCachedSecretaryBrief()?.let { _secretaryBriefFlow.value = it }
         loadCachedMemoryCenter()?.let { _memoryCenterFlow.value = it } ?: syncLocalFallbackMemoryCenter()
 
         scope.launch {
             transportClient.activeTierFlow.collect { tier ->
                 if (tier != "DISCONNECTED") {
+                    if (macScope.ticket().macId != currentMacId()) withContext(Dispatchers.Main.immediate) { loadCachedCatalogForMac(currentMacId()) }
                     flushPendingSyncToMac()
                     flushPendingBrowserCurates()
                     refreshAgentSessions()
@@ -948,9 +956,10 @@ class CockpitRuntimeCoordinator(
         }
 
     private suspend fun sendOrQueueVaultPromotion(itemId: String, payload: JSONObject): Boolean {
+        val targetMac = currentMacId()
         if (transportClient.activeTierFlow.value != "DISCONNECTED") {
             val ok = runCatching {
-                val res = transportClient.callHostRpc("memory.promote_vault", payload, 10_000L)
+                val res = transportClient.callHostRpc("memory.promote_vault", payload, 10_000L, targetMac)
                 res?.optBoolean("ok", false) == true
             }.getOrDefault(false)
             if (ok) {
@@ -958,60 +967,42 @@ class CockpitRuntimeCoordinator(
                 return true
             }
         }
-        chatRepo.enqueuePendingVaultPromotion(itemId, payload)
+        chatRepo.enqueuePendingVaultPromotion(itemId, payload, targetMac)
         vibrateTick()
         return false
     }
 
     fun flushPendingSyncToMac() {
         if (transportClient.activeTierFlow.value == "DISCONNECTED") return
-        scope.launch {
-            runCatching {
-                chatRepo.exportUnsyncedBatch(40)?.let { (payload, ids) ->
-                    val res = transportClient.callHostRpc("chat.sync.batch", payload, 8000L)
-                    if (res?.optBoolean("ok", false) == true) {
-                        chatRepo.markBatchSynced(ids.first, ids.second)
-                    }
-                }
-                for ((itemId, promPayload) in chatRepo.listPendingVaultPromotions()) {
-                    val res = transportClient.callHostRpc("memory.promote_vault", promPayload, 10_000L)
-                    if (res?.optBoolean("ok", false) == true) {
-                        chatRepo.removePendingVaultPromotion(itemId)
-                    }
-                }
-            }
-        }
+        scope.launch { chatSync.flush() }
     }
 
     // =========================================================================
     // Chisu (尺素) Mac Library Sync, Dual-Doc Detail Cache & Inline Image Loader
     // =========================================================================
 
-    private fun chisuCacheDir(): File = File(appContext.filesDir, "chisu_cache").apply { mkdirs() }
-    private fun chisuAssetCacheDir(): File = File(appContext.cacheDir, "chisu_assets").apply { mkdirs() }
+    private fun chisuCacheDir(macId: String = currentMacId()): File = MacRequestScope.directory(File(appContext.filesDir, "chisu_cache_v2"), macId)
+    private fun chisuAssetCacheDir(macId: String = currentMacId()): File = MacRequestScope.directory(File(appContext.cacheDir, "chisu_assets_v2"), macId)
 
     fun refreshChisuArticles(limit: Int = 80) {
         if (transportClient.activeTierFlow.value == "DISCONNECTED") return
-        scope.launch {
+        val ticket = macScope.ticket()
+        val generation = catalogGeneration.incrementAndGet()
+        scope.launch(Dispatchers.Main.immediate) {
             _isRefreshingChisuFlow.value = true
             try {
-                val resp = transportClient.callHostRpc(
-                    "wechat.articles.list",
-                    JSONObject().put("limit", limit),
-                    10_000L
-                ) ?: return@launch
-                if (resp.optBoolean("ok", false)) {
-                    edgeStore.saveCachedChisuCatalogJson(resp.toString())
-                    applyChisuArticlesCatalogJson(resp)
+                val resp = transportClient.callHostRpc("wechat.articles.list", JSONObject().put("limit", limit), 10_000L, ticket.macId)
+                if (resp?.optBoolean("ok", false) == true && accepts(ticket) && generation == catalogGeneration.get()) {
+                    File(chisuCacheDir(ticket.macId), "catalog.json").writeText(resp.toString())
+                    applyChisuArticlesCatalogJson(resp, ticket.macId)
                 }
-            } catch (_: Throwable) {
-            } finally {
-                _isRefreshingChisuFlow.value = false
-            }
+            } catch (cancel: CancellationException) { throw cancel }
+            catch (_: Exception) { }
+            finally { if (accepts(ticket) && generation == catalogGeneration.get()) _isRefreshingChisuFlow.value = false }
         }
     }
 
-    private fun applyChisuArticlesCatalogJson(resp: JSONObject) {
+    private fun applyChisuArticlesCatalogJson(resp: JSONObject, macId: String) {
         val arr = resp.optJSONArray("articles") ?: return
         val out = ArrayList<ChisuArticleItemUi>(arr.length())
         for (i in 0 until arr.length()) {
@@ -1037,7 +1028,8 @@ class CockpitRuntimeCoordinator(
             }
             out.add(
                 ChisuArticleItemUi(
-                    stableKey = stableKey,
+                    stableKey = "$macId:$stableKey",
+                    ownerMacId = macId,
                     articleId = id.takeIf { it > 0 },
                     turnId = turnId.takeIf { it > 0 },
                     entryKind = entryKind,
@@ -1059,17 +1051,23 @@ class CockpitRuntimeCoordinator(
                 )
             )
         }
-        _chisuArticlesFlow.value = out
+        if (currentMacId() == macId) _chisuArticlesFlow.value = out
     }
 
     fun openChisuArticle(item: ChisuArticleItemUi, forceRefresh: Boolean = false) {
+        detailJob?.cancel()
+        val generation = detailGeneration.incrementAndGet()
+        val ticket = macScope.ticket()
+        fun isCurrent() = accepts(ticket) && detailGeneration.get() == generation
         _chisuDetailErrorFlow.value = null
         val localSource = item.localSourceFilePath?.let { p ->
             runCatching { File(p).takeIf { it.exists() }?.readText(Charsets.UTF_8) }.getOrNull()
         }
-        val cached = loadCachedChisuDetail(item.articleId, item.turnId)
+        val ownsRemote = item.ownerMacId == ticket.macId && ticket.macId.isNotBlank()
+        val cached = if (ownsRemote) loadCachedChisuDetail(item.articleId, item.turnId, ticket.macId) else null
         val initial = ChisuArticleDetailUi(
             stableKey = item.stableKey,
+            ownerMacId = item.ownerMacId,
             articleId = item.articleId ?: cached?.articleId,
             turnId = item.turnId ?: cached?.turnId,
             entryKind = item.entryKind,
@@ -1093,16 +1091,16 @@ class CockpitRuntimeCoordinator(
         )
         _activeChisuDetailFlow.value = initial
 
-        val canQueryMac = transportClient.activeTierFlow.value != "DISCONNECTED" &&
+        val canQueryMac = ownsRemote && transportClient.activeTierFlow.value != "DISCONNECTED" &&
             (item.articleId != null || item.turnId != null || item.sourceUrl.isNotBlank() || item.title.isNotBlank())
-        val needsRemote = forceRefresh || initial.sourceMarkdown.isNullOrBlank() || initial.noteMarkdown.isNullOrBlank()
+        val needsRemote = forceRefresh || cached != null || initial.sourceMarkdown.isNullOrBlank() || initial.noteMarkdown.isNullOrBlank()
         if (!canQueryMac || !needsRemote) {
             _isLoadingChisuDetailFlow.value = false
             return
         }
 
         _isLoadingChisuDetailFlow.value = true
-        scope.launch {
+        detailJob = scope.launch(Dispatchers.Main.immediate) {
             try {
                 val req = JSONObject().apply {
                     item.articleId?.let { put("articleId", it) }
@@ -1110,7 +1108,8 @@ class CockpitRuntimeCoordinator(
                     if (item.sourceUrl.isNotBlank()) put("sourceUrl", item.sourceUrl)
                     if (item.title.isNotBlank()) put("title", item.title)
                 }
-                val resp = transportClient.callHostRpc("wechat.article.detail", req, 15_000L)
+                val resp = transportClient.callHostRpc("wechat.article.detail", req, 15_000L, ticket.macId)
+                if (!isCurrent()) return@launch
                 if (resp != null && resp.optBoolean("ok", false)) {
                     val artObj = resp.optJSONObject("article")
                     val resolvedId = artObj?.optInt("id", 0)?.takeIf { it > 0 } ?: item.articleId
@@ -1122,6 +1121,7 @@ class CockpitRuntimeCoordinator(
                     val summaryMd = resp.optString("summaryMarkdown", "").takeIf { it.isNotBlank() && it != "null" }
                     val remoteDetail = ChisuArticleDetailUi(
                         stableKey = item.stableKey,
+                        ownerMacId = ticket.macId,
                         articleId = resolvedId,
                         turnId = resolvedTurnId,
                         entryKind = resolvedEntryKind,
@@ -1143,25 +1143,29 @@ class CockpitRuntimeCoordinator(
                         fromCache = false
                     )
                     if (resolvedId != null || resolvedTurnId != null) {
-                        saveCachedChisuDetail(resolvedId, resolvedTurnId, remoteDetail)
+                        saveCachedChisuDetail(resolvedId, resolvedTurnId, remoteDetail, ticket.macId)
                     }
                     if (_activeChisuDetailFlow.value?.stableKey == item.stableKey) {
                         _activeChisuDetailFlow.value = remoteDetail
                     }
-                } else if (initial.sourceMarkdown.isNullOrBlank() && initial.noteMarkdown.isNullOrBlank()) {
+                } else if (isCurrent() && initial.sourceMarkdown.isNullOrBlank() && initial.noteMarkdown.isNullOrBlank()) {
                     _chisuDetailErrorFlow.value = resp?.optString("error", "").orEmpty().ifBlank { "未能从 Mac 读取该记录详情" }
                 }
-            } catch (e: Throwable) {
-                if (initial.sourceMarkdown.isNullOrBlank() && initial.noteMarkdown.isNullOrBlank()) {
+            } catch (cancel: CancellationException) { throw cancel
+            } catch (e: Exception) {
+                if (isCurrent() && initial.sourceMarkdown.isNullOrBlank() && initial.noteMarkdown.isNullOrBlank()) {
                     _chisuDetailErrorFlow.value = e.message ?: "同步失败"
                 }
             } finally {
-                _isLoadingChisuDetailFlow.value = false
+                if (isCurrent()) _isLoadingChisuDetailFlow.value = false
             }
         }
     }
 
     fun closeChisuArticle() {
+        detailGeneration.incrementAndGet()
+        detailJob?.cancel()
+        detailJob = null
         _activeChisuDetailFlow.value = null
         _isLoadingChisuDetailFlow.value = false
         _chisuDetailErrorFlow.value = null
@@ -1171,15 +1175,19 @@ class CockpitRuntimeCoordinator(
         articleId: Int?,
         turnId: Int?,
         docKind: String,
-        src: String
+        src: String,
+        ownerMacId: String
     ): ByteArray? = withContext(Dispatchers.IO) {
+        val ticket = macScope.ticket()
+        val remoteAllowed = ownerMacId.isNotBlank() && ownerMacId == ticket.macId
         val trimmed = src.trim()
         if (trimmed.isEmpty()) return@withContext null
         val ownerTag = if (turnId != null && turnId > 0) "t$turnId" else "a${articleId ?: 0}"
-        val cacheKey = "${ownerTag}_${docKind}_${trimmed.hashCode().toUInt()}"
-        val cacheFile = File(chisuAssetCacheDir(), "$cacheKey.img")
-        if (cacheFile.exists() && cacheFile.length() > 0L) {
-            return@withContext runCatching { cacheFile.readBytes() }.getOrNull()
+        val cacheKey = "${ownerTag}_${docKind}_${MacRequestScope.key(trimmed)}"
+        val cacheFile = File(chisuAssetCacheDir(ownerMacId), "$cacheKey.img")
+        if (cacheFile.exists() && cacheFile.length() in 1..(4 * 1024 * 1024)) {
+            val cached = runCatching { cacheFile.inputStream().use { it.readBounded(4 * 1024 * 1024) } }.getOrNull()
+            return@withContext if (accepts(ticket)) cached else null
         }
 
         val bytes: ByteArray? = if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) {
@@ -1188,10 +1196,10 @@ class CockpitRuntimeCoordinator(
                 val req = okhttp3.Request.Builder().url(trimmed).build()
                 client.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) null
-                    else resp.body?.bytes()?.takeIf { it.isNotEmpty() && it.size <= 4 * 1024 * 1024 }
+                    else resp.body?.let { body -> body.byteStream().use { it.readBounded(4 * 1024 * 1024, body.contentLength()) } }
                 }
             }.getOrNull()
-        } else if (((turnId != null && turnId > 0) || (articleId != null && articleId > 0)) && transportClient.activeTierFlow.value != "DISCONNECTED") {
+        } else if (remoteAllowed && ((turnId != null && turnId > 0) || (articleId != null && articleId > 0)) && transportClient.activeTierFlow.value != "DISCONNECTED") {
             runCatching {
                 val reqObj = JSONObject().apply {
                     if (turnId != null && turnId > 0) {
@@ -1202,28 +1210,29 @@ class CockpitRuntimeCoordinator(
                     }
                     put("path", trimmed)
                 }
-                val resp = transportClient.callHostRpc("wechat.article.asset", reqObj, 10_000L)
+                val resp = transportClient.callHostRpc("wechat.article.asset", reqObj, 10_000L, ticket.macId)
                 val b64 = resp?.takeIf { it.optBoolean("ok", false) }?.optString("dataBase64", "").orEmpty()
-                if (b64.isNotBlank()) Base64.decode(b64, Base64.DEFAULT) else null
+                if (b64.isNotBlank() && b64.length <= 6 * 1024 * 1024) Base64.decode(b64, Base64.DEFAULT) else null
             }.getOrNull()
         } else {
             null
         }
 
+        if (!accepts(ticket)) return@withContext null
         if (bytes != null && bytes.isNotEmpty()) {
             runCatching { cacheFile.writeBytes(bytes) }
         }
         bytes
     }
 
-    private fun saveCachedChisuDetail(articleId: Int?, turnId: Int?, detail: ChisuArticleDetailUi) {
+    private fun saveCachedChisuDetail(articleId: Int?, turnId: Int?, detail: ChisuArticleDetailUi, macId: String) {
         runCatching {
             val fileName = when {
                 turnId != null && turnId > 0 -> "turn_$turnId.json"
                 articleId != null && articleId > 0 -> "article_$articleId.json"
                 else -> return
             }
-            val file = File(chisuCacheDir(), fileName)
+            val file = File(chisuCacheDir(macId), fileName)
             val obj = JSONObject().apply {
                 articleId?.takeIf { it > 0 }?.let { put("articleId", it) }
                 turnId?.takeIf { it > 0 }?.let { put("turnId", it) }
@@ -1248,14 +1257,14 @@ class CockpitRuntimeCoordinator(
         }
     }
 
-    private fun loadCachedChisuDetail(articleId: Int?, turnId: Int? = null): ChisuArticleDetailUi? {
+    private fun loadCachedChisuDetail(articleId: Int?, turnId: Int? = null, macId: String): ChisuArticleDetailUi? {
         val fileName = when {
             turnId != null && turnId > 0 -> "turn_$turnId.json"
             articleId != null && articleId > 0 -> "article_$articleId.json"
             else -> return null
         }
         return runCatching {
-            val file = File(chisuCacheDir(), fileName)
+            val file = File(chisuCacheDir(macId), fileName)
             if (!file.exists()) return null
             val o = JSONObject(file.readText(Charsets.UTF_8))
             val resolvedArticleId = o.optInt("articleId", 0).takeIf { it > 0 } ?: articleId
@@ -1574,27 +1583,41 @@ class CockpitRuntimeCoordinator(
 
     fun refreshAgentSessions() {
         if (transportClient.activeTierFlow.value == "DISCONNECTED") return
+        val ticket = macScope.ticket()
         scope.launch {
             runCatching {
                 val resp = transportClient.callHostRpc(
                     "agent.workspace_catalog",
                     JSONObject().put("limit", 96),
-                    12_000L
+                    12_000L, ticket.macId
                 ) ?: return@launch
-                val activeMacId = streamRepo.getPairedMac()?.macId.orEmpty()
+                if (!accepts(ticket)) return@launch
+                val activeMacId = ticket.macId
                 edgeStore.saveCachedWorkspaceCatalogJson(resp.toString())
                 if (activeMacId.isNotBlank()) {
                     runCatching {
                         File(appContext.filesDir, "agent_catalog_${activeMacId}.json").writeText(resp.toString(), Charsets.UTF_8)
                     }
                 }
-                applyWorkspaceCatalogJson(resp)
+                withContext(Dispatchers.Main.immediate) { if (accepts(ticket)) applyWorkspaceCatalogJson(resp) }
             }
         }
     }
 
     fun loadCachedCatalogForMac(macId: String) {
+        if (macScope.switchTo(macId)) {
+            closeChisuArticle()
+            catalogGeneration.incrementAndGet()
+            _isRefreshingChisuFlow.value = false
+            _chisuArticlesFlow.value = emptyList()
+            _selectedAgentSessionFlow.value = null
+            _selectedAgentStepsFlow.value = emptyList()
+            _agentProjectsFlow.value = emptyList()
+        }
         if (macId.isBlank()) return
+        chatRepo.bindLegacyPromotions(macId)
+        val catalog = File(chisuCacheDir(macId), "catalog.json")
+        if (catalog.exists()) runCatching { applyChisuArticlesCatalogJson(JSONObject(catalog.readText()), macId) }
         val file = File(appContext.filesDir, "agent_catalog_${macId}.json")
         if (file.exists()) {
             runCatching { applyWorkspaceCatalogJson(JSONObject(file.readText(Charsets.UTF_8))) }

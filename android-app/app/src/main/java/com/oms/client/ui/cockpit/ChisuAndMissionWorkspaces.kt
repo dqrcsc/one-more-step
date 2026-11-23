@@ -212,7 +212,8 @@ fun ChisuWorkspaceView(
                     articleId = activeDetail?.articleId,
                     turnId = activeDetail?.turnId,
                     docKind = docKind,
-                    src = src
+                    src = src,
+                    ownerMacId = activeDetail?.ownerMacId.orEmpty()
                 )
             },
             onDiscussInChat = { title, cleanBody ->
@@ -1881,8 +1882,8 @@ private fun AgentBackendQuotaRow(
                     quota.statusNote.contains("受限") ||
                     (quota.statusNote.contains("触发") && !quota.statusNote.contains("未触发"))
                 Text(
-                    text = if (isRateLimited) "触发限流" else "运行正常",
-                    color = if (isRateLimited) palette.warning else palette.success,
+                    text = if (!quota.available) "额度未知" else if (isRateLimited) "触发限流" else "运行正常",
+                    color = if (!quota.available) palette.textTertiary else if (isRateLimited) palette.warning else palette.success,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold
                 )
@@ -1942,9 +1943,11 @@ private fun AgentBackendQuotaRow(
                 fontSize = 12.sp
             )
         }
-        if (quota.statusNote.isNotBlank() && quota.windows.isEmpty()) {
+        if (quota.statusNote.isNotBlank()) {
             Text(
-                text = quota.statusNote,
+                text = quota.statusNote + if (quota.backend == "codex" && quota.capturedAtMs > 0L) {
+                    " · 采样于 " + SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(Date(quota.capturedAtMs))
+                } else "",
                 color = palette.textTertiary,
                 fontSize = 11.sp
             )

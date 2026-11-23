@@ -371,21 +371,10 @@ object PhoneToolExecutor {
         val act = (if (sepIdx >= 0) encodedTarget.substring(0, sepIdx) else encodedTarget).trim()
         val target = (if (sepIdx >= 0) encodedTarget.substring(sepIdx + 1) else "").trim()
 
-        var biometricOk = false
-        if (act == "unlock" && tier == "WAN_WEBRTC") {
-            val (passed, reason) = BiometricAuthHelper.authenticateForSensitiveRemoteAction(context)
-            if (!passed) {
-                return PhoneToolExecResult(false, reason)
-            }
-            biometricOk = true
-        }
-
         return withContext(Dispatchers.IO) {
             val params = JSONObject().apply {
                 put("action", act)
                 if (target.isNotBlank()) put("target", target)
-                put("transportTierHint", tier)
-                if (biometricOk) put("biometricVerified", true)
                 val intVal = valueRaw.toIntOrNull()
                 val boolVal = when {
                     valueRaw.equals("true", true) || valueRaw.equals("on", true) -> true
@@ -397,10 +386,11 @@ object PhoneToolExecutor {
             }
             val resp = tc.callHostRpc("mac.control.execute", params, timeoutMs = 12_000L)
                 ?: return@withContext PhoneToolExecResult(false, "Mac 控制请求超时")
-            if (resp.optBoolean("requiresBiometric", false) && !biometricOk) {
+            if (resp.optBoolean("requiresBiometric", false)) {
                 val (passed, reason) = BiometricAuthHelper.authenticateForSensitiveRemoteAction(context)
                 if (!passed) return@withContext PhoneToolExecResult(false, reason)
                 params.put("biometricVerified", true)
+                params.put("unlockChallenge", resp.optString("unlockChallenge", ""))
                 val retry = tc.callHostRpc("mac.control.execute", params, timeoutMs = 12_000L)
                     ?: return@withContext PhoneToolExecResult(false, "Mac 解锁响应超时")
                 return@withContext PhoneToolExecResult(

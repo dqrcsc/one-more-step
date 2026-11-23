@@ -43,7 +43,8 @@ data class ChisuArticleItemUi(
     val hasNote: Boolean = false,
     val hasSource: Boolean = false,
     val isEdgeNightStandby: Boolean = false,
-    val isFallbackNote: Boolean = false
+    val isFallbackNote: Boolean = false,
+    val ownerMacId: String = ""
 )
 
 data class ChisuArticleDetailUi(
@@ -66,7 +67,8 @@ data class ChisuArticleDetailUi(
     val summaryMarkdown: String? = null,
     val noteTruncated: Boolean = false,
     val sourceTruncated: Boolean = false,
-    val fromCache: Boolean = false
+    val fromCache: Boolean = false,
+    val ownerMacId: String = ""
 )
 
 /**
@@ -379,22 +381,23 @@ object ChisuDocumentParser {
         streamItems: List<StreamItemModel>
     ): List<ChisuArticleItemUi> {
         val result = ArrayList<ChisuArticleItemUi>(macArticles.size + streamItems.size)
-        val byArticleId = HashMap<Int, Int>()
+        val byArticleId = HashMap<Pair<String, Int>, Int>()
         val byUrl = HashMap<String, Int>()
         val byNormTitle = HashMap<String, Int>()
 
         for (macItem in macArticles) {
             val idx = result.size
             result.add(macItem)
-            macItem.articleId?.takeIf { it > 0 }?.let { byArticleId[it] = idx }
-            if (macItem.sourceUrl.isNotBlank()) byUrl[macItem.sourceUrl.trim()] = idx
+            macItem.articleId?.takeIf { it > 0 }?.let { byArticleId[macItem.ownerMacId to it] = idx }
+            if (macItem.sourceUrl.isNotBlank()) byUrl[macItem.ownerMacId + "|" + macItem.sourceUrl.trim()] = idx
             val normT = normalizeTitleForMatch(macItem.title)
-            if (normT.isNotBlank()) byNormTitle.putIfAbsent(normT, idx)
+            if (normT.isNotBlank()) byNormTitle.putIfAbsent(macItem.ownerMacId + "|" + normT, idx)
         }
 
         val localChisu = streamItems.filter(::isChisuStreamItem)
         for (item in localChisu) {
             val meta = parseMetaMap(item.metadataJson)
+            val owner = metaString(meta, "sourceMacId")
             val rawBody = item.textContent ?: item.voiceTranscript ?: ""
             val parsed = parse(rawBody, fallbackTitle = item.title.orEmpty())
             val resolvedArticleId = metaInt(meta, "wechatArticleId").takeIf { it > 0 }
@@ -405,9 +408,9 @@ object ChisuDocumentParser {
             val isEdge = isEdgeStandbyItem(item)
             val localSourcePath = metaString(meta, "sourceFilePath").takeIf { it.isNotBlank() }
 
-            val existingIdx = resolvedArticleId?.let { byArticleId[it] }
-                ?: resolvedUrl.takeIf { it.isNotBlank() }?.let { byUrl[it] }
-                ?: normT.takeIf { it.isNotBlank() }?.let { byNormTitle[it] }
+            val existingIdx = resolvedArticleId?.let { byArticleId[owner to it] }
+                ?: resolvedUrl.takeIf { it.isNotBlank() }?.let { byUrl[owner + "|" + it] }
+                ?: normT.takeIf { it.isNotBlank() }?.let { byNormTitle[owner + "|" + it] }
 
             if (existingIdx != null) {
                 val prev = result[existingIdx]
@@ -430,7 +433,8 @@ object ChisuDocumentParser {
                 val summaryStr = metaString(meta, "shortSummary").trim()
                 val excerpt = parsed.previewExcerpt.ifBlank { buildPlainExcerpt(summaryStr, 220) }
                 val newItem = ChisuArticleItemUi(
-                    stableKey = resolvedArticleId?.let { "wx_$it" } ?: "local_${item.itemId}",
+                    stableKey = "local_${item.itemId}",
+                    ownerMacId = owner,
                     articleId = resolvedArticleId,
                     localStreamItemId = item.itemId,
                     title = resolvedTitle,
@@ -450,9 +454,9 @@ object ChisuDocumentParser {
                     isEdgeNightStandby = isEdge
                 )
                 result.add(newItem)
-                resolvedArticleId?.let { byArticleId[it] = idx }
-                if (resolvedUrl.isNotBlank()) byUrl[resolvedUrl] = idx
-                if (normT.isNotBlank()) byNormTitle.putIfAbsent(normT, idx)
+                resolvedArticleId?.let { byArticleId[owner to it] = idx }
+                if (resolvedUrl.isNotBlank()) byUrl[owner + "|" + resolvedUrl] = idx
+                if (normT.isNotBlank()) byNormTitle.putIfAbsent(owner + "|" + normT, idx)
             }
         }
 
