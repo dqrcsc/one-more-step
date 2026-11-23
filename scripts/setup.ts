@@ -19,9 +19,11 @@ try {
 if (process.platform === "darwin") {
   const btSrc = path.join(repoRoot, "mac-host/bluetooth-bridge/main.swift");
   const hudSrc = path.join(repoRoot, "mac-host/mac-hud/main.swift");
+  const ctlSrc = path.join(repoRoot, "mac-host/mac-ctl/main.swift");
   const btBinDir = path.join(repoRoot, "mac-host/bin");
   const btBin = path.join(btBinDir, "oms-bt-bridge");
   const hudBin = path.join(btBinDir, "oms-mac-hud");
+  const ctlBin = path.join(btBinDir, "oms-mac-ctl");
   try {
     fs.mkdirSync(btBinDir, { recursive: true });
     execFileSync("swiftc", [path.join(path.dirname(btSrc), "AirPodsOperation.swift"), path.join(path.dirname(btSrc), "AirPodsNativeRequest.swift"), btSrc, "-o", btBin], { stdio: "inherit" });
@@ -34,6 +36,16 @@ if (process.platform === "darwin") {
     console.log(`✅ Compiled macOS Native HUD helper: ${hudBin}`);
   } catch (err: any) {
     console.warn(`⚠️ Skipping Mac HUD binary compilation (${err?.message || err})`);
+  }
+  try {
+    execFileSync(
+      "swiftc",
+      ["-O", "-framework", "AppKit", "-framework", "ApplicationServices", "-framework", "CoreGraphics", "-framework", "IOKit", ctlSrc, "-o", ctlBin],
+      { stdio: "inherit" }
+    );
+    console.log(`✅ Compiled macOS Remote Control helper: ${ctlBin}`);
+  } catch (err: any) {
+    console.warn(`⚠️ Skipping Mac Control binary compilation (${err?.message || err})`);
   }
 }
 

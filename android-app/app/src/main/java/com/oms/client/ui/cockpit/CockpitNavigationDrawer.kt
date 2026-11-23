@@ -9,6 +9,7 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,6 +26,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -79,6 +81,22 @@ internal data class ProjectSessionGroupUi(
     val runningCount: Int,
     val lastActiveAtMs: Long
 )
+
+internal fun agentDisplayName(backend: String): String = when (backend) {
+    "codex" -> "Codex"
+    "agy" -> "Antigravity"
+    "workbuddy" -> "WorkBuddy"
+    "opencode" -> "OpenCode"
+    else -> backend
+}
+
+internal fun agentShortBadge(backend: String): String = when (backend) {
+    "codex" -> "Codex"
+    "agy" -> "AGY"
+    "workbuddy" -> "WB"
+    "opencode" -> "OC"
+    else -> backend.take(3).uppercase(Locale.ROOT)
+}
 
 internal fun buildProjectSessionGroups(
     projects: List<RemoteAgentProjectUi>,
@@ -149,10 +167,7 @@ internal fun formatCompactRelativeTime(timestampMs: Long): String {
         mins < 24L * 60L -> "${mins / 60L}小时前"
         mins < 48L * 60L -> "昨天"
         mins < 7L * 24L * 60L -> "${mins / (24L * 60L)}天前"
-        else -> {
-            val d = java.text.SimpleDateFormat("MM/dd", Locale.CHINA).format(java.util.Date(timestampMs))
-            d
-        }
+        else -> java.text.SimpleDateFormat("MM/dd", Locale.CHINA).format(java.util.Date(timestampMs))
     }
 }
 
@@ -194,6 +209,7 @@ internal fun CockpitUnifiedDrawerSheet(
     onOpenWorkbench: () -> Unit,
     onSelectTab: (CockpitTab) -> Unit,
     onOpenSpecimenGallery: () -> Unit,
+    onOpenMemoryCenter: () -> Unit = {},
     onOpenDropzone: () -> Unit,
     onStartIncognitoChat: () -> Unit,
     onStartNewChat: () -> Unit,
@@ -208,7 +224,7 @@ internal fun CockpitUnifiedDrawerSheet(
 ) {
     val context = LocalContext.current
     val palette = OmsTheme.colors
-    val edgeStore = OmsApplication.instance?.edgeStore
+    val app = OmsApplication.instance
     val searchFocusRequester = remember { FocusRequester() }
 
     LaunchedEffect(focusSearchNonce) {
@@ -218,41 +234,25 @@ internal fun CockpitUnifiedDrawerSheet(
         }
     }
 
-    var macSectionExpanded by remember { mutableStateOf(true) }
+    // Priority 1: Everyday Personal Assistant Conversations ALWAYS expanded at top!
+    // Priority 2: Computer Collaboration collapsed by default (`false`) at bottom!
     var chatSectionExpanded by remember { mutableStateOf(true) }
-    var backendFilter by remember { mutableStateOf("ALL") }
+    var macSectionExpanded by remember { mutableStateOf(false) }
+    var selectedAgentBackend by remember { mutableStateOf("codex") }
 
-    val projectGroups = remember(agentProjects, agentSessions, backendFilter) {
-        buildProjectSessionGroups(agentProjects, agentSessions, backendFilter)
+    val pairedMacName = remember(activeTier) {
+        app?.repository?.getPairedMac()?.macName?.ifBlank { "我的 Mac" } ?: "我的 Mac"
     }
-
-    // Smart default project expand state (persisted once toggled by user)
-    var userSavedExpandedPaths by remember {
-        mutableStateOf(edgeStore?.loadExpandedProjectPaths("drawer"))
+    val runningAgentCount = remember(agentSessions) {
+        agentSessions.count { it.status == "running" }
     }
-    val expandedProjects = remember(projectGroups, userSavedExpandedPaths) {
-        val saved = userSavedExpandedPaths
-        if (saved != null) {
-            saved
-        } else {
-            // Auto-expand projects with running sessions + top 2 most recently active
-            buildSet {
-                projectGroups.forEachIndexed { idx, g ->
-                    if (g.runningCount > 0 || idx < 2) add(g.normPath)
-                }
-            }
-        }
+    val selectedBackendSessions = remember(agentSessions, selectedAgentBackend) {
+        agentSessions.filter { it.backend == selectedAgentBackend }.sortedWith(
+            compareByDescending<RemoteAgentSessionUi> { it.status == "running" }
+                .thenByDescending { it.updatedAtMs }
+        )
     }
-    val showAllSessionsMap = remember { mutableStateMapOf<String, Boolean>() }
-
-    fun toggleProjectExpanded(normPath: String) {
-        val next = expandedProjects.toMutableSet()
-        if (!next.add(normPath)) next.remove(normPath)
-        userSavedExpandedPaths = next
-        edgeStore?.saveExpandedProjectPaths("drawer", next)
-    }
-
-    val miniQuota = remember(agentQuotas) { formatMiniQuotaSummary(agentQuotas) }
+    val showAllDrawerAgentSessions = remember { mutableStateMapOf<String, Boolean>() }
 
     // Omni-search debounce trigger
     LaunchedEffect(searchQuery, activeTier) {
@@ -304,7 +304,7 @@ internal fun CockpitUnifiedDrawerSheet(
                     Box(modifier = Modifier.weight(1f)) {
                         if (searchQuery.isEmpty()) {
                             Text(
-                                text = "搜对话·项目·尺素·知识库…",
+                                text = "搜随身助理对话·记忆·尺素·协同…",
                                 color = palette.textTertiary,
                                 fontSize = 13.sp,
                                 maxLines = 1,
@@ -345,7 +345,7 @@ internal fun CockpitUnifiedDrawerSheet(
                 )
             }
 
-            // 2. Compact 2x2 Quick Navigation Grid (Theme swatch moved to Top Bar / Footer!)
+            // 2. Compact 2x2 Quick Navigation Grid (Includes dedicated `记忆中心`!)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(7.dp), modifier = Modifier.fillMaxWidth()) {
                     DrawerQuickNavPill(
@@ -356,19 +356,19 @@ internal fun CockpitUnifiedDrawerSheet(
                         modifier = Modifier.weight(1f)
                     )
                     DrawerQuickNavPill(
-                        icon = OmsIcons.BookOpen,
-                        label = "尺素伴读",
-                        active = currentTab == CockpitTab.CHISU,
-                        onClick = { onSelectTab(CockpitTab.CHISU) },
+                        icon = OmsIcons.Bookmark,
+                        label = "记忆中心",
+                        active = false,
+                        onClick = onOpenMemoryCenter,
                         modifier = Modifier.weight(1f)
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(7.dp), modifier = Modifier.fillMaxWidth()) {
                     DrawerQuickNavPill(
-                        icon = OmsIcons.Globe,
-                        label = "应用舱",
-                        active = currentTab == CockpitTab.WEB_APPS,
-                        onClick = { onSelectTab(CockpitTab.WEB_APPS) },
+                        icon = OmsIcons.BookOpen,
+                        label = "尺素伴读",
+                        active = currentTab == CockpitTab.CHISU,
+                        onClick = { onSelectTab(CockpitTab.CHISU) },
                         modifier = Modifier.weight(1f)
                     )
                     DrawerQuickNavPill(
@@ -381,9 +381,12 @@ internal fun CockpitUnifiedDrawerSheet(
                 }
             }
 
-            // 3. Main Scroll Area: Search Results OR Unified IDE Project Tree + Chat History
+            // 3. Main Scroll Area: Search Results OR Everyday Assistant Dialogues (Top) + Collapsible Collaboration (Bottom)
             if (searchQuery.isNotBlank()) {
                 val qLower = searchQuery.trim().lowercase(Locale.ROOT)
+                val chatHits = remember(searchQuery, threads) {
+                    coordinator.chatRepo.searchGlobalMessages(searchQuery, limit = 15)
+                }
                 val matchedAgents = remember(searchQuery, agentSessions) {
                     agentSessions.filter { s ->
                         s.title.lowercase(Locale.ROOT).contains(qLower) ||
@@ -392,9 +395,6 @@ internal fun CockpitUnifiedDrawerSheet(
                             s.lastSummary.lowercase(Locale.ROOT).contains(qLower)
                     }.take(12)
                 }
-                val chatHits = remember(searchQuery, threads) {
-                    coordinator.chatRepo.searchGlobalMessages(searchQuery, limit = 15)
-                }
 
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
@@ -402,7 +402,7 @@ internal fun CockpitUnifiedDrawerSheet(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "协同 ${matchedAgents.size} · 对话 ${chatHits.size} · 文库 ${omniSearchHits.size}",
+                        text = "对话 ${chatHits.size} · 文库 ${omniSearchHits.size} · 协同 ${matchedAgents.size}",
                         color = palette.textTertiary,
                         fontSize = 11.5.sp
                     )
@@ -415,61 +415,28 @@ internal fun CockpitUnifiedDrawerSheet(
                     modifier = Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    if (matchedAgents.isNotEmpty()) {
-                        item(key = "sec_search_agents") {
-                            DrawerSearchSectionLabel("Mac 双脑协同会话")
+                    // Search Priority 1: Everyday Assistant Chats
+                    if (chatHits.isNotEmpty()) {
+                        item(key = "sec_search_chat") {
+                            DrawerSearchSectionLabel("随身助理对话")
                         }
-                        items(items = matchedAgents, key = { "sa_${it.backend}:${it.sessionId}" }) { sess ->
-                            val projLabel = sess.projectDisplayName.ifBlank {
-                                sess.workspacePath.trimEnd('/').substringAfterLast('/').ifBlank { "工作区" }
-                            }
+                        items(items = chatHits, key = { it.messageId }) { hit ->
                             OmsSurfaceCard(
                                 cornerRadius = 13.dp,
                                 contentPadding = PaddingValues(10.dp),
-                                onClick = { onSelectAgentSession(sess) },
+                                onClick = {
+                                    onSelectSearchChatHit(hit.threadId, hit.messageId, searchQuery.trim())
+                                },
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    Text(
-                                        text = if (sess.backend == "codex") "Codex" else "AGY",
-                                        color = palette.accent,
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(5.dp))
-                                            .background(palette.accentSoft)
-                                            .padding(horizontal = 5.dp, vertical = 1.dp)
-                                    )
-                                    Text(
-                                        text = projLabel,
-                                        color = palette.textTertiary,
-                                        fontSize = 11.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    Text(
-                                        text = formatCompactRelativeTime(sess.updatedAtMs),
-                                        color = palette.textTertiary,
-                                        fontSize = 10.5.sp
-                                    )
-                                }
-                                Spacer(modifier = Modifier.height(3.dp))
-                                Text(
-                                    text = sess.title.ifBlank { "未命名任务" },
-                                    color = palette.textPrimary,
-                                    fontSize = 12.8.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis
-                                )
+                                Text(hit.threadTitle, color = palette.accent, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold)
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(hit.snippet, color = palette.textSecondary, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                             }
                         }
                     }
 
+                    // Search Priority 2: Vault / Chisu
                     if (omniSearchHits.isNotEmpty()) {
                         item(key = "sec_search_omni") {
                             DrawerSearchSectionLabel("个人知识库、书库与尺素")
@@ -534,22 +501,58 @@ internal fun CockpitUnifiedDrawerSheet(
                         }
                     }
 
-                    if (chatHits.isNotEmpty()) {
-                        item(key = "sec_search_chat") {
-                            DrawerSearchSectionLabel("随身秘书对话")
+                    // Search Priority 3: Mac Collaboration Sessions
+                    if (matchedAgents.isNotEmpty()) {
+                        item(key = "sec_search_agents") {
+                            DrawerSearchSectionLabel("电脑协同会话")
                         }
-                        items(items = chatHits, key = { it.messageId }) { hit ->
+                        items(items = matchedAgents, key = { "sa_${it.backend}:${it.sessionId}" }) { sess ->
+                            val projLabel = sess.projectDisplayName.ifBlank {
+                                sess.workspacePath.trimEnd('/').substringAfterLast('/').ifBlank { "工作区" }
+                            }
                             OmsSurfaceCard(
                                 cornerRadius = 13.dp,
                                 contentPadding = PaddingValues(10.dp),
-                                onClick = {
-                                    onSelectSearchChatHit(hit.threadId, hit.messageId, searchQuery.trim())
-                                },
+                                onClick = { onSelectAgentSession(sess) },
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Text(hit.threadTitle, color = palette.accent, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold)
-                                Spacer(modifier = Modifier.height(2.dp))
-                                Text(hit.snippet, color = palette.textSecondary, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = agentShortBadge(sess.backend),
+                                        color = palette.accent,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(5.dp))
+                                            .background(palette.accentSoft)
+                                            .padding(horizontal = 5.dp, vertical = 1.dp)
+                                    )
+                                    Text(
+                                        text = projLabel,
+                                        color = palette.textTertiary,
+                                        fontSize = 11.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Text(
+                                        text = formatCompactRelativeTime(sess.updatedAtMs),
+                                        color = palette.textTertiary,
+                                        fontSize = 10.5.sp
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(3.dp))
+                                Text(
+                                    text = sess.title.ifBlank { "未命名任务" },
+                                    color = palette.textPrimary,
+                                    fontSize = 12.8.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
                             }
                         }
                     }
@@ -561,234 +564,7 @@ internal fun CockpitUnifiedDrawerSheet(
                     verticalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
                     // =============================================================
-                    // Section A: MAC 双脑协同 (Flat Collapsible Project Tree)
-                    // =============================================================
-                    item(key = "drawer_sec_mac_header") {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 4.dp, bottom = 4.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(9.dp))
-                                    .clickable { macSectionExpanded = !macSectionExpanded }
-                                    .padding(horizontal = 4.dp, vertical = 4.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(5.dp),
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Icon(
-                                        imageVector = if (macSectionExpanded) OmsIcons.ChevronDown else OmsIcons.ChevronRight,
-                                        contentDescription = null,
-                                        tint = palette.textTertiary,
-                                        modifier = Modifier.size(13.dp)
-                                    )
-                                    Text(
-                                        text = "MAC 双脑协同",
-                                        color = palette.textSecondary,
-                                        fontSize = 11.5.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        letterSpacing = 0.4.sp
-                                    )
-                                    if (miniQuota.isNotBlank()) {
-                                        Text(
-                                            text = miniQuota,
-                                            color = palette.accent,
-                                            fontSize = 10.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            maxLines = 1,
-                                            modifier = Modifier
-                                                .clip(RoundedCornerShape(6.dp))
-                                                .background(palette.accentSoft)
-                                                .padding(horizontal = 5.dp, vertical = 1.5.dp)
-                                        )
-                                    }
-                                }
-
-                                Row(
-                                    horizontalArrangement = Arrangement.spacedBy(2.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    OmsCircleIconButton(
-                                        icon = OmsIcons.Refresh,
-                                        contentDescription = "刷新协同项目",
-                                        size = 24.dp,
-                                        iconSize = 13.dp,
-                                        contentColor = palette.textTertiary,
-                                        onClick = { coordinator.refreshAgentSessions() }
-                                    )
-                                    OmsCircleIconButton(
-                                        icon = OmsIcons.Plus,
-                                        contentDescription = "派发新任务",
-                                        size = 24.dp,
-                                        iconSize = 13.5.dp,
-                                        contentColor = palette.accent,
-                                        onClick = { onDispatchForProject("") }
-                                    )
-                                }
-                            }
-
-                            AnimatedVisibility(
-                                visible = macSectionExpanded,
-                                enter = expandVertically(tween(150)) + fadeIn(tween(120)),
-                                exit = shrinkVertically(tween(120)) + fadeOut(tween(100))
-                            ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                                        DrawerMiniFilterChip("全部", backendFilter == "ALL") { backendFilter = "ALL" }
-                                        DrawerMiniFilterChip("Codex", backendFilter == "codex") { backendFilter = "codex" }
-                                        DrawerMiniFilterChip("AGY", backendFilter == "agy") { backendFilter = "agy" }
-                                    }
-                                    Text(
-                                        text = "投递箱 ↗",
-                                        color = palette.textTertiary,
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.Medium,
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(6.dp))
-                                            .clickable { onOpenDropzone() }
-                                            .padding(horizontal = 5.dp, vertical = 2.dp)
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    if (macSectionExpanded) {
-                        if (projectGroups.isEmpty()) {
-                            item(key = "drawer_mac_empty") {
-                                Text(
-                                    text = if (activeTier == "DISCONNECTED") "连上 Mac 后将平铺展示各项目会话" else "暂无协同会话，点右上角 + 派发任务",
-                                    color = palette.textTertiary,
-                                    fontSize = 11.5.sp,
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                )
-                            }
-                        } else {
-                            projectGroups.forEach { group ->
-                                val isExpanded = expandedProjects.contains(group.normPath)
-                                val showAll = showAllSessionsMap[group.normPath] == true
-                                val visibleSessions = if (showAll) group.sessions else group.sessions.take(4)
-                                val hiddenCount = (group.sessions.size - visibleSessions.size).coerceAtLeast(0)
-
-                                item(key = "drawer_proj_${group.normPath}") {
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clip(RoundedCornerShape(10.dp))
-                                            .clickable { toggleProjectExpanded(group.normPath) }
-                                            .padding(horizontal = 6.dp, vertical = 6.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                            modifier = Modifier.weight(1f)
-                                        ) {
-                                            Icon(
-                                                imageVector = if (isExpanded) OmsIcons.ChevronDown else OmsIcons.ChevronRight,
-                                                contentDescription = null,
-                                                tint = palette.textTertiary,
-                                                modifier = Modifier.size(12.dp)
-                                            )
-                                            Icon(
-                                                imageVector = OmsIcons.Folder,
-                                                contentDescription = null,
-                                                tint = if (group.runningCount > 0) palette.success else palette.accent,
-                                                modifier = Modifier.size(14.dp)
-                                            )
-                                            Text(
-                                                text = group.displayName,
-                                                color = palette.textPrimary,
-                                                fontSize = 13.sp,
-                                                fontWeight = FontWeight.SemiBold,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                                modifier = Modifier.weight(1f, fill = false)
-                                            )
-                                            if (group.runningCount > 0) {
-                                                Box(
-                                                    modifier = Modifier
-                                                        .size(6.dp)
-                                                        .clip(CircleShape)
-                                                        .background(palette.success)
-                                                )
-                                            }
-                                            Text(
-                                                text = "${group.sessions.size}",
-                                                color = palette.textTertiary,
-                                                fontSize = 11.sp
-                                            )
-                                        }
-
-                                        if (group.rawPath.isNotBlank()) {
-                                            OmsCircleIconButton(
-                                                icon = OmsIcons.Plus,
-                                                contentDescription = "向 ${group.displayName} 派发任务",
-                                                size = 24.dp,
-                                                iconSize = 12.5.dp,
-                                                contentColor = palette.textSecondary,
-                                                onClick = { onDispatchForProject(group.rawPath) }
-                                            )
-                                        }
-                                    }
-                                }
-
-                                if (isExpanded) {
-                                    items(
-                                        items = visibleSessions,
-                                        key = { "ds_${group.normPath}_${it.backend}:${it.sessionId}" }
-                                    ) { sess ->
-                                        DrawerAgentSessionRow(
-                                            session = sess,
-                                            onClick = { onSelectAgentSession(sess) }
-                                        )
-                                    }
-
-                                    if (hiddenCount > 0 || (showAll && group.sessions.size > 4)) {
-                                        item(key = "drawer_proj_more_${group.normPath}") {
-                                            Text(
-                                                text = if (hiddenCount > 0) "··· 展开其余 $hiddenCount 条会话" else "收起多余会话",
-                                                color = palette.accent,
-                                                fontSize = 11.5.sp,
-                                                fontWeight = FontWeight.Medium,
-                                                modifier = Modifier
-                                                    .fillMaxWidth()
-                                                    .clip(RoundedCornerShape(8.dp))
-                                                    .clickable { showAllSessionsMap[group.normPath] = !showAll }
-                                                    .padding(start = 28.dp, top = 4.dp, bottom = 6.dp)
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    item(key = "drawer_divider_mid") {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 8.dp)
-                                .height(0.5.dp)
-                                .background(palette.hairline)
-                        )
-                    }
-
-                    // =============================================================
-                    // Section B: 随身秘书对话 (Collapsible Recency Tree)
+                    // Section 1 (TOP, Default Expanded): 随身助理对话
                     // =============================================================
                     item(key = "drawer_sec_chat_header") {
                         Row(
@@ -811,7 +587,7 @@ internal fun CockpitUnifiedDrawerSheet(
                                     modifier = Modifier.size(13.dp)
                                 )
                                 Text(
-                                    text = "随身秘书对话 (${threads.size})",
+                                    text = "随身助理对话 (${threads.size})",
                                     color = palette.textSecondary,
                                     fontSize = 11.5.sp,
                                     fontWeight = FontWeight.Bold,
@@ -852,6 +628,189 @@ internal fun CockpitUnifiedDrawerSheet(
                             }
                         }
                     }
+
+                    item(key = "drawer_divider_mid") {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 8.dp)
+                                .height(0.5.dp)
+                                .background(palette.hairline)
+                        )
+                    }
+
+                    // =============================================================
+                    // Section 2 (BOTTOM, Default Collapsed!): 电脑协同 (Mac -> Agent -> 会话)
+                    // =============================================================
+                    item(key = "drawer_sec_mac_header") {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 2.dp, bottom = 4.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(9.dp))
+                                    .clickable { macSectionExpanded = !macSectionExpanded }
+                                    .padding(horizontal = 4.dp, vertical = 5.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Icon(
+                                        imageVector = if (macSectionExpanded) OmsIcons.ChevronDown else OmsIcons.ChevronRight,
+                                        contentDescription = null,
+                                        tint = palette.textTertiary,
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                    Text(
+                                        text = "电脑协同 · $pairedMacName",
+                                        color = palette.textSecondary,
+                                        fontSize = 11.5.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    if (runningAgentCount > 0) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(3.dp),
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .background(palette.successSoft)
+                                                .padding(horizontal = 5.dp, vertical = 1.5.dp)
+                                        ) {
+                                            Box(modifier = Modifier.size(5.dp).clip(CircleShape).background(palette.success))
+                                            Text(
+                                                text = "${runningAgentCount}运行中",
+                                                color = palette.success,
+                                                fontSize = 9.5.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    } else {
+                                        Text(
+                                            text = "${agentSessions.size}",
+                                            color = palette.textTertiary,
+                                            fontSize = 10.5.sp
+                                        )
+                                    }
+                                }
+
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    OmsCircleIconButton(
+                                        icon = OmsIcons.Refresh,
+                                        contentDescription = "刷新协同会话",
+                                        size = 24.dp,
+                                        iconSize = 13.dp,
+                                        contentColor = palette.textTertiary,
+                                        onClick = { coordinator.refreshAgentSessions() }
+                                    )
+                                    OmsCircleIconButton(
+                                        icon = OmsIcons.Plus,
+                                        contentDescription = "派发新任务",
+                                        size = 24.dp,
+                                        iconSize = 13.5.dp,
+                                        contentColor = palette.accent,
+                                        onClick = { onDispatchForProject("") }
+                                    )
+                                }
+                            }
+
+                            AnimatedVisibility(
+                                visible = macSectionExpanded,
+                                enter = expandVertically(tween(150)) + fadeIn(tween(120)),
+                                exit = shrinkVertically(tween(120)) + fadeOut(tween(100))
+                            ) {
+                                Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                                    // Level 2: 4 Agent Selectors (Codex / Antigravity / WorkBuddy / OpenCode)
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .horizontalScroll(rememberScrollState())
+                                            .padding(horizontal = 4.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        listOf("codex", "agy", "workbuddy", "opencode").forEach { b ->
+                                            val cnt = agentSessions.count { it.backend == b }
+                                            DrawerMiniFilterChip(
+                                                label = "${agentDisplayName(b)} ($cnt)",
+                                                active = selectedAgentBackend == b,
+                                                onClick = { selectedAgentBackend = b }
+                                            )
+                                        }
+                                        Text(
+                                            text = "投递箱 ↗",
+                                            color = palette.textTertiary,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Medium,
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .clickable { onOpenDropzone() }
+                                                .padding(horizontal = 5.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (macSectionExpanded) {
+                        if (selectedBackendSessions.isEmpty()) {
+                            item(key = "drawer_mac_empty") {
+                                Text(
+                                    text = if (activeTier == "DISCONNECTED") {
+                                        "连上电脑后将同步 ${agentDisplayName(selectedAgentBackend)} 会话"
+                                    } else {
+                                        "暂无 ${agentDisplayName(selectedAgentBackend)} 会话，点 + 派发任务"
+                                    },
+                                    color = palette.textTertiary,
+                                    fontSize = 11.5.sp,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                )
+                            }
+                        } else {
+                            val showAll = showAllDrawerAgentSessions[selectedAgentBackend] == true
+                            val visible = if (showAll) selectedBackendSessions else selectedBackendSessions.take(6)
+                            val hiddenCount = (selectedBackendSessions.size - visible.size).coerceAtLeast(0)
+
+                            items(
+                                items = visible,
+                                key = { "ds_${it.backend}:${it.sessionId}" }
+                            ) { sess ->
+                                DrawerAgentSessionRow(
+                                    session = sess,
+                                    onClick = { onSelectAgentSession(sess) }
+                                )
+                            }
+
+                            if (hiddenCount > 0 || (showAll && selectedBackendSessions.size > 6)) {
+                                item(key = "drawer_agent_more_$selectedAgentBackend") {
+                                    Text(
+                                        text = if (hiddenCount > 0) "··· 展开其余 $hiddenCount 条会话" else "收起多余会话",
+                                        color = palette.accent,
+                                        fontSize = 11.5.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .clickable { showAllDrawerAgentSessions[selectedAgentBackend] = !showAll }
+                                            .padding(start = 16.dp, top = 4.dp, bottom = 6.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -883,11 +842,11 @@ internal fun CockpitUnifiedDrawerSheet(
                         Icon(OmsIcons.Sparkles, contentDescription = null, tint = palette.accent, modifier = Modifier.size(15.dp))
                     }
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("青简 · 咫尺", color = palette.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Text("青简 · 随身助理", color = palette.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                         val sub = when {
-                            activeTier == "LAN_WS" -> "Mac 局域网直连"
-                            activeTier == "WAN_WEBRTC" -> "Mac 跨网远程在线"
-                            activeTier == "BT_RFCOMM" -> "Mac 蓝牙近场在线"
+                            activeTier == "LAN_WS" -> "$pairedMacName · 局域网直连"
+                            activeTier == "WAN_WEBRTC" -> "$pairedMacName · 跨网在线"
+                            activeTier == "BT_RFCOMM" -> "$pairedMacName · 蓝牙近场"
                             standbyLease == StandbyLeaseState.ACTIVE_POLLING -> "手机值守尺素中"
                             else -> "随身独立云端模式"
                         }
@@ -1015,7 +974,9 @@ private fun DrawerAgentSessionRow(
         "completed" -> palette.accent
         else -> palette.textTertiary.copy(alpha = 0.55f)
     }
-    val backendTag = if (session.backend == "codex") "C" else "A"
+    val projHint = session.projectDisplayName.ifBlank {
+        session.workspacePath.trimEnd('/').substringAfterLast('/')
+    }
     val timeHint = remember(session.updatedAtMs) { formatCompactRelativeTime(session.updatedAtMs) }
 
     Row(
@@ -1023,7 +984,7 @@ private fun DrawerAgentSessionRow(
         horizontalArrangement = Arrangement.spacedBy(7.dp),
         modifier = Modifier
             .fillMaxWidth()
-            .padding(start = 18.dp)
+            .padding(start = 8.dp)
             .omsBounceClick(scaleDown = 0.98f, shape = RoundedCornerShape(9.dp), onClick = onClick)
             .padding(horizontal = 8.dp, vertical = 6.5.dp)
     ) {
@@ -1033,16 +994,18 @@ private fun DrawerAgentSessionRow(
                 .clip(CircleShape)
                 .background(statusDotColor)
         )
-        Text(
-            text = backendTag,
-            color = if (session.backend == "codex") palette.textSecondary else palette.accent,
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier
-                .clip(RoundedCornerShape(4.dp))
-                .background(palette.subtleSurface)
-                .padding(horizontal = 4.dp, vertical = 0.5.dp)
-        )
+        if (projHint.isNotBlank()) {
+            Text(
+                text = projHint.take(10),
+                color = palette.accent,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(palette.subtleSurface)
+                    .padding(horizontal = 4.5.dp, vertical = 0.5.dp)
+            )
+        }
         Text(
             text = session.title.ifBlank { "未命名会话" },
             color = palette.textSecondary,

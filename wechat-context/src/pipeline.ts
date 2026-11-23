@@ -119,7 +119,15 @@ export class WeChatContextPipeline {
     this.lastEnvMtimeMs = this.getEnvFileMtimeMs();
   }
 
-  public async processArticleById(id: number, options?: { sendWeChatReply?: boolean }): Promise<ArticleRecord> {
+  public async processArticleById(
+    id: number,
+    options?: {
+      sendWeChatReply?: boolean;
+      fallbackTitle?: string;
+      fallbackAuthor?: string;
+      fallbackMarkdown?: string;
+    }
+  ): Promise<ArticleRecord> {
     return this.db.withLock(`article_${id}`, async () => {
       const record = this.db.getArticleById(id);
       if (!record) throw new Error(`Article #${id} not found`);
@@ -142,39 +150,80 @@ export class WeChatContextPipeline {
             this.db.updateArticle(id, { status: "extracting", error_message: "" });
             const isWeChat = isWeChatArticleUrl(record.url);
             const savedSource = record.source_md_path && existsSync(record.source_md_path) ? readFileSync(record.source_md_path, "utf8") : "";
-            const extracted =
-              savedSource
-                ? {
-                    url: record.url,
-                    title: record.title,
-                    author: record.author,
-                    digest: record.digest,
-                    publishDate: savedPublicationDate(savedSource),
-                    extractionQuality: readSavedExtractionQuality(savedSource),
-                    markdownBody: savedSource.replace(
-                      /^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/,
-                      ""
-                    ),
-                    imageUrls: [],
-                    extractorUsed: "native_http" as const,
-                  }
-                : isWeChat
+            const browserFallbackMd = String(options?.fallbackMarkdown || "").trim();
+            const isVideoUrl = /(?:youtube\.com\/(?:watch|shorts|live)|youtu\.be\/|bilibili\.com\/video|douyin\.com\/)/i.test(record.url);
+            const buildBrowserFallbackExtracted = () => ({
+              url: record.url,
+              title: (options?.fallbackTitle || record.title || record.url).trim(),
+              author: (options?.fallbackAuthor || record.author || (isVideoUrl ? "YouTube" : "")).trim(),
+              digest: browserFallbackMd.slice(0, 220).replace(/\s+/g, " "),
+              publishDate: new Date().toISOString().slice(0, 10),
+              extractionQuality: {
+                status: (isVideoUrl ? "metadata_only" : "complete") as "metadata_only" | "complete",
+                reasons: ["authenticated_browser_dom"],
+              },
+              markdownBody: browserFallbackMd,
+              imageUrls: [] as string[],
+              extractorUsed: "native_http" as const,
+              mediaKind: (isVideoUrl ? "video" : "article") as "video" | "article",
+              sourceType: (isVideoUrl ? "youtube_video" : "web_article") as "youtube_video" | "web_article",
+            });
+
+            let extracted: Awaited<ReturnType<typeof extractGeneralWebArticle>>;
+            if (savedSource) {
+              extracted = {
+                url: record.url,
+                title: record.title,
+                author: record.author,
+                digest: record.digest,
+                publishDate: savedPublicationDate(savedSource),
+                extractionQuality: readSavedExtractionQuality(savedSource),
+                markdownBody: savedSource.replace(
+                  /^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/,
+                  ""
+                ),
+                imageUrls: [],
+                extractorUsed: "native_http" as const,
+              };
+            } else {
+              try {
+                extracted = isWeChat
                   ? await extractWeChatArticle(
                       record.url,
-                      record.title,
-                      record.author,
+                      options?.fallbackTitle || record.title,
+                      options?.fallbackAuthor || record.author,
                       record.digest
                     )
                   : await extractGeneralWebArticle(
                       record.url,
-                      record.title,
-                      record.author,
+                      options?.fallbackTitle || record.title,
+                      options?.fallbackAuthor || record.author,
                       record.digest,
                       {
                         allowJinaFallback: this.config.allowJinaFallback,
                         config: this.config,
                       }
                     );
+                if (
+                  browserFallbackMd.length >= 100 &&
+                  extracted.markdownBody.trim().length < 180 &&
+                  browserFallbackMd.length > extracted.markdownBody.trim().length
+                ) {
+                  extracted = {
+                    ...extracted,
+                    title: extracted.title || options?.fallbackTitle || record.title,
+                    author: extracted.author || options?.fallbackAuthor || record.author,
+                    markdownBody: browserFallbackMd,
+                  };
+                }
+              } catch (extractErr) {
+                if (browserFallbackMd.length >= 40) {
+                  extracted = buildBrowserFallbackExtracted();
+                } else {
+                  throw extractErr;
+                }
+              }
+            }
 
             this.db.updateArticle(id, {
               title: extracted.title,

@@ -1,5 +1,20 @@
 # Changelog · 更新日志
 
+## 3.6.3 - 2026-11-23 · 随身助理更名与对话置顶、独立记忆中心、多标签免 VPN 应用舱与伴读自动入库、多机四脑协同三层架构及远程操控 Mac
+
+- **全面更名「随身助理」与侧边栏日常对话优先 (`CockpitNavigationDrawer`、`WorkbenchHomeView`、`ChatWorkspaceView` & `AudioTranscribeAndTools`)**：全端界面、按钮与系统提示词统一由「随身秘书 / 问秘书」升级为「**随身助理 / 问助理**」；侧边抽屉优先置顶并默认展开「**随身助理对话**」，将「**电脑协同**」移至下方并默认折叠收起，全局检索结果亦优先呈现日常对话。
+- **协同工作区重构为 `Mac -> 四大 Agent -> 会话` 三层架构 (`StreamRepository`、`OmsTransportClient`、`AgentSessionHub` & `MissionHubWorkspaceView`)**：升级手机端配对存储为多机加密注册表（`paired_macs_registry_v1`，支持绑定与一键切换多台 Mac 电脑且不覆盖历史密钥）；扩展 Mac 重脑中枢原生支持 **`Codex` · `Antigravity` · `WorkBuddy` · `OpenCode`** 四大 Agent（自动发现 `workbuddy.db` 与 `opencode.db` 本地会话并支持 CLI 新建/接续任务）。
+- **尺素阅读器重排为 `初筛摘要 -> 原文 -> 分析报告` (`ChisuAndMissionWorkspaces`、`mac-hud` & `inbox-web-dashboard`)**：将「保存原文」精简为「**原文**」，统一手机端、Mac 原生浮窗与本地 Web 总控台切换顺序为 `初筛摘要 | 原文 | 分析报告`，进入阅读器默认先看初筛摘要。
+- **独立全屏「记忆中心」板块与防复活遗忘机制 (`MemoryCenterScreen`、`SecretaryCore` & `CockpitRuntimeCoordinator`)**：在侧边栏导航格与工作台右上角设立独立「**记忆中心**」，聚合长期画像、近期对话观察（L1）与个人知识库脉络锚点，清晰标注「**手动添加**」与「**对话自动提取（附强化次数）**」，支持一键固化常驻、原地编辑及单条删除遗忘（内置 `forgottenFingerprints` 遗忘墓碑，防止已删记忆被后台蒸馏再次复活）。
+- **多标签常驻免 VPN「应用舱」、全屏零底栏防误触与 AI 自动化操控 (`WebAppHubOverlay`、`CockpitShell` & `LoopbackMixedGateway`)**：
+  - **免 VPN 内置代理直连与登录态持久保留**：通过 `androidx.webkit` `ProxyController` 将内置 WebView 接管至本进程免鉴权代理网关（国内与局域网智能直连，无需手机安装 VPN 即可直达 YouTube、Google、Gmail、X、GitHub），清洗 `; wv` UA 兼容 Google OAuth 登录并支持视频全屏播放。
+  - **多标签常驻保活与显式关闭**：支持同时保留多个未关闭网页/视频标签页（不主动点 `✕` 关闭将持续保留播放秒数与滚动位置），跨板块切换至随身助理再切回 `0ms` 零重载无缝续看；舱首页展示保留标签快捷续看卡与 `继续看` 角标。
+  - **零底栏全高视口与原生级跟手触摸**：浏览态底部 `0dp` 占用，禁用外层抽屉侧滑手势并挂载 `TouchUnimpededWebView` 杜绝误拉侧边栏，彻底消除 YouTube 视频进度条拖动与上下滑动阻尼。
+  - **网页与跨应用 AI 自动化**：支持基于实时 DOM 控件树自动点击、填表、滚动提取、保存自动化配方及联动唤起原生 App。
+- **浏览器「伴读自动入知识库」开关与全端 AI 上下文实时对齐 (`WebAppHubOverlay`、`OmsDaemon`、`WeChatContextPipeline` & `MobileMemoryMirror`)**：新增持久化伴读入库开关，自动过滤首页/搜索流并仅针对 YouTube 视频或深度文章详情页做 `15s` 驻留价值感知（支持一键立即入库或跳过）；后台自动拉取视频字幕/已登录正文提炼伴读笔记落盘至个人知识库 `01_inputs/video|articles/`，实时刷新尺素、`ContextCapsule`、工作记忆及 `oms://context/recent_curated` MCP 资源，让手机助理与电脑四大协同 Agent 自动共享你刚看过的有价值内容。
+- **手机超级工具免点击自动直行与确认直呼电话 (`PhoneToolExecutor`、`ChatWorkspaceView` & `OmsAccessibilityService`)**：补齐 `READ_CONTACTS` 与 `CALL_PHONE` 动态权限及手机真实通讯录匹配；打开 App、调音量、导航、打开网页、设闹钟与无冲突日程全面升级为免手动点击自动直行；拨打电话在确认呼叫对象后（说“确认”或点按钮）经 `TelecomManager` / `ACTION_CALL` 直接拨出并兼容双卡。
+- **手机反向操控 Mac 系统与独立控机助手包 (`MacOsController`、`oms-mac-ctl`、`青简控机助手.app` & `MacRemoteControlModal`)**：支持手机一键执行 Mac **点亮屏幕**、**立即锁屏**、**远程解锁**、**启动/退出已安装应用**、**音量/媒体调节**与**防休眠开关**；自动封装独立 TCC 权限主体 `~/Applications/青简控机助手.app` 结合 IOKit 原生唤醒、完整 ANSI 硬件虚拟键码注入及钥匙串 + 睡眠加密凭据双保险（局域网直连免指纹一键秒解，跨网远程强制手机指纹/面容核验后安全解锁）。
+
 ## 3.5.0 - 2026-11-22 · 四栏旗舰工作台架构、IDE 级项目树侧边栏与按项目协同分组、常驻 Web 应用舱与 OTA 横幅容错
 
 - **底部四栏旗舰架构与沉浸式自动收起 (`CockpitShell`)**：升级根壳层为 `工作台 · 尺素 · 协同 · 应用舱` 底部四栏导航 + 极简情境顶栏；进入深层沉浸页面（对话详情流、尺素双文档阅读器、协同会话详情、网页浏览态）或弹出输入法时自动收起底部导航栏，释放全屏视口。

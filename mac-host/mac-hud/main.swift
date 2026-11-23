@@ -1915,7 +1915,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         actionRow.translatesAutoresizingMaskIntoConstraints = false
         box.addSubview(actionRow)
 
-        let docSeg = NSSegmentedControl(labels: ["📒 伴读笔记", "💡 初筛摘要", "📄 归档原文"], trackingMode: .selectOne, target: self, action: #selector(wxDocSegmentChanged(_:)))
+        let docSeg = NSSegmentedControl(labels: ["💡 初筛摘要", "📄 原文", "📒 分析报告"], trackingMode: .selectOne, target: self, action: #selector(wxDocSegmentChanged(_:)))
         docSeg.selectedSegment = selectedWxDocSegment
         actionRow.addArrangedSubview(docSeg)
 
@@ -1951,7 +1951,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         modeBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
         actionRow.addArrangedSubview(modeBtn)
 
-        let targetFinderPath = selectedWxDocSegment == 2
+        let targetFinderPath = selectedWxDocSegment == 1
             ? (!art.source_md_path.isEmpty ? art.source_md_path : art.note_md_path)
             : (!art.note_md_path.isEmpty ? art.note_md_path : art.source_md_path)
         if !targetFinderPath.isEmpty {
@@ -1969,14 +1969,16 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         let bodyContent: String
         let richHtml: String?
         switch selectedWxDocSegment {
+        case 0:
+            bodyContent = !art.short_summary.isEmpty
+                ? art.short_summary
+                : (detail.noteMarkdown ?? "（暂无初筛摘要）")
+            richHtml = detail.summaryHtml ?? detail.noteHtml
         case 1:
-            bodyContent = art.short_summary.isEmpty ? "（暂无初筛摘要）" : art.short_summary
-            richHtml = detail.summaryHtml
-        case 2:
             bodyContent = detail.sourceMarkdown ?? "（本地原文文件不存在或尚未抓取）"
             richHtml = detail.sourceHtml
         default:
-            bodyContent = detail.noteMarkdown ?? (art.short_summary.isEmpty ? "（暂无伴读笔记）" : art.short_summary)
+            bodyContent = detail.noteMarkdown ?? (art.short_summary.isEmpty ? "（暂无分析报告）" : art.short_summary)
             richHtml = detail.noteHtml ?? detail.summaryHtml
         }
 
@@ -2086,8 +2088,8 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         guard let detail = currentWxDetail, let art = detail.article else { return }
         let txt: String
         switch selectedWxDocSegment {
-        case 1: txt = art.short_summary
-        case 2: txt = detail.sourceMarkdown ?? ""
+        case 0: txt = !art.short_summary.isEmpty ? art.short_summary : (detail.noteMarkdown ?? "")
+        case 1: txt = detail.sourceMarkdown ?? ""
         default: txt = detail.noteMarkdown ?? art.short_summary
         }
         if !txt.isEmpty {
@@ -2098,7 +2100,7 @@ final class OmsMacHudAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     @objc private func revealSelectedWeChatNoteInFinder() {
         guard let art = currentWxDetail?.article else { return }
-        let path = selectedWxDocSegment == 2
+        let path = selectedWxDocSegment == 1
             ? (!art.source_md_path.isEmpty ? art.source_md_path : art.note_md_path)
             : (!art.note_md_path.isEmpty ? art.note_md_path : art.source_md_path)
         guard !path.isEmpty else { return }

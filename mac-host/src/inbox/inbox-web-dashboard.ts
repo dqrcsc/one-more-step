@@ -1767,7 +1767,7 @@ let activeWxSubTab = 'articles';
 let wxOverviewData = { articles: [], turns: [], schedules: [], agentTasks: [], status: {} };
 let selectedWxArticleId = null;
 let selectedWxTurnId = null;
-let selectedWxDocMode = 'note';
+let selectedWxDocMode = 'summary';
 let wxRawSourceMode = false;
 
 function switchTopModule(mod) {
@@ -1956,9 +1956,9 @@ function renderCurrentWxArticleDetail() {
     (a.user_notes ? ('<div style="background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.35);border-radius:8px;padding:8px 12px;margin-bottom:12px;font-size:12.5px;color:#FDE68A;">💬 你的批注：' + escapeHtml(a.user_notes) + '</div>') : '') +
     '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px;">' +
       '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
-        '<button class="tab ' + (selectedWxDocMode === 'note' ? 'active' : '') + '" onclick="setWxDocMode(\'note\')">📒 伴读笔记 (_note.md)</button>' +
-        '<button class="tab ' + (selectedWxDocMode === 'summary' ? 'active' : '') + '" onclick="setWxDocMode(\'summary\')">💡 微信初筛摘要</button>' +
-        '<button class="tab ' + (selectedWxDocMode === 'source' ? 'active' : '') + '" onclick="setWxDocMode(\'source\')">📄 归档原文 (_source.md)</button>' +
+        '<button class="tab ' + (selectedWxDocMode === 'summary' ? 'active' : '') + '" onclick="setWxDocMode(\'summary\')">💡 初筛摘要</button>' +
+        '<button class="tab ' + (selectedWxDocMode === 'source' ? 'active' : '') + '" onclick="setWxDocMode(\'source\')">📄 原文 (_source.md)</button>' +
+        '<button class="tab ' + (selectedWxDocMode === 'note' ? 'active' : '') + '" onclick="setWxDocMode(\'note\')">📒 分析报告 (_note.md)</button>' +
       '</div>' +
       '<button class="tab ' + (wxRawSourceMode ? 'active' : '') + '" onclick="toggleWxRawSourceMode()" title="切换富文本阅读视图与原始 Markdown 源码">' +
         (wxRawSourceMode ? '📖 返回阅读视图' : '&lt;/&gt; 查看源码') +

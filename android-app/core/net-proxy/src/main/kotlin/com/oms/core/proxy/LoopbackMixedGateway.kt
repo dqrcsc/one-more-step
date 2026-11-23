@@ -38,7 +38,8 @@ class LoopbackMixedGateway(
     val router: SmartRegionRouter,
     val authUser: String = "oms",
     val authSecret: String = Base64.getUrlEncoder().withoutPadding()
-        .encodeToString(ProxyCryptoPrimitives.randomBytes(18))
+        .encodeToString(ProxyCryptoPrimitives.randomBytes(18)),
+    val requireAuth: Boolean = true
 ) : AutoCloseable {
 
     private var serverSocket: ServerSocket? = null
@@ -172,27 +173,32 @@ class LoopbackMixedGateway(
     private fun handleSocks5(client: Socket, input: InputStream, output: OutputStream): RoutedTunnelResult? {
         val nMethods = readExactBytes(input, 1)[0].toInt() and 0xFF
         val methods = readExactBytes(input, nMethods)
-        if (!methods.any { (it.toInt() and 0xFF) == 0x02 }) {
-            output.write(byteArrayOf(0x05, 0xFF.toByte()))
+        if (!requireAuth && methods.any { (it.toInt() and 0xFF) == 0x00 }) {
+            output.write(byteArrayOf(0x05, 0x00))
             output.flush()
-            return null
-        }
-        output.write(byteArrayOf(0x05, 0x02))
-        output.flush()
+        } else {
+            if (!methods.any { (it.toInt() and 0xFF) == 0x02 }) {
+                output.write(byteArrayOf(0x05, 0xFF.toByte()))
+                output.flush()
+                return null
+            }
+            output.write(byteArrayOf(0x05, 0x02))
+            output.flush()
 
-        val authVer = readExactBytes(input, 1)[0].toInt() and 0xFF
-        if (authVer != 0x01) return null
-        val uLen = readExactBytes(input, 1)[0].toInt() and 0xFF
-        val uStr = String(readExactBytes(input, uLen), Charsets.UTF_8)
-        val pLen = readExactBytes(input, 1)[0].toInt() and 0xFF
-        val pStr = String(readExactBytes(input, pLen), Charsets.UTF_8)
-        if (uStr != authUser || pStr != authSecret) {
-            output.write(byteArrayOf(0x01, 0x01))
+            val authVer = readExactBytes(input, 1)[0].toInt() and 0xFF
+            if (authVer != 0x01) return null
+            val uLen = readExactBytes(input, 1)[0].toInt() and 0xFF
+            val uStr = String(readExactBytes(input, uLen), Charsets.UTF_8)
+            val pLen = readExactBytes(input, 1)[0].toInt() and 0xFF
+            val pStr = String(readExactBytes(input, pLen), Charsets.UTF_8)
+            if (requireAuth && (uStr != authUser || pStr != authSecret)) {
+                output.write(byteArrayOf(0x01, 0x01))
+                output.flush()
+                return null
+            }
+            output.write(byteArrayOf(0x01, 0x00))
             output.flush()
-            return null
         }
-        output.write(byteArrayOf(0x01, 0x00))
-        output.flush()
 
         val head = readExactBytes(input, 4)
         if (head[0].toInt() != 0x05 || head[1].toInt() != 0x01) {
@@ -263,7 +269,7 @@ class LoopbackMixedGateway(
             it.startsWith("Proxy-Authorization:", ignoreCase = true)
         }?.substringAfter(':')?.trim()
 
-        if (proxyAuth != expectedBasicHeader) {
+        if (requireAuth && proxyAuth != expectedBasicHeader) {
             val resp407 = (
                 "HTTP/1.1 407 Proxy Authentication Required\r\n" +
                     "Proxy-Authenticate: Basic realm=\"oms-local\"\r\n" +
@@ -382,6 +388,7 @@ class OmsProxyManager(
         maxPreferredLatencyMs = maxPreferredLatencyMs
     )
     val gateway = LoopbackMixedGateway(router)
+    val webViewGateway = LoopbackMixedGateway(router, requireAuth = false)
 
     private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val lastPrewarmAtMs = AtomicLong(0L)
@@ -412,6 +419,13 @@ class OmsProxyManager(
         return gateway.port
     }
 
+    fun ensureWebViewGatewayStarted(): Int {
+        if (webViewGateway.port == 0) {
+            webViewGateway.start(0)
+        }
+        return webViewGateway.port
+    }
+
     fun hasAvailableNodes(): Boolean = router.allNodesSnapshot().isNotEmpty()
 
     /**
@@ -421,8 +435,10 @@ class OmsProxyManager(
     fun evictStaleConnections(onlyNode: ProxyNode? = null) {
         if (onlyNode != null) {
             gateway.closeConnectionsForNode(onlyNode)
+            webViewGateway.closeConnectionsForNode(onlyNode)
         } else {
             gateway.closeAllConnections()
+            webViewGateway.closeAllConnections()
         }
         runCatching { sharedProxiedClient?.connectionPool?.evictAll() }
     }
@@ -649,6 +665,7 @@ class OmsProxyManager(
     override fun close() {
         evictStaleConnections()
         gateway.close()
+        webViewGateway.close()
     }
 
     suspend fun runFullSpeedTest(concurrency: Int = 14, timeoutMs: Int = 4000): List<ProxyNodeStatusView> =

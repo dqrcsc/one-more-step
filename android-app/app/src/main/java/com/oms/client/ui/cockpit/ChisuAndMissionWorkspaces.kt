@@ -430,7 +430,7 @@ fun ChisuWorkspaceView(
                     text = if (searchQuery.isNotBlank()) {
                         "尝试换个关键词，或清空筛选查看全部归档"
                     } else {
-                        "在微信将公众号文章转发给「尺素」即可自动精析入库\n连通 Mac 后可同步查看全部伴读报告与保存原文"
+                        "在微信将公众号文章转发给「尺素」即可自动精析入库\n连通 Mac 后可同步查看初筛摘要、原文与分析报告"
                     },
                     color = palette.textTertiary,
                     fontSize = 13.sp,
@@ -682,7 +682,11 @@ private fun ChisuImmersiveReaderScreen(
 
     var docMode by remember(detail.stableKey) {
         mutableStateOf(
-            if (parsedNote != null || parsedSummary != null) ChisuReaderDocMode.REPORT else ChisuReaderDocMode.SOURCE
+            when {
+                parsedSummary != null || parsedNote != null -> ChisuReaderDocMode.SUMMARY
+                parsedSource != null -> ChisuReaderDocMode.SOURCE
+                else -> ChisuReaderDocMode.REPORT
+            }
         )
     }
 
@@ -739,30 +743,23 @@ private fun ChisuImmersiveReaderScreen(
         "image_note" -> "原图与原文"
         "video" -> "转录与原文"
         "idea" -> "原始灵感"
-        else -> "保存原文"
+        else -> "原文"
     }
     val activeDocLabel = when (docMode) {
-        ChisuReaderDocMode.REPORT -> reportTabLabel
         ChisuReaderDocMode.SUMMARY -> "初筛摘要"
         ChisuReaderDocMode.SOURCE -> sourceTabLabel
+        ChisuReaderDocMode.REPORT -> reportTabLabel
     }
     val estReadMin = remember(activeBodyMarkdown) {
         (activeBodyMarkdown.length / 360).coerceAtLeast(1)
     }
 
-    val segmentItems = remember(hasDistinctSummary, reportTabLabel, sourceTabLabel) {
-        if (hasDistinctSummary) {
-            listOf(
-                OmsSegmentItem(ChisuReaderDocMode.REPORT, reportTabLabel),
-                OmsSegmentItem(ChisuReaderDocMode.SUMMARY, "初筛摘要"),
-                OmsSegmentItem(ChisuReaderDocMode.SOURCE, sourceTabLabel)
-            )
-        } else {
-            listOf(
-                OmsSegmentItem(ChisuReaderDocMode.REPORT, reportTabLabel),
-                OmsSegmentItem(ChisuReaderDocMode.SOURCE, sourceTabLabel)
-            )
-        }
+    val segmentItems = remember(reportTabLabel, sourceTabLabel) {
+        listOf(
+            OmsSegmentItem(ChisuReaderDocMode.SUMMARY, "初筛摘要"),
+            OmsSegmentItem(ChisuReaderDocMode.SOURCE, sourceTabLabel),
+            OmsSegmentItem(ChisuReaderDocMode.REPORT, reportTabLabel)
+        )
     }
 
     Box(modifier = Modifier.fillMaxSize().background(palette.canvas)) {
@@ -844,7 +841,7 @@ private fun ChisuImmersiveReaderScreen(
                 }
             }
 
-            // Mac-Parity Document Mode Switcher: 分析报告 | (初筛摘要) | 保存原文
+            // Mac-Parity Document Mode Switcher: 初筛摘要 | 原文 | 分析报告
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -853,11 +850,7 @@ private fun ChisuImmersiveReaderScreen(
             ) {
                 OmsSlidingSegmentedBar(
                     items = segmentItems,
-                    selected = if (!hasDistinctSummary && docMode == ChisuReaderDocMode.SUMMARY) {
-                        ChisuReaderDocMode.REPORT
-                    } else {
-                        docMode
-                    },
+                    selected = docMode,
                     onSelect = { docMode = it },
                     height = 34.dp,
                     modifier = Modifier.fillMaxWidth()
@@ -1177,7 +1170,8 @@ fun MissionHubWorkspaceView(
     externalDispatchProjectPath: String = "",
     externalDispatchNonce: Long = 0L,
     externalSubViewTarget: String? = null,
-    externalSubViewNonce: Long = 0L
+    externalSubViewNonce: Long = 0L,
+    onOpenMacPairingSettings: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val palette = OmsTheme.colors
@@ -1190,9 +1184,18 @@ fun MissionHubWorkspaceView(
     val selectedSession by coordinator.selectedAgentSessionFlow.collectAsState()
     val selectedSteps by coordinator.selectedAgentStepsFlow.collectAsState()
     val isLoadingDetail by coordinator.isLoadingAgentDetailFlow.collectAsState()
+    val pairedMacs by app.repository.pairedMacsFlow.collectAsState()
+    val activeTier by app.transportClient.activeTierFlow.collectAsState()
+    var activeMacId by remember(pairedMacs, activeTier) {
+        mutableStateOf(app.repository.getPairedMac()?.macId ?: pairedMacs.firstOrNull()?.macId.orEmpty())
+    }
+    var showMacControlModal by remember { mutableStateOf(false) }
 
     var activeSubView by remember { mutableStateOf(HubSubView.AGENTS) }
-    var backendFilter by remember { mutableStateOf("ALL") }
+    // Hierarchy Level 2: Explicit 4-Agent Engine Selection (Codex / Antigravity / WorkBuddy / OpenCode)
+    var backendFilter by remember {
+        mutableStateOf(app.edgeStore.getSelectedMissionAgent())
+    }
     var groupedByProject by remember {
         mutableStateOf(app.edgeStore.isMissionGroupedByProject())
     }
@@ -1379,7 +1382,14 @@ fun MissionHubWorkspaceView(
         }
 
         if (activeSubView == HubSubView.AGENTS) {
-            // Backend Filter Strip + Project/Timeline View Toggle
+            // =========================================================================
+            // Hierarchy Level 1: Multi-Mac Computer Selector + 1-Tap Mac Remote Control
+            // =========================================================================
+            val currentMacName = remember(pairedMacs, activeMacId) {
+                pairedMacs.firstOrNull { it.macId == activeMacId }?.macName
+                    ?: app.repository.getPairedMac()?.macName
+                    ?: "未绑定电脑"
+            }
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1388,19 +1398,101 @@ fun MissionHubWorkspaceView(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Row(
+                    modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(7.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (pairedMacs.isEmpty()) {
+                        OmsTogglePill(
+                            label = "＋ 配对第一台 Mac",
+                            active = true,
+                            icon = OmsIcons.Laptop,
+                            onClick = onOpenMacPairingSettings
+                        )
+                    } else {
+                        pairedMacs.forEach { macCfg ->
+                            val isSelectedMac = macCfg.macId == activeMacId
+                            val statusPrefix = when {
+                                isSelectedMac && activeTier == "LAN_WS" -> "🟢 "
+                                isSelectedMac && activeTier == "WAN_WEBRTC" -> "🟣 "
+                                isSelectedMac && activeTier == "BT_RFCOMM" -> "🔵 "
+                                else -> ""
+                            }
+                            OmsTogglePill(
+                                label = "$statusPrefix${macCfg.macName}",
+                                active = isSelectedMac,
+                                icon = OmsIcons.Laptop,
+                                onClick = {
+                                    activeMacId = macCfg.macId
+                                    app.transportClient.switchToPairedMac(macCfg.macId) { ok, msg ->
+                                        OmsFeedbackController.show(msg, if (ok) OmsToastKind.SUCCESS else OmsToastKind.INFO)
+                                    }
+                                }
+                            )
+                        }
+                        OmsCircleIconButton(
+                            icon = OmsIcons.Plus,
+                            contentDescription = "配对更多电脑",
+                            size = 29.dp,
+                            iconSize = 14.dp,
+                            containerColor = palette.subtleSurface,
+                            borderColor = palette.hairline,
+                            onClick = onOpenMacPairingSettings
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.width(6.dp))
+
+                OmsSecondaryButton(
+                    label = "遥控 Mac",
+                    icon = OmsIcons.Sliders,
+                    height = 30.dp,
+                    onClick = { showMacControlModal = true }
+                )
+            }
+
+            // =========================================================================
+            // Hierarchy Level 2: 4 Agent Selectors (Codex · Antigravity · WorkBuddy · OpenCode)
+            // =========================================================================
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState())
                 ) {
-                    OmsTogglePill("全部 (${sessions.size})", backendFilter == "ALL", onClick = { backendFilter = "ALL" })
-                    OmsTogglePill("Codex", backendFilter == "codex", icon = OmsIcons.Terminal, onClick = { backendFilter = "codex" })
-                    OmsTogglePill("AGY", backendFilter == "agy", icon = OmsIcons.Sparkles, onClick = { backendFilter = "agy" })
+                    val agentSpecs = listOf(
+                        Triple("codex", "Codex", OmsIcons.Terminal),
+                        Triple("agy", "Antigravity", OmsIcons.Sparkles),
+                        Triple("workbuddy", "WorkBuddy", OmsIcons.Cpu),
+                        Triple("opencode", "OpenCode", OmsIcons.Bolt)
+                    )
+                    agentSpecs.forEach { (key, title, ic) ->
+                        val cnt = sessions.count { it.backend == key }
+                        val runningCnt = sessions.count { it.backend == key && it.status == "running" }
+                        val pillLabel = if (runningCnt > 0) "$title ($cnt·运行)" else "$title ($cnt)"
+                        OmsTogglePill(
+                            label = pillLabel,
+                            active = backendFilter == key,
+                            icon = ic,
+                            onClick = {
+                                backendFilter = key
+                                app.edgeStore.setSelectedMissionAgent(key)
+                            }
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.width(6.dp))
 
                 OmsTogglePill(
-                    label = if (groupedByProject) "按项目" else "时间流",
+                    label = if (groupedByProject) "按仓库" else "时间流",
                     active = groupedByProject,
                     icon = if (groupedByProject) OmsIcons.Folder else OmsIcons.Clock,
                     onClick = {
@@ -1423,13 +1515,16 @@ fun MissionHubWorkspaceView(
                 ) {
                     Icon(OmsIcons.Laptop, contentDescription = null, tint = palette.warning, modifier = Modifier.size(15.dp))
                     Text(
-                        text = "当前未连通 Mac，展示上次缓存快照；恢复连接后可实时刷新额度与会话",
+                        text = "当前未连通 $currentMacName，展示本地缓存会话；恢复连接后可实时派单与操控电脑",
                         color = palette.textSecondary,
                         fontSize = 12.sp
                     )
                 }
             }
 
+            // =========================================================================
+            // Hierarchy Level 3: Sessions for Selected (Mac -> Agent)
+            // =========================================================================
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 24.dp),
@@ -1455,10 +1550,15 @@ fun MissionHubWorkspaceView(
                                 Icon(OmsIcons.Terminal, contentDescription = null, tint = palette.textTertiary, modifier = Modifier.size(24.dp))
                             }
                             Spacer(modifier = Modifier.height(14.dp))
-                            Text("当前筛选下暂无会话", color = palette.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                text = "当前电脑暂无 ${agentDisplayName(backendFilter)} 会话",
+                                color = palette.textPrimary,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                "点击右上角「派发任务」即可在 Mac 指定仓库启动 Codex 或 Antigravity 会话",
+                                text = "点击右上角「派发任务」即可在 $currentMacName 上通过 ${agentDisplayName(backendFilter)} 启动任务",
                                 color = palette.textTertiary,
                                 fontSize = 13.sp
                             )
@@ -1512,6 +1612,7 @@ fun MissionHubWorkspaceView(
                 sessions = sessions,
                 initialPrompt = dispatchInitialPrompt,
                 initialProjectPath = dispatchInitialProjectPath,
+                initialBackend = backendFilter,
                 onDispatched = {
                     dispatchInitialPrompt = ""
                     dispatchInitialProjectPath = ""
@@ -1519,6 +1620,18 @@ fun MissionHubWorkspaceView(
                 }
             )
         }
+    }
+
+    if (showMacControlModal) {
+        val curName = pairedMacs.firstOrNull { it.macId == activeMacId }?.macName
+            ?: app.repository.getPairedMac()?.macName
+            ?: "我的 Mac"
+        MacRemoteControlModal(
+            coordinator = coordinator,
+            activeTier = activeTier,
+            pairedMacName = curName,
+            onDismiss = { showMacControlModal = false }
+        )
     }
 
     // Half-Screen Cross-Device Drop-to-Mac Sheet
@@ -1636,7 +1749,7 @@ internal fun AgentQuotaDashboardCard(quotas: RemoteAgentQuotasUi) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
                 Icon(OmsIcons.Cpu, contentDescription = null, tint = palette.accent, modifier = Modifier.size(14.5.dp))
                 Text(
-                    text = if (expanded) "Mac 双脑额度余量与重置周期" else "Mac 双脑额度",
+                    text = if (expanded) "四大 Agent 引擎状态与额度" else "Agent 引擎额度与状态",
                     color = palette.textPrimary,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.SemiBold
@@ -1692,6 +1805,22 @@ internal fun AgentQuotaDashboardCard(quotas: RemoteAgentQuotasUi) {
                     icon = OmsIcons.Sparkles,
                     quota = quotas.agy
                 )
+                quotas.workbuddy?.let { wbQuota ->
+                    Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
+                    AgentBackendQuotaRow(
+                        title = "WorkBuddy",
+                        icon = OmsIcons.Cpu,
+                        quota = wbQuota
+                    )
+                }
+                quotas.opencode?.let { ocQuota ->
+                    Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(palette.hairline))
+                    AgentBackendQuotaRow(
+                        title = "OpenCode",
+                        icon = OmsIcons.Bolt,
+                        quota = ocQuota
+                    )
+                }
             }
         }
     }
@@ -1968,7 +2097,7 @@ private fun MissionProjectAccordionCard(
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 Text(
-                                    text = if (sess.backend == "codex") "Codex" else "AGY",
+                                    text = agentShortBadge(sess.backend),
                                     color = palette.accent,
                                     fontSize = 10.sp,
                                     fontWeight = FontWeight.Bold,
@@ -2082,7 +2211,12 @@ private fun AgentSessionCard(session: RemoteAgentSessionUi, onClick: () -> Unit)
                 modifier = Modifier.weight(1f)
             ) {
                 Icon(
-                    imageVector = if (session.backend == "codex") OmsIcons.Terminal else OmsIcons.Sparkles,
+                    imageVector = when (session.backend) {
+                        "codex" -> OmsIcons.Terminal
+                        "workbuddy" -> OmsIcons.Cpu
+                        "opencode" -> OmsIcons.Bolt
+                        else -> OmsIcons.Sparkles
+                    },
                     contentDescription = null,
                     tint = palette.accent,
                     modifier = Modifier.size(14.dp)
@@ -2100,7 +2234,7 @@ private fun AgentSessionCard(session: RemoteAgentSessionUi, onClick: () -> Unit)
                     )
                 }
                 Text(
-                    text = if (session.backend == "codex") "Codex" else "Antigravity",
+                    text = agentDisplayName(session.backend),
                     color = palette.textSecondary,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold
@@ -2134,7 +2268,7 @@ private fun AgentSessionCard(session: RemoteAgentSessionUi, onClick: () -> Unit)
 
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = session.title.ifBlank { "${if (session.backend == "codex") "Codex" else "Antigravity"} · $projectLabel" },
+            text = session.title.ifBlank { "${agentDisplayName(session.backend)} · $projectLabel" },
             color = palette.textPrimary,
             fontSize = 16.sp,
             fontWeight = FontWeight.SemiBold,
@@ -2263,7 +2397,7 @@ private fun AgentSessionDetailScreen(
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = "${if (session.backend == "codex") "Codex" else "Antigravity"} · ${session.projectDisplayName.ifBlank { session.workspacePath.substringAfterLast('/') }} · 桌面同步可见",
+                        text = "${agentDisplayName(session.backend)} · ${session.projectDisplayName.ifBlank { session.workspacePath.substringAfterLast('/') }} · 桌面同步可见",
                         color = palette.textTertiary,
                         fontSize = 11.5.sp,
                         maxLines = 1,
@@ -2543,6 +2677,7 @@ private fun AgentDispatchSheetContent(
     sessions: List<RemoteAgentSessionUi>,
     initialPrompt: String,
     initialProjectPath: String = "",
+    initialBackend: String = "codex",
     onDispatched: () -> Unit
 ) {
     val palette = OmsTheme.colors
@@ -2556,7 +2691,11 @@ private fun AgentDispatchSheetContent(
     var projectSearchText by remember { mutableStateOf("") }
     var targetResumeSessionId by remember { mutableStateOf("") }
     var showSessionDropdown by remember { mutableStateOf(false) }
-    var newBackend by remember { mutableStateOf("codex") }
+    var newBackend by remember(initialBackend) {
+        mutableStateOf(
+            if (initialBackend in listOf("codex", "agy", "workbuddy", "opencode")) initialBackend else "codex"
+        )
+    }
     val dispatchDraftKey = "__new_dispatch__"
     var promptText by remember(initialPrompt) {
         mutableStateOf(
@@ -2666,7 +2805,7 @@ private fun AgentDispatchSheetContent(
                         text = {
                             Column {
                                 Text(
-                                    text = "${if (sess.backend == "codex") "Codex" else "AGY"} · ${sess.title}",
+                                    text = "${agentDisplayName(sess.backend)} · ${sess.title}",
                                     color = palette.textPrimary,
                                     fontSize = 13.sp,
                                     fontWeight = FontWeight.Medium,
@@ -2689,9 +2828,14 @@ private fun AgentDispatchSheetContent(
         }
 
         if (chosenResumeSession == null) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OmsTogglePill("OpenAI Codex", newBackend == "codex", icon = OmsIcons.Terminal, onClick = { newBackend = "codex" })
-                OmsTogglePill("Google Antigravity", newBackend == "agy", icon = OmsIcons.Sparkles, onClick = { newBackend = "agy" })
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+            ) {
+                OmsTogglePill("Codex", newBackend == "codex", icon = OmsIcons.Terminal, onClick = { newBackend = "codex" })
+                OmsTogglePill("Antigravity", newBackend == "agy", icon = OmsIcons.Sparkles, onClick = { newBackend = "agy" })
+                OmsTogglePill("WorkBuddy", newBackend == "workbuddy", icon = OmsIcons.Cpu, onClick = { newBackend = "workbuddy" })
+                OmsTogglePill("OpenCode", newBackend == "opencode", icon = OmsIcons.Bolt, onClick = { newBackend = "opencode" })
             }
         }
 

@@ -28,7 +28,9 @@ data class XiaomiHealthChecklist(
     val smsReadGranted: Boolean = false, // RECEIVE_SMS & READ_SMS
     val calendarGranted: Boolean,
     val mediaReadGranted: Boolean,
-    val recordAudioGranted: Boolean = false
+    val recordAudioGranted: Boolean = false,
+    val contactsGranted: Boolean = false,
+    val callPhoneGranted: Boolean = false
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("xiaomiBackgroundPopupAllowed", backgroundPopupAllowed)
@@ -42,6 +44,8 @@ data class XiaomiHealthChecklist(
         put("calendarGranted", calendarGranted)
         put("mediaReadGranted", mediaReadGranted)
         put("recordAudioGranted", recordAudioGranted)
+        put("contactsGranted", contactsGranted)
+        put("callPhoneGranted", callPhoneGranted)
     }
 }
 
@@ -113,6 +117,15 @@ object XiaomiAdaptationHelper {
             Manifest.permission.READ_SMS
         ) == PackageManager.PERMISSION_GRANTED
 
+        val contactsGranted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.READ_CONTACTS
+        ) == PackageManager.PERMISSION_GRANTED
+        val callPhoneGranted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.CALL_PHONE
+        ) == PackageManager.PERMISSION_GRANTED
+
         val notifListenerEnabled = isNotificationListenerEnabled(context)
 
         return XiaomiHealthChecklist(
@@ -127,7 +140,9 @@ object XiaomiAdaptationHelper {
             smsReadGranted = smsGranted,
             calendarGranted = calendarGranted,
             mediaReadGranted = mediaGranted,
-            recordAudioGranted = audioGranted
+            recordAudioGranted = audioGranted,
+            contactsGranted = contactsGranted,
+            callPhoneGranted = callPhoneGranted
         )
     }
 

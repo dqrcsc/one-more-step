@@ -536,6 +536,12 @@ export const OMS_MCP_RESOURCES = [
     description: "手机在场状态 (AT_DESK/AWAY)、传输通道与权限状态",
     mimeType: "application/json",
   },
+  {
+    uri: "oms://context/recent_curated",
+    name: "Recent Browser & Chisu Curated Knowledge Context",
+    description: "用户近期在应用舱浏览器（如 YouTube 视频、技术文章）中浏览并由助理自动/手动整理存入个人知识库的摘要与本地文件路径，用于保持跨 AI 上下文一致",
+    mimeType: "application/json",
+  },
 ];
 
 export class OmsMcpServer {
@@ -639,6 +645,8 @@ export class OmsMcpServer {
             data = { count: items.length, items };
           } else if (uri === "oms://phone/status") {
             data = await this.ipc.call("phone_presence_status", {});
+          } else if (uri === "oms://context/recent_curated") {
+            data = await this.ipc.call("chisu.recent_curated", { limit: 10 });
           } else {
             throw new Error(`Unknown resource URI: ${uri}`);
           }

@@ -58,6 +58,9 @@ class StreamRepository(context: Context) :
     private val _itemsFlow = MutableStateFlow<List<StreamItemModel>>(emptyList())
     val itemsFlow: StateFlow<List<StreamItemModel>> = _itemsFlow
 
+    private val _pairedMacsFlow = MutableStateFlow<List<PairedMacConfig>>(emptyList())
+    val pairedMacsFlow: StateFlow<List<PairedMacConfig>> = _pairedMacsFlow
+
     @Volatile
     private var cachedPairedMac: PairedMacConfig? = null
     @Volatile
@@ -66,6 +69,7 @@ class StreamRepository(context: Context) :
     init {
         writableDatabase.execSQL("UPDATE stream_items SET sync_status = 'FAILED' WHERE sync_status = 'PREPARING'")
         refreshFlow()
+        refreshPairedMacsFlow()
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -226,6 +230,116 @@ class StreamRepository(context: Context) :
             pairingVersion = config.pairingVersion
         )
         pairedMacLoaded = true
+        upsertIntoMacRegistryLocked(cachedPairedMac!!)
+    }
+
+    @Synchronized
+    private fun upsertIntoMacRegistryLocked(entry: PairedMacConfig) {
+        val currentList = loadMacRegistryLocked().toMutableList()
+        val encSecret = encryptPairSecret(entry.pairSecretHex) ?: return
+        val idx = currentList.indexOfFirst { it.first.macId == entry.macId }
+        if (idx >= 0) {
+            currentList[idx] = entry to encSecret
+        } else {
+            currentList.add(0, entry to encSecret)
+        }
+        persistMacRegistryLocked(currentList.take(10))
+        _pairedMacsFlow.value = currentList.take(10).map { it.first }
+    }
+
+    private fun loadMacRegistryLocked(): List<Pair<PairedMacConfig, String>> {
+        val raw = prefs.getString("paired_macs_registry_v1", null)
+        val out = mutableListOf<Pair<PairedMacConfig, String>>()
+        if (!raw.isNullOrBlank()) {
+            runCatching {
+                val arr = JSONArray(raw)
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val id = o.optString("macId", "").trim()
+                    val enc = o.optString("pairSecretEnc", "").trim()
+                    if (id.isEmpty() || enc.isEmpty()) continue
+                    val decSecret = decryptPairSecret(enc).orEmpty()
+                    if (decSecret.isEmpty()) continue
+                    val ipsArr = o.optJSONArray("lanIps") ?: JSONArray()
+                    val ips = (0 until ipsArr.length()).mapNotNull { ipsArr.optString(it).takeIf(String::isNotBlank) }
+                    val cfg = PairedMacConfig(
+                        macId = id,
+                        macName = o.optString("macName", "Mac"),
+                        lanIps = ips,
+                        lanPort = o.optInt("lanPort", 19527),
+                        macPubKeyBase64Url = o.optString("macPubKey", ""),
+                        wanRoomId = o.optString("wanRoomId", ""),
+                        wanRelayWssUrl = o.optString("wanRelayUrl", "").takeIf { it.isNotBlank() },
+                        pairSecretHex = decSecret,
+                        pairingVersion = o.optInt("pairingVersion", 2)
+                    )
+                    out.add(cfg to enc)
+                }
+            }
+        }
+        return out
+    }
+
+    private fun persistMacRegistryLocked(entries: List<Pair<PairedMacConfig, String>>) {
+        val arr = JSONArray()
+        for ((cfg, enc) in entries) {
+            arr.put(
+                JSONObject()
+                    .put("macId", cfg.macId)
+                    .put("macName", cfg.macName)
+                    .put("lanIps", JSONArray(cfg.lanIps))
+                    .put("lanPort", cfg.lanPort)
+                    .put("macPubKey", cfg.macPubKeyBase64Url)
+                    .put("wanRoomId", cfg.wanRoomId)
+                    .put("wanRelayUrl", cfg.wanRelayWssUrl ?: "")
+                    .put("pairSecretEnc", enc)
+                    .put("pairingVersion", cfg.pairingVersion)
+            )
+        }
+        prefs.edit().putString("paired_macs_registry_v1", arr.toString()).apply()
+    }
+
+    @Synchronized
+    private fun refreshPairedMacsFlow() {
+        val active = getPairedMac()
+        val reg = loadMacRegistryLocked()
+        if (reg.isEmpty() && active != null && active.pairSecretHex.isNotBlank()) {
+            upsertIntoMacRegistryLocked(active)
+        } else {
+            _pairedMacsFlow.value = reg.map { it.first }
+        }
+    }
+
+    @Synchronized
+    fun getPairedMacs(): List<PairedMacConfig> {
+        if (_pairedMacsFlow.value.isEmpty()) {
+            refreshPairedMacsFlow()
+        }
+        val list = _pairedMacsFlow.value
+        if (list.isNotEmpty()) return list
+        return listOfNotNull(getPairedMac())
+    }
+
+    @Synchronized
+    fun switchActiveMac(macId: String): PairedMacConfig? {
+        val target = getPairedMacs().firstOrNull { it.macId == macId } ?: return getPairedMac()
+        savePairedMac(target)
+        return target
+    }
+
+    @Synchronized
+    fun removePairedMac(macId: String) {
+        val remaining = loadMacRegistryLocked().filterNot { it.first.macId == macId }
+        persistMacRegistryLocked(remaining)
+        _pairedMacsFlow.value = remaining.map { it.first }
+        if (cachedPairedMac?.macId == macId) {
+            val next = remaining.firstOrNull()?.first
+            if (next != null) {
+                savePairedMac(next)
+            } else {
+                clearPairedMac()
+            }
+        }
     }
 
     /** Discovery may refresh routing, never restore a stale pairing credential or security version. */

@@ -1259,6 +1259,7 @@ class OmsAccessibilityService : AccessibilityService() {
                 DialerTargetPolicy.matchesSim(label(node), node.viewIdResourceName ?: "", simPref)
             val candidates = nodes.filter { isCallButton(it) && matchesSim(it) }
             val chosen = candidates.singleOrNull()
+                ?: (if (simPref.isBlank()) candidates.firstOrNull() else null)
                 ?: return@withGuardedPhoneAction failed("call_target_or_sim_not_verified")
             val chosenSimLabel = label(chosen)
             val clicked = steps.effect {

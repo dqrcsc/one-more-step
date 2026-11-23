@@ -788,6 +788,62 @@ export class WeChatBridgeSupervisor extends EventEmitter {
     }
   }
 
+  public async ingestUrlToVault(params: {
+    url: string;
+    title?: string;
+    author?: string;
+    userNote?: string;
+    fallbackMarkdown?: string;
+  }): Promise<{
+    ok: boolean;
+    article?: WeChatArticleListItem;
+    sourcePath?: string;
+    notePath?: string;
+    shortSummary?: string;
+    triage?: string;
+    error?: string;
+  }> {
+    if (!this.isRunning()) {
+      return { ok: false, error: "WeChat Context worker is not running" };
+    }
+    try {
+      const res = await fetch(`http://127.0.0.1:${this.internalPort}/api/ingest`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Host: `127.0.0.1:${this.internalPort}`,
+        },
+        body: JSON.stringify({
+          url: params.url,
+          title: params.title,
+          author: params.author,
+          note: params.userNote,
+          fallbackMarkdown: params.fallbackMarkdown,
+        }),
+        signal: AbortSignal.timeout(120_000),
+      });
+      const data = (await res.json()) as Record<string, any>;
+      if (!res.ok || !data?.ok || !data?.article) {
+        return {
+          ok: false,
+          error: String(data?.error || `Ingest failed with HTTP ${res.status}`),
+        };
+      }
+      const raw = data.article as Record<string, any>;
+      const mapped = this.mapRawArticleSummary(raw);
+      return {
+        ok: true,
+        article: mapped,
+        sourcePath: typeof raw.source_md_path === "string" ? raw.source_md_path : undefined,
+        notePath: typeof raw.note_md_path === "string" ? raw.note_md_path : undefined,
+        shortSummary: mapped.shortSummary || mapped.digest || "",
+        triage: mapped.triage,
+      };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  }
+
   public async stop(): Promise<void> {
     this.stopped = true;
     if (this.respawnTimer) {

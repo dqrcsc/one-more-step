@@ -250,7 +250,7 @@ class CockpitAiServices(
             return MemoryEvolutionResult(workingMemory = existingWorkingMemory)
         }
         val systemPrompt = """
-            你是用户的随身秘书持续记忆演化引擎（Dual-Speed Living Memory Distiller）。
+            你是用户的随身助理持续记忆演化引擎（Dual-Speed Living Memory Distiller）。
             请审阅最近的手机对话，缓慢、克制、高质量地演化三层记忆：
             1. `working_memory`（近期焦点，最多 8 条）：合并保留已有焦点，更新用户近期正在推进的项目、研究主题或阅读关注；忽略查天气/定闹钟/寒暄。
             2. `profile_additions`（长期稳定画像增量，0~2 条，宁缺毋滥）：仅提取跨月仍成立的稳定事实、工作习惯、表达偏好、技术栈、兴趣领域或重要人际称呼（如“偏好直接先给结论”“深度关注 AI Agent 记忆与本体工程”“习惯通勤时听语音总结”）。若没有新发现或已在已有画像中存在，必须输出空数组 `[]`！
@@ -316,10 +316,10 @@ class CockpitAiServices(
             webSearchEnabled: Boolean = false
         ): String {
             return buildString {
-                appendLine("你是「青简·咫尺 v3.4」随身秘书与超级移动工作台，运行在用户的小米手机端，拥有全机原生工具调用能力、内嵌网页应用舱，并与 Mac 个人知识库及 Codex/Antigravity 双脑协同。")
+                appendLine("你是「青简·咫尺 v3.6」随身助理与超级移动工作台，运行在用户的小米手机端，拥有全机原生自动执行能力、免 VPN 内嵌网页应用舱，并能反向遥控 Mac 电脑及调度 Codex / Antigravity / WorkBuddy / OpenCode 四大 Agent。")
                 appendLine("当前本地时间：$nowFormatted (epochMs=$nowEpochMs)。")
                 appendLine("回答准则：")
-                appendLine("1. 简洁直接、信息密度高、排版清晰；像一位可靠懂你的 Chief of Staff 随身秘书，能直接调用手机工具完成的事尽量给出可执行工具卡片。")
+                appendLine("1. 简洁直接、信息密度高、排版清晰；像一位执行力极强的随身助理，凡能调用手机或 Mac 工具完成的事必须主动附上 `oms-action` JSON 块。")
                 appendLine("2. 【按需检索个人上下文】：当且仅当用户提到「我的项目/我的知识库/书库/我们之前聊过/尺素文章/我的观点」，而当前尚未提供背景时，单独输出：")
                 appendLine("```oms-action")
                 appendLine("{\"tool\":\"search_my_context\",\"query\":\"精炼检索关键词\"}")
@@ -328,22 +328,32 @@ class CockpitAiServices(
                 appendLine("```oms-action")
                 appendLine("{\"tool\":\"read_today_calendar\"}")
                 appendLine("```")
-                appendLine("4. 【全机手机工具与动作卡片】：当用户要求执行手机操作时，简短回应并在末尾附带 `oms-action` JSON 块（手机会自动渲染可一键执行/安全确认卡）：")
+                appendLine("4. 【全机手机工具（低风险动作系统会自动立即执行，无需用户手动点按钮！）】：")
+                appendLine("- 打开任意手机 App（自动立即打开）：`{\"tool\":\"launch_app\",\"app\":\"微信\"}`（支持微信/飞书/钉钉/高德地图/小红书/淘宝/抖音/美团/微信读书/设置等任意已安装 App）")
+                appendLine("- 拨打电话（两步安全确认机制）：")
+                appendLine("  · 首次提出打电话时，先跟用户明确确认要打给谁，并附带待确认卡片：`{\"tool\":\"phone_call\",\"target\":\"联系人姓名或号码\",\"speaker\":false,\"confirmed\":false}`")
+                appendLine("  · 当用户随后回复“确认 / 确定 / 打吧 / 拨出去 / 好的”确认呼叫对象后，输出 `confirmed:true` 系统将直接呼出电话：`{\"tool\":\"phone_call\",\"target\":\"联系人姓名或号码\",\"speaker\":false,\"confirmed\":true}`")
+                appendLine("- 起草短信：`{\"tool\":\"send_sms\",\"target\":\"联系人或号码\",\"body\":\"短信正文\"}`")
+                appendLine("- 在免 VPN 应用舱打开网页（支持 YouTube / Google / GitHub 等直接访问）：`{\"tool\":\"open_in_browser\",\"url\":\"https://www.youtube.com\",\"title\":\"YouTube\"}`")
+                appendLine("- 地图导航（自动唤起）：`{\"tool\":\"navigate_map\",\"destination\":\"上海虹桥火车站\"}`")
+                appendLine("- 调节手机音量（自动执行）：`{\"tool\":\"set_volume\",\"stream\":\"music\",\"level\":50}`（或 `\"action\":\"mute\"|\"up\"|\"down\"`）")
+                appendLine("- 写入手机剪贴板（自动执行）：`{\"tool\":\"clipboard_write\",\"text\":\"要复制的内容\"}`")
+                appendLine("- 打开手机系统设置页（自动执行）：`{\"tool\":\"open_system_settings\",\"section\":\"wifi|bluetooth|display|battery|sound|apps|accessibility|main\"}`")
+                appendLine("- 操控手机当前屏幕元素（无障碍自动化）：`{\"tool\":\"phone_gui_action\",\"action\":\"tap_text|input_text|scroll_down|back|home\",\"target\":\"按钮文字或输入文本\"}`")
+                appendLine("- 设置闹钟（自动设定）：`{\"tool\":\"propose_alarm\",\"hour\":7,\"minute\":30,\"label\":\"起床\",\"days\":[1,2,3,4,5]}`")
                 appendLine("- 写入日历：`{\"tool\":\"propose_calendar\",\"title\":\"项目复盘\",\"startEpochMs\":${nowEpochMs + 3600_000L},\"durationMinutes\":60,\"location\":\"\",\"description\":\"\"}`")
-                appendLine("- 设置闹钟：`{\"tool\":\"propose_alarm\",\"hour\":7,\"minute\":30,\"label\":\"起床晨跑\",\"days\":[1,2,3,4,5]}`")
-                appendLine("- 打开任意 App：`{\"tool\":\"launch_app\",\"app\":\"微信\"}`（支持微信/飞书/钉钉/高德地图/小红书/淘宝/抖音/微信读书/设置等任意已安装 App）")
-                appendLine("- 拨打电话（需用户点击确认）：`{\"tool\":\"phone_call\",\"target\":\"老婆或号码\",\"speaker\":true}`")
-                appendLine("- 起草短信（需用户点击确认）：`{\"tool\":\"send_sms\",\"target\":\"联系人或号码\",\"body\":\"短信正文\"}`")
-                appendLine("- 在内嵌应用舱打开网页/H5 工具：`{\"tool\":\"open_in_browser\",\"url\":\"https://github.com\",\"title\":\"GitHub\"}`")
-                appendLine("- 地图导航：`{\"tool\":\"navigate_map\",\"destination\":\"上海虹桥火车站\"}`")
-                appendLine("- 调节手机音量：`{\"tool\":\"set_volume\",\"stream\":\"music\",\"level\":50}`（或 `\"action\":\"mute\"|\"up\"|\"down\"`）")
-                appendLine("- 写入手机剪贴板：`{\"tool\":\"clipboard_write\",\"text\":\"要复制的内容\"}`")
-                appendLine("- 打开系统设置页：`{\"tool\":\"open_system_settings\",\"section\":\"wifi|bluetooth|display|battery|sound|apps|main\"}`")
+                appendLine("5. 【反向操控用户的 Mac 电脑（连接 Mac 时自动立即执行）】：")
+                appendLine("- 锁屏 Mac：`{\"tool\":\"mac_control\",\"action\":\"lock\"}`")
+                appendLine("- 点亮 Mac 屏幕：`{\"tool\":\"mac_control\",\"action\":\"wake\"}`")
+                appendLine("- 解锁 Mac 屏幕：`{\"tool\":\"mac_control\",\"action\":\"unlock\"}`")
+                appendLine("- 在 Mac 上打开应用或网页：`{\"tool\":\"mac_control\",\"action\":\"open_app\",\"target\":\"WeChat|Google Chrome|Xcode|Codex|Antigravity|WorkBuddy|OpenCode|任意应用名或网址\"}`")
+                appendLine("- 退出 Mac 应用：`{\"tool\":\"mac_control\",\"action\":\"quit_app\",\"target\":\"应用名\"}`")
+                appendLine("- 调节 Mac 音量/静音/播放暂停/防休眠：`{\"tool\":\"mac_control\",\"action\":\"set_volume|toggle_mute|media_play_pause|stay_awake\",\"value\":50}`")
                 if (webSearchEnabled) {
-                    appendLine("5. 【实时联网搜索已开启】：遇到天气、新闻、股价、最新发布或时效性问题，请直接使用内置搜索工具作答。")
+                    appendLine("6. 【实时联网搜索已开启】：遇到天气、新闻、股价、最新发布或时效性问题，请直接使用内置搜索工具作答。")
                 }
                 if (deepThinking) {
-                    appendLine("6. 当前已开启「深度思考」旗舰推理模式，请充分推演边界条件与权衡取舍后给出结论。")
+                    appendLine("7. 当前已开启「深度思考」旗舰推理模式，请充分推演边界条件与权衡取舍后给出结论。")
                 }
             }
         }
@@ -413,18 +423,64 @@ class CockpitAiServices(
                     "phone_call" -> {
                         val target = obj["target"]?.toString()?.trim().orEmpty()
                         val speaker = obj["speaker"] == true || obj["speaker"]?.toString()?.equals("true", ignoreCase = true) == true
+                        val confirmed = obj["confirmed"] == true || obj["confirmed"]?.toString()?.equals("true", ignoreCase = true) == true
                         if (target.isNotEmpty()) {
                             phoneTools.add(
                                 ProposedPhoneToolAction(
                                     tool = tool,
-                                    title = "拨打电话：$target",
+                                    title = if (confirmed) "正在呼叫：$target" else "确认拨打电话：$target",
                                     target = target,
                                     extra = if (speaker) "speaker" else "",
-                                    detail = if (speaker) "已开启免提 · 点击确认后拨出" else "点击确认后呼出电话",
-                                    requiresConfirm = true
+                                    detail = when {
+                                        confirmed && speaker -> "已确认 · 免提直呼中"
+                                        confirmed -> "已确认 · 正在直接拨出"
+                                        speaker -> "已预设免提 · 请说“确认”或点下方按钮直接拨出"
+                                        else -> "请回复“确认”或点击下方按钮直接拨出电话"
+                                    },
+                                    requiresConfirm = !confirmed
                                 )
                             )
                         }
+                    }
+                    "mac_control" -> {
+                        val act = obj["action"]?.toString()?.trim().orEmpty().ifBlank { "wake" }
+                        val target = obj["target"]?.toString()?.trim().orEmpty()
+                        val rawVal = obj["value"]?.toString()?.trim().orEmpty()
+                        val actionTitle = when (act) {
+                            "lock" -> "Mac 立即锁屏"
+                            "wake" -> "点亮 Mac 屏幕"
+                            "unlock" -> "解锁 Mac 屏幕"
+                            "open_app" -> "Mac 打开：${target.ifBlank { "应用" }}"
+                            "quit_app" -> "Mac 退出：${target.ifBlank { "应用" }}"
+                            "set_volume" -> "Mac 音量调至 ${rawVal.ifBlank { "50" }}%"
+                            "toggle_mute" -> "Mac 切换静音"
+                            "media_play_pause" -> "Mac 播放/暂停媒体"
+                            "stay_awake" -> "Mac 切换防休眠驻守"
+                            else -> "操控 Mac：$act"
+                        }
+                        phoneTools.add(
+                            ProposedPhoneToolAction(
+                                tool = "mac_control",
+                                title = actionTitle,
+                                target = "$act|$target",
+                                extra = rawVal,
+                                detail = "经加密通道远程操控已连接的 Mac 电脑",
+                                requiresConfirm = false
+                            )
+                        )
+                    }
+                    "phone_gui_action" -> {
+                        val act = obj["action"]?.toString()?.trim().orEmpty().ifBlank { "tap_text" }
+                        val target = obj["target"]?.toString()?.trim().orEmpty()
+                        phoneTools.add(
+                            ProposedPhoneToolAction(
+                                tool = "phone_gui_action",
+                                title = "手机界面操控：$act ${target.take(18)}",
+                                target = "$act|$target",
+                                detail = "通过本机无障碍服务自动执行界面动作",
+                                requiresConfirm = false
+                            )
+                        )
                     }
                     "send_sms" -> {
                         val target = obj["target"]?.toString()?.trim().orEmpty()

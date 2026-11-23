@@ -2,6 +2,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { ScheduleRunRejected } from "./scheduler/engine.ts";
 import { ContextDatabase, ScheduledTaskKind, ScheduledTaskStatus } from "./db.ts";
 import { WeChatContextPipeline, normalizeWeChatUrl } from "./pipeline.ts";
+import { isWeChatArticleUrl, normalizeExternalWebUrl } from "./extractor/web.ts";
 import { isFallbackLightNote } from "./vault/analyzer.ts";
 import { decodeArtifactPaths } from "./storage.ts";
 import { scanLocalAgentClis } from "./agent/subagent_cli.ts";
@@ -24,6 +25,34 @@ import {
 } from "./reader_renderer.ts";
 
 export const LOCAL_HOST = "127.0.0.1";
+
+export function canonicalizeYouTubeOrWebUrl(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    const host = u.hostname.toLowerCase();
+    if (host === "youtu.be") {
+      const vid = u.pathname.replace(/^\/+/, "").split("/")[0]?.trim();
+      if (vid && /^[\w-]{6,20}$/.test(vid)) {
+        return `https://www.youtube.com/watch?v=${vid}`;
+      }
+    }
+    if (host === "youtube.com" || host.endsWith(".youtube.com")) {
+      if (u.pathname === "/watch") {
+        const vid = u.searchParams.get("v")?.trim();
+        if (vid && /^[\w-]{6,20}$/.test(vid)) {
+          return `https://www.youtube.com/watch?v=${vid}`;
+        }
+      }
+      const shortsMatch = u.pathname.match(/^\/(shorts|live)\/([\w-]{6,20})/);
+      if (shortsMatch) {
+        return `https://www.youtube.com/${shortsMatch[1]}/${shortsMatch[2]}`;
+      }
+    }
+    return rawUrl;
+  } catch {
+    return rawUrl;
+  }
+}
 
 export function createHttpHandler(db: ContextDatabase, pipeline: WeChatContextPipeline) {
   return async (req: Request): Promise<Response> => {
@@ -89,17 +118,51 @@ export function createHttpHandler(db: ContextDatabase, pipeline: WeChatContextPi
       return handleInitVaultRequest(req, pipeline);
     }
     if (url.pathname === "/api/ingest" && req.method === "POST") {
-      let body: { url: string; note?: string; title?: string };
+      let body: {
+        url: string;
+        note?: string;
+        title?: string;
+        author?: string;
+        fallbackMarkdown?: string;
+      };
       try {
         if (!req.headers.get("content-type")?.startsWith("application/json")) return new Response("Expected application/json", { status: 415 });
-        body = await req.json() as typeof body;
+        body = (await req.json()) as typeof body;
         if (body && "annotation" in body) throw new Error("Use note instead of annotation");
-        if (!body || typeof body.url !== "string" || (body.note !== undefined && typeof body.note !== "string") || (body.title !== undefined && typeof body.title !== "string")) throw new Error("Invalid article payload");
-        body.url = normalizeWeChatUrl(body.url);
+        if (
+          !body ||
+          typeof body.url !== "string" ||
+          (body.note !== undefined && typeof body.note !== "string") ||
+          (body.title !== undefined && typeof body.title !== "string") ||
+          (body.author !== undefined && typeof body.author !== "string") ||
+          (body.fallbackMarkdown !== undefined && typeof body.fallbackMarkdown !== "string")
+        ) {
+          throw new Error("Invalid article payload");
+        }
+        const rawTrimmed = body.url.trim();
+        const parsedHost = new URL(rawTrimmed.replace(/&amp;/g, "&")).hostname.toLowerCase();
+        const normalized =
+          parsedHost === "mp.weixin.qq.com" || isWeChatArticleUrl(rawTrimmed)
+            ? normalizeWeChatUrl(rawTrimmed)
+            : normalizeExternalWebUrl(rawTrimmed);
+        body.url = canonicalizeYouTubeOrWebUrl(normalized);
       } catch (error: any) { return Response.json({ ok: false, error: error.message }, { status: 400 }); }
       try {
-        const { record } = db.enqueueArticle({ msgid: `api_${crypto.randomUUID()}`, url: body.url, title: body.title, user_notes: body.note, channel: "cli", waitSeconds: 0 });
-        const article = await pipeline.processArticleById(record.id, { sendWeChatReply: false });
+        const { record } = db.enqueueArticle({
+          msgid: `api_${crypto.randomUUID()}`,
+          url: body.url,
+          title: body.title,
+          author: body.author,
+          user_notes: body.note,
+          channel: "cli",
+          waitSeconds: 0,
+        });
+        const article = await pipeline.processArticleById(record.id, {
+          sendWeChatReply: false,
+          fallbackTitle: body.title,
+          fallbackAuthor: body.author,
+          fallbackMarkdown: body.fallbackMarkdown,
+        });
         return Response.json({ ok: true, article });
       } catch (error: any) { return Response.json({ ok: false, error: error.message }, { status: 500 }); }
     }

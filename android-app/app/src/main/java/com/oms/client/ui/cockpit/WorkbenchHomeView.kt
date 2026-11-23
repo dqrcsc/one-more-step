@@ -116,6 +116,8 @@ internal fun WorkbenchHomeView(
     onOpenMacDrop: () -> Unit,
     onOpenOmniSearch: () -> Unit,
     onOpenMacDispatch: () -> Unit,
+    onOpenMemoryCenter: () -> Unit = {},
+    onOpenMacRemoteControl: () -> Unit = {},
     onOpenApprovals: () -> Unit,
     onResumeThread: (ChatThreadModel) -> Unit,
     onOpenAgentSession: (RemoteAgentSessionUi) -> Unit,
@@ -144,8 +146,8 @@ internal fun WorkbenchHomeView(
         }
     }
     val greetingTitle = brief?.let { "${it.greeting} · ${it.dateLabel}" } ?: fallbackGreeting
-    val subtitleLine = brief?.headline?.ifBlank { "$shortModelName · 随身秘书持续记忆中" }
-        ?: "$shortModelName · 随身秘书与知识库按需共鸣"
+    val subtitleLine = brief?.headline?.ifBlank { "$shortModelName · 随身助理持续记忆中" }
+        ?: "$shortModelName · 随身助理与知识库按需共鸣"
 
     val groupRealtime = listOf(
         WorkbenchToolSpec(OmsIcons.Waveform, "散步语音") { onOpenLiveVoice(false) },
@@ -161,8 +163,8 @@ internal fun WorkbenchHomeView(
     )
     val groupCrossDevice = listOf(
         WorkbenchToolSpec(OmsIcons.Smartphone, "手机工具") { showPhoneToolsSheet = true },
+        WorkbenchToolSpec(OmsIcons.Laptop, "遥控 Mac") { onOpenMacRemoteControl() },
         WorkbenchToolSpec(OmsIcons.Send, "快传 Mac") { onOpenMacDrop() },
-        WorkbenchToolSpec(OmsIcons.Search, "知识库搜") { onOpenOmniSearch() },
         WorkbenchToolSpec(OmsIcons.Terminal, "Mac 派单") { onOpenMacDispatch() }
     )
 
@@ -199,13 +201,10 @@ internal fun WorkbenchHomeView(
             }
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                 OmsSecondaryButton(
-                    label = "活记忆${if ((brief?.profileItems?.size ?: 0) > 0) " ${brief?.profileItems?.size}" else ""}",
+                    label = "记忆中心${if ((brief?.profileItems?.size ?: 0) > 0) " ${brief?.profileItems?.size}" else ""}",
                     icon = OmsIcons.Bookmark,
                     height = 31.dp,
-                    onClick = {
-                        memoryEditorText = brief?.profileItems?.joinToString("\n") ?: ""
-                        showMemoryDialog = true
-                    }
+                    onClick = onOpenMemoryCenter
                 )
                 OmsCircleIconButton(
                     icon = OmsIcons.Refresh,
@@ -277,7 +276,7 @@ internal fun WorkbenchHomeView(
                             Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(palette.success))
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = "运行中 · $projName (${if (sess.backend == "codex") "Codex" else "AGY"})",
+                                    text = "运行中 · $projName (${agentDisplayName(sess.backend)})",
                                     color = palette.success,
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.SemiBold
@@ -552,7 +551,12 @@ internal fun WorkbenchHomeView(
                             sess.workspacePath.trimEnd('/').substringAfterLast('/').ifBlank { "Mac" }
                         }
                         WorkbenchContinuityRow(
-                            icon = if (sess.backend == "codex") OmsIcons.Terminal else OmsIcons.Sparkles,
+                            icon = when (sess.backend) {
+                                "codex" -> OmsIcons.Terminal
+                                "workbuddy" -> OmsIcons.Cpu
+                                "opencode" -> OmsIcons.Bolt
+                                else -> OmsIcons.Sparkles
+                            },
                             badge = proj,
                             title = sess.title.ifBlank { "协同会话" },
                             trailing = formatCompactRelativeTime(sess.updatedAtMs),
@@ -709,7 +713,7 @@ internal fun WorkbenchHomeView(
         AlertDialog(
             onDismissRequest = { showMemoryDialog = false },
             containerColor = palette.composer,
-            title = { Text("随身秘书长期记忆（每行一条）", color = palette.textPrimary, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold) },
+            title = { Text("随身助理长期记忆（每行一条）", color = palette.textPrimary, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(

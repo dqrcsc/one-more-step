@@ -1329,6 +1329,54 @@ async function main() {
       break;
     }
 
+    case "memory": {
+      const op = (sub || "list").toLowerCase();
+      if (op === "add") {
+        const text = positional.slice(1).join(" ").trim();
+        if (!text) throw new Error("Usage: oms memory add <记忆内容>");
+        const res = await ipc.call("memory.entry.upsert", { text, source: "manual" });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "forget" || op === "rm" || op === "delete") {
+        const target = positional.slice(1).join(" ").trim();
+        if (!target) throw new Error("Usage: oms memory forget <idOrText>");
+        const res = await ipc.call("memory.entry.delete", { id: target, text: target });
+        console.log(JSON.stringify(res, null, 2));
+      } else {
+        const res = await ipc.call("memory.center.get", {});
+        console.log(JSON.stringify(res, null, 2));
+      }
+      break;
+    }
+
+    case "mac-ctl":
+    case "mac-unlock": {
+      const op = (sub || "status").toLowerCase();
+      if (op === "set-password" || op === "set") {
+        const pwd = positional.slice(1).join(" ").trim();
+        if (!pwd) throw new Error("Usage: oms mac-ctl set-password <macLoginPassword>");
+        const res = await ipc.call("mac.control.set_unlock_password", { password: pwd });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "clear-password" || op === "clear") {
+        const res = await ipc.call("mac.control.clear_unlock_password", {});
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "auth" || op === "request_accessibility" || op === "request-accessibility") {
+        const res = await ipc.call("mac.control.execute", { action: "request_accessibility" });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "wake" || op === "lock" || op === "unlock") {
+        const res = await ipc.call("mac.control.execute", { action: op, transportTierHint: "LAN_WS" });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (op === "open") {
+        const target = positional.slice(1).join(" ").trim();
+        if (!target) throw new Error("Usage: oms mac-ctl open <AppName>");
+        const res = await ipc.call("mac.control.execute", { action: "open_app", target });
+        console.log(JSON.stringify(res, null, 2));
+      } else {
+        const res = await ipc.call("mac.control.status", { refreshApps: Boolean(flags.apps) });
+        console.log(JSON.stringify(res, null, 2));
+      }
+      break;
+    }
+
     case "wx":
     case "wechat": {
       const wxSub = (sub || "list").toLowerCase();

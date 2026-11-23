@@ -1,16 +1,27 @@
 package com.oms.client.capability
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.net.Uri
+import android.os.Bundle
+import android.provider.ContactsContract
 import android.provider.Settings
+import android.telecom.TelecomManager
+import androidx.core.content.ContextCompat
 import com.oms.client.OmsApplication
 import com.oms.client.agent.OmsAccessibilityService
 import com.oms.core.ai.ProposedPhoneToolAction
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -19,16 +30,113 @@ import java.util.Locale
 
 data class PhoneToolExecResult(
     val ok: Boolean,
-    val message: String
+    val message: String,
+    val needsPermissions: List<String> = emptyList()
+)
+
+data class ResolvedPhoneContact(
+    val displayName: String,
+    val number: String,
+    val simHint: String = ""
 )
 
 /**
- * Unified Phone OS Super-Tool Executor for the AI Secretary:
- * Exposes native Android capabilities (launch apps, dial/call contacts, draft SMS,
- * navigate maps, adjust volume, write clipboard, open system settings, read calendar)
- * through one safe, auditable interface.
+ * Unified Phone & Cross-Device OS Super-Tool Executor for the Personal Assistant ("随身助理"):
+ * - Zero-click execution for safe native tools (launch_app, open_in_browser, navigate_map, set_volume, clipboard_write, open_system_settings, phone_gui_action)
+ * - Real ContactsContract lookup + direct TelecomManager / ACTION_CALL dialing once user confirms target
+ * - Remote Mac OS Control (`mac_control`: wake, lock, LAN instant unlock / WAN biometric unlock, open_app, volume, stay_awake)
  */
 object PhoneToolExecutor {
+
+    private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    fun isLikelyRawPhoneNumber(raw: String): Boolean {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return false
+        val digits = trimmed.count { it.isDigit() }
+        val letters = trimmed.count { it.isLetter() }
+        return digits >= 3 && letters == 0
+    }
+
+    fun requiredPermissionsForAction(context: Context, action: ProposedPhoneToolAction): List<String> {
+        if (action.tool != "phone_call") return emptyList()
+        val missing = mutableListOf<String>()
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+            missing.add(Manifest.permission.CALL_PHONE)
+        }
+        if (!isLikelyRawPhoneNumber(action.target) &&
+            OmsApplication.instance?.edgeStore?.resolveContact(action.target) == null &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            missing.add(Manifest.permission.READ_CONTACTS)
+        }
+        return missing
+    }
+
+    fun resolveContactCandidates(context: Context, rawTarget: String): List<ResolvedPhoneContact> {
+        val cleanQuery = rawTarget.trim()
+        if (cleanQuery.isEmpty()) return emptyList()
+
+        // 1. Direct phone number
+        if (isLikelyRawPhoneNumber(cleanQuery)) {
+            val digits = cleanQuery.replace(Regex("""[^\d+*#]"""), "")
+            if (digits.isNotBlank()) {
+                return listOf(ResolvedPhoneContact(displayName = digits, number = digits))
+            }
+        }
+
+        // 2. Synced Mac quick-contact alias (e.g. "老婆", "爸", etc.)
+        OmsApplication.instance?.edgeStore?.resolveContact(cleanQuery)?.let { (num, sim) ->
+            val cleanNum = num.replace(Regex("""[^\d+*#]"""), "")
+            if (cleanNum.isNotBlank()) {
+                return listOf(ResolvedPhoneContact(displayName = cleanQuery, number = cleanNum, simHint = sim))
+            }
+        }
+
+        // 3. Real Android Phone Contacts (`ContactsContract.CommonDataKinds.Phone`)
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            return emptyList()
+        }
+
+        val exactMatches = mutableListOf<ResolvedPhoneContact>()
+        val fuzzyMatches = mutableListOf<ResolvedPhoneContact>()
+        val seenNumbers = hashSetOf<String>()
+        val normTarget = cleanQuery.replace(Regex("""[\s\-_()（）]+"""), "").lowercase(Locale.ROOT)
+
+        runCatching {
+            val projection = arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NUMBER
+            )
+            context.contentResolver.query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                projection,
+                null,
+                null,
+                "${ContactsContract.CommonDataKinds.Phone.STARRED} DESC, ${ContactsContract.CommonDataKinds.Phone.TIMES_CONTACTED} DESC"
+            )?.use { cursor ->
+                val nameIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+                val numIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                while (cursor.moveToNext()) {
+                    val name = (if (nameIdx >= 0) cursor.getString(nameIdx) else null)?.trim().orEmpty()
+                    val rawNum = (if (numIdx >= 0) cursor.getString(numIdx) else null)?.trim().orEmpty()
+                    val num = rawNum.replace(Regex("""[^\d+*#]"""), "")
+                    if (name.isBlank() || num.isBlank()) continue
+                    val normName = name.replace(Regex("""[\s\-_()（）]+"""), "").lowercase(Locale.ROOT)
+                    val dedupKey = "$normName|$num"
+                    if (!seenNumbers.add(dedupKey)) continue
+
+                    when {
+                        normName == normTarget -> exactMatches.add(ResolvedPhoneContact(name, num))
+                        normTarget.isNotEmpty() && (normName.contains(normTarget) || normTarget.contains(normName)) ->
+                            fuzzyMatches.add(ResolvedPhoneContact(name, num))
+                    }
+                }
+            }
+        }
+
+        return if (exactMatches.isNotEmpty()) exactMatches else fuzzyMatches.take(5)
+    }
 
     suspend fun execute(
         context: Context,
@@ -55,7 +163,7 @@ object PhoneToolExecutor {
                     withContext(Dispatchers.Main) {
                         onOpenInWebAppHub(url, action.extra.ifBlank { action.title })
                     }
-                    PhoneToolExecResult(true, "已在应用舱打开网页")
+                    PhoneToolExecResult(true, "已在免 VPN 应用舱打开网页")
                 } else {
                     val (ok, err) = AppLauncherHelper.openUrl(context, url)
                     PhoneToolExecResult(ok, if (ok) "已在浏览器打开" else (err ?: "打开网页失败"))
@@ -69,30 +177,98 @@ object PhoneToolExecutor {
             "clipboard_write" -> withContext(Dispatchers.Main) {
                 runCatching {
                     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                    cm?.setPrimaryClip(ClipData.newPlainText("oms_secretary", action.target))
+                    cm?.setPrimaryClip(ClipData.newPlainText("oms_assistant", action.target))
                     PhoneToolExecResult(true, "已写入手机剪贴板")
                 }.getOrElse { PhoneToolExecResult(false, "写入剪贴板失败：${it.message}") }
             }
 
             "open_system_settings" -> executeOpenSettings(context, action.target)
 
+            "phone_gui_action" -> executeLocalGuiAction(action.target)
+
+            "mac_control" -> executeMacControlAction(context, action.target, action.extra)
+
             else -> PhoneToolExecResult(false, "暂不支持工具：${action.tool}")
         }
     }
 
+    @SuppressLint("MissingPermission")
     private suspend fun executePhoneCall(
         context: Context,
         rawTarget: String,
         speaker: Boolean
-    ): PhoneToolExecResult {
-        val resolved = OmsApplication.instance?.edgeStore?.resolveContact(rawTarget)
-        val number = (resolved?.first ?: rawTarget).replace(Regex("""[^\d+*#]"""), "")
-        val simHint = resolved?.second.orEmpty()
+    ): PhoneToolExecResult = withContext(Dispatchers.IO) {
+        val candidates = resolveContactCandidates(context, rawTarget)
+        val primary = candidates.firstOrNull()
+        val number = primary?.number ?: rawTarget.replace(Regex("""[^\d+*#]"""), "")
+        val displayLabel = primary?.displayName?.takeIf { it != number }?.let { "$it ($number)" } ?: number
+        val simHint = primary?.simHint.orEmpty()
+
         if (number.isBlank()) {
-            return PhoneToolExecResult(false, "未找到联系人「$rawTarget」的号码，可先在 Mac 运行 `oms contacts set` 同步")
+            val hasContactsPerm = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.READ_CONTACTS
+            ) == PackageManager.PERMISSION_GRANTED
+            val msg = if (!hasContactsPerm) {
+                "请先授予通讯录读取权限，以便查找「$rawTarget」的电话号码"
+            } else {
+                "手机通讯录中未找到「$rawTarget」的号码"
+            }
+            return@withContext PhoneToolExecResult(false, msg)
         }
 
-        // Prefer Accessibility-powered direct dial (supports speakerphone & dual SIM) when available
+        val hasCallPerm = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.CALL_PHONE
+        ) == PackageManager.PERMISSION_GRANTED
+
+        // Path 1 (Preferred & Most Reliable): Direct system call via TelecomManager / ACTION_CALL
+        if (hasCallPerm) {
+            val placedDirectly = withContext(Dispatchers.Main) {
+                val uri = Uri.fromParts("tel", number, null)
+                var placed = false
+                runCatching {
+                    val tm = context.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+                    if (tm != null && simHint.isBlank()) {
+                        val extras = Bundle().apply {
+                            if (speaker) {
+                                putBoolean(TelecomManager.EXTRA_START_CALL_WITH_SPEAKERPHONE, true)
+                            }
+                        }
+                        tm.placeCall(uri, extras)
+                        placed = true
+                    }
+                }
+                if (!placed) {
+                    runCatching {
+                        val callIntent = Intent(Intent.ACTION_CALL, uri).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            if (speaker) {
+                                putExtra(TelecomManager.EXTRA_START_CALL_WITH_SPEAKERPHONE, true)
+                            }
+                        }
+                        context.startActivity(callIntent)
+                        placed = true
+                    }
+                }
+                if (placed && speaker) {
+                    bgScope.launch {
+                        delay(1500L)
+                        runCatching {
+                            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                            @Suppress("DEPRECATION")
+                            am?.isSpeakerphoneOn = true
+                        }
+                    }
+                }
+                placed
+            }
+            if (placedDirectly) {
+                return@withContext PhoneToolExecResult(true, "正在直接呼出：$displayLabel")
+            }
+        }
+
+        // Path 2: Accessibility-assisted dialer call (supports explicit SIM selection)
         val a11y = OmsAccessibilityService.instance
         if (a11y != null) {
             val params = JSONObject().apply {
@@ -102,19 +278,140 @@ object PhoneToolExecutor {
             }
             val res = runCatching { a11y.performPhoneCall(params) { true } }.getOrNull()
             if (res?.optBoolean("ok", false) == true) {
-                return PhoneToolExecResult(true, "正在呼出 $rawTarget ($number)")
+                return@withContext PhoneToolExecResult(true, "正在呼出：$displayLabel")
             }
         }
 
-        // Universal fallback: launch system dialer pre-filled with the resolved phone number
-        return withContext(Dispatchers.Main) {
+        // Path 3: Fallback pre-filled system dialer
+        return@withContext withContext(Dispatchers.Main) {
             runCatching {
-                val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$number")).apply {
+                val intent = Intent(Intent.ACTION_DIAL, Uri.fromParts("tel", number, null)).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 context.startActivity(intent)
-                PhoneToolExecResult(true, "已调起拨号盘：$rawTarget ($number)")
-            }.getOrElse { PhoneToolExecResult(false, "调起拨号失败：${it.message}") }
+                PhoneToolExecResult(true, "已打开拨号盘：$displayLabel（授予电话权限后可直接呼出）")
+            }.getOrElse { PhoneToolExecResult(false, "拨号失败：${it.message}") }
+        }
+    }
+
+    private suspend fun executeLocalGuiAction(encodedTarget: String): PhoneToolExecResult {
+        val svc = OmsAccessibilityService.instance
+            ?: return PhoneToolExecResult(false, "请先在系统设置中开启「青简·咫尺」无障碍服务以支持跨 App 自动化")
+
+        val sepIdx = encodedTarget.indexOf('|')
+        val rawAct = (if (sepIdx >= 0) encodedTarget.substring(0, sepIdx) else encodedTarget).trim().lowercase(Locale.ROOT)
+        val query = (if (sepIdx >= 0) encodedTarget.substring(sepIdx + 1) else "").trim()
+
+        return runCatching {
+            when (rawAct) {
+                "back", "home", "recents", "notifications", "quick_settings", "scroll_down", "scroll_up" -> {
+                    val r = svc.executeGuiAction(
+                        JSONObject().put("action", rawAct).put("deadlineMs", System.currentTimeMillis() + 8_000L)
+                    ) { true }
+                    val ok = r.optBoolean("ok", false)
+                    PhoneToolExecResult(ok, if (ok) "已执行手机界面动作：$rawAct" else "界面动作未生效")
+                }
+
+                "tap_text", "click", "input_text" -> {
+                    val obs = svc.observeScreen(includeScreenshot = false, somAnnotation = false) { _, _, _ -> null }
+                    val obsId = obs.optString("observationId", "")
+                    val nodes = obs.optJSONArray("nodes")
+                    var matchedNodeId = ""
+                    if (nodes != null) {
+                        for (i in 0 until nodes.length()) {
+                            val n = nodes.optJSONObject(i) ?: continue
+                            val label = n.optString("label", "")
+                            val text = n.optString("text", "")
+                            if (rawAct == "input_text") {
+                                if (n.optBoolean("editable", false)) {
+                                    matchedNodeId = n.optString("id", "")
+                                    if (query.isEmpty() || label.contains(query, true)) break
+                                }
+                            } else if (query.isNotEmpty() && (label.contains(query, true) || text.contains(query, true))) {
+                                matchedNodeId = n.optString("id", "")
+                                if (n.optBoolean("clickable", false)) break
+                            }
+                        }
+                    }
+                    if (matchedNodeId.isBlank()) {
+                        return PhoneToolExecResult(false, "当前屏幕未找到匹配「$query」的可操作控件")
+                    }
+                    val guiAct = if (rawAct == "input_text") "input_text" else "click"
+                    val req = JSONObject()
+                        .put("action", guiAct)
+                        .put("observationId", obsId)
+                        .put("targetNodeId", matchedNodeId)
+                        .put("text", query)
+                        .put("deadlineMs", System.currentTimeMillis() + 10_000L)
+                    val r = svc.executeGuiAction(req) { true }
+                    val ok = r.optBoolean("ok", false)
+                    PhoneToolExecResult(ok, if (ok) "已完成界面操作：$query" else "点击/输入未成功")
+                }
+
+                else -> PhoneToolExecResult(false, "不支持的界面动作：$rawAct")
+            }
+        }.getOrElse { err ->
+            PhoneToolExecResult(false, "无障碍操控受限：${err.message}")
+        }
+    }
+
+    private suspend fun executeMacControlAction(
+        context: Context,
+        encodedTarget: String,
+        valueRaw: String
+    ): PhoneToolExecResult {
+        val app = OmsApplication.instance ?: return PhoneToolExecResult(false, "应用实例未就绪")
+        val tc = app.transportClient
+        val tier = tc.activeTierFlow.value
+        if (tier == "DISCONNECTED") {
+            return PhoneToolExecResult(false, "当前未连接到 Mac，请确认电脑在线后再试")
+        }
+
+        val sepIdx = encodedTarget.indexOf('|')
+        val act = (if (sepIdx >= 0) encodedTarget.substring(0, sepIdx) else encodedTarget).trim()
+        val target = (if (sepIdx >= 0) encodedTarget.substring(sepIdx + 1) else "").trim()
+
+        var biometricOk = false
+        if (act == "unlock" && tier == "WAN_WEBRTC") {
+            val (passed, reason) = BiometricAuthHelper.authenticateForSensitiveRemoteAction(context)
+            if (!passed) {
+                return PhoneToolExecResult(false, reason)
+            }
+            biometricOk = true
+        }
+
+        return withContext(Dispatchers.IO) {
+            val params = JSONObject().apply {
+                put("action", act)
+                if (target.isNotBlank()) put("target", target)
+                put("transportTierHint", tier)
+                if (biometricOk) put("biometricVerified", true)
+                val intVal = valueRaw.toIntOrNull()
+                val boolVal = when {
+                    valueRaw.equals("true", true) || valueRaw.equals("on", true) -> true
+                    valueRaw.equals("false", true) || valueRaw.equals("off", true) -> false
+                    else -> null
+                }
+                if (intVal != null) put("value", intVal)
+                else if (boolVal != null) put("value", boolVal)
+            }
+            val resp = tc.callHostRpc("mac.control.execute", params, timeoutMs = 12_000L)
+                ?: return@withContext PhoneToolExecResult(false, "Mac 控制请求超时")
+            if (resp.optBoolean("requiresBiometric", false) && !biometricOk) {
+                val (passed, reason) = BiometricAuthHelper.authenticateForSensitiveRemoteAction(context)
+                if (!passed) return@withContext PhoneToolExecResult(false, reason)
+                params.put("biometricVerified", true)
+                val retry = tc.callHostRpc("mac.control.execute", params, timeoutMs = 12_000L)
+                    ?: return@withContext PhoneToolExecResult(false, "Mac 解锁响应超时")
+                return@withContext PhoneToolExecResult(
+                    retry.optBoolean("ok", false),
+                    retry.optString("message", "已发送解锁指令")
+                )
+            }
+            PhoneToolExecResult(
+                resp.optBoolean("ok", false),
+                resp.optString("message", if (resp.optBoolean("ok")) "Mac 操作已完成" else "Mac 操作未成功")
+            )
         }
     }
 
@@ -123,8 +420,8 @@ object PhoneToolExecutor {
         rawTarget: String,
         body: String
     ): PhoneToolExecResult {
-        val resolved = OmsApplication.instance?.edgeStore?.resolveContact(rawTarget)
-        val number = (resolved?.first ?: rawTarget).replace(Regex("""[^\d+*#]"""), "")
+        val resolved = resolveContactCandidates(context, rawTarget).firstOrNull()
+        val number = (resolved?.number ?: rawTarget).replace(Regex("""[^\d+*#]"""), "")
         return withContext(Dispatchers.Main) {
             runCatching {
                 val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$number")).apply {

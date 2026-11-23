@@ -95,6 +95,8 @@ data class RemoteAgentBackendQuotaUi(
 data class RemoteAgentQuotasUi(
     val codex: RemoteAgentBackendQuotaUi,
     val agy: RemoteAgentBackendQuotaUi,
+    val workbuddy: RemoteAgentBackendQuotaUi? = null,
+    val opencode: RemoteAgentBackendQuotaUi? = null,
     val fetchedAtMs: Long
 )
 
@@ -154,6 +156,45 @@ data class SecretaryNudgeUi(
     val actionPayload: String
 )
 
+data class LivingMemoryEntryUi(
+    val id: String,
+    val text: String,
+    val source: String, // "manual" | "auto"
+    val category: String, // "profile" | "working" | "vault"
+    val originDetail: String = "",
+    val observations: Int = 1,
+    val createdAtMs: Long = 0L,
+    val lastSeenAtMs: Long = 0L
+)
+
+data class MemoryCenterSnapshotUi(
+    val profileEntries: List<LivingMemoryEntryUi> = emptyList(),
+    val workingEntries: List<LivingMemoryEntryUi> = emptyList(),
+    val vaultAnchors: List<LivingMemoryEntryUi> = emptyList(),
+    val forgottenCount: Int = 0,
+    val updatedAtMs: Long = 0L
+)
+
+data class MacInstalledAppUi(
+    val name: String,
+    val bundlePath: String,
+    val running: Boolean
+)
+
+data class MacControlStatusUi(
+    val macId: String = "",
+    val macName: String = "Mac",
+    val screenLocked: Boolean = false,
+    val stayAwakeEnabled: Boolean = false,
+    val unlockPasswordConfigured: Boolean = false,
+    val accessibilityTrusted: Boolean = false,
+    val volumePct: Int = 50,
+    val muted: Boolean = false,
+    val frontmostApp: String = "",
+    val installedApps: List<MacInstalledAppUi> = emptyList(),
+    val updatedAtMs: Long = 0L
+)
+
 data class SecretaryBriefUi(
     val greeting: String,
     val dateLabel: String,
@@ -168,11 +209,11 @@ data class SecretaryBriefUi(
 )
 
 /**
- * Application-scoped coordinator for 咫尺 v2.0:
+ * Application-scoped coordinator for 咫尺 v3.6:
  *  - Unlock TLS Prewarmer (`<800ms` TTFT)
  *  - Offline-resilient `BackgroundTurnExecutor` (`24ms` frame-aligned streaming + HyperOS haptics)
- *  - 3-Tier Memory Sync (`chat.sync.batch`, L1 distillation, L2 Vault promotion)
- *  - Mac Heavy-Brain Hub (`Codex` & `Antigravity` monitor + dispatch + `resume` continuation)
+ *  - 3-Tier Memory Sync + Standalone Memory Center (`memory.center.*`, anti-resurrection tombstones)
+ *  - Multi-Mac Heavy-Brain Hub (`Codex`, `Antigravity`, `WorkBuddy`, `OpenCode`) & Mac Remote OS Control
  */
 class CockpitRuntimeCoordinator(
     private val appContext: Context,
@@ -180,7 +221,7 @@ class CockpitRuntimeCoordinator(
     private val streamRepo: StreamRepository,
     private val edgeStore: EdgeSecureStore,
     private val proxyManager: OmsProxyManager,
-    private val llmEngine: DualLlmEngine,
+    val llmEngine: DualLlmEngine,
     private val transportClient: OmsTransportClient
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -243,6 +284,16 @@ class CockpitRuntimeCoordinator(
 
     private val _isRefreshingBriefFlow = MutableStateFlow(false)
     val isRefreshingBriefFlow: StateFlow<Boolean> = _isRefreshingBriefFlow
+
+    // Standalone Memory Center & Remote Mac OS Control Flows
+    private val _memoryCenterFlow = MutableStateFlow(MemoryCenterSnapshotUi())
+    val memoryCenterFlow: StateFlow<MemoryCenterSnapshotUi> = _memoryCenterFlow
+
+    private val _isRefreshingMemoryCenterFlow = MutableStateFlow(false)
+    val isRefreshingMemoryCenterFlow: StateFlow<Boolean> = _isRefreshingMemoryCenterFlow
+
+    private val _macControlStatusFlow = MutableStateFlow<MacControlStatusUi?>(null)
+    val macControlStatusFlow: StateFlow<MacControlStatusUi?> = _macControlStatusFlow
 
     // Proxy & Model Studio Reactive Flows
     private val _proxyNodesFlow = MutableStateFlow<List<ProxyNodeStatusView>>(emptyList())
@@ -327,12 +378,16 @@ class CockpitRuntimeCoordinator(
             runCatching { applyChisuArticlesCatalogJson(JSONObject(raw)) }
         }
         loadCachedSecretaryBrief()?.let { _secretaryBriefFlow.value = it }
+        loadCachedMemoryCenter()?.let { _memoryCenterFlow.value = it } ?: syncLocalFallbackMemoryCenter()
 
         scope.launch {
             transportClient.activeTierFlow.collect { tier ->
                 if (tier != "DISCONNECTED") {
                     flushPendingSyncToMac()
+                    flushPendingBrowserCurates()
                     refreshAgentSessions()
+                    refreshMemoryCenter()
+                    refreshMacControlStatus()
                     refreshChisuArticles()
                     refreshSecretaryBrief()
                 }
@@ -485,7 +540,37 @@ class CockpitRuntimeCoordinator(
         )
         val activeThreadForPrompt = chatRepo.getThreadById(threadId)
         val secretaryContextSuffix = if (activeThreadForPrompt?.incognito == true) "" else buildSecretaryMemoryPromptBlock()
-        val devPrompt = if (secretaryContextSuffix.isNotBlank()) "$baseDevPrompt\n\n$secretaryContextSuffix" else baseDevPrompt
+
+        // Detect pending unconfirmed `phone_call` from the immediately preceding assistant turn
+        val prevAssistantMsg = history.dropLast(1).lastOrNull { it.role == "assistant" }
+        val pendingCallAction = prevAssistantMsg?.phoneToolActions?.firstOrNull {
+            it.tool == "phone_call" && it.requiresConfirm
+        }
+        val latestUserText = history.lastOrNull { it.role == "user" }?.content?.trim().orEmpty()
+        val isDirectUserCallConfirm = pendingCallAction != null && (
+            Regex("""^(确认|确定|打吧|拨吧|拨号|拨出去|好|好的|可以|行|直接打|直接拨|确认拨出|嗯|是的|是)[!！。.,，~～]*$""")
+                .matches(latestUserText) ||
+                latestUserText.startsWith("确认打") ||
+                latestUserText.startsWith("确认拨")
+            )
+        val pendingCallPromptHint = if (pendingCallAction != null) {
+            val resolved = com.oms.client.capability.PhoneToolExecutor
+                .resolveContactCandidates(appContext, pendingCallAction.target)
+                .firstOrNull()
+            val numDesc = resolved?.let { "${it.displayName} (${it.number})" } ?: pendingCallAction.target
+            "\n\n【待确认通话状态】：上一轮你正等待用户确认是否拨打「$numDesc」。如果用户本轮表达同意/确认，请直接输出 `{\"tool\":\"phone_call\",\"target\":\"${pendingCallAction.target}\",\"speaker\":${pendingCallAction.extra == "speaker"},\"confirmed\":true}` 立即直接呼出！"
+        } else ""
+
+        val devPrompt = buildString {
+            append(baseDevPrompt)
+            if (secretaryContextSuffix.isNotBlank()) {
+                append("\n\n")
+                append(secretaryContextSuffix)
+            }
+            if (pendingCallPromptHint.isNotBlank()) {
+                append(pendingCallPromptHint)
+            }
+        }
 
         try {
             val firstPass = streamSinglePassWithRetry(
@@ -543,6 +628,28 @@ class CockpitRuntimeCoordinator(
             } else {
                 extractAndApplySecretaryCommitments(rawCleanMd)
             }
+            val mergedPhoneTools = if (isDirectUserCallConfirm && pendingCallAction != null) {
+                val existingCalls = parsedActions.phoneToolActions.filter { it.tool == "phone_call" }
+                if (existingCalls.isEmpty()) {
+                    parsedActions.phoneToolActions + pendingCallAction.copy(
+                        title = "正在呼叫：${pendingCallAction.target}",
+                        detail = "已收到你的确认 · 正在直接拨出电话",
+                        requiresConfirm = false
+                    )
+                } else {
+                    parsedActions.phoneToolActions.map { act ->
+                        if (act.tool == "phone_call") {
+                            act.copy(
+                                title = "正在呼叫：${act.target}",
+                                detail = "已收到你的确认 · 正在直接拨出电话",
+                                requiresConfirm = false
+                            )
+                        } else act
+                    }
+                }
+            } else {
+                parsedActions.phoneToolActions
+            }
             chatRepo.upsertMessage(
                 ChatMessageModel(
                     messageId = assistantMsgId,
@@ -554,7 +661,7 @@ class CockpitRuntimeCoordinator(
                     sources = completed.sources,
                     calendarActions = parsedActions.calendarActions,
                     alarmActions = parsedActions.alarmActions,
-                    phoneToolActions = parsedActions.phoneToolActions,
+                    phoneToolActions = mergedPhoneTools,
                     status = "DONE",
                     createdAtMs = System.currentTimeMillis()
                 ),
@@ -1203,7 +1310,7 @@ class CockpitRuntimeCoordinator(
         if (parts.isEmpty()) return ""
         return """
             |<PERSONAL_SECRETARY_MEMORY>
-            |你是用户的长期随身秘书（Chief of Staff），拥有跨对话的持续记忆。回答时自然承接以下背景，不要机械复述。
+            |你是用户的长期随身助理，拥有跨对话的持续记忆。回答时自然承接以下背景，不要机械复述。
             |当用户明确表达某项待办/承诺（如“提醒我这周……”“记一下明天……”）时，可在回复末尾追加一行隐藏指令 `[COMMITMENT:精炼事项标题|时间提示]`（无时间提示可留空），系统会自动记入今日简报的未闭环事项。
             |${parts.joinToString("\n")}
             |</PERSONAL_SECRETARY_MEMORY>
@@ -1471,12 +1578,29 @@ class CockpitRuntimeCoordinator(
             runCatching {
                 val resp = transportClient.callHostRpc(
                     "agent.workspace_catalog",
-                    JSONObject().put("limit", 48),
+                    JSONObject().put("limit", 96),
                     12_000L
                 ) ?: return@launch
+                val activeMacId = streamRepo.getPairedMac()?.macId.orEmpty()
                 edgeStore.saveCachedWorkspaceCatalogJson(resp.toString())
+                if (activeMacId.isNotBlank()) {
+                    runCatching {
+                        File(appContext.filesDir, "agent_catalog_${activeMacId}.json").writeText(resp.toString(), Charsets.UTF_8)
+                    }
+                }
                 applyWorkspaceCatalogJson(resp)
             }
+        }
+    }
+
+    fun loadCachedCatalogForMac(macId: String) {
+        if (macId.isBlank()) return
+        val file = File(appContext.filesDir, "agent_catalog_${macId}.json")
+        if (file.exists()) {
+            runCatching { applyWorkspaceCatalogJson(JSONObject(file.readText(Charsets.UTF_8))) }
+        } else {
+            _agentSessionsFlow.value = emptyList()
+            _agentQuotasFlow.value = null
         }
     }
 
@@ -1893,8 +2017,301 @@ class CockpitRuntimeCoordinator(
         return RemoteAgentQuotasUi(
             codex = parseBackend("codex"),
             agy = parseBackend("agy"),
+            workbuddy = if (qObj.has("workbuddy")) parseBackend("workbuddy") else null,
+            opencode = if (qObj.has("opencode")) parseBackend("opencode") else null,
             fetchedAtMs = qObj.optLong("fetchedAtMs", System.currentTimeMillis())
         )
+    }
+
+    // =========================================================================
+    // v3.6 Standalone Memory Center & Remote Mac System Control
+    // =========================================================================
+
+    private fun memoryCenterCacheFile(): File = File(appContext.filesDir, "memory_center_cache.json")
+
+    private fun parseLivingEntryJson(o: JSONObject, defaultCat: String): LivingMemoryEntryUi {
+        return LivingMemoryEntryUi(
+            id = o.optString("id", "mem_${o.optString("text").hashCode()}"),
+            text = o.optString("text", "").trim(),
+            source = o.optString("source", "manual"),
+            category = o.optString("category", defaultCat),
+            originDetail = o.optString("originDetail", ""),
+            observations = o.optInt("observations", 1).coerceAtLeast(1),
+            createdAtMs = o.optLong("createdAtMs", 0L),
+            lastSeenAtMs = o.optLong("lastSeenAtMs", 0L)
+        )
+    }
+
+    private fun parseMemoryCenterSnapshotJson(o: JSONObject): MemoryCenterSnapshotUi {
+        fun parseList(key: String, defCat: String): List<LivingMemoryEntryUi> {
+            val arr = o.optJSONArray(key) ?: return emptyList()
+            val out = ArrayList<LivingMemoryEntryUi>(arr.length())
+            for (i in 0 until arr.length()) {
+                val item = arr.optJSONObject(i) ?: continue
+                val parsed = parseLivingEntryJson(item, defCat)
+                if (parsed.text.isNotBlank()) out.add(parsed)
+            }
+            return out
+        }
+        val remoteWm = parseList("workingEntries", "working")
+        val localWmTexts = (edgeStore.loadContextCapsule().recentWorkingMemory + chatRepo.getLocalWorkingMemory()).distinct()
+        val mergedWorking = if (remoteWm.isNotEmpty()) {
+            val existingTexts = remoteWm.map { it.text }.toSet()
+            val extras = localWmTexts.filterNot { existingTexts.contains(it) }.map { txt ->
+                LivingMemoryEntryUi(
+                    id = "wm_local_${txt.hashCode()}",
+                    text = txt,
+                    source = "auto",
+                    category = "working",
+                    originDetail = "手机端近期对话自动提炼 (L1)"
+                )
+            }
+            remoteWm + extras
+        } else {
+            localWmTexts.map { txt ->
+                LivingMemoryEntryUi(
+                    id = "wm_local_${txt.hashCode()}",
+                    text = txt,
+                    source = "auto",
+                    category = "working",
+                    originDetail = "手机端近期对话自动提炼 (L1)"
+                )
+            }
+        }
+        return MemoryCenterSnapshotUi(
+            profileEntries = parseList("profileEntries", "profile"),
+            workingEntries = mergedWorking,
+            vaultAnchors = parseList("vaultAnchors", "vault"),
+            forgottenCount = o.optInt("forgottenCount", 0),
+            updatedAtMs = o.optLong("updatedAtMs", System.currentTimeMillis())
+        )
+    }
+
+    private fun loadCachedMemoryCenter(): MemoryCenterSnapshotUi? = runCatching {
+        val f = memoryCenterCacheFile()
+        if (!f.exists()) return null
+        parseMemoryCenterSnapshotJson(JSONObject(f.readText(Charsets.UTF_8)))
+    }.getOrNull()
+
+    private fun syncLocalFallbackMemoryCenter() {
+        val brief = _secretaryBriefFlow.value
+        val profile = brief?.profileItems.orEmpty().map { txt ->
+            LivingMemoryEntryUi(
+                id = "prof_local_${txt.hashCode()}",
+                text = txt,
+                source = "manual",
+                category = "profile",
+                originDetail = "本地缓存长期画像"
+            )
+        }
+        val wm = (edgeStore.loadContextCapsule().recentWorkingMemory + chatRepo.getLocalWorkingMemory())
+            .distinct()
+            .map { txt ->
+                LivingMemoryEntryUi(
+                    id = "wm_local_${txt.hashCode()}",
+                    text = txt,
+                    source = "auto",
+                    category = "working",
+                    originDetail = "手机端近期对话自动提炼 (L1)"
+                )
+            }
+        val vault = brief?.vaultFocusTitles.orEmpty().map { title ->
+            LivingMemoryEntryUi(
+                id = "vault_local_${title.hashCode()}",
+                text = title,
+                source = "auto",
+                category = "vault",
+                originDetail = "个人知识库近期主题"
+            )
+        }
+        _memoryCenterFlow.value = MemoryCenterSnapshotUi(
+            profileEntries = profile,
+            workingEntries = wm,
+            vaultAnchors = vault,
+            updatedAtMs = System.currentTimeMillis()
+        )
+    }
+
+    fun refreshMemoryCenter() {
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") {
+            if (_memoryCenterFlow.value.profileEntries.isEmpty() && _memoryCenterFlow.value.workingEntries.isEmpty()) {
+                syncLocalFallbackMemoryCenter()
+            }
+            return
+        }
+        scope.launch {
+            _isRefreshingMemoryCenterFlow.value = true
+            try {
+                val resp = transportClient.callHostRpc("memory.center.get", JSONObject(), 8_000L)
+                val snapObj = resp?.takeIf { it.optBoolean("ok", false) }?.optJSONObject("snapshot")
+                if (snapObj != null) {
+                    runCatching { memoryCenterCacheFile().writeText(snapObj.toString(), Charsets.UTF_8) }
+                    _memoryCenterFlow.value = parseMemoryCenterSnapshotJson(snapObj)
+                }
+            } catch (_: Throwable) {
+            } finally {
+                _isRefreshingMemoryCenterFlow.value = false
+            }
+        }
+    }
+
+    fun upsertMemoryCenterEntry(
+        id: String? = null,
+        text: String,
+        source: String = "manual",
+        originDetail: String = "手动添加"
+    ) {
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val localEntry = LivingMemoryEntryUi(
+            id = id ?: "mem_${clean.hashCode()}_$now",
+            text = clean,
+            source = source,
+            category = "profile",
+            originDetail = originDetail,
+            observations = 1,
+            createdAtMs = now,
+            lastSeenAtMs = now
+        )
+        val cur = _memoryCenterFlow.value
+        val updatedProfile = if (id != null && cur.profileEntries.any { it.id == id }) {
+            cur.profileEntries.map { if (it.id == id) localEntry else it }
+        } else {
+            listOf(localEntry) + cur.profileEntries.filterNot { it.text == clean }
+        }
+        _memoryCenterFlow.value = cur.copy(profileEntries = updatedProfile, updatedAtMs = now)
+        _secretaryBriefFlow.value?.let { b ->
+            _secretaryBriefFlow.value = b.copy(profileItems = updatedProfile.map { it.text })
+        }
+
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") return
+        scope.launch {
+            runCatching {
+                val req = JSONObject()
+                    .put("text", clean)
+                    .put("source", source)
+                    .put("originDetail", originDetail)
+                if (!id.isNullOrBlank()) req.put("id", id)
+                transportClient.callHostRpc("memory.entry.upsert", req, 6_000L)
+                refreshMemoryCenter()
+                refreshSecretaryBrief()
+            }
+        }
+    }
+
+    fun deleteMemoryCenterEntry(entry: LivingMemoryEntryUi) {
+        val cur = _memoryCenterFlow.value
+        when (entry.category) {
+            "working" -> {
+                val keptWm = cur.workingEntries.filterNot { it.id == entry.id || it.text == entry.text }
+                _memoryCenterFlow.value = cur.copy(workingEntries = keptWm)
+                val localWm = chatRepo.getLocalWorkingMemory().filterNot { it == entry.text }
+                chatRepo.saveLocalWorkingMemory(localWm)
+            }
+            "vault" -> {
+                val keptVault = cur.vaultAnchors.filterNot { it.id == entry.id || it.text == entry.text }
+                _memoryCenterFlow.value = cur.copy(
+                    vaultAnchors = keptVault,
+                    forgottenCount = cur.forgottenCount + 1
+                )
+            }
+            else -> {
+                val keptProf = cur.profileEntries.filterNot { it.id == entry.id || it.text == entry.text }
+                _memoryCenterFlow.value = cur.copy(
+                    profileEntries = keptProf,
+                    forgottenCount = cur.forgottenCount + 1
+                )
+                _secretaryBriefFlow.value?.let { b ->
+                    _secretaryBriefFlow.value = b.copy(profileItems = keptProf.map { it.text })
+                }
+            }
+        }
+
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") return
+        scope.launch {
+            runCatching {
+                transportClient.callHostRpc(
+                    "memory.entry.delete",
+                    JSONObject()
+                        .put("id", entry.id)
+                        .put("text", entry.text)
+                        .put("category", entry.category),
+                    6_000L
+                )
+                refreshMemoryCenter()
+                refreshSecretaryBrief()
+            }
+        }
+    }
+
+    private fun parseMacControlStatusJson(o: JSONObject): MacControlStatusUi {
+        val appsArr = o.optJSONArray("installedApps") ?: JSONArray()
+        val apps = ArrayList<MacInstalledAppUi>(appsArr.length())
+        for (i in 0 until appsArr.length()) {
+            val a = appsArr.optJSONObject(i) ?: continue
+            val name = a.optString("name", "").trim()
+            if (name.isEmpty()) continue
+            apps.add(
+                MacInstalledAppUi(
+                    name = name,
+                    bundlePath = a.optString("bundlePath", ""),
+                    running = a.optBoolean("running", false)
+                )
+            )
+        }
+        return MacControlStatusUi(
+            macId = o.optString("macId", ""),
+            macName = o.optString("macName", "Mac"),
+            screenLocked = o.optBoolean("screenLocked", false),
+            stayAwakeEnabled = o.optBoolean("stayAwakeEnabled", false),
+            unlockPasswordConfigured = o.optBoolean("unlockPasswordConfigured", false),
+            accessibilityTrusted = o.optBoolean("accessibilityTrusted", false),
+            volumePct = o.optInt("volumePct", 50),
+            muted = o.optBoolean("muted", false),
+            frontmostApp = o.optString("frontmostApp", ""),
+            installedApps = apps,
+            updatedAtMs = o.optLong("updatedAtMs", System.currentTimeMillis())
+        )
+    }
+
+    fun refreshMacControlStatus(refreshApps: Boolean = false) {
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") return
+        scope.launch {
+            runCatching {
+                val resp = transportClient.callHostRpc(
+                    "mac.control.status",
+                    JSONObject().put("refreshApps", refreshApps),
+                    6_000L
+                )
+                val stObj = resp?.takeIf { it.optBoolean("ok", false) }?.optJSONObject("status")
+                if (stObj != null) {
+                    _macControlStatusFlow.value = parseMacControlStatusJson(stObj)
+                }
+            }
+        }
+    }
+
+    suspend fun saveMacUnlockPassword(password: String): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        val clean = password.trim()
+        if (clean.isEmpty()) return@withContext false to "密码不能为空"
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") {
+            return@withContext false to "请先连接目标 Mac 后再保存钥匙串解锁密码"
+        }
+        val resp = transportClient.callHostRpc(
+            "mac.control.set_unlock_password",
+            JSONObject().put("password", clean),
+            8_000L
+        ) ?: return@withContext false to "Mac 响应超时"
+        resp.optJSONObject("status")?.let { _macControlStatusFlow.value = parseMacControlStatusJson(it) }
+        val ok = resp.optBoolean("ok", false)
+        ok to (if (ok) "已安全加密保存至 Mac 系统钥匙串（不明文落盘）" else "钥匙串写入失败")
+    }
+
+    suspend fun clearMacUnlockPassword(): Boolean = withContext(Dispatchers.IO) {
+        val resp = transportClient.callHostRpc("mac.control.clear_unlock_password", JSONObject(), 6_000L)
+        resp?.optJSONObject("status")?.let { _macControlStatusFlow.value = parseMacControlStatusJson(it) }
+        resp?.optBoolean("ok", false) == true
     }
 
     private fun parseStepJson(o: JSONObject) = RemoteAgentStepUi(
@@ -1926,6 +2343,135 @@ class CockpitRuntimeCoordinator(
         } else {
             @Suppress("DEPRECATION")
             appContext.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        }
+    }
+
+    // =========================================================================
+    // v3.6.1 Browser Companion Auto-Curate -> Vault + Unified Cross-AI Context
+    // =========================================================================
+
+    fun canonicalizeBrowserUrl(rawUrl: String): String {
+        val trimmed = rawUrl.trim()
+        if (trimmed.isEmpty()) return ""
+        return runCatching {
+            val u = android.net.Uri.parse(trimmed)
+            val host = (u.host ?: "").lowercase()
+            if (host == "youtu.be") {
+                val vid = u.pathSegments.firstOrNull()?.trim().orEmpty()
+                if (vid.length in 6..20) return@runCatching "https://www.youtube.com/watch?v=$vid"
+            }
+            if (host == "youtube.com" || host.endsWith(".youtube.com")) {
+                if (u.path == "/watch") {
+                    val vid = u.getQueryParameter("v")?.trim().orEmpty()
+                    if (vid.length in 6..20) return@runCatching "https://www.youtube.com/watch?v=$vid"
+                }
+                val segs = u.pathSegments
+                if (segs.size >= 2 && (segs[0] == "shorts" || segs[0] == "live")) {
+                    return@runCatching "https://www.youtube.com/${segs[0]}/${segs[1]}"
+                }
+            }
+            u.buildUpon().fragment(null).build().toString()
+        }.getOrDefault(trimmed)
+    }
+
+    fun curateBrowserContentToKnowledgeBase(
+        url: String,
+        title: String,
+        author: String = "",
+        extractedText: String = "",
+        userNote: String = "",
+        captureMode: String = "manual",
+        onComplete: ((Boolean, String) -> Unit)? = null
+    ) {
+        val canonicalUrl = canonicalizeBrowserUrl(url)
+        if (canonicalUrl.isBlank() || !canonicalUrl.startsWith("http")) {
+            onComplete?.invoke(false, "当前页面不是可归档的网页或视频链接")
+            return
+        }
+        val cleanTitle = title.replace(Regex("""\s*-\s*YouTube\s*$""", RegexOption.IGNORE_CASE), "").trim().ifBlank { canonicalUrl }
+        val isVideo = canonicalUrl.contains("youtube.com/") || canonicalUrl.contains("bilibili.com/video") || canonicalUrl.contains("douyin.com/")
+        val kindLabel = if (isVideo) "视频" else "网页"
+
+        scope.launch {
+            val reqJson = JSONObject().apply {
+                put("url", canonicalUrl)
+                put("title", cleanTitle)
+                if (author.isNotBlank()) put("author", author.trim())
+                if (extractedText.isNotBlank()) put("extractedText", extractedText.take(18000))
+                if (userNote.isNotBlank()) put("userNote", userNote.trim())
+                put("captureMode", captureMode)
+            }
+
+            if (transportClient.activeTierFlow.value != "DISCONNECTED") {
+                val resp = transportClient.callHostRpc("chisu.curate_url", reqJson, 125_000L)
+                if (resp != null && resp.optBoolean("ok", false)) {
+                    val resolvedTitle = resp.optString("title", cleanTitle).ifBlank { cleanTitle }
+                    val shortSummary = resp.optString("shortSummary", "").replace(Regex("\\s+"), " ").trim().take(130)
+                    val relNote = resp.optString("relNotePath", "").trim()
+                    val wmLine = buildString {
+                        append("[伴读沉淀·$kindLabel] 《${resolvedTitle.take(48)}》")
+                        if (shortSummary.isNotBlank()) append("：$shortSummary")
+                        if (relNote.isNotBlank()) append(" (知识库: $relNote)")
+                    }
+                    prependPhoneWorkingMemory(wmLine, resolvedTitle.take(20))
+                    edgeStore.markBrowserUrlCurated(canonicalUrl)
+                    refreshChisuArticles()
+                    refreshMemoryCenter()
+                    onComplete?.invoke(true, "已提炼《${resolvedTitle.take(24)}》存入知识库，全端 AI 上下文已同步")
+                    return@launch
+                }
+            }
+
+            // Offline fallback: summarize locally on phone so phone AI knows immediately, and queue for Mac Vault sync!
+            val localSummary = withContext(Dispatchers.IO) {
+                runCatching {
+                    val resp = llmEngine.completeSync(
+                        intent = RouteIntent.AUTO,
+                        developerPrompt = "请用不超过90字提炼用户刚刚查看的视频或文章核心价值点（纯中文一句话，不要标题或列表符号）。",
+                        turns = listOf(
+                            LlmTurnMessage(
+                                "user",
+                                "标题：$cleanTitle\n链接：$canonicalUrl\n作者：$author\n内容片段：\n${extractedText.take(3500)}"
+                            )
+                        )
+                    )
+                    resp.fullText.replace(Regex("\\s+"), " ").trim().take(110)
+                }.getOrDefault(extractedText.replace(Regex("\\s+"), " ").trim().take(90))
+            }
+
+            val wmOffline = buildString {
+                append("[伴读沉淀·$kindLabel] 《${cleanTitle.take(48)}》")
+                if (localSummary.isNotBlank()) append("：$localSummary")
+            }
+            prependPhoneWorkingMemory(wmOffline, cleanTitle.take(20))
+            edgeStore.markBrowserUrlCurated(canonicalUrl)
+            edgeStore.enqueuePendingBrowserCurate(reqJson)
+            syncLocalFallbackMemoryCenter()
+            onComplete?.invoke(true, "随身助理已记住核心要点，连上电脑后将自动归入知识库")
+        }
+    }
+
+    private fun prependPhoneWorkingMemory(entry: String, titleHint: String) {
+        val existing = chatRepo.getLocalWorkingMemory()
+        val hintLower = titleHint.trim().lowercase()
+        val next = listOf(entry) + existing.filterNot { item ->
+            item == entry || (hintLower.length >= 5 && item.lowercase().contains(hintLower))
+        }
+        chatRepo.saveLocalWorkingMemory(next.take(12))
+    }
+
+    private fun flushPendingBrowserCurates() {
+        val pending = edgeStore.drainPendingBrowserCurates()
+        if (pending.isEmpty()) return
+        scope.launch {
+            for (item in pending) {
+                val resp = transportClient.callHostRpc("chisu.curate_url", item, 125_000L)
+                if (resp == null || !resp.optBoolean("ok", false)) {
+                    edgeStore.enqueuePendingBrowserCurate(item)
+                }
+            }
+            refreshChisuArticles()
+            refreshMemoryCenter()
         }
     }
 }

@@ -1,6 +1,6 @@
 {
   "name": "@oms/mac-host",
-  "version": "3.5.0",
+  "version": "3.6.3",
   "type": "module",
   "bin": {
     "oms": "./src/cli/index.ts",
@@ -10,6 +10,7 @@
     "build": "tsc --noEmit",
     "build:bt": "mkdir -p bin && swiftc bluetooth-bridge/AirPodsOperation.swift bluetooth-bridge/AirPodsNativeRequest.swift bluetooth-bridge/main.swift -o bin/oms-bt-bridge",
     "build:hud": "mkdir -p bin && swiftc mac-hud/main.swift -framework Cocoa -framework PDFKit -framework Quartz -framework AVFoundation -framework WebKit -o bin/oms-mac-hud",
+    "build:ctl": "mkdir -p bin && swiftc -O mac-ctl/main.swift -o bin/oms-mac-ctl",
     "test": "bun test"
   },
   "dependencies": {

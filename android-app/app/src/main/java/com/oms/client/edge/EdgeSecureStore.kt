@@ -686,4 +686,105 @@ class EdgeSecureStore(context: Context) {
         paths.forEach { arr.put(it) }
         prefs.edit().putString("ui_expanded_projects_${scopeKey}_v1", arr.toString()).apply()
     }
+
+    // =========================================================================
+    // v3.6 Web App Hub Proxy Mode, Automation Playbooks & Multi-Agent Selection
+    // =========================================================================
+
+    fun getWebAppProxyMode(): String =
+        prefs.getString("web_app_proxy_mode_v1", "SMART") ?: "SMART"
+
+    fun setWebAppProxyMode(mode: String) {
+        prefs.edit().putString("web_app_proxy_mode_v1", mode).apply()
+    }
+
+    fun getSelectedMissionAgent(): String =
+        prefs.getString("ui_mission_selected_agent_v1", "codex") ?: "codex"
+
+    fun setSelectedMissionAgent(backend: String) {
+        prefs.edit().putString("ui_mission_selected_agent_v1", backend).apply()
+    }
+
+    fun loadAutomationPlaybooksJson(): String? =
+        prefs.getString("web_app_automation_playbooks_v1", null)
+
+    fun saveAutomationPlaybooksJson(json: String) {
+        prefs.edit().putString("web_app_automation_playbooks_v1", json).apply()
+    }
+
+    // =========================================================================
+    // v3.6.1 Browser Auto-Curate Toggle, Deduplication Set & Offline Queue
+    // =========================================================================
+
+    fun isBrowserAutoCurateEnabled(): Boolean =
+        prefs.getBoolean("web_app_auto_curate_enabled_v1", false)
+
+    fun setBrowserAutoCurateEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("web_app_auto_curate_enabled_v1", enabled).apply()
+    }
+
+    fun getBrowserAutoCurateDwellSec(): Int =
+        prefs.getInt("web_app_auto_curate_dwell_sec_v1", 15).coerceIn(8, 60)
+
+    fun setBrowserAutoCurateDwellSec(seconds: Int) {
+        prefs.edit().putInt("web_app_auto_curate_dwell_sec_v1", seconds.coerceIn(8, 60)).apply()
+    }
+
+    fun loadCuratedBrowserUrls(): Set<String> = synchronized(lock) {
+        val raw = prefs.getString("web_app_curated_urls_v1", null) ?: return emptySet()
+        return runCatching {
+            val arr = org.json.JSONArray(raw)
+            buildSet {
+                for (i in 0 until arr.length()) {
+                    val u = arr.optString(i, "").trim()
+                    if (u.isNotEmpty()) add(u)
+                }
+            }
+        }.getOrDefault(emptySet())
+    }
+
+    fun markBrowserUrlCurated(canonicalUrl: String) = synchronized(lock) {
+        val clean = canonicalUrl.trim()
+        if (clean.isEmpty()) return@synchronized
+        val next = (listOf(clean) + loadCuratedBrowserUrls().filterNot { it == clean }).take(300)
+        val arr = org.json.JSONArray()
+        next.forEach { arr.put(it) }
+        prefs.edit().putString("web_app_curated_urls_v1", arr.toString()).apply()
+    }
+
+    fun enqueuePendingBrowserCurate(payload: org.json.JSONObject) = synchronized(lock) {
+        val url = payload.optString("url", "").trim()
+        if (url.isEmpty()) return@synchronized
+        val existingRaw = prefs.getString("web_app_pending_curates_v1", null)
+        val nextList = mutableListOf<org.json.JSONObject>()
+        nextList.add(payload)
+        if (!existingRaw.isNullOrBlank()) {
+            runCatching {
+                val arr = org.json.JSONArray(existingRaw)
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    if (o.optString("url", "") != url) nextList.add(o)
+                }
+            }
+        }
+        val out = org.json.JSONArray()
+        nextList.take(30).forEach { out.put(it) }
+        prefs.edit().putString("web_app_pending_curates_v1", out.toString()).apply()
+    }
+
+    fun drainPendingBrowserCurates(): List<org.json.JSONObject> = synchronized(lock) {
+        val raw = prefs.getString("web_app_pending_curates_v1", null) ?: return emptyList()
+        prefs.edit().remove("web_app_pending_curates_v1").apply()
+        return runCatching {
+            val arr = org.json.JSONArray(raw)
+            (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+        }.getOrDefault(emptyList())
+    }
+
+    fun loadOpenBrowserTabsJson(): String? =
+        prefs.getString("web_app_open_tabs_v1", null)
+
+    fun saveOpenBrowserTabsJson(json: String) {
+        prefs.edit().putString("web_app_open_tabs_v1", json).apply()
+    }
 }

@@ -4,6 +4,8 @@ import crypto from "node:crypto";
 import { Database } from "bun:sqlite";
 import type {
   AgentSessionSummary,
+  LivingMemoryEntry,
+  MemoryCenterSnapshot,
   SecretaryBriefSnapshot,
   SecretaryCommitmentItem,
   SecretaryNudgeItem,
@@ -11,8 +13,10 @@ import type {
 import { listImportedBooks } from "../knowledge/epub-importer.js";
 
 export interface ProfileMemoryEntry {
+  id: string;
   text: string;
   source: "manual" | "auto";
+  originDetail?: string;
   observations: number;
   createdAtMs: number;
   lastSeenAtMs: number;
@@ -21,6 +25,7 @@ export interface ProfileMemoryEntry {
 interface PersistedSecretaryState {
   profileItems: string[];
   profileEntries?: ProfileMemoryEntry[];
+  forgottenFingerprints?: Record<string, number>;
   commitments: SecretaryCommitmentItem[];
   dismissedNudges: Record<string, number>;
   updatedAtIso: string;
@@ -33,10 +38,37 @@ export interface SecretaryBriefBuildContext {
   nowMs?: number;
 }
 
+function normalizeMemoryText(s: string): string {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[\s\p{P}\p{S}]+/gu, "")
+    .trim();
+}
+
+function stableMemoryId(text: string): string {
+  const hash = crypto.createHash("sha1").update(normalizeMemoryText(text) || text).digest("hex").slice(0, 12);
+  return `mem_${hash}`;
+}
+
+function agentDisplayLabel(backend: string): string {
+  switch (backend) {
+    case "codex":
+      return "Codex";
+    case "agy":
+      return "Antigravity";
+    case "workbuddy":
+      return "WorkBuddy";
+    case "opencode":
+      return "OpenCode";
+    default:
+      return backend;
+  }
+}
+
 /**
- * Executive Chief-of-Staff core for OneMoreStep:
- * Maintains transparent, user-editable Living Memory (Profile Preferences + Open Loops / Commitments)
- * and synthesizes a calm, actionable Today Brief + Proactive Nudges from Chisu, Vault, Books, and Mac Agents.
+ * Personal Assistant ("随身助理") Living Memory & Today Brief core:
+ * Maintains transparent, user-editable Living Memory (Profile Preferences + Working Memory + Vault Anchors + Open Loops)
+ * with anti-resurrection tombstones (`forgottenFingerprints`) so deleted auto-extracted memories never come back.
  */
 export class SecretaryCore {
   private readonly statePath: string;
@@ -52,28 +84,45 @@ export class SecretaryCore {
       if (fs.existsSync(this.statePath)) {
         const parsed = JSON.parse(fs.readFileSync(this.statePath, "utf8"));
         const rawItems: string[] = Array.isArray(parsed?.profileItems)
-          ? parsed.profileItems.map((x: unknown) => String(x || "").trim()).filter(Boolean).slice(0, 24)
+          ? parsed.profileItems.map((x: unknown) => String(x || "").trim()).filter(Boolean).slice(0, 48)
           : [];
         const rawEntries: ProfileMemoryEntry[] = Array.isArray(parsed?.profileEntries)
           ? parsed.profileEntries
               .filter((e: any) => e && typeof e.text === "string" && e.text.trim())
-              .map((e: any) => ({
-                text: String(e.text).trim(),
-                source: e.source === "auto" ? "auto" : "manual",
-                observations: Math.max(1, Number(e.observations) || 1),
-                createdAtMs: Number(e.createdAtMs) || Date.now(),
-                lastSeenAtMs: Number(e.lastSeenAtMs) || Date.now(),
-              }))
+              .map((e: any) => {
+                const cleanText = String(e.text).trim();
+                const src: "manual" | "auto" = e.source === "auto" ? "auto" : "manual";
+                return {
+                  id: typeof e.id === "string" && e.id.trim() ? e.id.trim() : stableMemoryId(cleanText),
+                  text: cleanText,
+                  source: src,
+                  originDetail:
+                    typeof e.originDetail === "string" && e.originDetail.trim()
+                      ? e.originDetail.trim()
+                      : src === "auto"
+                        ? "历史对话自动提取"
+                        : "手动添加",
+                  observations: Math.max(1, Number(e.observations) || 1),
+                  createdAtMs: Number(e.createdAtMs) || Date.now(),
+                  lastSeenAtMs: Number(e.lastSeenAtMs) || Date.now(),
+                };
+              })
           : rawItems.map((text) => ({
+              id: stableMemoryId(text),
               text,
               source: "manual" as const,
+              originDetail: "手动添加",
               observations: 1,
               createdAtMs: Date.now(),
               lastSeenAtMs: Date.now(),
             }));
         return {
-          profileItems: rawEntries.map((e) => e.text).slice(0, 24),
-          profileEntries: rawEntries.slice(0, 24),
+          profileItems: rawEntries.map((e) => e.text).slice(0, 48),
+          profileEntries: rawEntries.slice(0, 48),
+          forgottenFingerprints:
+            parsed?.forgottenFingerprints && typeof parsed.forgottenFingerprints === "object"
+              ? parsed.forgottenFingerprints
+              : {},
           commitments: Array.isArray(parsed?.commitments) ? parsed.commitments.slice(0, 80) : [],
           dismissedNudges:
             parsed?.dismissedNudges && typeof parsed.dismissedNudges === "object"
@@ -86,6 +135,7 @@ export class SecretaryCore {
     return {
       profileItems: [],
       profileEntries: [],
+      forgottenFingerprints: {},
       commitments: [],
       dismissedNudges: {},
       updatedAtIso: "",
@@ -95,7 +145,7 @@ export class SecretaryCore {
   private saveState(state: PersistedSecretaryState): void {
     state.updatedAtIso = new Date().toISOString();
     if (state.profileEntries) {
-      state.profileItems = state.profileEntries.map((e) => e.text).slice(0, 24);
+      state.profileItems = state.profileEntries.map((e) => e.text).slice(0, 48);
     }
     const tmp = `${this.statePath}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8");
@@ -110,18 +160,160 @@ export class SecretaryCore {
     return this.loadState().profileEntries || [];
   }
 
+  public getLivingProfileEntries(): LivingMemoryEntry[] {
+    return this.getProfileEntries().map((e) => ({
+      id: e.id,
+      text: e.text,
+      source: e.source,
+      category: "profile",
+      originDetail: e.originDetail || (e.source === "auto" ? "历史对话自动提取" : "手动添加"),
+      observations: e.observations,
+      createdAtMs: e.createdAtMs,
+      lastSeenAtMs: e.lastSeenAtMs,
+    }));
+  }
+
+  private isForgottenNormalized(state: PersistedSecretaryState, candidateNorm: string): boolean {
+    if (!candidateNorm) return false;
+    const forgotten = state.forgottenFingerprints || {};
+    for (const key of Object.keys(forgotten)) {
+      if (!key) continue;
+      if (key === candidateNorm) return true;
+      if (key.length >= 6 && candidateNorm.length >= 6 && (key.includes(candidateNorm) || candidateNorm.includes(key))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  public addOrUpdateMemoryEntry(params: {
+    id?: string;
+    text: string;
+    source?: "manual" | "auto";
+    originDetail?: string;
+  }): LivingMemoryEntry {
+    const cleanText = String(params.text || "").trim().slice(0, 160);
+    if (!cleanText) throw new Error("记忆内容不能为空");
+    const state = this.loadState();
+    const entries = [...(state.profileEntries || [])];
+    const now = Date.now();
+    const norm = normalizeMemoryText(cleanText);
+    if (state.forgottenFingerprints && norm) {
+      for (const k of Object.keys(state.forgottenFingerprints)) {
+        if (k === norm || (k.length >= 6 && norm.length >= 6 && (k.includes(norm) || norm.includes(k)))) {
+          delete state.forgottenFingerprints[k];
+        }
+      }
+    }
+
+    const src: "manual" | "auto" = params.source === "auto" ? "auto" : "manual";
+    const existingIdx = params.id
+      ? entries.findIndex((e) => e.id === params.id)
+      : entries.findIndex((e) => normalizeMemoryText(e.text) === norm);
+
+    let target: ProfileMemoryEntry;
+    if (existingIdx >= 0) {
+      const prev = entries[existingIdx];
+      target = {
+        ...prev,
+        id: prev.id || stableMemoryId(cleanText),
+        text: cleanText,
+        source: src === "manual" ? "manual" : prev.source,
+        originDetail: params.originDetail || (src === "manual" ? "手动编辑" : prev.originDetail),
+        lastSeenAtMs: now,
+      };
+      entries[existingIdx] = target;
+    } else {
+      target = {
+        id: params.id || stableMemoryId(cleanText),
+        text: cleanText,
+        source: src,
+        originDetail: params.originDetail || (src === "auto" ? "历史对话自动提取" : "手动添加"),
+        observations: 1,
+        createdAtMs: now,
+        lastSeenAtMs: now,
+      };
+      entries.unshift(target);
+    }
+
+    state.profileEntries = entries.slice(0, 48);
+    this.saveState(state);
+    return {
+      id: target.id,
+      text: target.text,
+      source: target.source,
+      category: "profile",
+      originDetail: target.originDetail,
+      observations: target.observations,
+      createdAtMs: target.createdAtMs,
+      lastSeenAtMs: target.lastSeenAtMs,
+    };
+  }
+
+  public deleteMemoryEntry(idOrText: string, rememberTombstone = true): boolean {
+    const clean = String(idOrText || "").trim();
+    if (!clean) return false;
+    const state = this.loadState();
+    const entries = state.profileEntries || [];
+    const targetNorm = normalizeMemoryText(clean);
+    const removed: ProfileMemoryEntry[] = [];
+    const kept = entries.filter((e) => {
+      const matched = e.id === clean || e.text === clean || (targetNorm && normalizeMemoryText(e.text) === targetNorm);
+      if (matched) removed.push(e);
+      return !matched;
+    });
+    if (removed.length === 0) return false;
+
+    if (rememberTombstone) {
+      state.forgottenFingerprints = state.forgottenFingerprints || {};
+      for (const r of removed) {
+        const fp = normalizeMemoryText(r.text);
+        if (fp) state.forgottenFingerprints[fp] = Date.now();
+      }
+      // Cap tombstones at 200 most recent
+      const fpEntries = Object.entries(state.forgottenFingerprints).sort((a, b) => b[1] - a[1]).slice(0, 200);
+      state.forgottenFingerprints = Object.fromEntries(fpEntries);
+    }
+    state.profileEntries = kept;
+    this.saveState(state);
+    return true;
+  }
+
   public saveProfileItems(items: string[]): string[] {
     const state = this.loadState();
     const prevByText = new Map((state.profileEntries || []).map((e) => [e.text, e]));
     const now = Date.now();
     const cleaned = Array.from(
       new Set(items.map((x) => String(x || "").trim()).filter(Boolean))
-    ).slice(0, 24);
+    ).slice(0, 48);
+    const nextSetNorm = new Set(cleaned.map(normalizeMemoryText));
+
+    // Record removed items into tombstones so auto-distiller won't re-add them
+    state.forgottenFingerprints = state.forgottenFingerprints || {};
+    for (const old of state.profileEntries || []) {
+      const oldNorm = normalizeMemoryText(old.text);
+      if (oldNorm && !nextSetNorm.has(oldNorm)) {
+        state.forgottenFingerprints[oldNorm] = now;
+      }
+    }
+
     state.profileEntries = cleaned.map((text) => {
       const existing = prevByText.get(text);
+      const norm = normalizeMemoryText(text);
+      if (norm && state.forgottenFingerprints) {
+        delete state.forgottenFingerprints[norm];
+      }
       return existing
         ? { ...existing, lastSeenAtMs: now }
-        : { text, source: "manual", observations: 1, createdAtMs: now, lastSeenAtMs: now };
+        : {
+            id: stableMemoryId(text),
+            text,
+            source: "manual",
+            originDetail: "手动添加",
+            observations: 1,
+            createdAtMs: now,
+            lastSeenAtMs: now,
+          };
     });
     state.profileItems = cleaned;
     this.saveState(state);
@@ -130,10 +322,10 @@ export class SecretaryCore {
 
   /**
    * Slow, conservative living-memory evolution from everyday conversations:
+   * - Skips any trait matching `forgottenFingerprints` (user-deleted memories never resurrect!)
    * - Deduplicates & reinforces matching memories (`observations += 1`)
-   * - Appends only high-signal new traits (`source: "auto"`), capping total at 24
+   * - Appends high-signal new traits (`source: "auto"`), capping total at 36
    *   while NEVER auto-evicting user-edited manual memories.
-   * - Also records implicit commitments into Open Loops cleanly.
    */
   public evolveMemoryFromDialogue(params: {
     profileAdditions?: string[];
@@ -145,16 +337,14 @@ export class SecretaryCore {
     let addedProfile = 0;
     let reinforcedProfile = 0;
 
-    const normalize = (s: string) =>
-      s.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "").trim();
-
     for (const raw of (params.profileAdditions || []).slice(0, 3)) {
-      const text = String(raw || "").trim().slice(0, 80);
+      const text = String(raw || "").trim().slice(0, 100);
       if (text.length < 4) continue;
-      const norm = normalize(text);
-      if (!norm) continue;
+      const norm = normalizeMemoryText(text);
+      if (!norm || this.isForgottenNormalized(state, norm)) continue;
+
       const matchIdx = entries.findIndex((e) => {
-        const en = normalize(e.text);
+        const en = normalizeMemoryText(e.text);
         return en === norm || (norm.length >= 6 && (en.includes(norm) || norm.includes(en)));
       });
       if (matchIdx >= 0) {
@@ -166,8 +356,10 @@ export class SecretaryCore {
         reinforcedProfile += 1;
       } else {
         entries.push({
+          id: stableMemoryId(text),
           text,
           source: "auto",
+          originDetail: "历史对话自动提取",
           observations: 1,
           createdAtMs: now,
           lastSeenAtMs: now,
@@ -176,14 +368,13 @@ export class SecretaryCore {
       }
     }
 
-    // Cap at 24: preserve all manual entries first, then highest-observation / most recent auto entries
-    if (entries.length > 24) {
+    if (entries.length > 36) {
       const manual = entries.filter((e) => e.source === "manual");
       const auto = entries
         .filter((e) => e.source === "auto")
         .sort((a, b) => b.observations - a.observations || b.lastSeenAtMs - a.lastSeenAtMs);
-      const keepAuto = Math.max(0, 24 - manual.length);
-      state.profileEntries = [...manual, ...auto.slice(0, keepAuto)].slice(0, 24);
+      const keepAuto = Math.max(0, 36 - manual.length);
+      state.profileEntries = [...manual, ...auto.slice(0, keepAuto)].slice(0, 36);
     } else {
       state.profileEntries = entries;
     }
@@ -194,7 +385,7 @@ export class SecretaryCore {
       const title = String(c?.title || "").trim();
       if (title.length < 3) continue;
       const alreadyOpen = this.listCommitments(false).some(
-        (o) => normalize(o.title) === normalize(title)
+        (o) => normalizeMemoryText(o.title) === normalizeMemoryText(title)
       );
       if (!alreadyOpen) {
         this.upsertCommitment({
@@ -211,6 +402,88 @@ export class SecretaryCore {
       reinforcedProfile,
       addedCommitments,
       profileItems: this.getProfileItems(),
+    };
+  }
+
+  public buildMemoryCenterSnapshot(params: {
+    workingMemoryItems: string[];
+    vaultRoot: string;
+  }): MemoryCenterSnapshot {
+    const state = this.loadState();
+    const now = Date.now();
+    const profileEntries = this.getLivingProfileEntries();
+
+    const workingEntries: LivingMemoryEntry[] = (params.workingMemoryItems || [])
+      .map((raw) => String(raw || "").trim())
+      .filter(Boolean)
+      .map((text) => ({
+        id: `wm_${crypto.createHash("sha1").update(normalizeMemoryText(text) || text).digest("hex").slice(0, 12)}`,
+        text,
+        source: "auto" as const,
+        category: "working" as const,
+        originDetail: "近期对话自动蒸馏 (L1 工作记忆)",
+        observations: 1,
+        createdAtMs: now,
+        lastSeenAtMs: now,
+      }));
+
+    const vaultAnchors: LivingMemoryEntry[] = [];
+    const scanDirs: Array<{ sub: string; label: string }> = [
+      { sub: "04_topics", label: "知识库主题" },
+      { sub: "03_ideas/developed", label: "深度思考沉淀" },
+      { sub: "03_ideas/seeds", label: "灵感种子" },
+    ];
+    for (const { sub, label } of scanDirs) {
+      const absDir = path.join(params.vaultRoot, sub);
+      if (!fs.existsSync(absDir)) continue;
+      try {
+        const files = fs
+          .readdirSync(absDir, { withFileTypes: true })
+          .filter((e) => e.isFile() && e.name.endsWith(".md") && e.name !== "instruction.md")
+          .map((e) => {
+            const p = path.join(absDir, e.name);
+            const st = fs.statSync(p);
+            return { relPath: `${sub}/${e.name}`, absPath: p, name: path.basename(e.name, ".md"), mtimeMs: st.mtimeMs };
+          })
+          .sort((a, b) => b.mtimeMs - a.mtimeMs)
+          .slice(0, 6);
+
+        for (const f of files) {
+          let summaryLine = "";
+          try {
+            const head = fs.readFileSync(f.absPath, "utf8").slice(0, 1200);
+            const stripped = head
+              .replace(/^---[\s\S]*?---\s*/, "")
+              .split(/\r?\n/)
+              .map((l) => l.replace(/^#+\s*/, "").trim())
+              .filter((l) => l.length >= 8 && !l.startsWith("![[") && !l.startsWith("> "));
+            summaryLine = stripped[0] ? `${f.name}：${stripped[0].slice(0, 72)}` : f.name;
+          } catch {
+            summaryLine = f.name;
+          }
+          const vId = `vault_${crypto.createHash("sha1").update(f.relPath).digest("hex").slice(0, 12)}`;
+          const vNorm = normalizeMemoryText(summaryLine);
+          if (this.isForgottenNormalized(state, vNorm)) continue;
+          vaultAnchors.push({
+            id: vId,
+            text: summaryLine,
+            source: "auto",
+            category: "vault",
+            originDetail: `${label} · ${f.relPath}`,
+            observations: 1,
+            createdAtMs: Math.floor(f.mtimeMs),
+            lastSeenAtMs: Math.floor(f.mtimeMs),
+          });
+        }
+      } catch {}
+    }
+
+    return {
+      profileEntries,
+      workingEntries,
+      vaultAnchors: vaultAnchors.slice(0, 14),
+      forgottenCount: Object.keys(state.forgottenFingerprints || {}).length,
+      updatedAtMs: now,
     };
   }
 
@@ -300,7 +573,6 @@ export class SecretaryCore {
     if (!clean) return;
     const state = this.loadState();
     state.dismissedNudges[clean] = Date.now();
-    // Prune dismissals older than 7 days
     const cutoff = Date.now() - 7 * 86400_000;
     for (const [k, ts] of Object.entries(state.dismissedNudges)) {
       if (ts < cutoff) delete state.dismissedNudges[k];
@@ -332,7 +604,6 @@ export class SecretaryCore {
       .sort((a, b) => b.updatedAtMs - a.updatedAtMs)
       .slice(0, 10);
 
-    // Inspect recent 48h WeChat Chisu items (articles + multimodal turns)
     let recentChisuCount = 0;
     let topChisuTitle = "";
     if (ctx.wechatDbPath && fs.existsSync(ctx.wechatDbPath)) {
@@ -358,7 +629,6 @@ export class SecretaryCore {
       }
     }
 
-    // Inspect recent Vault Focus (recent 04_topics & 03_ideas)
     const vaultFocusTitles: string[] = [];
     for (const subDir of ["04_topics", "03_ideas/developed", "03_ideas/seeds"]) {
       const absDir = path.join(ctx.vaultRoot, subDir);
@@ -386,7 +656,6 @@ export class SecretaryCore {
 
     const importedBooks = listImportedBooks(ctx.vaultRoot);
 
-    // Build calm, high-signal Proactive Nudges (filtered by 24h dismissal)
     const nudges: SecretaryNudgeItem[] = [];
     const isDismissed = (id: string) => {
       const ts = state.dismissedNudges[id];
@@ -398,7 +667,7 @@ export class SecretaryCore {
         id: "nudge_commute_chisu",
         kind: "commute_chisu",
         title: `近 48 小时新收 ${recentChisuCount} 篇尺素资料`,
-        subtitle: topChisuTitle ? `推荐先看：《${topChisuTitle.slice(0, 34)}》` : "可一键开启耳机通勤联播或双文档精读",
+        subtitle: topChisuTitle ? `推荐先看：《${topChisuTitle.slice(0, 34)}》` : "可一键开启耳机通勤联播或精读",
         actionLabel: "去尺素听读",
         actionType: "open_chisu",
         actionPayload: "",
@@ -411,7 +680,7 @@ export class SecretaryCore {
         id: `nudge_agent_${latest.sessionId}`,
         kind: "agent_review",
         title: `Mac 协同任务已完成：${latest.title.slice(0, 28)}`,
-        subtitle: `${latest.backend === "codex" ? "Codex" : "Antigravity"} · ${latest.projectDisplayName || "工作区"}，可随时验收或追问`,
+        subtitle: `${agentDisplayLabel(latest.backend)} · ${latest.projectDisplayName || "工作区"}，可随时验收或追问`,
         actionLabel: "查看结果",
         actionType: "open_missions",
         actionPayload: latest.sessionId,
@@ -427,7 +696,7 @@ export class SecretaryCore {
         subtitle: `优先关注：${top.title}${top.dueHint ? `（${top.dueHint}）` : ""}`,
         actionLabel: "梳理推进方案",
         actionType: "ask_chat",
-        actionPayload: `请作为我的随身秘书，帮我把当前未闭环事项梳理成今天最省力的执行顺序，优先推进「${top.title}」。`,
+        actionPayload: `请作为我的随身助理，帮我把当前未闭环事项梳理成今天最省力的执行顺序，优先推进「${top.title}」。`,
       });
     }
 
@@ -468,6 +737,7 @@ export class SecretaryCore {
       dateLabel,
       headline,
       profileItems: state.profileItems,
+      profileEntries: this.getLivingProfileEntries(),
       openLoops,
       nudges: nudges.slice(0, 4),
       recentChisuCount,

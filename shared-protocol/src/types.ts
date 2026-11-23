@@ -218,6 +218,8 @@ export interface PhonePermissionStatus {
   calendarGranted: boolean;
   mediaReadGranted: boolean;
   recordAudioGranted?: boolean;
+  contactsGranted?: boolean;
+  callPhoneGranted?: boolean;
 }
 
 export interface PhoneDeviceStatus {
@@ -682,11 +684,34 @@ export interface SecretaryNudgeItem {
   actionPayload: string;
 }
 
+export type LivingMemorySource = "manual" | "auto";
+export type LivingMemoryCategory = "profile" | "working" | "vault";
+
+export interface LivingMemoryEntry {
+  id: string;
+  text: string;
+  source: LivingMemorySource;
+  category: LivingMemoryCategory;
+  originDetail?: string;
+  observations: number;
+  createdAtMs: number;
+  lastSeenAtMs: number;
+}
+
+export interface MemoryCenterSnapshot {
+  profileEntries: LivingMemoryEntry[];
+  workingEntries: LivingMemoryEntry[];
+  vaultAnchors: LivingMemoryEntry[];
+  forgottenCount: number;
+  updatedAtMs: number;
+}
+
 export interface SecretaryBriefSnapshot {
   greeting: string;
   dateLabel: string;
   headline: string;
   profileItems: string[];
+  profileEntries?: LivingMemoryEntry[];
   openLoops: SecretaryCommitmentItem[];
   nudges: SecretaryNudgeItem[];
   recentChisuCount: number;
@@ -696,9 +721,9 @@ export interface SecretaryBriefSnapshot {
 }
 
 /**
- * Milestone 3 (v2.0): Mac Heavy-Brain Hub (Codex & Antigravity Live Session Monitor + Dispatch + Resume)
+ * Milestone 3 (v2.0+): Mac Heavy-Brain Hub (Codex, Antigravity, WorkBuddy & OpenCode)
  */
-export type AgentBackendType = "codex" | "agy";
+export type AgentBackendType = "codex" | "agy" | "workbuddy" | "opencode";
 
 export interface AgentSessionSummary {
   sessionId: string;
@@ -745,6 +770,8 @@ export interface AgentBackendQuotaStatus {
 export interface AgentQuotasSnapshot {
   codex: AgentBackendQuotaStatus;
   agy: AgentBackendQuotaStatus;
+  workbuddy?: AgentBackendQuotaStatus;
+  opencode?: AgentBackendQuotaStatus;
   fetchedAtMs: number;
 }
 
@@ -791,4 +818,94 @@ export interface AgentSessionStreamEventParams {
   step?: AgentStepItem;
   finalSummary?: string;
   updatedAtMs: number;
+}
+
+/**
+ * Milestone 4 (v3.6): Remote Mac System Control Contracts (Wake / Lock / Unlock / Launch Apps / Media)
+ */
+export interface MacInstalledAppItem {
+  name: string;
+  bundlePath: string;
+  running: boolean;
+}
+
+export interface MacControlStatusSnapshot {
+  macId: string;
+  macName: string;
+  screenLocked: boolean;
+  displayAsleep: boolean;
+  stayAwakeEnabled: boolean;
+  unlockPasswordConfigured: boolean;
+  accessibilityTrusted: boolean;
+  volumePct: number;
+  muted: boolean;
+  frontmostApp?: string;
+  installedApps: MacInstalledAppItem[];
+  updatedAtMs: number;
+}
+
+export type MacControlActionType =
+  | "wake"
+  | "lock"
+  | "unlock"
+  | "request_accessibility"
+  | "open_app"
+  | "quit_app"
+  | "set_volume"
+  | "toggle_mute"
+  | "media_play_pause"
+  | "stay_awake";
+
+export interface MacControlExecuteParams {
+  action: MacControlActionType;
+  target?: string;
+  value?: number | boolean;
+  transportTierHint?: string;
+  biometricVerified?: boolean;
+}
+
+export interface MacControlExecuteResult {
+  ok: boolean;
+  action: MacControlActionType;
+  message: string;
+  requiresBiometric?: boolean;
+  status?: MacControlStatusSnapshot;
+}
+
+/**
+ * v3.6.1: Browser Auto-Curate & Unified Cross-AI Knowledge Base Context Contracts
+ */
+export interface CurateBrowserUrlParams {
+  url: string;
+  title?: string;
+  author?: string;
+  extractedText?: string;
+  userNote?: string;
+  captureMode?: "auto_dwell" | "manual";
+}
+
+export interface RecentCuratedContextItem {
+  url: string;
+  title: string;
+  mediaKind: "video" | "article";
+  shortSummary: string;
+  sourcePath?: string;
+  notePath?: string;
+  relNotePath?: string;
+  captureMode: "auto_dwell" | "manual";
+  curatedAtMs: number;
+}
+
+export interface CurateBrowserUrlResult {
+  ok: boolean;
+  articleId?: number;
+  url: string;
+  title: string;
+  mediaKind: "video" | "article";
+  shortSummary: string;
+  triage?: string;
+  sourcePath?: string;
+  notePath?: string;
+  relNotePath?: string;
+  error?: string;
 }

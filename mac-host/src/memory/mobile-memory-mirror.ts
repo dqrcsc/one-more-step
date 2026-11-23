@@ -3,11 +3,14 @@ import path from "node:path";
 import { Database } from "bun:sqlite";
 import type {
   ChatSyncBatchParams,
+  CurateBrowserUrlParams,
+  CurateBrowserUrlResult,
   MemoryPromoteVaultParams,
   MemoryPromoteVaultResult,
   MemoryReadVaultDocResult,
   MemorySearchHit,
   MemorySearchVaultResult,
+  RecentCuratedContextItem,
 } from "@oms/shared-protocol";
 import { parseDotEnvSafe } from "../wechat/edge-proxy-bootstrap.js";
 
@@ -87,6 +90,7 @@ export class MobileMemoryMirror {
   private readonly chatDir: string;
   private readonly dbPath: string;
   private readonly workingMemoryPath: string;
+  private readonly recentCuratedPath: string;
   private readonly wechatEnvPath: string;
   private readonly vaultRootOverride?: string;
   private db: Database;
@@ -98,6 +102,7 @@ export class MobileMemoryMirror {
     fs.mkdirSync(this.chatDir, { recursive: true, mode: 0o700 });
     this.dbPath = path.join(this.chatDir, "mobile_chat.db");
     this.workingMemoryPath = path.join(this.chatDir, "working_memory.json");
+    this.recentCuratedPath = path.join(this.chatDir, "recent_curated.json");
     this.wechatEnvPath = opts.wechatEnvPath || path.join(opts.omsHomeDir, "wechat", ".env");
     this.vaultRootOverride = opts.vaultRootOverride;
 
@@ -257,7 +262,7 @@ export class MobileMemoryMirror {
   }
 
   public saveWorkingMemory(items: string[]): void {
-    const cleaned = Array.from(new Set(items.map((s) => s.trim()).filter(Boolean))).slice(0, 12);
+    const cleaned = Array.from(new Set(items.map((s) => s.trim()).filter(Boolean))).slice(0, 16);
     const tmp = `${this.workingMemoryPath}.tmp`;
     fs.writeFileSync(
       tmp,
@@ -265,6 +270,160 @@ export class MobileMemoryMirror {
       "utf8"
     );
     fs.renameSync(tmp, this.workingMemoryPath);
+  }
+
+  public prependWorkingMemoryObservation(entry: string, dedupeKeyHint?: string): void {
+    const clean = String(entry || "").trim();
+    if (!clean) return;
+    const current = this.loadWorkingMemory();
+    const hint = String(dedupeKeyHint || "").trim().toLowerCase();
+    const filtered = current.filter((item) => {
+      if (item === clean) return false;
+      if (hint && hint.length >= 6 && item.toLowerCase().includes(hint)) return false;
+      return true;
+    });
+    this.saveWorkingMemory([clean, ...filtered]);
+  }
+
+  public getRecentCuratedContext(limit = 8): RecentCuratedContextItem[] {
+    try {
+      if (!fs.existsSync(this.recentCuratedPath)) return [];
+      const parsed = JSON.parse(fs.readFileSync(this.recentCuratedPath, "utf8"));
+      if (Array.isArray(parsed?.items)) {
+        return parsed.items.slice(0, Math.max(1, limit));
+      }
+    } catch {
+      // ignore
+    }
+    return [];
+  }
+
+  public recordCuratedContent(item: RecentCuratedContextItem): void {
+    const existing = this.getRecentCuratedContext(30).filter((x) => x.url !== item.url);
+    const next = [item, ...existing].slice(0, 24);
+    const tmp = `${this.recentCuratedPath}.tmp`;
+    fs.writeFileSync(
+      tmp,
+      JSON.stringify({ updatedAtIso: new Date().toISOString(), items: next }, null, 2),
+      "utf8"
+    );
+    fs.renameSync(tmp, this.recentCuratedPath);
+
+    const vaultRoot = this.resolveVaultRoot();
+    const relNote =
+      item.relNotePath ||
+      (item.notePath && item.notePath.startsWith(vaultRoot)
+        ? path.relative(vaultRoot, item.notePath).replace(/\\/g, "/")
+        : undefined);
+    const kindLabel = item.mediaKind === "video" ? "视频" : "网页";
+    const briefTakeaway = item.shortSummary
+      .replace(/\s+/g, " ")
+      .replace(/^📋\s*内容提炼[:：]?\s*/u, "")
+      .trim()
+      .slice(0, 110);
+    const wmText = `[伴读沉淀·${kindLabel}] 《${item.title.slice(0, 48)}》${briefTakeaway ? `：${briefTakeaway}` : ""}${relNote ? ` (知识库: ${relNote})` : ""}`;
+    this.prependWorkingMemoryObservation(wmText, item.title.slice(0, 24));
+  }
+
+  public curateDirectToVaultFallback(params: CurateBrowserUrlParams): CurateBrowserUrlResult {
+    const vaultRoot = this.resolveVaultRoot();
+    const rawUrl = String(params.url || "").trim();
+    const isVideo = /(?:youtube\.com\/(?:watch|shorts|live)|youtu\.be\/|bilibili\.com\/video|douyin\.com\/)/i.test(rawUrl);
+    const mediaKind: "video" | "article" = isVideo ? "video" : "article";
+    const subDir = isVideo
+      ? path.join(vaultRoot, "01_inputs", "video")
+      : path.join(vaultRoot, "01_inputs", "articles", "web");
+    fs.mkdirSync(subDir, { recursive: true });
+
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const title = String(params.title || rawUrl).trim();
+    const asciiSlug = title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 40);
+    const urlHash = Buffer.from(rawUrl).toString("hex").slice(0, 10);
+    const baseName = `${isVideo ? "video_source" : "web_article"}_${dateStr.replace(/-/g, "_")}_${asciiSlug || urlHash}`;
+    const sourcePath = path.join(subDir, `${baseName}.md`);
+    const notePath = path.join(subDir, `${baseName}_note.md`);
+    const bodyText = String(params.extractedText || "").trim();
+    const summaryText = bodyText
+      ? bodyText.replace(/\s+/g, " ").slice(0, 260)
+      : `已从应用舱收录${isVideo ? "视频" : "网页"}《${title}》`;
+
+    if (!fs.existsSync(sourcePath)) {
+      const rawDoc = [
+        "---",
+        `title: ${JSON.stringify(title)}`,
+        `source_url: ${JSON.stringify(rawUrl)}`,
+        ...(params.author ? [`author: ${JSON.stringify(params.author)}`] : []),
+        `captured_at: ${dateStr}`,
+        "process_level: raw",
+        "triage: reference",
+        "---",
+        "",
+        `# ${title}`,
+        "",
+        `- 来源链接：${rawUrl}`,
+        ...(params.author ? [`- 作者/频道：${params.author}`] : []),
+        "",
+        bodyText || "（待联网补充完整字幕或正文）",
+        "",
+      ].join("\n");
+      fs.writeFileSync(sourcePath, rawDoc, "utf8");
+    }
+
+    const relSource = path.relative(vaultRoot, sourcePath).replace(/\\/g, "/");
+    const relNote = path.relative(vaultRoot, notePath).replace(/\\/g, "/");
+    if (!fs.existsSync(notePath)) {
+      const noteDoc = [
+        "---",
+        `title: ${JSON.stringify(`${title}（伴读整理）`)}`,
+        `source_path: ${JSON.stringify(relSource)}`,
+        `source_url: ${JSON.stringify(rawUrl)}`,
+        `captured_at: ${dateStr}`,
+        "process_level: light",
+        "triage: reference",
+        "---",
+        "",
+        `# ${title} · 伴读提炼`,
+        "",
+        "## 核心摘要",
+        "",
+        summaryText,
+        ...(params.userNote ? ["", "## 用户关注点", "", params.userNote] : []),
+        "",
+      ].join("\n");
+      fs.writeFileSync(notePath, noteDoc, "utf8");
+    }
+
+    return {
+      ok: true,
+      url: rawUrl,
+      title,
+      mediaKind,
+      shortSummary: summaryText,
+      triage: "reference",
+      sourcePath,
+      notePath,
+      relNotePath: relNote,
+    };
+  }
+
+  public deleteWorkingMemoryItem(textOrId: string): boolean {
+    const clean = String(textOrId || "").trim();
+    if (!clean) return false;
+    const current = this.loadWorkingMemory();
+    const norm = (s: string) => s.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "").trim();
+    const targetNorm = norm(clean);
+    const filtered = current.filter((item) => {
+      if (item === clean) return false;
+      if (targetNorm && norm(item) === targetNorm) return false;
+      return true;
+    });
+    if (filtered.length === current.length) return false;
+    this.saveWorkingMemory(filtered);
+    return true;
   }
 
   public resolveVaultRoot(): string {

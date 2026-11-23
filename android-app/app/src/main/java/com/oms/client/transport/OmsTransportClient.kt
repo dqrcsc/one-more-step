@@ -903,6 +903,24 @@ class OmsTransportClient(
     /**
      * Manual one-tap reconnect & LAN auto-discovery triggered from UI (strictly restricted to already-paired Mac)
      */
+    fun switchToPairedMac(macId: String, onResult: (Boolean, String) -> Unit) {
+        val currentId = repo.getPairedMac()?.macId
+        if (currentId == macId && _activeTierFlow.value != "DISCONNECTED") {
+            reconnectNow(onResult)
+            return
+        }
+        lanWebSocket?.let { closeSecureSource(FrameSource("LAN_WS", it, null), "Switched active Mac") }
+        wanWebSocket?.let { closeSecureSource(FrameSource("WAN_WEBRTC", it, null), "Switched active Mac") }
+        _activeTierFlow.value = "DISCONNECTED"
+        val switched = repo.switchActiveMac(macId)
+        if (switched == null) {
+            onResult(false, "未找到目标电脑配对记录")
+            return
+        }
+        com.oms.client.OmsApplication.instance?.cockpitCoordinator?.loadCachedCatalogForMac(macId)
+        reconnectNow(onResult)
+    }
+
     fun reconnectNow(onResult: (Boolean, String) -> Unit) {
         scope.launch {
             val paired = repo.getPairedMac()

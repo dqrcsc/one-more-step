@@ -11,8 +11,8 @@ android {
         applicationId = "com.oms.client"
         minSdk = 30
         targetSdk = 34
-        versionCode = 62
-        versionName = "3.5.0"
+        versionCode = 66
+        versionName = "3.6.3"
     }
 
     signingConfigs {
@@ -94,4 +94,5 @@ dependencies {
     implementation("androidx.camera:camera-camera2:1.3.4")
     implementation("androidx.camera:camera-lifecycle:1.3.4")
     implementation("androidx.camera:camera-view:1.3.4")
+    implementation("androidx.webkit:webkit:1.11.0")
 }

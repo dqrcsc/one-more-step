@@ -540,7 +540,7 @@ fun ChatWorkspaceView(
                             }
                             Spacer(modifier = Modifier.height(14.dp))
                             Text(
-                                text = if (activeThread?.incognito == true) "开启无痕对话" else "随身秘书已就绪",
+                                text = if (activeThread?.incognito == true) "开启无痕对话" else "随身助理已就绪",
                                 color = palette.textPrimary,
                                 fontSize = 18.sp,
                                 fontWeight = FontWeight.SemiBold
@@ -1193,8 +1193,8 @@ private fun EmptyChatWelcomeHero(
         }
     }
     val greetingTitle = brief?.let { "${it.greeting} · ${it.dateLabel}" } ?: fallbackGreeting
-    val subtitleLine = brief?.headline?.ifBlank { "$shortModelName · 随身秘书持续记忆中" }
-        ?: "$shortModelName · 随身秘书与知识库按需共鸣"
+    val subtitleLine = brief?.headline?.ifBlank { "$shortModelName · 随身助理持续记忆中" }
+        ?: "$shortModelName · 随身助理与知识库按需共鸣"
 
     Column(
         modifier = Modifier
@@ -1511,11 +1511,11 @@ private fun EmptyChatWelcomeHero(
         androidx.compose.material3.AlertDialog(
             onDismissRequest = { showMemoryDialog = false },
             containerColor = palette.composer,
-            title = { Text("随身秘书长期记忆（每行一条）", color = palette.textPrimary, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold) },
+            title = { Text("随身助理长期记忆（每行一条）", color = palette.textPrimary, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "所有个人偏好与工作原则完全透明可控，会在非无痕对话中自动注入，让秘书更懂你的节奏。",
+                        text = "所有个人偏好与工作原则完全透明可控，会在非无痕对话中自动注入，让随身助理更懂你的节奏。",
                         color = palette.textTertiary,
                         fontSize = 12.sp,
                         lineHeight = 17.sp
@@ -1858,16 +1858,26 @@ private fun ChatMessageTurn(
                     }
                 }
 
-                // Inline Native Calendar, Alarm & Phone OS Super-Tool Action Cards
-                msg.calendarActions.forEach { cal ->
-                    InlineCalendarActionCard(action = cal)
+                // Inline Native Calendar, Alarm & Phone OS Super-Tool Action Cards (Zero-Click Auto-Execution for fresh safe actions!)
+                msg.calendarActions.forEachIndexed { idx, cal ->
+                    InlineCalendarActionCard(
+                        action = cal,
+                        actionKey = "${msg.messageId}_cal_$idx",
+                        messageCreatedAtMs = msg.createdAtMs
+                    )
                 }
-                msg.alarmActions.forEach { alarm ->
-                    InlineAlarmActionCard(action = alarm)
+                msg.alarmActions.forEachIndexed { idx, alarm ->
+                    InlineAlarmActionCard(
+                        action = alarm,
+                        actionKey = "${msg.messageId}_alm_$idx",
+                        messageCreatedAtMs = msg.createdAtMs
+                    )
                 }
-                msg.phoneToolActions.forEach { toolAct ->
+                msg.phoneToolActions.forEachIndexed { idx, toolAct ->
                     InlinePhoneToolActionCard(
                         action = toolAct,
+                        actionKey = "${msg.messageId}_tool_$idx",
+                        messageCreatedAtMs = msg.createdAtMs,
                         onOpenInWebAppHub = { url, title -> onOpenWebAppHub(url, title) }
                     )
                 }
@@ -2001,17 +2011,85 @@ private fun StreamingAssistantTurn(state: com.oms.client.cockpit.StreamingTurnSt
     }
 }
 
+private object AutoExecutedActionRegistry {
+    private val seenKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private const val FRESH_WINDOW_MS = 25_000L
+
+    fun shouldAutoRunNow(actionKey: String, messageCreatedAtMs: Long): Boolean {
+        if (actionKey.isBlank()) return false
+        val ageMs = System.currentTimeMillis() - messageCreatedAtMs
+        if (ageMs < -5_000L || ageMs > FRESH_WINDOW_MS) return false
+        return seenKeys.add(actionKey)
+    }
+
+    fun isExecuted(actionKey: String): Boolean = seenKeys.contains(actionKey)
+}
+
 @Composable
 private fun InlinePhoneToolActionCard(
     action: com.oms.core.ai.ProposedPhoneToolAction,
+    actionKey: String = "",
+    messageCreatedAtMs: Long = 0L,
     onOpenInWebAppHub: (url: String, title: String) -> Unit
 ) {
     val context = LocalContext.current
     val palette = OmsTheme.colors
     val scope = rememberCoroutineScope()
-    var executed by remember { mutableStateOf(false) }
-    var isRunning by remember { mutableStateOf(false) }
-    var resultHint by remember { mutableStateOf("") }
+    var executed by remember(actionKey) { mutableStateOf(AutoExecutedActionRegistry.isExecuted(actionKey)) }
+    var isRunning by remember(actionKey) { mutableStateOf(false) }
+    var resultHint by remember(actionKey) { mutableStateOf("") }
+
+    val resolvedCallTarget by androidx.compose.runtime.produceState<com.oms.client.capability.ResolvedPhoneContact?>(
+        initialValue = null,
+        action.tool,
+        action.target
+    ) {
+        if (action.tool == "phone_call") {
+            value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                com.oms.client.capability.PhoneToolExecutor.resolveContactCandidates(context, action.target).firstOrNull()
+            }
+        }
+    }
+
+    fun runToolNow() {
+        isRunning = true
+        scope.launch {
+            val res = com.oms.client.capability.PhoneToolExecutor.execute(
+                context = context,
+                action = action,
+                onOpenInWebAppHub = onOpenInWebAppHub
+            )
+            isRunning = false
+            executed = res.ok
+            resultHint = res.message
+            OmsFeedbackController.show(
+                res.message,
+                if (res.ok) OmsToastKind.SUCCESS else OmsToastKind.WARNING
+            )
+        }
+    }
+
+    val permLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        runToolNow()
+    }
+
+    fun triggerWithPermissions() {
+        val missing = com.oms.client.capability.PhoneToolExecutor.requiredPermissionsForAction(context, action)
+        if (missing.isNotEmpty()) {
+            permLauncher.launch(missing.toTypedArray())
+        } else {
+            runToolNow()
+        }
+    }
+
+    // Zero-click auto-execution for all non-confirm actions (and confirmed phone calls!)
+    LaunchedEffect(actionKey, action.requiresConfirm) {
+        if (!action.requiresConfirm && AutoExecutedActionRegistry.shouldAutoRunNow(actionKey, messageCreatedAtMs)) {
+            triggerWithPermissions()
+        }
+    }
 
     val icon = when (action.tool) {
         "launch_app" -> OmsIcons.Bolt
@@ -2022,23 +2100,34 @@ private fun InlinePhoneToolActionCard(
         "set_volume" -> OmsIcons.Volume
         "clipboard_write" -> OmsIcons.Copy
         "open_system_settings" -> OmsIcons.Sliders
+        "mac_control" -> OmsIcons.Laptop
+        "phone_gui_action" -> OmsIcons.Smartphone
         else -> OmsIcons.Bolt
     }
     val actionBtnLabel = when {
         isRunning -> "正在执行…"
-        executed -> "已执行"
+        executed && action.tool == "phone_call" -> "再次呼叫"
+        executed -> "已自动执行 · 再次运行"
         action.tool == "open_in_browser" -> "应用舱内打开"
-        action.tool == "phone_call" -> "确认拨出"
+        action.tool == "phone_call" -> "确认立即拨出"
         action.tool == "send_sms" -> "打开短信草稿"
         action.tool == "launch_app" -> "立即打开"
         action.tool == "navigate_map" -> "开始导航"
         action.tool == "clipboard_write" -> "一键复制"
+        action.tool == "mac_control" -> "操控 Mac"
         else -> "立即执行"
+    }
+
+    val displayTitle = if (action.tool == "phone_call" && resolvedCallTarget != null) {
+        val rc = resolvedCallTarget!!
+        if (rc.displayName != rc.number) "呼叫：${rc.displayName} (${rc.number})" else "呼叫：${rc.number}"
+    } else {
+        action.title
     }
 
     OmsSurfaceCard(
         containerColor = palette.subtleSurface,
-        borderColor = if (action.requiresConfirm) palette.warning.copy(alpha = 0.45f) else palette.hairline,
+        borderColor = if (action.requiresConfirm && !executed) palette.warning.copy(alpha = 0.5f) else palette.hairline,
         cornerRadius = 16.dp,
         modifier = Modifier.fillMaxWidth()
     ) {
@@ -2053,18 +2142,23 @@ private fun InlinePhoneToolActionCard(
             ) {
                 Icon(icon, contentDescription = null, tint = palette.accent, modifier = Modifier.size(16.dp))
                 Text(
-                    text = if (action.requiresConfirm) "手机操作 · 需确认" else "手机超级工具",
-                    color = if (action.requiresConfirm) palette.warning else palette.textSecondary,
+                    text = when {
+                        executed -> "随身助理 · 已执行"
+                        action.requiresConfirm -> "通话安全确认 · 说“确认”或点按钮直呼"
+                        action.tool == "mac_control" -> "跨端遥控 Mac · 自动直行"
+                        else -> "手机超级工具 · 自动直行"
+                    },
+                    color = if (action.requiresConfirm && !executed) palette.warning else palette.textSecondary,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold
                 )
             }
             if (executed) {
-                Text("已完成", color = palette.success, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+                Text("✓ 已完成", color = palette.success, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
             }
         }
         Spacer(modifier = Modifier.height(6.dp))
-        Text(action.title, color = palette.textPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        Text(displayTitle, color = palette.textPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
         if (action.detail.isNotBlank()) {
             Spacer(modifier = Modifier.height(2.dp))
             Text(action.detail, color = palette.textSecondary, fontSize = 12.5.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -2079,32 +2173,20 @@ private fun InlinePhoneToolActionCard(
             icon = if (executed) OmsIcons.Check else icon,
             enabled = !isRunning,
             height = 36.dp,
-            onClick = {
-                isRunning = true
-                scope.launch {
-                    val res = com.oms.client.capability.PhoneToolExecutor.execute(
-                        context = context,
-                        action = action,
-                        onOpenInWebAppHub = onOpenInWebAppHub
-                    )
-                    isRunning = false
-                    executed = res.ok
-                    resultHint = res.message
-                    OmsFeedbackController.show(
-                        res.message,
-                        if (res.ok) OmsToastKind.SUCCESS else OmsToastKind.WARNING
-                    )
-                }
-            }
+            onClick = { triggerWithPermissions() }
         )
     }
 }
 
 @Composable
-private fun InlineCalendarActionCard(action: ProposedCalendarAction) {
+private fun InlineCalendarActionCard(
+    action: ProposedCalendarAction,
+    actionKey: String = "",
+    messageCreatedAtMs: Long = 0L
+) {
     val context = LocalContext.current
     val palette = OmsTheme.colors
-    var committed by remember { mutableStateOf(false) }
+    var committed by remember(actionKey) { mutableStateOf(AutoExecutedActionRegistry.isExecuted(actionKey)) }
     val endMs = action.startEpochMs + action.durationMinutes * 60_000L
     val conflictTitle = remember(action.startEpochMs, action.durationMinutes) {
         runCatching {
@@ -2120,6 +2202,30 @@ private fun InlineCalendarActionCard(action: ProposedCalendarAction) {
         SimpleDateFormat("MM月dd日 HH:mm", Locale.CHINA).format(Date(action.startEpochMs))
     }
 
+    fun commitEventNow() {
+        runCatching {
+            CalendarExecutor.insertEvent(
+                context,
+                JSONObject()
+                    .put("title", action.title)
+                    .put("startMs", action.startEpochMs)
+                    .put("endMs", endMs)
+                    .put("location", action.location)
+                    .put("description", action.description)
+            )
+            committed = true
+            OmsFeedbackController.show("已自动写入小米系统日历", OmsToastKind.SUCCESS)
+        }.onFailure {
+            OmsFeedbackController.show("写入失败，请检查日历权限", OmsToastKind.WARNING)
+        }
+    }
+
+    LaunchedEffect(actionKey, conflictTitle) {
+        if (conflictTitle.isNullOrBlank() && AutoExecutedActionRegistry.shouldAutoRunNow(actionKey, messageCreatedAtMs)) {
+            commitEventNow()
+        }
+    }
+
     OmsSurfaceCard(
         containerColor = palette.subtleSurface,
         borderColor = palette.hairline,
@@ -2131,16 +2237,16 @@ private fun InlineCalendarActionCard(action: ProposedCalendarAction) {
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Icon(OmsIcons.Calendar, contentDescription = null, tint = palette.accent, modifier = Modifier.size(16.dp))
-            Text("系统日历确认", color = palette.textSecondary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Text(if (committed) "系统日历 · 已写入" else "系统日历", color = palette.textSecondary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
         }
         Spacer(modifier = Modifier.height(6.dp))
         Text(action.title, color = palette.textPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
         Text("$timeStr · ${action.durationMinutes} 分钟", color = palette.textSecondary, fontSize = 13.sp)
         Spacer(modifier = Modifier.height(6.dp))
-        if (!conflictTitle.isNullOrBlank()) {
-            Text("时段存在已有日程：《$conflictTitle》", color = palette.warning, fontSize = 12.sp)
+        if (!conflictTitle.isNullOrBlank() && !committed) {
+            Text("时段存在已有日程：《$conflictTitle》，请确认是否仍写入", color = palette.warning, fontSize = 12.sp)
         } else {
-            Text("已核验该时段无日程冲突", color = palette.success, fontSize = 12.sp)
+            Text(if (committed) "✓ 已同步至手机系统日历" else "已核验该时段无日程冲突", color = palette.success, fontSize = 12.sp)
         }
         Spacer(modifier = Modifier.height(10.dp))
         OmsPrimaryButton(
@@ -2148,33 +2254,42 @@ private fun InlineCalendarActionCard(action: ProposedCalendarAction) {
             icon = if (committed) OmsIcons.Check else OmsIcons.Calendar,
             enabled = !committed,
             height = 36.dp,
-            onClick = {
-                runCatching {
-                    CalendarExecutor.insertEvent(
-                        context,
-                        JSONObject()
-                            .put("title", action.title)
-                            .put("startMs", action.startEpochMs)
-                            .put("endMs", endMs)
-                            .put("location", action.location)
-                            .put("description", action.description)
-                    )
-                    committed = true
-                    OmsFeedbackController.show("已写入小米系统日历", OmsToastKind.SUCCESS)
-                }.onFailure {
-                    OmsFeedbackController.show("写入失败，请检查日历权限", OmsToastKind.WARNING)
-                }
-            }
+            onClick = { commitEventNow() }
         )
     }
 }
 
 @Composable
-private fun InlineAlarmActionCard(action: ProposedAlarmAction) {
+private fun InlineAlarmActionCard(
+    action: ProposedAlarmAction,
+    actionKey: String = "",
+    messageCreatedAtMs: Long = 0L
+) {
     val context = LocalContext.current
     val palette = OmsTheme.colors
-    var committed by remember { mutableStateOf(false) }
+    var committed by remember(actionKey) { mutableStateOf(AutoExecutedActionRegistry.isExecuted(actionKey)) }
     val timeLabel = String.format(Locale.US, "%02d:%02d", action.hour, action.minute)
+
+    fun setAlarmNow() {
+        val res = AlarmExecutor.setSystemAlarm(
+            context,
+            JSONObject()
+                .put("hour", action.hour)
+                .put("minute", action.minute)
+                .put("label", action.label)
+                .put("days", JSONArray(action.daysOfWeek))
+        )
+        if (res.optBoolean("ok", false)) {
+            committed = true
+            OmsFeedbackController.show("已自动设定 $timeLabel 闹钟", OmsToastKind.SUCCESS)
+        }
+    }
+
+    LaunchedEffect(actionKey) {
+        if (AutoExecutedActionRegistry.shouldAutoRunNow(actionKey, messageCreatedAtMs)) {
+            setAlarmNow()
+        }
+    }
 
     OmsSurfaceCard(
         containerColor = palette.subtleSurface,
@@ -2211,20 +2326,7 @@ private fun InlineAlarmActionCard(action: ProposedAlarmAction) {
                 icon = if (committed) OmsIcons.Check else null,
                 enabled = !committed,
                 height = 36.dp,
-                onClick = {
-                    val res = AlarmExecutor.setSystemAlarm(
-                        context,
-                        JSONObject()
-                            .put("hour", action.hour)
-                            .put("minute", action.minute)
-                            .put("label", action.label)
-                            .put("days", JSONArray(action.daysOfWeek))
-                    )
-                    if (res.optBoolean("ok", false)) {
-                        committed = true
-                        OmsFeedbackController.show("已设定 $timeLabel 闹钟", OmsToastKind.SUCCESS)
-                    }
-                }
+                onClick = { setAlarmNow() }
             )
         }
     }

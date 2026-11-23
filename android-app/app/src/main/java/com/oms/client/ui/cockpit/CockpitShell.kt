@@ -182,7 +182,13 @@ fun OmsCockpitRootScreen() {
 
     var currentTab by remember { mutableStateOf(CockpitTab.CHAT) }
     var isChatThreadOpen by remember { mutableStateOf(false) }
-    val webAppHubState = remember { WebAppHubState() }
+    val webAppHubState = remember {
+        WebAppHubState(
+            onPersistTabs = { json -> app.edgeStore.saveOpenBrowserTabsJson(json) }
+        ).apply {
+            restoreFromJson(app.edgeStore.loadOpenBrowserTabsJson())
+        }
+    }
     DisposableEffect(Unit) {
         onDispose { webAppHubState.destroyWebView() }
     }
@@ -194,6 +200,8 @@ fun OmsCockpitRootScreen() {
     var initialSettingsTab by remember { mutableStateOf(SettingsStudioTab.APPEARANCE) }
     var showQuickThemeSheet by remember { mutableStateOf(false) }
     var showSpecimenGallery by remember { mutableStateOf(false) }
+    var showMemoryCenter by remember { mutableStateOf(false) }
+    var showMacRemoteControl by remember { mutableStateOf(false) }
 
     var searchQuery by remember { mutableStateOf("") }
     var drawerFocusSearchNonce by remember { mutableLongStateOf(0L) }
@@ -241,7 +249,7 @@ fun OmsCockpitRootScreen() {
         else -> palette.warning
     }
 
-    // Immersive state detection: hide bottom bar on deep views or when IME keyboard is open
+    // Immersive state detection: hide bottom bar on deep views (including active WebView!) so YouTube/pages get 100% bottom height!
     val isDeepChisuReader = currentTab == CockpitTab.CHISU && activeChisuDetail != null
     val isDeepAgentDetail = currentTab == CockpitTab.MISSION_HUB && selectedAgentSession != null
     val isDeepWebBrowser = currentTab == CockpitTab.WEB_APPS && webAppHubState.isBrowsing
@@ -283,6 +291,7 @@ fun OmsCockpitRootScreen() {
     Box(modifier = Modifier.fillMaxSize().background(palette.canvas)) {
         ModalNavigationDrawer(
             drawerState = drawerState,
+            gesturesEnabled = drawerState.isOpen || !(currentTab == CockpitTab.WEB_APPS && webAppHubState.isBrowsing),
             drawerContent = {
                 CockpitUnifiedDrawerSheet(
                     coordinator = coordinator,
@@ -314,6 +323,10 @@ fun OmsCockpitRootScreen() {
                     onOpenSpecimenGallery = {
                         scope.launch { drawerState.close() }
                         showSpecimenGallery = true
+                    },
+                    onOpenMemoryCenter = {
+                        scope.launch { drawerState.close() }
+                        showMemoryCenter = true
                     },
                     onOpenDropzone = {
                         missionSubViewTarget = "DROPZONE"
@@ -708,6 +721,8 @@ fun OmsCockpitRootScreen() {
                                             missionDispatchNonce = System.nanoTime()
                                             currentTab = CockpitTab.MISSION_HUB
                                         },
+                                        onOpenMemoryCenter = { showMemoryCenter = true },
+                                        onOpenMacRemoteControl = { showMacRemoteControl = true },
                                         onOpenApprovals = { currentTab = CockpitTab.MISSION_HUB },
                                         onResumeThread = { thr ->
                                             coordinator.chatRepo.selectThread(thr.threadId)
@@ -746,45 +761,55 @@ fun OmsCockpitRootScreen() {
                                 externalDispatchProjectPath = missionDispatchProjectPath,
                                 externalDispatchNonce = missionDispatchNonce,
                                 externalSubViewTarget = missionSubViewTarget,
-                                externalSubViewNonce = missionSubViewNonce
-                            )
-
-                            CockpitTab.WEB_APPS -> WebAppHubWorkspace(
-                                state = webAppHubState,
-                                openAddDialogNonce = webAppAddDialogNonce,
-                                onAskSecretaryWithPage = { pageTitle, pageUrl, body ->
-                                    openChatWithPrefill(
-                                        buildString {
-                                            appendLine("请作为我的随身秘书，帮我提炼这篇网页的核心要点并结合我的知识库给出建议：")
-                                            appendLine("- 标题：$pageTitle")
-                                            appendLine("- 链接：$pageUrl")
-                                            if (body.isNotBlank()) {
-                                                appendLine()
-                                                append(body.take(2600))
-                                            }
-                                        }
-                                    )
-                                },
-                                onSavePageToVault = { pageTitle, pageUrl, body ->
-                                    val md = buildString {
-                                        appendLine("# $pageTitle")
-                                        appendLine()
-                                        appendLine("- **来源链接**：$pageUrl")
-                                        appendLine()
-                                        append(body.ifBlank { pageUrl })
-                                    }
-                                    app.transportClient.submitItemToMacOrQueue(
-                                        intentTag = "pkb_vault",
-                                        itemType = "TEXT",
-                                        title = pageTitle.take(60),
-                                        textContent = md,
-                                        voiceTranscript = null,
-                                        fileUri = null
-                                    )
-                                    OmsFeedbackController.show("已推送网页内容至 Mac 知识库收件箱", OmsToastKind.SUCCESS)
+                                externalSubViewNonce = missionSubViewNonce,
+                                onOpenMacPairingSettings = {
+                                    initialSettingsTab = SettingsStudioTab.SYSTEM_PAIRING
+                                    showSettingsModal = true
                                 }
                             )
+
+                            CockpitTab.WEB_APPS -> Box(modifier = Modifier.fillMaxSize())
                         }
+                    }
+
+                    // Persistent Multi-Tab Browser Host Layer:
+                    // Stays mounted across tab switches when tabs are open so YouTube/WebViews never detach or reload!
+                    if (currentTab == CockpitTab.WEB_APPS || webAppHubState.hasOpenTabs) {
+                        WebAppHubWorkspace(
+                            state = webAppHubState,
+                            isForegroundVisible = currentTab == CockpitTab.WEB_APPS,
+                            openAddDialogNonce = webAppAddDialogNonce,
+                            onOpenDrawer = { scope.launch { drawerState.open() } },
+                            onSwitchToAssistant = {
+                                webAppHubState.pauseActiveVideosForJumpOut()
+                                currentTab = CockpitTab.CHAT
+                                isChatThreadOpen = false
+                            },
+                            onAskSecretaryWithPage = { pageTitle, pageUrl, body ->
+                                webAppHubState.pauseActiveVideosForJumpOut()
+                                openChatWithPrefill(
+                                    buildString {
+                                        appendLine("请作为我的随身助理，帮我提炼这篇内容的核心要点并结合我的知识库给出建议：")
+                                        appendLine("- 标题：$pageTitle")
+                                        appendLine("- 链接：$pageUrl")
+                                        if (body.isNotBlank()) {
+                                            appendLine()
+                                            append(body.take(2600))
+                                        }
+                                    }
+                                )
+                            },
+                            onCuratePageToKnowledgeBase = { pageTitle, pageUrl, pageAuthor, body, mode, onDone ->
+                                coordinator.curateBrowserContentToKnowledgeBase(
+                                    url = pageUrl,
+                                    title = pageTitle,
+                                    author = pageAuthor,
+                                    extractedText = body,
+                                    captureMode = mode,
+                                    onComplete = onDone
+                                )
+                            }
+                        )
                     }
 
                     // Global Floating Commute Audio Mini-Player Bar (when TTS is speaking)
@@ -819,11 +844,13 @@ fun OmsCockpitRootScreen() {
                     CockpitBottomNavBar(
                         currentTab = currentTab,
                         missionDotColor = missionDotColor,
-                        webAppActiveDot = webAppHubState.isBrowsing,
+                        webAppActiveDot = webAppHubState.hasOpenTabs,
                         onSelectTab = { chosen ->
                             coordinator.vibrateTick()
                             if (chosen == CockpitTab.CHAT) {
                                 isChatThreadOpen = false
+                            } else if (chosen == CockpitTab.WEB_APPS && currentTab == CockpitTab.WEB_APPS && webAppHubState.isBrowsing) {
+                                webAppHubState.exitToDock()
                             }
                             currentTab = chosen
                         }
@@ -952,6 +979,25 @@ fun OmsCockpitRootScreen() {
     }
 
     // Rename Thread Dialog
+    if (showMemoryCenter) {
+        MemoryCenterModal(
+            coordinator = coordinator,
+            macConnected = activeTier != "DISCONNECTED",
+            onOpenVaultDoc = { relPath -> coordinator.openVaultDoc(relPath) },
+            onDismiss = { showMemoryCenter = false }
+        )
+    }
+
+    if (showMacRemoteControl) {
+        val macName = app.repository.getPairedMac()?.macName?.ifBlank { "我的 Mac" } ?: "我的 Mac"
+        MacRemoteControlModal(
+            coordinator = coordinator,
+            activeTier = activeTier,
+            pairedMacName = macName,
+            onDismiss = { showMacRemoteControl = false }
+        )
+    }
+
     renamingThread?.let { target ->
         AlertDialog(
             onDismissRequest = { renamingThread = null },

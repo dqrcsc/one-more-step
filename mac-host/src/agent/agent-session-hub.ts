@@ -26,6 +26,7 @@ export interface SpawnedCliSpec {
   command: string;
   args: string[];
   cwd: string;
+  env?: Record<string, string>;
 }
 
 export type CliSpawnerFn = (spec: SpawnedCliSpec) => ChildProcess;
@@ -35,6 +36,8 @@ export interface AgentSessionHubOptions {
   codexSessionsDir?: string;
   agyBrainDir?: string;
   agyCliDir?: string;
+  workbuddyDir?: string;
+  opencodeDataDir?: string;
   defaultWorkspacePath?: string;
   cliSpawner?: CliSpawnerFn;
   appServerSpawner?: () => ChildProcess;
@@ -66,6 +69,8 @@ export class AgentSessionHub extends EventEmitter {
   private readonly codexSessionsDir: string;
   private readonly agyBrainDir: string;
   private readonly agyCliDir: string;
+  private readonly workbuddyDir: string;
+  private readonly opencodeDataDir: string;
   private readonly defaultWorkspacePath: string;
   private readonly hasCustomCliSpawner: boolean;
   private readonly cliSpawner: CliSpawnerFn;
@@ -87,6 +92,16 @@ export class AgentSessionHub extends EventEmitter {
     this.codexSessionsDir = opts.codexSessionsDir || path.join(os.homedir(), ".codex", "sessions");
     this.agyBrainDir = opts.agyBrainDir || path.join(os.homedir(), ".gemini", "antigravity", "brain");
     this.agyCliDir = opts.agyCliDir || path.join(os.homedir(), ".gemini", "antigravity-cli");
+    this.workbuddyDir =
+      opts.workbuddyDir ||
+      (process.env.OMS_TEST_ISOLATION === "1"
+        ? path.join(opts.omsHomeDir, "mock_workbuddy")
+        : path.join(os.homedir(), ".workbuddy"));
+    this.opencodeDataDir =
+      opts.opencodeDataDir ||
+      (process.env.OMS_TEST_ISOLATION === "1"
+        ? path.join(opts.omsHomeDir, "mock_opencode")
+        : path.join(os.homedir(), ".local", "share", "opencode"));
     this.defaultWorkspacePath = opts.defaultWorkspacePath || process.cwd();
     this.hasCustomCliSpawner = Boolean(opts.cliSpawner);
     this.appServerSpawner = opts.appServerSpawner;
@@ -95,7 +110,7 @@ export class AgentSessionHub extends EventEmitter {
       ((spec) =>
         spawn(spec.command, spec.args, {
           cwd: spec.cwd,
-          env: this.buildSpawnEnv(),
+          env: { ...this.buildSpawnEnv(), ...(spec.env || {}) },
           stdio: ["ignore", "pipe", "pipe"],
         }));
     this.loadPersistedTasks();
@@ -116,10 +131,12 @@ export class AgentSessionHub extends EventEmitter {
     const home = os.homedir();
     const extraPaths = [
       path.join(home, ".local", "bin"),
+      path.join(home, ".opencode", "bin"),
       path.join(home, ".bun", "bin"),
       "/opt/homebrew/bin",
       "/usr/local/bin",
       "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS",
+      "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin",
       "/usr/bin",
       "/bin",
     ];
@@ -129,7 +146,7 @@ export class AgentSessionHub extends EventEmitter {
     };
   }
 
-  public listSessions(limit = 24): AgentSessionSummary[] {
+  public listSessions(limit = 48): AgentSessionSummary[] {
     const byKey = new Map<string, AgentSessionSummary>();
     const codexMeta = this.loadCodexIndexMetadata();
 
@@ -156,6 +173,24 @@ export class AgentSessionHub extends EventEmitter {
       }
     }
 
+    // 4. Discover WorkBuddy (`~/.workbuddy/workbuddy.db`) sessions
+    for (const s of this.scanWorkBuddySessions(36)) {
+      const key = `workbuddy:${s.sessionId}`;
+      const existing = byKey.get(key);
+      if (!existing || (existing.status !== "running" && s.updatedAtMs >= existing.updatedAtMs)) {
+        byKey.set(key, existing ? { ...s, origin: existing.origin } : s);
+      }
+    }
+
+    // 5. Discover OpenCode (`~/.local/share/opencode/opencode.db`) sessions
+    for (const s of this.scanOpenCodeSessions(36)) {
+      const key = `opencode:${s.sessionId}`;
+      const existing = byKey.get(key);
+      if (!existing || (existing.status !== "running" && s.updatedAtMs >= existing.updatedAtMs)) {
+        byKey.set(key, existing ? { ...s, origin: existing.origin } : s);
+      }
+    }
+
     const sorted = Array.from(byKey.values())
       .map((s) => {
         const normWs = (s.workspacePath || "").trim().replace(/\/+$/, "");
@@ -172,10 +207,10 @@ export class AgentSessionHub extends EventEmitter {
         return b.updatedAtMs - a.updatedAtMs;
       });
 
-    return sorted.slice(0, Math.max(1, Math.min(80, limit)));
+    return sorted.slice(0, Math.max(1, Math.min(160, limit)));
   }
 
-  public getWorkspaceCatalog(sessionLimit = 48): AgentWorkspaceCatalogResult {
+  public getWorkspaceCatalog(sessionLimit = 96): AgentWorkspaceCatalogResult {
     const codexMeta = this.loadCodexIndexMetadata();
     const sessions = this.listSessions(sessionLimit);
     const projectsMap = new Map<string, AgentProjectItem>();
@@ -309,6 +344,8 @@ export class AgentSessionHub extends EventEmitter {
     return {
       codex: this.collectCodexQuota(),
       agy: this.collectAgyQuota(),
+      workbuddy: this.collectWorkBuddyQuota(),
+      opencode: this.collectOpenCodeQuota(),
       fetchedAtMs: Date.now(),
     };
   }
@@ -395,7 +432,11 @@ export class AgentSessionHub extends EventEmitter {
     const diskDetail =
       backend === "codex"
         ? this.readCodexSessionDetail(sessionId)
-        : this.readAgySessionDetail(sessionId);
+        : backend === "agy"
+          ? this.readAgySessionDetail(sessionId)
+          : backend === "workbuddy"
+            ? this.readWorkBuddySessionDetail(sessionId)
+            : this.readOpenCodeSessionDetail(sessionId);
 
     if (managed && diskDetail) {
       const lastDiskTs = diskDetail.steps.length > 0 ? diskDetail.steps[diskDetail.steps.length - 1].timestampMs : 0;
@@ -492,22 +533,49 @@ export class AgentSessionHub extends EventEmitter {
             ],
             cwd: workspace,
           }
-        : {
-            command: "agy",
-            args: this.hasCustomCliSpawner
-              ? ["--print", params.prompt, "--output-format", "stream-json"]
-              : [
-                  "--dangerously-skip-permissions",
-                  ...(agyProjectId ? ["--project", agyProjectId] : []),
-                  "--add-dir",
+        : params.backend === "workbuddy"
+          ? {
+              command: this.resolveWorkBuddyCliCommand(),
+              args: ["-p", "--output-format", "stream-json", "-y", params.prompt],
+              cwd: workspace,
+              env: {
+                CODEBUDDY_FORCE_LITE_WB_BUNDLE: "1",
+                CODEBUDDY_CONFIG_DIR: this.workbuddyDir,
+                CODEBUDDY_DATA_ROOT: this.workbuddyDir,
+              },
+            }
+          : params.backend === "opencode"
+            ? {
+                command: this.resolveOpenCodeCliCommand(),
+                args: [
+                  "run",
+                  "--format",
+                  "json",
+                  "--auto",
+                  "--dir",
                   workspace,
-                  "--print",
+                  "--title",
+                  summary.title,
                   params.prompt,
-                  "--output-format",
-                  "stream-json",
                 ],
-            cwd: workspace,
-          };
+                cwd: workspace,
+              }
+            : {
+                command: "agy",
+                args: this.hasCustomCliSpawner
+                  ? ["--print", params.prompt, "--output-format", "stream-json"]
+                  : [
+                      "--dangerously-skip-permissions",
+                      ...(agyProjectId ? ["--project", agyProjectId] : []),
+                      "--add-dir",
+                      workspace,
+                      "--print",
+                      params.prompt,
+                      "--output-format",
+                      "stream-json",
+                    ],
+                cwd: workspace,
+              };
 
     return this.launchManagedProcess(summary, [initialStep], spec);
   }
@@ -570,31 +638,58 @@ export class AgentSessionHub extends EventEmitter {
             args: ["exec", "resume", targetSessionId, "--skip-git-repo-check", "--json", params.prompt],
             cwd: workspace,
           }
-        : {
-            command: "agy",
-            args: this.hasCustomCliSpawner
-              ? [
-                  "--conversation",
-                  targetSessionId,
-                  "--print",
-                  params.prompt,
-                  "--output-format",
-                  "stream-json",
-                ]
-              : [
-                  "--dangerously-skip-permissions",
-                  ...(agyProjectId ? ["--project", agyProjectId] : []),
-                  "--add-dir",
+        : params.backend === "workbuddy"
+          ? {
+              command: this.resolveWorkBuddyCliCommand(),
+              args: ["-p", "--output-format", "stream-json", "-y", "-r", targetSessionId, params.prompt],
+              cwd: workspace,
+              env: {
+                CODEBUDDY_FORCE_LITE_WB_BUNDLE: "1",
+                CODEBUDDY_CONFIG_DIR: this.workbuddyDir,
+                CODEBUDDY_DATA_ROOT: this.workbuddyDir,
+              },
+            }
+          : params.backend === "opencode"
+            ? {
+                command: this.resolveOpenCodeCliCommand(),
+                args: [
+                  "run",
+                  "--format",
+                  "json",
+                  "--auto",
+                  "--dir",
                   workspace,
-                  "--conversation",
+                  "--session",
                   targetSessionId,
-                  "--print",
                   params.prompt,
-                  "--output-format",
-                  "stream-json",
                 ],
-            cwd: workspace,
-          };
+                cwd: workspace,
+              }
+            : {
+                command: "agy",
+                args: this.hasCustomCliSpawner
+                  ? [
+                      "--conversation",
+                      targetSessionId,
+                      "--print",
+                      params.prompt,
+                      "--output-format",
+                      "stream-json",
+                    ]
+                  : [
+                      "--dangerously-skip-permissions",
+                      ...(agyProjectId ? ["--project", agyProjectId] : []),
+                      "--add-dir",
+                      workspace,
+                      "--conversation",
+                      targetSessionId,
+                      "--print",
+                      params.prompt,
+                      "--output-format",
+                      "stream-json",
+                    ],
+                cwd: workspace,
+              };
 
     return this.launchManagedProcess(summary, priorSteps, spec);
   }
@@ -2561,8 +2656,11 @@ export class AgentSessionHub extends EventEmitter {
       const realId =
         obj.thread_id ||
         obj.session_id ||
+        obj.sessionID ||
+        obj.sessionId ||
         obj.conversation_id ||
         obj.conversationId ||
+        obj.part?.sessionID ||
         obj.payload?.id;
       if (typeof realId === "string" && realId.length >= 8) {
         onDiscoveredSessionId(realId);
@@ -2636,24 +2734,70 @@ export class AgentSessionHub extends EventEmitter {
             type.toUpperCase().includes("RESULT") ||
             type.toUpperCase().includes("PLANNER") ||
             type === "message" ||
+            type === "text" ||
             !type)
         ) {
+          const replyTitle =
+            backend === "workbuddy"
+              ? "🛠️ WorkBuddy 回复"
+              : backend === "opencode"
+                ? "⚡ OpenCode 回复"
+                : "🌌 Antigravity 回复";
           return {
             stepIndex: nextIndex,
             kind: "assistant",
-            title: "🌌 Antigravity 回复",
+            title: replyTitle,
             detail: text.slice(0, 1200),
             timestampMs: now,
           };
+        }
+        // OpenCode `--format json` part event (`obj.part`)
+        if (obj.part && typeof obj.part === "object") {
+          const pType = String(obj.part.type || "");
+          if (pType === "reasoning" && typeof obj.part.text === "string" && obj.part.text.trim()) {
+            return {
+              stepIndex: nextIndex,
+              kind: "thinking",
+              title: "💭 OpenCode 思考",
+              detail: obj.part.text.trim().slice(0, 500),
+              timestampMs: now,
+            };
+          }
+          if ((pType === "tool" || pType === "tool-invocation") && obj.part.tool) {
+            return {
+              stepIndex: nextIndex,
+              kind: "tool",
+              title: "🔧 调用工具",
+              detail: String(obj.part.tool || "tool").slice(0, 240),
+              timestampMs: now,
+            };
+          }
+          if (pType === "text" && typeof obj.part.text === "string" && obj.part.text.trim()) {
+            return {
+              stepIndex: nextIndex,
+              kind: "assistant",
+              title: "⚡ OpenCode 回复",
+              detail: obj.part.text.trim().slice(0, 1200),
+              timestampMs: now,
+            };
+          }
         }
       }
       return null;
     } catch {
       // Plain text line fallback
+      const plainTitle =
+        backend === "codex"
+          ? "🤖 Codex"
+          : backend === "workbuddy"
+            ? "🛠️ WorkBuddy"
+            : backend === "opencode"
+              ? "⚡ OpenCode"
+              : "🌌 Antigravity";
       return {
         stepIndex: nextIndex,
         kind: "assistant",
-        title: backend === "codex" ? "🤖 Codex" : "🌌 Antigravity",
+        title: plainTitle,
         detail: line.slice(0, 800),
         timestampMs: now,
       };
@@ -3901,6 +4045,453 @@ export class AgentSessionHub extends EventEmitter {
     };
     this.cachedAgyQuota = { fetchedAtMs: now, status };
     return status;
+  }
+
+  private resolveWorkBuddyCliCommand(): string {
+    if (this.hasCustomCliSpawner) return "codebuddy";
+    const appBundled = "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy";
+    if (fs.existsSync(appBundled)) return appBundled;
+    return "codebuddy";
+  }
+
+  private resolveOpenCodeCliCommand(): string {
+    if (this.hasCustomCliSpawner) return "opencode";
+    const homeBin = path.join(os.homedir(), ".opencode", "bin", "opencode");
+    if (fs.existsSync(homeBin)) return homeBin;
+    return "opencode";
+  }
+
+  private stripWorkBuddySystemReminder(raw: string): string {
+    return String(raw || "")
+      .replace(/<system-reminder[\s\S]*?<\/system-reminder>/gi, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  private scanWorkBuddySessions(limit: number): AgentSessionSummary[] {
+    const dbPath = path.join(this.workbuddyDir, "workbuddy.db");
+    if (!fs.existsSync(dbPath)) return [];
+    let db: Database | null = null;
+    try {
+      db = new Database(dbPath, { readonly: true });
+      const rows = db
+        .query(
+          `SELECT id, cwd, title, custom_title, status, created_at, updated_at, last_activity_at, model
+           FROM sessions
+           WHERE (deleted_at IS NULL OR deleted_at <= 0)
+           ORDER BY COALESCE(last_activity_at, updated_at, created_at) DESC
+           LIMIT $limit`
+        )
+        .all({ $limit: Math.max(1, limit) }) as Array<{
+        id: string;
+        cwd: string;
+        title?: string | null;
+        custom_title?: string | null;
+        status?: string | null;
+        created_at?: number | null;
+        updated_at?: number | null;
+        last_activity_at?: number | null;
+        model?: string | null;
+      }>;
+
+      return rows
+        .filter((r) => r && r.id)
+        .map((r) => {
+          const rawSt = String(r.status || "").toLowerCase();
+          const normStatus: AgentSessionSummary["status"] =
+            rawSt === "running" || rawSt === "in_progress"
+              ? "running"
+              : rawSt === "failed" || rawSt === "error"
+                ? "failed"
+                : rawSt === "completed" || rawSt === "done"
+                  ? "completed"
+                  : "idle";
+          const tsRaw = Number(r.last_activity_at || r.updated_at || r.created_at || Date.now());
+          const updatedAtMs = tsRaw < 1e11 ? tsRaw * 1000 : tsRaw;
+          const ws = String(r.cwd || this.defaultWorkspacePath).trim();
+          const title = String(r.custom_title || r.title || "WorkBuddy 会话").trim();
+          return {
+            sessionId: r.id,
+            backend: "workbuddy" as const,
+            origin: "desktop" as const,
+            title,
+            workspacePath: ws,
+            status: normStatus,
+            lastSummary: r.model ? `模型: ${r.model} · 状态: ${r.status || "idle"}` : title,
+            updatedAtMs,
+            canContinue: true,
+          };
+        });
+    } catch {
+      return [];
+    } finally {
+      try {
+        db?.close();
+      } catch {}
+    }
+  }
+
+  private findWorkBuddyTranscriptFile(sessionId: string): string | null {
+    const projectsRoot = path.join(this.workbuddyDir, "projects");
+    if (!fs.existsSync(projectsRoot)) return null;
+    try {
+      for (const projEntry of fs.readdirSync(projectsRoot, { withFileTypes: true })) {
+        if (!projEntry.isDirectory()) continue;
+        const candidate = path.join(projectsRoot, projEntry.name, `${sessionId}.jsonl`);
+        if (fs.existsSync(candidate)) return candidate;
+      }
+    } catch {}
+    return null;
+  }
+
+  private readWorkBuddySessionDetail(sessionId: string): AgentSessionDetailResult | null {
+    const scanned = this.scanWorkBuddySessions(80);
+    const meta = scanned.find((s) => s.sessionId === sessionId);
+    const jsonlPath = this.findWorkBuddyTranscriptFile(sessionId);
+    if (!meta && !jsonlPath) return null;
+
+    const steps: AgentStepItem[] = [];
+    let lastSummary = meta?.lastSummary || "";
+    if (jsonlPath && fs.existsSync(jsonlPath)) {
+      const lines = this.readJsonlBoundedLines(jsonlPath, 64 * 1024, 384 * 1024, true);
+      for (const line of lines) {
+        try {
+          const obj = JSON.parse(line);
+          const tsRaw = Number(obj?.timestamp || Date.now());
+          const ts = tsRaw < 1e11 ? tsRaw * 1000 : tsRaw;
+          if (obj?.type === "message" && (obj.role === "user" || obj.role === "assistant")) {
+            const parts = Array.isArray(obj.content) ? obj.content : [];
+            const rawText = parts
+              .map((p: any) => (typeof p === "string" ? p : typeof p?.text === "string" ? p.text : ""))
+              .filter(Boolean)
+              .join("\n");
+            const cleaned =
+              obj.role === "user" ? this.stripWorkBuddySystemReminder(rawText) : rawText.trim();
+            if (!cleaned) continue;
+            steps.push({
+              stepIndex: steps.length + 1,
+              kind: obj.role === "user" ? "user" : "assistant",
+              title: obj.role === "user" ? "👤 用户输入" : "🛠️ WorkBuddy 回复",
+              detail: cleaned.slice(0, 2400),
+              timestampMs: ts,
+            });
+            if (obj.role === "assistant") {
+              lastSummary = cleaned.slice(0, 160);
+            }
+          } else if (obj?.type === "tool_use" || obj?.type === "function_call") {
+            steps.push({
+              stepIndex: steps.length + 1,
+              kind: "tool",
+              title: `🔧 ${String(obj.name || "工具调用")}`,
+              detail: JSON.stringify(obj.input || obj.arguments || {}).slice(0, 320),
+              timestampMs: ts,
+            });
+          }
+        } catch {}
+      }
+    }
+
+    const session: AgentSessionSummary = meta
+      ? { ...meta, lastSummary: lastSummary || meta.lastSummary }
+      : {
+          sessionId,
+          backend: "workbuddy",
+          origin: "desktop",
+          title: "WorkBuddy 会话",
+          workspacePath: this.defaultWorkspacePath,
+          status: "completed",
+          lastSummary: lastSummary || "WorkBuddy 历史会话",
+          updatedAtMs: Date.now(),
+          canContinue: true,
+        };
+
+    return { session, steps };
+  }
+
+  private collectWorkBuddyQuota(): AgentBackendQuotaStatus {
+    const now = Date.now();
+    const cliBin = "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy";
+    const dbPath = path.join(this.workbuddyDir, "workbuddy.db");
+    const available =
+      fs.existsSync(cliBin) ||
+      fs.existsSync("/Applications/WorkBuddy.app") ||
+      fs.existsSync(dbPath);
+    if (!available) {
+      return {
+        backend: "workbuddy",
+        available: false,
+        planLabel: "WorkBuddy",
+        windows: [],
+        statusNote: "本机未检测到 WorkBuddy",
+        capturedAtMs: now,
+      };
+    }
+    const sessions = this.scanWorkBuddySessions(30);
+    let latestModel = "auto";
+    if (fs.existsSync(dbPath)) {
+      let db: Database | null = null;
+      try {
+        db = new Database(dbPath, { readonly: true });
+        const row = db
+          .query(`SELECT model FROM sessions WHERE model IS NOT NULL AND model != '' ORDER BY updated_at DESC LIMIT 1`)
+          .get() as { model?: string } | null;
+        if (row?.model) latestModel = row.model;
+      } catch {} finally {
+        try {
+          db?.close();
+        } catch {}
+      }
+    }
+    return {
+      backend: "workbuddy",
+      available: true,
+      planLabel: "WorkBuddy Desktop & CLI",
+      activeModel: latestModel,
+      windows: [],
+      creditsSummary: `已同步 ${sessions.length} 个本地会话`,
+      statusNote: "运行正常 · 支持新建与恢复会话",
+      capturedAtMs: now,
+    };
+  }
+
+  private parseOpenCodeModelLabel(rawModel: string | null | undefined): string {
+    if (!rawModel) return "";
+    try {
+      const parsed = JSON.parse(rawModel);
+      if (parsed && typeof parsed === "object") {
+        return String(parsed.id || parsed.modelID || "").trim();
+      }
+    } catch {}
+    return String(rawModel).trim();
+  }
+
+  private scanOpenCodeSessions(limit: number): AgentSessionSummary[] {
+    const dbPath = path.join(this.opencodeDataDir, "opencode.db");
+    if (!fs.existsSync(dbPath)) return [];
+    let db: Database | null = null;
+    try {
+      db = new Database(dbPath, { readonly: true });
+      const rows = db
+        .query(
+          `SELECT s.id, s.directory, s.title, s.time_updated, s.time_created, s.model, p.worktree, p.name AS project_name
+           FROM session s
+           LEFT JOIN project p ON p.id = s.project_id
+           WHERE s.time_archived IS NULL
+           ORDER BY s.time_updated DESC
+           LIMIT $limit`
+        )
+        .all({ $limit: Math.max(1, limit) }) as Array<{
+        id: string;
+        directory: string;
+        title: string;
+        time_updated: number;
+        time_created: number;
+        model?: string | null;
+        worktree?: string | null;
+        project_name?: string | null;
+      }>;
+
+      return rows
+        .filter((r) => r && r.id)
+        .map((r) => {
+          const rawDir = String(r.directory || r.worktree || "").trim();
+          const ws = rawDir && rawDir !== "/" ? rawDir : this.defaultWorkspacePath;
+          const modelLabel = this.parseOpenCodeModelLabel(r.model);
+          const updatedAtMs = Number(r.time_updated || r.time_created || Date.now());
+          const title = String(r.title || "OpenCode 会话").trim();
+          return {
+            sessionId: r.id,
+            backend: "opencode" as const,
+            origin: "desktop" as const,
+            title,
+            workspacePath: ws,
+            projectDisplayName: r.project_name || undefined,
+            status: "completed" as const,
+            lastSummary: modelLabel ? `模型: ${modelLabel} · ${title}` : title,
+            updatedAtMs: updatedAtMs < 1e11 ? updatedAtMs * 1000 : updatedAtMs,
+            canContinue: true,
+          };
+        });
+    } catch {
+      return [];
+    } finally {
+      try {
+        db?.close();
+      } catch {}
+    }
+  }
+
+  private readOpenCodeSessionDetail(sessionId: string): AgentSessionDetailResult | null {
+    const dbPath = path.join(this.opencodeDataDir, "opencode.db");
+    if (!fs.existsSync(dbPath)) return null;
+    const scanned = this.scanOpenCodeSessions(80);
+    const meta = scanned.find((s) => s.sessionId === sessionId);
+    let db: Database | null = null;
+    try {
+      db = new Database(dbPath, { readonly: true });
+      const sessionRow =
+        meta ||
+        (() => {
+          const r = db!
+            .query(`SELECT id, directory, title, time_updated, model FROM session WHERE id = $id LIMIT 1`)
+            .get({ $id: sessionId }) as
+            | { id: string; directory: string; title: string; time_updated: number; model?: string }
+            | null;
+          if (!r) return null;
+          return {
+            sessionId: r.id,
+            backend: "opencode" as const,
+            origin: "desktop" as const,
+            title: r.title || "OpenCode 会话",
+            workspacePath: r.directory && r.directory !== "/" ? r.directory : this.defaultWorkspacePath,
+            status: "completed" as const,
+            lastSummary: r.title || "",
+            updatedAtMs: r.time_updated || Date.now(),
+            canContinue: true,
+          };
+        })();
+      if (!sessionRow) return null;
+
+      const msgRows = db
+        .query(
+          `SELECT id, time_created, data FROM message WHERE session_id = $sid ORDER BY time_created ASC LIMIT 240`
+        )
+        .all({ $sid: sessionId }) as Array<{ id: string; time_created: number; data: string }>;
+      const partRows = db
+        .query(
+          `SELECT message_id, time_created, data FROM part WHERE session_id = $sid ORDER BY time_created ASC, id ASC LIMIT 800`
+        )
+        .all({ $sid: sessionId }) as Array<{ message_id: string; time_created: number; data: string }>;
+
+      const partsByMsg = new Map<string, Array<{ ts: number; obj: Record<string, any> }>>();
+      for (const pr of partRows) {
+        try {
+          const obj = JSON.parse(pr.data);
+          const arr = partsByMsg.get(pr.message_id) || [];
+          arr.push({ ts: pr.time_created, obj });
+          partsByMsg.set(pr.message_id, arr);
+        } catch {}
+      }
+
+      const steps: AgentStepItem[] = [];
+      let lastSummary = sessionRow.lastSummary;
+      for (const mr of msgRows) {
+        let mObj: Record<string, any> = {};
+        try {
+          mObj = JSON.parse(mr.data);
+        } catch {}
+        const role = String(mObj.role || "");
+        const mParts = partsByMsg.get(mr.id) || [];
+
+        if (role === "user") {
+          const textParts = mParts
+            .filter((p) => p.obj.type === "text" && typeof p.obj.text === "string")
+            .map((p) => String(p.obj.text).trim())
+            .filter(Boolean);
+          const fallbackTitle = String(mObj.summary?.title || "").trim();
+          const userText = textParts.join("\n") || fallbackTitle;
+          if (userText) {
+            steps.push({
+              stepIndex: steps.length + 1,
+              kind: "user",
+              title: "👤 用户提问",
+              detail: userText.slice(0, 2400),
+              timestampMs: mr.time_created,
+            });
+          }
+        } else {
+          for (const p of mParts) {
+            const pt = String(p.obj.type || "");
+            if (pt === "reasoning" && typeof p.obj.text === "string" && p.obj.text.trim()) {
+              steps.push({
+                stepIndex: steps.length + 1,
+                kind: "thinking",
+                title: "💭 推理思考",
+                detail: p.obj.text.trim().slice(0, 600),
+                timestampMs: p.ts,
+              });
+            } else if (pt === "tool" || pt === "tool-invocation") {
+              const tName = String(p.obj.tool || p.obj.name || "工具调用");
+              steps.push({
+                stepIndex: steps.length + 1,
+                kind: "tool",
+                title: `🔧 ${tName}`,
+                detail: JSON.stringify(p.obj.state?.input || p.obj.input || {}).slice(0, 320),
+                timestampMs: p.ts,
+              });
+            } else if (pt === "text" && typeof p.obj.text === "string" && p.obj.text.trim()) {
+              const txt = p.obj.text.trim();
+              steps.push({
+                stepIndex: steps.length + 1,
+                kind: "assistant",
+                title: "⚡ OpenCode 回复",
+                detail: txt.slice(0, 2400),
+                timestampMs: p.ts,
+              });
+              lastSummary = txt.slice(0, 160);
+            }
+          }
+        }
+      }
+
+      return {
+        session: { ...sessionRow, lastSummary: lastSummary || sessionRow.lastSummary },
+        steps,
+      };
+    } catch {
+      return null;
+    } finally {
+      try {
+        db?.close();
+      } catch {}
+    }
+  }
+
+  private collectOpenCodeQuota(): AgentBackendQuotaStatus {
+    const now = Date.now();
+    const homeBin = path.join(os.homedir(), ".opencode", "bin", "opencode");
+    const dbPath = path.join(this.opencodeDataDir, "opencode.db");
+    const available =
+      fs.existsSync(homeBin) ||
+      fs.existsSync("/Applications/OpenCode.app") ||
+      fs.existsSync(dbPath);
+    if (!available) {
+      return {
+        backend: "opencode",
+        available: false,
+        planLabel: "OpenCode",
+        windows: [],
+        statusNote: "本机未检测到 OpenCode",
+        capturedAtMs: now,
+      };
+    }
+    const sessions = this.scanOpenCodeSessions(30);
+    let latestModel = "OpenCode";
+    if (fs.existsSync(dbPath)) {
+      let db: Database | null = null;
+      try {
+        db = new Database(dbPath, { readonly: true });
+        const row = db
+          .query(`SELECT model FROM session WHERE model IS NOT NULL AND model != '' ORDER BY time_updated DESC LIMIT 1`)
+          .get() as { model?: string } | null;
+        const parsed = this.parseOpenCodeModelLabel(row?.model);
+        if (parsed) latestModel = parsed;
+      } catch {} finally {
+        try {
+          db?.close();
+        } catch {}
+      }
+    }
+    return {
+      backend: "opencode",
+      available: true,
+      planLabel: "OpenCode Desktop & CLI",
+      activeModel: latestModel,
+      windows: [],
+      creditsSummary: `已同步 ${sessions.length} 个本地会话`,
+      statusNote: "运行正常 · 支持 opencode run 新建与接续",
+      capturedAtMs: now,
+    };
   }
 
   private cleanBoilerplatePrompt(raw: string): string {

@@ -8,6 +8,7 @@ import crypto from "node:crypto";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { synthesizeNeuralAudio, neuralTtsPython, type TtsFallbackReason } from "./neural-tts.js";
 import {
+  AgentBackendType,
   AgentSessionContinueParams,
   AgentSessionStartParams,
   AgentSessionStreamEventParams,
@@ -15,6 +16,8 @@ import {
   ApprovalRespondParams,
   buildPairingUri,
   ChatSyncBatchParams,
+  CurateBrowserUrlParams,
+  CurateBrowserUrlResult,
   DecodedScreenFrame,
   encodeScreenFrame,
   FRAME_HEADER_BYTES,
@@ -25,6 +28,7 @@ import {
   InboxSubmitItemParams,
   IntentTag,
   JsonRpcRequest,
+  MacControlExecuteParams,
   MemoryPromoteVaultParams,
   MirrorStatusSnapshot,
   OMS_BLE_SERVICE_SHORT_UUID,
@@ -47,6 +51,12 @@ import { MobileMemoryMirror } from "../memory/mobile-memory-mirror.js";
 import { SecretaryCore } from "../memory/secretary-core.js";
 import { importEpubToVault, listImportedBooks } from "../knowledge/epub-importer.js";
 import { AgentSessionHub, type AgentSessionHubOptions } from "../agent/agent-session-hub.js";
+import { MacOsController, type MacControlRuntimeContext } from "./mac-os-controller.js";
+
+function normalizeAgentBackend(raw: unknown): AgentBackendType {
+  if (raw === "agy" || raw === "workbuddy" || raw === "opencode") return raw;
+  return "codex";
+}
 
 export interface OmsHostConfig {
   lanPort: number;
@@ -124,6 +134,7 @@ export class OmsDaemon {
   public readonly memoryMirror: MobileMemoryMirror;
   public readonly secretary: SecretaryCore;
   public readonly agentHub: AgentSessionHub;
+  public readonly macControl: MacOsController;
 
   private readonly configPath: string;
   private readonly wechatPendingPhoneQueuePath: string;
@@ -235,6 +246,7 @@ export class OmsDaemon {
       wechatEnvPath: path.join(this.wechat.wechatHomeDir, ".env"),
     });
     this.secretary = new SecretaryCore(this.homeDir);
+    this.macControl = new MacOsController(repoRoot);
     this.agentHub = new AgentSessionHub({
       omsHomeDir: this.homeDir,
       defaultWorkspacePath: repoRoot,
@@ -465,6 +477,16 @@ export class OmsDaemon {
     this.saveConfig();
     this.applyStayAwakeState();
     return this.getStayAwakeStatus();
+  }
+
+  private buildMacControlContext(): MacControlRuntimeContext {
+    return {
+      macId: this.identity.deviceId,
+      macName: os.hostname().replace(/\.local$/i, "") || "Mac",
+      activeTier: this.session.getActiveTier(),
+      stayAwakeEnabled: Boolean(this.config.stayAwakeEnabled),
+      onSetStayAwake: (en: boolean) => this.setStayAwakeEnabled(en).enabled,
+    };
   }
 
   private applyStayAwakeState(): void {
@@ -1254,6 +1276,25 @@ export class OmsDaemon {
                 });
               }
             })();
+          } else if (req.method === "chisu.curate_url") {
+            const p = (req.params || {}) as CurateBrowserUrlParams;
+            void this.curateBrowserUrlToVaultAndContext(p)
+              .then((res) => reply({ result: res }))
+              .catch((err: any) =>
+                reply({
+                  result: {
+                    ok: false,
+                    url: String(p.url || ""),
+                    title: String(p.title || p.url || ""),
+                    mediaKind: "article",
+                    shortSummary: "",
+                    error: err?.message || String(err),
+                  } satisfies CurateBrowserUrlResult,
+                })
+              );
+          } else if (req.method === "chisu.recent_curated") {
+            const p = (req.params || {}) as { limit?: number };
+            reply({ result: { ok: true, items: this.memoryMirror.getRecentCuratedContext(p.limit ?? 8) } });
           } else if (req.method === "wechat.articles.list") {
             const p = (req.params || {}) as { limit?: number };
             void this.wechat
@@ -1352,29 +1393,113 @@ export class OmsDaemon {
             const p = (req.params || {}) as { id?: string };
             this.secretary.dismissNudge(String(p.id || ""));
             reply({ result: { ok: true } });
+          } else if (req.method === "memory.center.get") {
+            const snapshot = this.secretary.buildMemoryCenterSnapshot({
+              workingMemoryItems: this.memoryMirror.loadWorkingMemory(),
+              vaultRoot: this.memoryMirror.resolveVaultRoot(),
+            });
+            reply({ result: { ok: true, snapshot } });
+          } else if (req.method === "memory.entry.upsert") {
+            const p = (req.params || {}) as {
+              id?: string;
+              text?: string;
+              source?: "manual" | "auto";
+              originDetail?: string;
+            };
+            const entry = this.secretary.addOrUpdateMemoryEntry({
+              id: p.id,
+              text: String(p.text || ""),
+              source: p.source || "manual",
+              originDetail: p.originDetail,
+            });
+            reply({ result: { ok: true, entry } });
+          } else if (req.method === "memory.entry.delete") {
+            const p = (req.params || {}) as { id?: string; text?: string; category?: string };
+            const target = String(p.text || p.id || "");
+            const isWorking = p.category === "working" || String(p.id || "").startsWith("wm_");
+            const deleted = isWorking
+              ? this.memoryMirror.deleteWorkingMemoryItem(target)
+              : this.secretary.deleteMemoryEntry(String(p.id || p.text || ""), true) ||
+                (p.text ? this.secretary.deleteMemoryEntry(String(p.text), true) : false);
+            reply({ result: { ok: deleted } });
+          } else if (req.method === "mac.control.status") {
+            const p = (req.params || {}) as { refreshApps?: boolean };
+            void this.macControl
+              .getStatusSnapshotAsync(this.buildMacControlContext(), Boolean(p.refreshApps))
+              .then((status) => reply({ result: { ok: true, status } }))
+              .catch(() =>
+                reply({
+                  result: {
+                    ok: true,
+                    status: this.macControl.getStatusSnapshot(this.buildMacControlContext(), Boolean(p.refreshApps)),
+                  },
+                })
+              );
+          } else if (req.method === "mac.control.execute") {
+            const p = (req.params || {}) as MacControlExecuteParams;
+            void this.macControl
+              .execute(p, this.buildMacControlContext())
+              .then((res) => reply({ result: res }))
+              .catch((err: any) =>
+                reply({
+                  error: {
+                    code: -32000,
+                    message: err?.message || "Mac control failed",
+                  },
+                })
+              );
+          } else if (req.method === "mac.control.set_unlock_password") {
+            const p = (req.params || {}) as { password?: string };
+            const ok = this.macControl.setUnlockPassword(String(p.password || ""));
+            reply({
+              result: {
+                ok,
+                status: this.macControl.getStatusSnapshot(this.buildMacControlContext()),
+              },
+            });
+          } else if (req.method === "mac.control.clear_unlock_password") {
+            const ok = this.macControl.clearUnlockPassword();
+            reply({
+              result: {
+                ok,
+                status: this.macControl.getStatusSnapshot(this.buildMacControlContext()),
+              },
+            });
           } else if (req.method === "agent.sessions.list") {
             const p = (req.params || {}) as { limit?: number };
-            reply({ result: { sessions: this.agentHub.listSessions(p.limit ?? 48) } });
+            reply({ result: { sessions: this.agentHub.listSessions(p.limit ?? 96) } });
           } else if (req.method === "agent.workspace_catalog" || req.method === "agent.projects.list") {
             const p = (req.params || {}) as { limit?: number };
-            reply({ result: this.agentHub.getWorkspaceCatalog(p.limit ?? 48) });
+            reply({ result: this.agentHub.getWorkspaceCatalog(p.limit ?? 96) });
           } else if (req.method === "agent.quotas") {
             reply({ result: this.agentHub.getQuotasSnapshot() });
           } else if (req.method === "agent.session.detail") {
-            const p = (req.params || {}) as { backend: "codex" | "agy"; sessionId: string };
-            const detail = this.agentHub.getSessionDetail(p.backend || "codex", String(p.sessionId || ""));
+            const p = (req.params || {}) as { backend?: string; sessionId: string };
+            const detail = this.agentHub.getSessionDetail(
+              normalizeAgentBackend(p.backend),
+              String(p.sessionId || "")
+            );
             reply({ result: detail });
           } else if (req.method === "agent.session.start") {
-            const started = this.agentHub.startSession((req.params || {}) as AgentSessionStartParams);
+            const p = (req.params || {}) as AgentSessionStartParams;
+            const started = this.agentHub.startSession({
+              ...p,
+              prompt: this.enrichAgentPromptWithRecentCurated(p.prompt),
+            });
             reply({ result: { ok: true, session: started } });
           } else if (req.method === "agent.session.continue") {
-            const resumed = this.agentHub.continueSession(
-              (req.params || {}) as AgentSessionContinueParams
-            );
+            const p = (req.params || {}) as AgentSessionContinueParams;
+            const resumed = this.agentHub.continueSession({
+              ...p,
+              prompt: this.enrichAgentPromptWithRecentCurated(p.prompt),
+            });
             reply({ result: { ok: true, session: resumed } });
           } else if (req.method === "agent.session.cancel") {
-            const p = (req.params || {}) as { backend: "codex" | "agy"; sessionId: string };
-            const cancelled = this.agentHub.cancelSession(p.backend || "codex", String(p.sessionId || ""));
+            const p = (req.params || {}) as { backend?: string; sessionId: string };
+            const cancelled = this.agentHub.cancelSession(
+              normalizeAgentBackend(p.backend),
+              String(p.sessionId || "")
+            );
             reply({ result: { ok: cancelled } });
           } else {
             reply({ result: { ack: true } });
@@ -2808,6 +2933,18 @@ export class OmsDaemon {
         return await this.syncEdgeConfigAndCapsuleToPhone(true);
       }
 
+      case "chisu.curate_url": {
+        return await this.curateBrowserUrlToVaultAndContext(params as unknown as CurateBrowserUrlParams);
+      }
+
+      case "chisu.recent_curated": {
+        return {
+          ok: true,
+          items: this.memoryMirror.getRecentCuratedContext(Number(params.limit) || 8),
+          workingMemory: this.memoryMirror.loadWorkingMemory(),
+        };
+      }
+
       case "agent.sessions.list": {
         return this.agentHub.getWorkspaceCatalog(Number(params.limit) || 48);
       }
@@ -2821,7 +2958,7 @@ export class OmsDaemon {
       }
 
       case "agent.session.detail": {
-        const backend = params.backend === "agy" ? "agy" : "codex";
+        const backend = normalizeAgentBackend(params.backend);
         return this.agentHub.getSessionDetail(backend, String(params.sessionId || ""));
       }
 
@@ -2836,8 +2973,64 @@ export class OmsDaemon {
       }
 
       case "agent.session.cancel": {
-        const backend = params.backend === "agy" ? "agy" : "codex";
+        const backend = normalizeAgentBackend(params.backend);
         return { ok: this.agentHub.cancelSession(backend, String(params.sessionId || "")) };
+      }
+
+      case "memory.center.get": {
+        return {
+          ok: true,
+          snapshot: this.secretary.buildMemoryCenterSnapshot({
+            workingMemoryItems: this.memoryMirror.loadWorkingMemory(),
+            vaultRoot: this.memoryMirror.resolveVaultRoot(),
+          }),
+        };
+      }
+
+      case "memory.entry.upsert": {
+        const entry = this.secretary.addOrUpdateMemoryEntry({
+          id: typeof params.id === "string" ? params.id : undefined,
+          text: String(params.text || ""),
+          source: params.source === "auto" ? "auto" : "manual",
+          originDetail: typeof params.originDetail === "string" ? params.originDetail : undefined,
+        });
+        return { ok: true, entry };
+      }
+
+      case "memory.entry.delete": {
+        const target = String(params.text || params.id || "");
+        const isWorking = params.category === "working" || String(params.id || "").startsWith("wm_");
+        const deleted = isWorking
+          ? this.memoryMirror.deleteWorkingMemoryItem(target)
+          : this.secretary.deleteMemoryEntry(String(params.id || params.text || ""), true);
+        return { ok: deleted };
+      }
+
+      case "mac.control.status": {
+        return {
+          ok: true,
+          status: await this.macControl.getStatusSnapshotAsync(
+            this.buildMacControlContext(),
+            Boolean(params.refreshApps)
+          ),
+        };
+      }
+
+      case "mac.control.execute": {
+        return await this.macControl.execute(
+          params as unknown as MacControlExecuteParams,
+          this.buildMacControlContext()
+        );
+      }
+
+      case "mac.control.set_unlock_password": {
+        const ok = this.macControl.setUnlockPassword(String(params.password || ""));
+        return { ok, status: this.macControl.getStatusSnapshot(this.buildMacControlContext()) };
+      }
+
+      case "mac.control.clear_unlock_password": {
+        const ok = this.macControl.clearUnlockPassword();
+        return { ok, status: this.macControl.getStatusSnapshot(this.buildMacControlContext()) };
       }
 
       case "memory.search_vault": {
@@ -3989,5 +4182,136 @@ export class OmsDaemon {
     this.agentHub.stopAll();
     this.memoryMirror.close();
     await this.session.stop();
+  }
+
+  private canonicalizeCurateUrl(rawUrl: string): string {
+    const trimmed = String(rawUrl || "").trim();
+    try {
+      const u = new URL(trimmed);
+      const host = u.hostname.toLowerCase();
+      if (host === "youtu.be") {
+        const vid = u.pathname.replace(/^\/+/, "").split("/")[0]?.trim();
+        if (vid && /^[\w-]{6,20}$/.test(vid)) return `https://www.youtube.com/watch?v=${vid}`;
+      }
+      if (host === "youtube.com" || host.endsWith(".youtube.com")) {
+        if (u.pathname === "/watch") {
+          const vid = u.searchParams.get("v")?.trim();
+          if (vid && /^[\w-]{6,20}$/.test(vid)) return `https://www.youtube.com/watch?v=${vid}`;
+        }
+        const m = u.pathname.match(/^\/(shorts|live)\/([\w-]{6,20})/);
+        if (m) return `https://www.youtube.com/${m[1]}/${m[2]}`;
+      }
+      u.hash = "";
+      return u.toString();
+    } catch {
+      return trimmed;
+    }
+  }
+
+  public async curateBrowserUrlToVaultAndContext(
+    params: CurateBrowserUrlParams
+  ): Promise<CurateBrowserUrlResult> {
+    const cleanUrl = this.canonicalizeCurateUrl(params.url);
+    if (!cleanUrl || !/^https?:\/\//i.test(cleanUrl)) {
+      return {
+        ok: false,
+        url: cleanUrl,
+        title: String(params.title || ""),
+        mediaKind: "article",
+        shortSummary: "",
+        error: "无效的网页或视频链接",
+      };
+    }
+
+    const vaultRoot = this.memoryMirror.resolveVaultRoot();
+    let result: CurateBrowserUrlResult;
+
+    const wxRes = await this.wechat.ingestUrlToVault({
+      url: cleanUrl,
+      title: params.title,
+      author: params.author,
+      userNote: params.userNote,
+      fallbackMarkdown: params.extractedText,
+    });
+
+    if (wxRes.ok && wxRes.article) {
+      const mediaKind: "video" | "article" =
+        wxRes.article.mediaKind === "video" ? "video" : "article";
+      const relNotePath =
+        wxRes.notePath && wxRes.notePath.startsWith(vaultRoot)
+          ? path.relative(vaultRoot, wxRes.notePath).replace(/\\/g, "/")
+          : undefined;
+      result = {
+        ok: true,
+        articleId: wxRes.article.id,
+        url: wxRes.article.url || cleanUrl,
+        title: wxRes.article.title || params.title || cleanUrl,
+        mediaKind,
+        shortSummary: wxRes.shortSummary || wxRes.article.digest || `已整理《${wxRes.article.title}》并存入知识库`,
+        triage: wxRes.triage,
+        sourcePath: wxRes.sourcePath,
+        notePath: wxRes.notePath,
+        relNotePath,
+      };
+    } else {
+      result = this.memoryMirror.curateDirectToVaultFallback({
+        ...params,
+        url: cleanUrl,
+      });
+    }
+
+    if (result.ok) {
+      this.memoryMirror.recordCuratedContent({
+        url: result.url,
+        title: result.title,
+        mediaKind: result.mediaKind,
+        shortSummary: result.shortSummary,
+        sourcePath: result.sourcePath,
+        notePath: result.notePath,
+        relNotePath: result.relNotePath,
+        captureMode: params.captureMode === "auto_dwell" ? "auto_dwell" : "manual",
+        curatedAtMs: Date.now(),
+      });
+      try {
+        this.memoryMirror.syncVaultIndex(true);
+      } catch {
+        // non-fatal
+      }
+      void this.syncEdgeConfigAndCapsuleToPhone(true).catch(() => {});
+    }
+
+    return result;
+  }
+
+  public enrichAgentPromptWithRecentCurated(rawPrompt: string): string {
+    const prompt = String(rawPrompt || "");
+    if (!prompt.trim()) return prompt;
+    const recent = this.memoryMirror
+      .getRecentCuratedContext(5)
+      .filter((x) => Date.now() - x.curatedAtMs <= 72 * 3600 * 1000);
+    if (recent.length === 0) return prompt;
+
+    const lower = prompt.toLowerCase();
+    const mentionsReadingOrVault =
+      /(?:刚才看|刚看|最近看|刚保存|刚收录|那个视频|那篇文章|伴读|知识库|youtube|油管|浏览器里)/i.test(prompt) ||
+      recent.some((item) => {
+        const cleanTitle = item.title.toLowerCase().trim();
+        return cleanTitle.length >= 4 && lower.includes(cleanTitle.slice(0, 12));
+      });
+    if (!mentionsReadingOrVault) return prompt;
+
+    const refLines = recent.slice(0, 3).map((item) => {
+      const kind = item.mediaKind === "video" ? "视频" : "网页";
+      const summary = item.shortSummary.replace(/\s+/g, " ").slice(0, 140);
+      const paths = [
+        item.notePath ? `伴读笔记: ${item.notePath}` : "",
+        item.sourcePath ? `原文/字幕: ${item.sourcePath}` : "",
+      ]
+        .filter(Boolean)
+        .join(" | ");
+      return `- [${kind}] 《${item.title}》 (${item.url})${summary ? `\n  提炼摘要: ${summary}` : ""}${paths ? `\n  本地知识库路径: ${paths}` : ""}`;
+    });
+
+    return `${prompt}\n\n---\n[青简·伴读知识库上下文同步（用户近期在应用舱查看并沉淀的内容，可直接读取本地路径保持上下文一致）]\n${refLines.join("\n")}`;
   }
 }
