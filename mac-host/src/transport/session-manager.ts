@@ -1607,7 +1607,7 @@ export class PhoneSessionManager extends EventEmitter {
     this.emit("phoneRequest", req, (resultOrError: { result?: unknown; error?: { code: number; message: string } }) => {
       if (!req.id || !this.isLivePipe(pipe)) return;
       this.sendSecure(pipe, encodeJsonRpcFrame({ jsonrpc: "2.0", id: req.id, ...(resultOrError.error ? { error: resultOrError.error } : { result: resultOrError.result }) }));
-    });
+    }, { tier: pipe.tier, connectionId: pipe.diagnosticId, phoneId: pipe.phoneId });
   }
 
   private equalDigest(expected: string, actual: unknown): boolean {

@@ -400,19 +400,20 @@ describe("Milestone 2 & 3: MobileMemoryMirror + AgentSessionHub", () => {
     ]);
     cdb.close();
 
+    const quotaResetSeconds = Math.floor(Date.now() / 1000) + 3600;
     fs.writeFileSync(
       path.join(codexSessions, "rollout-2026-11-20T19-47-47-01a1f8c8-bb49-7b10-bcd3-3c74e878f6f0.jsonl"),
       [
         JSON.stringify({ timestamp: "2026-11-20T11:47:47Z", type: "session_meta", payload: { id: "01a1f8c8-bb49-7b10-bcd3-3c74e878f6f0", cwd: projDir } }),
         JSON.stringify({ timestamp: "2026-11-20T11:48:00Z", type: "turn_context", payload: { model: "gpt-5.4", cwd: projDir } }),
         JSON.stringify({
-          timestamp: "2026-11-20T11:49:00Z",
+          timestamp: new Date().toISOString(),
           type: "event_msg",
           payload: {
             type: "token_count",
             rate_limits: {
               plan_type: "prolite",
-              primary: { used_percent: 82, window_minutes: 10080, resets_at: 1795217109 },
+              primary: { used_percent: 82, window_minutes: 10080, resets_at: quotaResetSeconds },
               secondary: null,
             },
           },
@@ -487,7 +488,7 @@ describe("Milestone 2 & 3: MobileMemoryMirror + AgentSessionHub", () => {
       expect(cat.quotas?.codex.available).toBe(true);
       expect(cat.quotas?.codex.planLabel).toBe("Pro Lite");
       expect(cat.quotas?.codex.windows[0]?.remainingPercent).toBe(18);
-      expect(cat.quotas?.codex.windows[0]?.resetsAtMs).toBe(1795217109000);
+      expect(cat.quotas?.codex.windows[0]?.resetsAtMs).toBe(quotaResetSeconds * 1000);
       expect(cat.quotas?.agy.activeModel).toBe("Gemini 4 Neon (High)");
     } finally {
       hub.stopAll();

@@ -862,6 +862,7 @@ export interface MacControlExecuteParams {
   value?: number | boolean;
   transportTierHint?: string;
   biometricVerified?: boolean;
+  unlockChallenge?: string;
 }
 
 export interface MacControlExecuteResult {
@@ -869,6 +870,7 @@ export interface MacControlExecuteResult {
   action: MacControlActionType;
   message: string;
   requiresBiometric?: boolean;
+  unlockChallenge?: string;
   status?: MacControlStatusSnapshot;
 }
 

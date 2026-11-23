@@ -138,6 +138,7 @@ export class OmsDaemon {
 
   private readonly configPath: string;
   private readonly wechatPendingPhoneQueuePath: string;
+  private wechatPhoneFlush: Promise<void> | null = null;
   private readonly identityPath: string;
   private readonly trustedDevicesPath: string;
   private readonly config: OmsHostConfig;
@@ -1034,7 +1035,8 @@ export class OmsDaemon {
       "phoneRequest",
       (
         req: JsonRpcRequest,
-        reply: (res: { result?: unknown; error?: { code: number; message: string } }) => void
+        reply: (res: { result?: unknown; error?: { code: number; message: string } }) => void,
+        source?: { tier: string; connectionId?: string; phoneId?: string }
       ) => {
         try {
           if (req.method === "inbox.submitItem") {
@@ -1438,7 +1440,8 @@ export class OmsDaemon {
           } else if (req.method === "mac.control.execute") {
             const p = (req.params || {}) as MacControlExecuteParams;
             void this.macControl
-              .execute(p, this.buildMacControlContext())
+              .execute(p, { ...this.buildMacControlContext(), activeTier: source?.tier || "UNKNOWN",
+                requestConnectionId: source?.connectionId })
               .then((res) => reply({ result: res }))
               .catch((err: any) =>
                 reply({
@@ -1806,7 +1809,7 @@ export class OmsDaemon {
         if (!Array.isArray(queue)) queue = [];
       }
       queue = queue.filter((q) => q.key !== entry.key);
-      queue.push(entry);
+      queue.push({ ...entry, revision: generateUuidV7() } as typeof entry);
       if (queue.length > 25) {
         queue = queue.slice(queue.length - 25);
       }
@@ -1908,56 +1911,43 @@ export class OmsDaemon {
     }
   }
 
-  private async flushPendingWeChatPhoneQueue(): Promise<void> {
-    if (this.session.getActiveTier() === "DISCONNECTED") return;
-    if (!fs.existsSync(this.wechatPendingPhoneQueuePath)) return;
-    let queue: Array<{
-      key: string;
-      articleId?: number;
-      title: string;
-      markdown: string;
-      metadata?: Record<string, unknown>;
-      createdAtMs: number;
-    }> = [];
-    try {
-      queue = JSON.parse(fs.readFileSync(this.wechatPendingPhoneQueuePath, "utf8"));
-      if (!Array.isArray(queue) || queue.length === 0) return;
-    } catch {
-      return;
-    }
+  private flushPendingWeChatPhoneQueue(): Promise<void> {
+    if (this.wechatPhoneFlush) return this.wechatPhoneFlush;
+    this.wechatPhoneFlush = this.drainPendingWeChatPhoneQueue().finally(() => { this.wechatPhoneFlush = null; });
+    return this.wechatPhoneFlush;
+  }
 
-    const remaining: typeof queue = [];
-    for (const item of queue) {
-      if (this.session.getActiveTier() === "DISCONNECTED") {
-        remaining.push(item);
-        continue;
-      }
+  private async drainPendingWeChatPhoneQueue(): Promise<void> {
+    const readQueue = (): Array<{key: string; title: string; markdown: string; articleId?: number;
+      metadata?: Record<string, unknown>; revision?: string; createdAtMs: number}> => {
+      if (!fs.existsSync(this.wechatPendingPhoneQueuePath)) return [];
+      const value = JSON.parse(fs.readFileSync(this.wechatPendingPhoneQueuePath, "utf8"));
+      if (!Array.isArray(value)) throw new Error("Invalid pending WeChat phone queue");
+      return value;
+    };
+    // Remember failures for this invocation; do not spin on an unreachable phone.
+    const attempted = new Set<string>();
+    while (this.session.getActiveTier() !== "DISCONNECTED") {
+      let queue: ReturnType<typeof readQueue>;
+      try { queue = readQueue(); } catch { return; }
+      const item = queue.find(i => !attempted.has(JSON.stringify(i)));
+      if (!item) return;
+      const version = JSON.stringify(item);
+      attempted.add(version);
       try {
-        const bytes = new TextEncoder().encode(item.markdown);
         const safeStem = item.title.replace(/^💬\s*/, "").replace(/[^\p{L}\p{N}_-]+/gu, "_").slice(0, 48) || "wechat_note";
         await this.session.pushStreamToPhone({
-          fileName: `${item.key}_${safeStem}.md`,
-          mimeType: "text/markdown",
-          data: bytes,
-          title: item.title,
-          intentTag: "wechat_context",
-          enableCommuteTts: true,
-          wechatArticleId: item.articleId,
-          metadata: item.metadata,
+          fileName: `${item.key}_${safeStem}.md`, mimeType: "text/markdown",
+          data: new TextEncoder().encode(item.markdown), title: item.title,
+          intentTag: "wechat_context", enableCommuteTts: true,
+          wechatArticleId: item.articleId, metadata: item.metadata,
         });
+        // Re-read after await and remove only the acknowledged version, including for the same key.
+        const latest = readQueue().filter(i => JSON.stringify(i) !== version);
+        this.writeSecureFileAtomic(this.wechatPendingPhoneQueuePath, JSON.stringify(latest, null, 2));
       } catch {
-        remaining.push(item);
+        // Keep failures and concurrent enqueues intact for the next retry.
       }
-    }
-
-    try {
-      if (remaining.length === 0) {
-        fs.unlinkSync(this.wechatPendingPhoneQueuePath);
-      } else {
-        this.writeSecureFileAtomic(this.wechatPendingPhoneQueuePath, JSON.stringify(remaining, null, 2));
-      }
-    } catch {
-      // ignore
     }
   }
 

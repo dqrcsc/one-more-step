@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
+import { readResponseBounded } from "../io/bounded-read.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import type {
   WeChatArticleAssetParams,
@@ -697,11 +698,11 @@ export class WeChatBridgeSupervisor extends EventEmitter {
       if (overview.ok) {
         const wantUrl = String(params.sourceUrl || "").trim();
         const wantTitle = this.normalizeMatchTitle(params.title || "");
-        const matched = overview.articles.find((a) => {
-          if (wantUrl && a.url && a.url.trim() === wantUrl) return true;
-          if (wantTitle && this.normalizeMatchTitle(a.title) === wantTitle) return true;
-          return false;
-        });
+        const matches = overview.articles.filter((a) => wantUrl
+          ? a.url?.trim() === wantUrl
+          : Boolean(wantTitle) && this.normalizeMatchTitle(a.title) === wantTitle);
+        if (matches.length > 1) return { ok: false, error: "Ambiguous article; specify articleId" };
+        const matched = matches[0];
         if (matched) {
           if (matched.entryKind === "turn" && matched.turnId) {
             return this.fetchArticleDetail({ turnId: matched.turnId });
@@ -773,7 +774,7 @@ export class WeChatBridgeSupervisor extends EventEmitter {
       if (!res.ok) {
         return { ok: false, error: `Asset fetch HTTP ${res.status}` };
       }
-      const buf = Buffer.from(await res.arrayBuffer());
+      const buf = await readResponseBounded(res, 3 * 1024 * 1024);
       if (buf.byteLength === 0 || buf.byteLength > 3 * 1024 * 1024) {
         return { ok: false, error: "Asset empty or exceeds 3 MiB mobile cap" };
       }

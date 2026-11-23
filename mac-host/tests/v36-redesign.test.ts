@@ -175,7 +175,7 @@ describe("v3.6 Redesign: Memory Center Tombstones, 4-Agent Hub & Mac Remote Cont
 
     // 2. WAN with biometricVerified = true succeeds
     const wanPassed = await ctl.execute(
-      { action: "unlock", transportTierHint: "WAN_WEBRTC", biometricVerified: true },
+      { action: "unlock", transportTierHint: "WAN_WEBRTC", biometricVerified: true, unlockChallenge: wanBlocked.unlockChallenge },
       { ...baseCtx, activeTier: "WAN_WEBRTC" }
     );
     expect(wanPassed.ok).toBe(true);

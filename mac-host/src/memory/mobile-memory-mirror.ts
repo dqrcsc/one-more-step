@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import crypto from "node:crypto";
 import path from "node:path";
 import { Database } from "bun:sqlite";
 import type {
@@ -112,6 +113,11 @@ export class MobileMemoryMirror {
 
   private initSchema(): void {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS vault_promotions (
+        item_id TEXT PRIMARY KEY,
+        digest TEXT NOT NULL,
+        result_json TEXT NOT NULL
+      );
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS mobile_threads (
         thread_id TEXT PRIMARY KEY,
@@ -449,32 +455,51 @@ export class MobileMemoryMirror {
     const dateStr = new Date(params.createdAtMs || Date.now()).toISOString().slice(0, 10);
     const safeStem = this.sanitizeFileName(params.slugHint || params.title || params.kind);
 
-    let savedImagePath: string | undefined;
-    let savedImageFileName: string | undefined;
-    if (params.jpegBase64 && params.jpegBase64.trim()) {
-      const assetsDir = path.join(subFolder, "assets");
-      fs.mkdirSync(assetsDir, { recursive: true });
-      const rawImgName = this.sanitizeFileName(
-        (params.imageFileName || `${dateStr}_${safeStem}`).replace(/\.(jpe?g|png)$/i, "")
-      );
-      savedImagePath = this.allocateCollisionFreePath(assetsDir, rawImgName, ".jpg");
-      savedImageFileName = path.basename(savedImagePath);
-      fs.writeFileSync(savedImagePath, Buffer.from(params.jpegBase64, "base64"));
+    if (!params.itemId?.trim()) throw new Error("Promotion itemId is required");
+    const image = params.jpegBase64?.trim() ? Buffer.from(params.jpegBase64, "base64") : undefined;
+    if (image && image.length > 4 * 1024 * 1024) throw new Error("Promotion image exceeds 4 MiB");
+    const digest = crypto.createHash("sha256").update(JSON.stringify([
+      vaultRoot, params.kind, params.title, params.slugHint || "", params.markdownContent || "",
+      params.createdAtMs || 0, params.imageFileName || "", image?.toString("base64") || ""
+    ])).digest("hex");
+    const previous = this.db.query("SELECT digest, result_json FROM vault_promotions WHERE item_id = ?")
+      .get(params.itemId) as {digest: string; result_json: string} | null;
+    if (previous && previous.digest !== digest) throw new Error("Promotion itemId already used with different content");
+    let result: MemoryPromoteVaultResult;
+    if (previous) {
+      result = JSON.parse(previous.result_json);
+    } else {
+      let savedImagePath: string | undefined;
+      if (image) {
+        const assetsDir = path.join(subFolder, "assets");
+        fs.mkdirSync(assetsDir, { recursive: true });
+        const stem = this.sanitizeFileName((params.imageFileName || `${dateStr}_${safeStem}`).replace(/\.(jpe?g|png)$/i, ""));
+        // Include the operation digest so even unfinished reservations cannot collide.
+        savedImagePath = this.allocateCollisionFreePath(assetsDir, `${stem}_${crypto.createHash("sha256").update(params.itemId).digest("hex").slice(0, 16)}`, ".jpg");
+      }
+      const noteStem = `${dateStr}_${safeStem}_${crypto.createHash("sha256").update(params.itemId).digest("hex").slice(0, 16)}`;
+      result = { ok: true, savedNotePath: this.allocateCollisionFreePath(subFolder, noteStem, ".md"), savedImagePath };
+      // Persist the reservation BEFORE either file: retries after a crash recover the same paths.
+      this.db.query("INSERT INTO vault_promotions (item_id, digest, result_json) VALUES (?, ?, ?)")
+        .run(params.itemId, digest, JSON.stringify(result));
     }
-
-    let mdBody = params.markdownContent || "";
-    if (savedImageFileName && !mdBody.includes(savedImageFileName)) {
-      mdBody = `![[assets/${savedImageFileName}]]\n\n${mdBody}`;
-    }
-
-    const notePath = this.allocateCollisionFreePath(subFolder, `${dateStr}_${safeStem}`, ".md");
-    fs.writeFileSync(notePath, mdBody.endsWith("\n") ? mdBody : `${mdBody}\n`, "utf8");
-
-    return {
-      ok: true,
-      savedNotePath: notePath,
-      savedImagePath,
+    const writeOnce = (target: string, bytes: Buffer) => {
+      if (fs.existsSync(target)) {
+        if (!fs.readFileSync(target).equals(bytes)) throw new Error("Promoted file was modified; refusing to overwrite");
+        return;
+      }
+      const tmp = `${target}.${crypto.randomUUID()}.tmp`;
+      const fd = fs.openSync(tmp, "wx", 0o600);
+      try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      try { fs.linkSync(tmp, target); } finally { fs.unlinkSync(tmp); }
     };
+    if (result.savedImagePath && image) writeOnce(result.savedImagePath, image);
+    let body = params.markdownContent || "";
+    if (result.savedImagePath && !body.includes(path.basename(result.savedImagePath))) {
+      body = `![[assets/${path.basename(result.savedImagePath)}]]\n\n${body}`;
+    }
+    writeOnce(result.savedNotePath, Buffer.from(body.endsWith("\n") ? body : `${body}\n`));
+    return result;
   }
 
   private classifyVaultCategory(relPath: string): { category: string; weight: number } {
@@ -668,11 +693,29 @@ export class MobileMemoryMirror {
       return { ok: false, error: "Vault document not found" };
     }
     try {
-      const st = fs.statSync(targetAbs);
-      if (!st.isFile()) return { ok: false, error: "Not a file" };
-      const raw = fs.readFileSync(targetAbs, "utf8");
-      const truncated = raw.length > maxChars;
-      const markdown = truncated ? raw.slice(0, maxChars) : raw;
+      const realRoot = fs.realpathSync(vaultRoot);
+      const realTarget = fs.realpathSync(targetAbs);
+      if (!realTarget.startsWith(`${realRoot}${path.sep}`)) return { ok: false, error: "Path escapes vault root" };
+      const fd = fs.openSync(realTarget, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      let raw: string;
+      try {
+        const st = fs.fstatSync(fd);
+        if (!st.isFile()) return { ok: false, error: "Not a file" };
+        const cap = 4 * 1024 * 1024;
+        if (st.size > cap) return { ok: false, error: "Vault document exceeds 4 MiB" };
+        const bytes = Buffer.alloc(cap + 1);
+        let size = 0;
+        while (size < bytes.length) {
+          const n = fs.readSync(fd, bytes, size, bytes.length - size, null);
+          if (!n) break;
+          size += n;
+        }
+        if (size > cap) return { ok: false, error: "Vault document exceeds 4 MiB" };
+        raw = bytes.subarray(0, size).toString("utf8");
+      } finally { fs.closeSync(fd); }
+      const charLimit = Number.isFinite(maxChars) ? Math.max(1, Math.min(120_000, maxChars)) : 120_000;
+      const truncated = raw.length > charLimit;
+      const markdown = truncated ? raw.slice(0, charLimit) : raw;
       const { category } = this.classifyVaultCategory(cleanRel);
       return {
         ok: true,

@@ -23,6 +23,18 @@ function header(data: Uint8Array) {
   return { streamId: generateUuidV7(), fileName: "test.txt", mimeType: "text/plain", totalBytes: data.length, chunkSize: 4, totalChunks: Math.max(1, Math.ceil(data.length / 4)), sha256: crypto.createHash("sha256").update(data).digest("hex") };
 }
 
+test("phoneRequest carries server-owned authenticated connection metadata", async () => {
+  const f = fixture();
+  let source: any;
+  f.manager.on("phoneRequest", (_req, _reply, origin) => { source = origin; });
+  f.raw.handleJsonRpcMessage(f.pipe, { id: "source", method: "mac.control.execute", params: {transportTierHint: "WAN_WEBRTC"} });
+  expect(source.tier).toBe(f.pipe.tier);
+  expect(source.phoneId).toBe(f.phone.deviceId);
+  expect(source.connectionId).toBe(f.pipe.diagnosticId);
+  expect(source.connectionId).toBeTruthy();
+  await f.manager.stop();
+});
+
 test("RPC ignores unauthenticated and other-pipe replies, accepts issuing pipe", async () => {
   const f = fixture();
   let done = false;

@@ -3732,6 +3732,15 @@ export class AgentSessionHub extends EventEmitter {
   // Quota Remaining & Reset Timestamp Collectors (Codex + Antigravity)
   // ===========================================================================
 
+  private withQuotaFreshness(status: AgentBackendQuotaStatus): AgentBackendQuotaStatus {
+    const now = Date.now();
+    const fresh = status.capturedAtMs > 0 && status.capturedAtMs <= now + 60_000 && now - status.capturedAtMs <= 15 * 60_000;
+    const windows = fresh ? status.windows.filter(w => !w.resetsAtMs || w.resetsAtMs > now) : [];
+    return { ...status, available: windows.length > 0, windows,
+      creditsSummary: fresh ? status.creditsSummary : undefined,
+      statusNote: windows.length ? "本地近期采样（非官方实时额度）" : "配额样本已过期，当前额度未知" };
+  }
+
   private collectCodexQuota(): AgentBackendQuotaStatus {
     const emptyStatus: AgentBackendQuotaStatus = {
       backend: "codex",
@@ -3772,7 +3781,7 @@ export class AgentSessionHub extends EventEmitter {
     const candidates = files.slice(0, 18);
     const fingerprint = candidates.map((c) => `${c.filePath}:${Math.floor(c.mtimeMs)}:${c.size}`).join("|");
     if (this.cachedCodexQuota && this.cachedCodexQuota.fingerprint === fingerprint) {
-      return this.cachedCodexQuota.status;
+      return this.withQuotaFreshness(this.cachedCodexQuota.status);
     }
 
     let bestRateLimits: Record<string, any> | null = null;
@@ -3807,7 +3816,9 @@ export class AgentSessionHub extends EventEmitter {
             if (obj?.type !== "event_msg" || obj?.payload?.type !== "token_count" || !obj?.payload?.rate_limits) {
               continue;
             }
-            const evMs = obj.timestamp ? Date.parse(String(obj.timestamp)) || c.mtimeMs : c.mtimeMs;
+            // A copied/touched log file is not a new quota sample.
+            const evMs = Date.parse(String(obj.timestamp || ""));
+            if (!Number.isFinite(evMs) || evMs <= 0 || evMs > Date.now() + 60_000) continue;
             if (evMs >= bestAtMs) {
               bestAtMs = evMs;
               bestRateLimits = obj.payload.rate_limits as Record<string, any>;
@@ -3893,11 +3904,11 @@ export class AgentSessionHub extends EventEmitter {
       creditsSummary,
       statusNote: bestRateLimits.rate_limit_reached_type
         ? `已触发限流 (${bestRateLimits.rate_limit_reached_type})`
-        : "实时同步自 Codex 本地会话遥测",
+        : "本地近期采样（非官方实时额度）",
       capturedAtMs: Math.floor(bestAtMs || Date.now()),
     };
     this.cachedCodexQuota = { fingerprint, status };
-    return status;
+    return this.withQuotaFreshness(status);
   }
 
   private collectAgyQuota(): AgentBackendQuotaStatus {

@@ -54,6 +54,8 @@ export interface MacControlRuntimeContext {
   macId: string;
   macName: string;
   activeTier: string;
+  /** Authenticated request connection, never supplied by the requesting client. */
+  requestConnectionId?: string;
   stayAwakeEnabled: boolean;
   onSetStayAwake: (enabled: boolean) => boolean;
 }
@@ -74,6 +76,7 @@ export class MacOsController {
   } | null = null;
   private testMockLocked = false;
   private testMockPassword = "";
+  private readonly unlockChallenges = new Map<string, { token: string; expiresAt: number }>();
 
   constructor(repoRoot: string, customOmsHomeDir?: string) {
     this.ctlBinaryPath = path.join(repoRoot, "mac-host", "bin", "oms-mac-ctl");
@@ -598,7 +601,7 @@ export class MacOsController {
     ctx: MacControlRuntimeContext
   ): Promise<MacControlExecuteResult> {
     const action = params.action as MacControlActionType;
-    const effectiveTier = String(params.transportTierHint || ctx.activeTier || "");
+    const effectiveTier = ctx.activeTier;
 
     switch (action) {
       case "wake": {
@@ -659,16 +662,30 @@ export class MacOsController {
 
       case "unlock": {
         // Policy B: LAN_WS / BT_RFCOMM unlocks immediately in 1 tap; WAN_WEBRTC requires phone biometric verification!
-        const isWanRemote = effectiveTier === "WAN_WEBRTC";
-        if (isWanRemote && !params.biometricVerified) {
+        // Fail closed for unknown origins. A client hint cannot downgrade WAN to LAN.
+        const needsConfirmation = !["LAN_WS", "BT_RFCOMM"].includes(effectiveTier);
+        const scope = ctx.requestConnectionId || "local-ipc";
+        for (const [key, value] of this.unlockChallenges) {
+          if (value.expiresAt <= Date.now()) this.unlockChallenges.delete(key);
+        }
+        const challenge = this.unlockChallenges.get(scope);
+        const confirmed = params.biometricVerified === true && challenge &&
+          params.unlockChallenge === challenge.token && challenge.expiresAt > Date.now();
+        if (needsConfirmation && !confirmed) {
+          if (this.unlockChallenges.size >= 64) this.unlockChallenges.clear();
+          const token = crypto.randomBytes(24).toString("hex");
+          this.unlockChallenges.set(scope, { token, expiresAt: Date.now() + 60_000 });
           return {
             ok: false,
             action,
             requiresBiometric: true,
+            unlockChallenge: token,
             message: "当前为跨网远程连接，请先通过手机指纹/面容确认后再解锁 Mac",
             status: await this.getStatusSnapshotAsync(ctx),
           };
         }
+        // Consume before any asynchronous OS operation; duplicate requests cannot replay approval.
+        this.unlockChallenges.delete(scope);
 
         const before = await this.probeNativeStatusAsync();
         if (!before.screenLocked) {
