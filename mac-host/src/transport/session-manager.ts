@@ -731,8 +731,10 @@ export class PhoneSessionManager extends EventEmitter {
           tier: "BT_RFCOMM",
           authenticated: false,
           decoder: new FrameStreamDecoder(),
-            sendRaw: (bytes) => this.btBridge?.sendFrameOverBluetooth(bytes) ?? false,
-          close: () => {},
+          sendRaw: (bytes) => this.btBridge?.sendFrameOverBluetooth(bytes) ?? false,
+          close: () => {
+            this.btBridge?.dropPendingTxFrames();
+          },
         };
         const previousBt = this.pendingBtPipe;
         if (previousBt) this.onPipeClosed(previousBt);
@@ -756,7 +758,9 @@ export class PhoneSessionManager extends EventEmitter {
             authenticated: false,
             decoder: new FrameStreamDecoder(),
             sendRaw: (b) => this.btBridge?.sendFrameOverBluetooth(b) ?? false,
-            close: () => {},
+            close: () => {
+              this.btBridge?.dropPendingTxFrames();
+            },
           };
           this.pendingBtPipe = btPipe;
           this.onPipeOpened(btPipe);

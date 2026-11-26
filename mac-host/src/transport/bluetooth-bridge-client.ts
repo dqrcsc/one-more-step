@@ -294,6 +294,10 @@ export class BluetoothBridgeServer extends EventEmitter {
     });
   }
 
+  public dropPendingTxFrames(): void {
+    this.sendToBridge({ type: "drop_tx_queue" });
+  }
+
   public updateMacLanInfo(lanIps: string[], lanPort: number): void {
     this.opts.lanIps = lanIps;
     this.opts.lanPort = lanPort;
@@ -321,6 +325,8 @@ export class BluetoothBridgeServer extends EventEmitter {
     switch (msg.type) {
       case "bridge_ready":
         this.respawnAttempt = 0;
+        this.updateMacLanInfo(this.opts.lanIps, this.opts.lanPort);
+        this.pushAirpodsConfigToBridge();
         break;
       case "ble_state":
         this.emit("bleState", msg.state);

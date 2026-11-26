@@ -816,8 +816,15 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
     private var macInfoChar: CBMutableCharacteristic?
     private var framePipeChar: CBMutableCharacteristic?
     private var subscribedCentrals: [CBCentral] = []
+    private var centralLastActiveAt: [UUID: Date] = [:]
+    private var activeCentralId: UUID? = nil
     private var announcedCentrals: Set<UUID> = []
     private var txQueue: [Data] = []
+    private var drainRetryScheduled: Bool = false
+    private var drainStallCount: Int = 0
+    private let maxTxQueueSlices = 256
+    private let maxDrainStallRetries = 40
+    private let staleCentralTtlSec: TimeInterval = 45.0
     private let ipc: UnixSocketLineClient
     private var macInfoJsonData: Data
     private let airpodsController: MacAirPodsController
@@ -853,6 +860,9 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
                        let rawData = Data(base64Encoded: b64) {
                         self.notifyFrameToPhone(rawData)
                     }
+                case "drop_tx_queue":
+                    self.txQueue.removeAll()
+                    self.drainStallCount = 0
                 case "airpods_config":
                     if let autoSw = msg["autoSwitch"] as? Bool {
                         self.airpodsController.autoSwitchEnabled = autoSw
@@ -962,10 +972,43 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
         }
     }
 
-    private func announceCentralIfNeeded(_ central: CBCentral, reason: String) {
-        if !subscribedCentrals.contains(where: { $0.identifier == central.identifier }) {
+    private func pruneStaleCentrals(keeping currentId: UUID? = nil) {
+        let now = Date()
+        subscribedCentrals.removeAll { central in
+            if central.identifier == currentId { return false }
+            guard let lastSeen = centralLastActiveAt[central.identifier] else { return true }
+            return now.timeIntervalSince(lastSeen) > staleCentralTtlSec
+        }
+        let validIds = Set(subscribedCentrals.map { $0.identifier })
+        centralLastActiveAt = centralLastActiveAt.filter { validIds.contains($0.key) }
+        announcedCentrals = announcedCentrals.intersection(validIds)
+        if let active = activeCentralId, !validIds.contains(active) {
+            activeCentralId = subscribedCentrals.last?.identifier
+        }
+    }
+
+    private func touchCentral(_ central: CBCentral) {
+        centralLastActiveAt[central.identifier] = Date()
+        activeCentralId = central.identifier
+        if let idx = subscribedCentrals.firstIndex(where: { $0.identifier == central.identifier }) {
+            subscribedCentrals[idx] = central
+        } else {
             subscribedCentrals.append(central)
         }
+        pruneStaleCentrals(keeping: central.identifier)
+    }
+
+    private func currentTargetCentral() -> CBCentral? {
+        pruneStaleCentrals(keeping: activeCentralId)
+        if let active = activeCentralId,
+           let match = subscribedCentrals.last(where: { $0.identifier == active }) {
+            return match
+        }
+        return subscribedCentrals.last
+    }
+
+    private func announceCentralIfNeeded(_ central: CBCentral, reason: String) {
+        touchCentral(central)
         guard !announcedCentrals.contains(central.identifier) else { return }
         announcedCentrals.insert(central.identifier)
         ipc.sendJson(["type": "ble_state", "state": "centralReady:\(reason):mtu=\(central.maximumUpdateValueLength)"])
@@ -978,9 +1021,7 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
         if request.characteristic.uuid == CHAR_MAC_INFO_UUID {
-            if !subscribedCentrals.contains(where: { $0.identifier == request.central.identifier }) {
-                subscribedCentrals.append(request.central)
-            }
+            touchCentral(request.central)
             if request.offset > macInfoJsonData.count {
                 peripheral.respond(to: request, withResult: .invalidOffset)
                 return
@@ -988,14 +1029,10 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
             request.value = macInfoJsonData.subdata(in: request.offset..<macInfoJsonData.count)
             peripheral.respond(to: request, withResult: .success)
             let central = request.central
-            if request.offset == 0 {
-                announcedCentrals.remove(central.identifier)
-                if subscribedCentrals.count <= 1 && subscribedCentrals.first?.identifier == central.identifier {
-                    txQueue.removeAll()
+            if !announcedCentrals.contains(central.identifier) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    self?.announceCentralIfNeeded(central, reason: "readFallback")
                 }
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-                self?.announceCentralIfNeeded(central, reason: "readFallback")
             }
         } else {
             peripheral.respond(to: request, withResult: .requestNotSupported)
@@ -1026,26 +1063,49 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
+        // New CCCD subscription replaces stale queued frames from any previous attempt
+        txQueue.removeAll()
+        drainStallCount = 0
+        announcedCentrals.remove(central.identifier)
         announceCentralIfNeeded(central, reason: "subscribed")
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
         subscribedCentrals.removeAll { $0.identifier == central.identifier }
+        centralLastActiveAt.removeValue(forKey: central.identifier)
         announcedCentrals.remove(central.identifier)
+        if activeCentralId == central.identifier {
+            activeCentralId = subscribedCentrals.last?.identifier
+        }
         if subscribedCentrals.isEmpty {
             txQueue.removeAll()
+            drainStallCount = 0
             ipc.sendJson(["type": "central_disconnected", "centralId": central.identifier.uuidString])
         }
     }
 
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
+        drainStallCount = 0
         drainTxQueue()
     }
 
     private func notifyFrameToPhone(_ data: Data) {
-        guard !subscribedCentrals.isEmpty else { return }
-        let mtu = max(20, subscribedCentrals.first?.maximumUpdateValueLength ?? 180)
+        guard let target = currentTargetCentral() else {
+            txQueue.removeAll()
+            return
+        }
+        let mtu = max(20, target.maximumUpdateValueLength)
+        var slicesNeeded = 0
         var offset = 0
+        while offset < data.count {
+            slicesNeeded += 1
+            offset += mtu
+        }
+        if txQueue.count + slicesNeeded > maxTxQueueSlices {
+            txQueue.removeAll()
+            drainStallCount = 0
+        }
+        offset = 0
         while offset < data.count {
             let end = min(offset + mtu, data.count)
             txQueue.append(data.subdata(in: offset..<end))
@@ -1054,20 +1114,47 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
         drainTxQueue()
     }
 
+    private func scheduleSingleDrainRetry() {
+        guard !drainRetryScheduled else { return }
+        drainRetryScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+            guard let self = self else { return }
+            self.drainRetryScheduled = false
+            self.drainTxQueue()
+        }
+    }
+
     private func drainTxQueue() {
-        guard let pipeChar = framePipeChar, !subscribedCentrals.isEmpty else {
+        guard let pipeChar = framePipeChar, let target = currentTargetCentral() else {
             txQueue.removeAll()
+            drainStallCount = 0
             return
         }
         while !txQueue.isEmpty {
             let slice = txQueue[0]
-            let ok = peripheralManager.updateValue(slice, for: pipeChar, onSubscribedCentrals: nil)
+            let ok = peripheralManager.updateValue(slice, for: pipeChar, onSubscribedCentrals: [target])
             if ok {
                 txQueue.removeFirst()
+                drainStallCount = 0
             } else {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
-                    self?.drainTxQueue()
+                drainStallCount += 1
+                if drainStallCount > maxDrainStallRetries {
+                    // Dead/unreachable central stalled CoreBluetooth buffer; drop queue & evict to prevent CPU spin.
+                    txQueue.removeAll()
+                    drainStallCount = 0
+                    let deadId = target.identifier
+                    subscribedCentrals.removeAll { $0.identifier == deadId }
+                    centralLastActiveAt.removeValue(forKey: deadId)
+                    announcedCentrals.remove(deadId)
+                    if activeCentralId == deadId {
+                        activeCentralId = subscribedCentrals.last?.identifier
+                    }
+                    if subscribedCentrals.isEmpty {
+                        ipc.sendJson(["type": "central_disconnected", "centralId": deadId.uuidString])
+                    }
+                    return
                 }
+                scheduleSingleDrainRetry()
                 return
             }
         }
