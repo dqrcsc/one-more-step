@@ -822,9 +822,9 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
     private var txQueue: [Data] = []
     private var drainRetryScheduled: Bool = false
     private var drainStallCount: Int = 0
-    private let maxTxQueueSlices = 256
-    private let maxDrainStallRetries = 40
-    private let staleCentralTtlSec: TimeInterval = 45.0
+    private let maxTxQueueSlices = 16384
+    private let maxDrainStallRetries = 75
+    private let staleCentralTtlSec: TimeInterval = 120.0
     private let ipc: UnixSocketLineClient
     private var macInfoJsonData: Data
     private let airpodsController: MacAirPodsController
@@ -973,9 +973,11 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
     }
 
     private func pruneStaleCentrals(keeping currentId: UUID? = nil) {
+        guard subscribedCentrals.count > 1 else { return }
+        let keepId = currentId ?? activeCentralId ?? subscribedCentrals.last?.identifier
         let now = Date()
         subscribedCentrals.removeAll { central in
-            if central.identifier == currentId { return false }
+            if central.identifier == keepId { return false }
             guard let lastSeen = centralLastActiveAt[central.identifier] else { return true }
             return now.timeIntervalSince(lastSeen) > staleCentralTtlSec
         }
@@ -1089,6 +1091,20 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
         drainTxQueue()
     }
 
+    private func evictDeadCentral(_ deadId: UUID) {
+        txQueue.removeAll()
+        drainStallCount = 0
+        subscribedCentrals.removeAll { $0.identifier == deadId }
+        centralLastActiveAt.removeValue(forKey: deadId)
+        announcedCentrals.remove(deadId)
+        if activeCentralId == deadId {
+            activeCentralId = subscribedCentrals.last?.identifier
+        }
+        if subscribedCentrals.isEmpty {
+            ipc.sendJson(["type": "central_disconnected", "centralId": deadId.uuidString])
+        }
+    }
+
     private func notifyFrameToPhone(_ data: Data) {
         guard let target = currentTargetCentral() else {
             txQueue.removeAll()
@@ -1102,8 +1118,9 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
             offset += mtu
         }
         if txQueue.count + slicesNeeded > maxTxQueueSlices {
-            txQueue.removeAll()
-            drainStallCount = 0
+            // Never silently drop middle AEAD slices; close cleanly so session re-handshakes if >8MB backlog occurs.
+            evictDeadCentral(target.identifier)
+            return
         }
         offset = 0
         while offset < data.count {
@@ -1111,20 +1128,20 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
             txQueue.append(data.subdata(in: offset..<end))
             offset = end
         }
-        drainTxQueue()
+        drainTxQueue(fromTimer: false)
     }
 
     private func scheduleSingleDrainRetry() {
         guard !drainRetryScheduled else { return }
         drainRetryScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             guard let self = self else { return }
             self.drainRetryScheduled = false
-            self.drainTxQueue()
+            self.drainTxQueue(fromTimer: true)
         }
     }
 
-    private func drainTxQueue() {
+    private func drainTxQueue(fromTimer: Bool = false) {
         guard let pipeChar = framePipeChar, let target = currentTargetCentral() else {
             txQueue.removeAll()
             drainStallCount = 0
@@ -1137,22 +1154,12 @@ final class OmsBluetoothBridge: NSObject, CBPeripheralManagerDelegate {
                 txQueue.removeFirst()
                 drainStallCount = 0
             } else {
-                drainStallCount += 1
-                if drainStallCount > maxDrainStallRetries {
-                    // Dead/unreachable central stalled CoreBluetooth buffer; drop queue & evict to prevent CPU spin.
-                    txQueue.removeAll()
-                    drainStallCount = 0
-                    let deadId = target.identifier
-                    subscribedCentrals.removeAll { $0.identifier == deadId }
-                    centralLastActiveAt.removeValue(forKey: deadId)
-                    announcedCentrals.remove(deadId)
-                    if activeCentralId == deadId {
-                        activeCentralId = subscribedCentrals.last?.identifier
+                if fromTimer {
+                    drainStallCount += 1
+                    if drainStallCount > maxDrainStallRetries {
+                        evictDeadCentral(target.identifier)
+                        return
                     }
-                    if subscribedCentrals.isEmpty {
-                        ipc.sendJson(["type": "central_disconnected", "centralId": deadId.uuidString])
-                    }
-                    return
                 }
                 scheduleSingleDrainRetry()
                 return
