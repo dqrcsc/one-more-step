@@ -1,7 +1,10 @@
 package com.oms.client.otp
 
+import android.content.Context
 import com.oms.client.OmsApplication
-import java.util.concurrent.ConcurrentHashMap
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.concurrent.CopyOnWriteArrayList
 
 data class OtpMatch(
     val code: String,
@@ -9,6 +12,14 @@ data class OtpMatch(
     val fullText: String,
     val sourceApp: String? = null,
     val capturedAtMs: Long = System.currentTimeMillis()
+)
+
+data class RecentOtpRecord(
+    val code: String,
+    val sender: String?,
+    val sourceApp: String?,
+    val normalizedTail: String,
+    val firstSeenAtMs: Long
 )
 
 /**
@@ -22,8 +33,15 @@ data class OtpMatch(
 object OtpExtractor {
 
     const val OTP_MAX_AGE_MS = 5 * 60 * 1000L
-    private const val DEDUP_WINDOW_MS = 25_000L
-    private val recentCodes = ConcurrentHashMap<String, Long>()
+    const val FAST_CROSS_CHANNEL_DEDUP_MS = 60_000L
+    const val EXTENDED_UNLOCK_DEDUP_MS = 30 * 60 * 1000L
+    private const val MAX_PERSISTED_RECORDS = 24
+    private const val PREFS_NAME = "oms_otp_dedup_v2"
+    private const val PREFS_KEY_RECORDS = "recent_otp_records_json"
+
+    private val recentRecords = CopyOnWriteArrayList<RecentOtpRecord>()
+    @Volatile
+    private var prefsLoaded = false
 
     @Volatile
     var latestCapturedOtp: OtpMatch? = null
@@ -177,38 +195,165 @@ object OtpExtractor {
         return null
     }
 
+    fun normalizeOtpContextTail(fullText: String, code: String): String {
+        val idx = fullText.indexOf(code, ignoreCase = true)
+        val slice = if (idx >= 0) fullText.substring(idx) else fullText
+        return slice
+            .replace(CN_BRACKET_REGEX, "")
+            .replace(Regex("""[^\p{L}\p{N}]+"""), "")
+            .lowercase()
+            .take(28)
+    }
+
+    private val NUMERIC_ADDRESS_REGEX = Regex("""^\+?\d[\d\s-]{2,}$""")
+
+    private fun normalizeBrandSender(sender: String?): String? {
+        val s = sender?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return null
+        return if (NUMERIC_ADDRESS_REGEX.matches(s)) null else s
+    }
+
+    fun isDuplicateOfRecent(
+        candidate: OtpMatch,
+        history: Collection<RecentOtpRecord>,
+        nowMs: Long
+    ): Boolean {
+        val candTail = normalizeOtpContextTail(candidate.fullText, candidate.code)
+        val candSender = normalizeBrandSender(candidate.sender)
+        val candApp = candidate.sourceApp?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+
+        for (prev in history) {
+            val ageMs = nowMs - prev.firstSeenAtMs
+            if (ageMs < -5_000L || ageMs >= EXTENDED_UNLOCK_DEDUP_MS) continue
+            if (!prev.code.equals(candidate.code, ignoreCase = true)) continue
+
+            val prevSender = normalizeBrandSender(prev.sender)
+            val prevApp = prev.sourceApp?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+
+            // Explicit different brand senders (e.g. "飞书" vs "小红书") with different message tails are independent
+            if (prevSender != null && candSender != null &&
+                prevSender != candSender && !prevSender.contains(candSender) && !candSender.contains(prevSender) &&
+                (candTail.length < 6 || prev.normalizedTail != candTail)
+            ) {
+                continue
+            }
+
+            // 1. Within 60s: cross-channel dedup (PDU vs ContentObserver vs Notification)
+            if (ageMs < FAST_CROSS_CHANNEL_DEDUP_MS) return true
+
+            // 2. Within 30m: suppress delayed lockscreen -> unlock notification re-posts & truncated tickers ("…您的验证码是: 192268")
+            if (candTail.length >= 6 && prev.normalizedTail == candTail) return true
+
+            if (prevSender != null && candSender != null) {
+                return true
+            }
+
+            if (prevApp != null && candApp != null && prevApp == candApp) {
+                return true
+            }
+            if (prevSender == null && candSender == null && (prevApp == null || candApp == null)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun ensurePrefsLoaded(context: Context, nowMs: Long) {
+        if (prefsLoaded) return
+        prefsLoaded = true
+        runCatching {
+            val raw = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(PREFS_KEY_RECORDS, null) ?: return
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val code = o.optString("code", "").trim()
+                val seenAt = o.optLong("firstSeenAtMs", 0L)
+                if (code.isEmpty() || nowMs - seenAt !in -5_000L until EXTENDED_UNLOCK_DEDUP_MS) continue
+                recentRecords.add(
+                    RecentOtpRecord(
+                        code = code,
+                        sender = o.optString("sender", "").takeIf { it.isNotBlank() },
+                        sourceApp = o.optString("sourceApp", "").takeIf { it.isNotBlank() },
+                        normalizedTail = o.optString("normalizedTail", ""),
+                        firstSeenAtMs = seenAt
+                    )
+                )
+            }
+        }
+    }
+
+    private fun persistRecentRecords(context: Context) {
+        runCatching {
+            val arr = JSONArray()
+            for (rec in recentRecords.takeLast(MAX_PERSISTED_RECORDS)) {
+                arr.put(
+                    JSONObject().apply {
+                        put("code", rec.code)
+                        if (!rec.sender.isNullOrBlank()) put("sender", rec.sender)
+                        if (!rec.sourceApp.isNullOrBlank()) put("sourceApp", rec.sourceApp)
+                        put("normalizedTail", rec.normalizedTail)
+                        put("firstSeenAtMs", rec.firstSeenAtMs)
+                    }
+                )
+            }
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(PREFS_KEY_RECORDS, arr.toString())
+                .apply()
+        }
+    }
+
     /**
      * Entry point called by NotificationListener, SmsBroadcastReceiver, ContentObserver, or Accessibility.
-     * Deduplicates within a 25-second window and immediately dispatches to Mac.
+     * Deduplicates cross-channel bursts (60s) and delayed unlock re-posts (30m) with persistent state.
      */
     @Synchronized
     fun onCandidateTextReceived(
         rawText: String?,
         senderHint: String? = null,
-        sourcePackage: String? = null
+        sourcePackage: String? = null,
+        eventTimestampMs: Long? = null
     ): OtpMatch? {
         if (rawText.isNullOrBlank()) return null
         val app = OmsApplication.instance ?: return null
         if (sourcePackage == app.packageName) return null
         if (!app.repository.isAutoSyncOtpEnabled()) return null
 
-        val match = extractOtp(rawText, senderHint, sourcePackage) ?: return null
         val now = System.currentTimeMillis()
-
-        val iter = recentCodes.entries.iterator()
-        while (iter.hasNext()) {
-            val entry = iter.next()
-            if (now - entry.value > DEDUP_WINDOW_MS) {
-                iter.remove()
-            }
-        }
-
-        val prevTime = recentCodes[match.code]
-        if (prevTime != null && now - prevTime < DEDUP_WINDOW_MS) {
+        // Drop notifications whose original arrival timestamp is already older than OTP_MAX_AGE_MS (5m)
+        if (eventTimestampMs != null && eventTimestampMs > 0L && now - eventTimestampMs > OTP_MAX_AGE_MS) {
             return null
         }
 
-        recentCodes[match.code] = now
+        val extracted = extractOtp(rawText, senderHint, sourcePackage) ?: return null
+        val effectiveCapturedAt = if (eventTimestampMs != null && eventTimestampMs in (now - OTP_MAX_AGE_MS)..now) {
+            eventTimestampMs
+        } else {
+            now
+        }
+        val match = extracted.copy(capturedAtMs = effectiveCapturedAt)
+
+        ensurePrefsLoaded(app, now)
+        recentRecords.removeIf { now - it.firstSeenAtMs >= EXTENDED_UNLOCK_DEDUP_MS }
+
+        if (isDuplicateOfRecent(match, recentRecords, now)) {
+            return null
+        }
+
+        recentRecords.add(
+            RecentOtpRecord(
+                code = match.code,
+                sender = match.sender,
+                sourceApp = match.sourceApp,
+                normalizedTail = normalizeOtpContextTail(match.fullText, match.code),
+                firstSeenAtMs = now
+            )
+        )
+        while (recentRecords.size > MAX_PERSISTED_RECORDS) {
+            recentRecords.removeAt(0)
+        }
+        persistRecentRecords(app)
+
         latestCapturedOtp = match
         app.transportClient.submitOtpToMacOrQueue(match)
         return match

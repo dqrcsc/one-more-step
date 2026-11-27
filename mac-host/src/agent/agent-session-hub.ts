@@ -89,9 +89,21 @@ export class AgentSessionHub extends EventEmitter {
     this.hubDir = path.join(opts.omsHomeDir, "agent_hub");
     fs.mkdirSync(this.hubDir, { recursive: true, mode: 0o700 });
     this.statePath = path.join(this.hubDir, "mobile_sessions.json");
-    this.codexSessionsDir = opts.codexSessionsDir || path.join(os.homedir(), ".codex", "sessions");
-    this.agyBrainDir = opts.agyBrainDir || path.join(os.homedir(), ".gemini", "antigravity", "brain");
-    this.agyCliDir = opts.agyCliDir || path.join(os.homedir(), ".gemini", "antigravity-cli");
+    this.codexSessionsDir =
+      opts.codexSessionsDir ||
+      (process.env.OMS_TEST_ISOLATION === "1"
+        ? path.join(opts.omsHomeDir, "mock_codex_sessions")
+        : path.join(os.homedir(), ".codex", "sessions"));
+    this.agyBrainDir =
+      opts.agyBrainDir ||
+      (process.env.OMS_TEST_ISOLATION === "1"
+        ? path.join(opts.omsHomeDir, "mock_agy_brain")
+        : path.join(os.homedir(), ".gemini", "antigravity", "brain"));
+    this.agyCliDir =
+      opts.agyCliDir ||
+      (process.env.OMS_TEST_ISOLATION === "1" || opts.agyBrainDir
+        ? path.join(opts.omsHomeDir, "mock_agy_cli")
+        : path.join(os.homedir(), ".gemini", "antigravity-cli"));
     this.workbuddyDir =
       opts.workbuddyDir ||
       (process.env.OMS_TEST_ISOLATION === "1"

@@ -1,6 +1,6 @@
 # <img src="./docs/assets/icon-qingjian-zhichi.png" width="36" height="36" align="top" alt="QingJian Icon" /> 青简 · OneMoreStep (`oms` · 咫尺 + 尺素) — macOS 本地 AI ⇄ 小米 Android 认知座舱与双脑协同底座
 
-[![Version: v3.6.5](https://img.shields.io/badge/Version-v3.6.5-10b981?style=flat-square)](./CHANGELOG.md)
+[![Version: v3.6.6](https://img.shields.io/badge/Version-v3.6.6-10b981?style=flat-square)](./CHANGELOG.md)
 [![Runtime: Bun >= 1.1](https://img.shields.io/badge/Runtime-Bun_%E2%89%A51.1-f472b6?style=flat-square&logo=bun&logoColor=white)](https://bun.sh)
 [![macOS Host](https://img.shields.io/badge/macOS_Host-TypeScript_%2B_Swift_(AppKit_HUD_%2F_CoreBluetooth)-0284c7?style=flat-square&logo=apple&logoColor=white)](./mac-host)
 [![Xiaomi Android](https://img.shields.io/badge/Xiaomi_Android-Kotlin_%2B_Compose_(HyperOS_%2F_MIUI)-ff6900?style=flat-square&logo=xiaomi&logoColor=white)](./android-app)
@@ -12,7 +12,7 @@
 > **青简载思，咫尺通达 (`One More Step`) —— 集「随身第一现场认知座舱（咫尺）」、「微信活上下文网关（尺素）」与「跨网双脑重任调度中枢」于一体的个人 AI 操作系统底座。**  
 > 在家或工位走 `1ms` 局域网与近场蓝牙直连；走出家门切 5G 自动无缝接入自建零信任加密中继（`Tier 3 WAN`），**不占手机系统 VPN 槽位、云端零明文零密钥留存**——随时随地在手机上远程唤醒并指挥家里的 Mac 运行 `Codex` 与 `Antigravity`、流式监控工具调用、远程拍板高危操作审批、无脑裂接管微信文章深读、秒同步锁屏验证码与剪贴板、无感流转 AirPods。
 
-**最新修复版 v3.6.5**：补齐收藏幂等摘要与离线队列毒丸隔离、恢复本机 IPC `oms mac-ctl unlock` 解锁放行、切机同步清理蓝牙连接。[更新说明](docs/releases/v3.6.5.md)。跨网解锁请同步升级 Mac 和 Android。
+**最新修复版 v3.6.6**：根治锁屏收码后解锁手机二次重复推送（Android + Mac 四层 30 分钟语义去重与滚动摘要拦截），并修复 Wi-Fi AP 隔离环境下近场蓝牙 `oms-bt-bridge` 高 CPU 空转与大包截断导致“手机值守”锁屏异常。[更新说明](docs/releases/v3.6.6.md)。跨网解锁请同步升级 Mac 和 Android。
 
 ---
 

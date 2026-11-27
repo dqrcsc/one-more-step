@@ -1,5 +1,14 @@
 # Changelog · 更新日志
 
+## 3.6.6 - 2026-11-27 · 锁屏至解锁验证码双端防重推与近场蓝牙拥塞修复
+
+- **根治锁屏收码后延迟解锁二次触发推送 (`OtpExtractor`、`OmsNotificationListenerService`、`OmsAccessibilityService`、`SmsContentObserver`、`inbox-manager` & `oms-daemon`)**：
+  - **收敛无障碍通知兜底**：`OmsNotificationListenerService` 已连接时跳过无障碍 `TYPE_NOTIFICATION_STATE_CHANGED`，根除小米 HyperOS 解锁瞬间状态栏滚动残片（`…您的验证码是: xxxxxx`）导致的二次误报；同时过滤 `FLAG_GROUP_SUMMARY` 群组摘要与 `notif.when` 超过 5 分钟有效期的旧通知重发，并按 `sbn.key -> code` 记录已处理通知。
+  - **短信库高水位与两级持久化语义去重**：`SmsContentObserver` 引入 `_id` 高水位与已读行集合防更新重扫；`OtpExtractor` 升级为 `SharedPreferences` 持久化的 60 秒跨通道并发去重 + 30 分钟后缀上下文指纹（`normalizeOtpContextTail`）去重，兼容前缀被截断的滚动摘要且不误伤跨品牌同号段验证码。
+  - **Mac 守护进程 30 分钟双端兜底去重**：`omsd` 在 `inbox.submitItem` 入库前执行 `findRecentDuplicateOtp` 语义查重，命中重复时静默抑制重复入库、弹窗与剪贴板覆盖，并按 Android Outbox 协议返回有效核销回执。
+- **近场蓝牙 `oms-bt-bridge` 170% CPU 空转与大包截断修复 (`bluetooth-bridge/main.swift`、`bluetooth-bridge-client` & `session-manager`)**：修复办公 Wi-Fi AP 隔离下 BLE GATT 写缓冲背压引发的无退避忙等死循环及 200–300 KB 工作台同步大包溢出截断，消除由此引发的 RSSI 心跳饥饿与误入“手机值守”锁屏。
+- **单测沙箱隔离加固 (`agent-session-hub`)**：补齐 `OMS_TEST_ISOLATION=1` 与自定义 `agyBrainDir` 下 `agyCliDir` 的沙箱目录隔离。
+
 ## 3.6.5 - 2026-11-23 · 收藏队列防毒丸阻塞、本机 IPC 解锁恢复与切机蓝牙清理
 
 - **博物图鉴重复入库幂等与离线队列防毒丸阻塞 (`mobile-memory-mirror`、`oms-daemon`、`ChatSyncQueue` & `CockpitRuntimeCoordinator`)**：计算知识库收藏幂等摘要时剔除易变的 `createdAtMs`，复用图鉴卡固定生成时间，并对参数非法/内容冲突透传 `-32602` 错误码；Android 同步队列自动淘汰确定性拒绝条目且不阻塞后续待发记录，同时为旧版无 `payload.itemId` 条目自动补齐 `itemId`。

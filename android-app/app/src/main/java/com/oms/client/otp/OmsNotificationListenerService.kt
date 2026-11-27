@@ -4,6 +4,7 @@ import android.app.Notification
 import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Primary Real-Time Verification Code (OTP) Listener.
@@ -12,7 +13,11 @@ import android.service.notification.StatusBarNotification
  */
 class OmsNotificationListenerService : NotificationListenerService() {
 
+    private val seenNotificationCodes = ConcurrentHashMap<String, Pair<String, Long>>()
+
     companion object {
+        private const val SEEN_KEY_TTL_MS = OtpExtractor.EXTENDED_UNLOCK_DEDUP_MS
+
         @Volatile
         var isConnected: Boolean = false
             private set
@@ -28,12 +33,27 @@ class OmsNotificationListenerService : NotificationListenerService() {
         super.onListenerDisconnected()
     }
 
+    override fun onNotificationRemoved(sbn: StatusBarNotification?) {
+        super.onNotificationRemoved(sbn)
+        // Keep seenNotificationCodes until TTL so clear/repost bursts don't re-trigger
+    }
+
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         if (sbn == null) return
         val pkg = sbn.packageName ?: return
         if (pkg == packageName || sbn.isOngoing) return
 
         val notif = sbn.notification ?: return
+        // Skip Android/MIUI group summary notifications which re-emit old child previews
+        if ((notif.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
+
+        val now = System.currentTimeMillis()
+        val notifWhen = notif.`when`
+        // When Xiaomi HyperOS un-redacts or re-posts an unread lockscreen notification upon unlock
+        // more than 5 minutes after the message arrived, `notif.when` preserves the original arrival time.
+        if (notifWhen in 1L until (now - OtpExtractor.OTP_MAX_AGE_MS)) return
+
+        seenNotificationCodes.entries.removeIf { now - it.value.second > SEEN_KEY_TTL_MS }
         val extras = notif.extras ?: Bundle.EMPTY
 
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
@@ -79,11 +99,19 @@ class OmsNotificationListenerService : NotificationListenerService() {
         if (candidates.isEmpty()) return
 
         val effectiveSenderHint = messagingSender ?: title
+        val sbnKey = sbn.key ?: "$pkg:${sbn.id}"
         for (candidate in candidates) {
+            val preview = OtpExtractor.extractOtp(candidate, effectiveSenderHint, pkg) ?: continue
+            val prevForKey = seenNotificationCodes[sbnKey]
+            if (prevForKey != null && prevForKey.first.equals(preview.code, ignoreCase = true)) {
+                return
+            }
+            seenNotificationCodes[sbnKey] = preview.code to now
             val matched = OtpExtractor.onCandidateTextReceived(
                 rawText = candidate,
                 senderHint = effectiveSenderHint,
-                sourcePackage = pkg
+                sourcePackage = pkg,
+                eventTimestampMs = notifWhen.takeIf { it > 0L }
             )
             if (matched != null) break
         }

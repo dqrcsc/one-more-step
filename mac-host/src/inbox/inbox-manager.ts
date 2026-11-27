@@ -133,6 +133,78 @@ export class InboxManager {
   }
 
   /**
+   * Detect delayed duplicate OTP submissions (e.g. phone unlock notification re-post or truncated ticker
+   * arriving with a fresh clientItemId minutes after lockscreen SMS capture).
+   */
+  public findRecentDuplicateOtp(
+    params: InboxSubmitItemParams,
+    windowMs = 30 * 60 * 1000
+  ): StoredInboxItem | undefined {
+    if (params.attachments && params.attachments.length > 0) return undefined;
+    const extracted =
+      !params.otpCode && params.textContent
+        ? extractOtpFromText(params.textContent, params.otpSender || params.title || params.sourceApp)
+        : null;
+    const otpCode = (params.otpCode || extracted?.code || "").trim();
+    if (!otpCode) return undefined;
+
+    const normalizeBrand = (s: string | undefined): string => {
+      const clean = (s || "").trim().toLowerCase();
+      return /^\+?\d[\d\s-]{2,}$/.test(clean) ? "" : clean;
+    };
+    const otpSender = normalizeBrand(params.otpSender || extracted?.sender);
+    const sourceApp = (params.sourceApp || "").trim().toLowerCase();
+    const nowMs = Date.now();
+    const incomingAtMs = params.createdAtMs || nowMs;
+
+    const normalizeTail = (text: string | undefined, code: string): string => {
+      if (!text) return "";
+      const idx = text.toLowerCase().indexOf(code.toLowerCase());
+      const slice = idx >= 0 ? text.slice(idx) : text;
+      return slice
+        .replace(/【[^【】]{1,24}】/g, "")
+        .replace(/[^\p{L}\p{N}]+/gu, "")
+        .toLowerCase()
+        .slice(0, 28);
+    };
+    const candTail = normalizeTail(params.textContent, otpCode);
+
+    for (const item of this.itemsMap.values()) {
+      if (item.itemId === params.clientItemId) continue;
+      if (!item.otpCode || item.otpCode.toLowerCase() !== otpCode.toLowerCase()) continue;
+
+      const itemReceivedMs = Date.parse(item.receivedAt) || item.createdAtMs;
+      const ageMs =
+        params.createdAtMs && item.createdAtMs
+          ? Math.abs(incomingAtMs - item.createdAtMs)
+          : Math.abs(nowMs - itemReceivedMs);
+      if (ageMs > windowMs) continue;
+
+      const prevTail = normalizeTail(item.textContent, item.otpCode);
+      const prevSender = normalizeBrand(item.otpSender);
+      const prevApp = (item.sourceApp || "").trim().toLowerCase();
+
+      if (
+        prevSender &&
+        otpSender &&
+        prevSender !== otpSender &&
+        !prevSender.includes(otpSender) &&
+        !otpSender.includes(prevSender) &&
+        (candTail.length < 6 || prevTail !== candTail)
+      ) {
+        continue;
+      }
+
+      if (ageMs < 60_000) return item;
+      if (candTail.length >= 6 && prevTail === candTail) return item;
+      if (prevSender && otpSender) return item;
+      if (prevApp && sourceApp && prevApp === sourceApp) return item;
+      if (!prevSender && !otpSender && (!prevApp || !sourceApp)) return item;
+    }
+    return undefined;
+  }
+
+  /**
    * Idempotently store a submitted item from the Xiaomi phone
    */
   public storeSubmittedItem(

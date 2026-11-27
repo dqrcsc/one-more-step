@@ -96,18 +96,29 @@ class OmsAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null || !::guard.isInitialized) return
         if (event.eventType == AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) {
+            // Zero-config fallback only: when NotificationListenerService is active, HyperOS unlock
+            // status-bar marquee/tickers ("…您的验证码是: 192268") must not double-trigger OTP sync.
+            if (com.oms.client.otp.OmsNotificationListenerService.isConnected) return
             val pkg = event.packageName?.toString() ?: return
             if (pkg == packageName) return
             try {
                 val notif = event.parcelableData as? Notification
                 if (notif != null) {
+                    if ((notif.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
+                    val now = System.currentTimeMillis()
+                    if (notif.`when` in 1L until (now - OtpExtractor.OTP_MAX_AGE_MS)) return
                     val extras = notif.extras
                     val title = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()
                     val bigText = extras?.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()
                     val text = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString()
                     val body = bigText ?: text ?: event.text.joinToString(" ")
                     if (body.isNotBlank()) {
-                        OtpExtractor.onCandidateTextReceived(body, title, pkg)
+                        OtpExtractor.onCandidateTextReceived(
+                            rawText = body,
+                            senderHint = title,
+                            sourcePackage = pkg,
+                            eventTimestampMs = notif.`when`.takeIf { it > 0L }
+                        )
                     }
                 } else {
                     val eventTxt = event.text.joinToString(" ").trim()

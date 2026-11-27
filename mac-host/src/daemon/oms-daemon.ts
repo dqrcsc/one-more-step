@@ -1042,6 +1042,21 @@ export class OmsDaemon {
           if (req.method === "inbox.submitItem") {
             const params = req.params as InboxSubmitItemParams;
             const alreadyCommitted = Boolean(this.inbox.getItem(params.clientItemId));
+            if (!alreadyCommitted) {
+              const dupOtp = this.inbox.findRecentDuplicateOtp(params);
+              if (dupOtp) {
+                reply({
+                  result: {
+                    ack: true,
+                    deduplicated: true,
+                    savedId: params.clientItemId,
+                    otpCode: dupOtp.otpCode,
+                    macPath: this.inbox.inboxRootDir,
+                  },
+                });
+                return;
+              }
+            }
             const stored = this.inbox.storeSubmittedItem(params, (streamId) =>
               this.session.getCompletedStream(streamId)
             );
