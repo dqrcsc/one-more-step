@@ -54,6 +54,7 @@ class VerifiedOtaInstaller(private val context: Context) {
         metadata: VerifiedOtaPolicy.Metadata,
         client: OkHttpClient,
         fallbackHttpsClient: OkHttpClient = client,
+        directFallbackHttpsClient: OkHttpClient? = null,
         onProgress: (downloadedBytes: Long, totalBytes: Long) -> Unit = { _, _ -> }
     ): File = prepareMutex.withLock {
         metadata.validate()
@@ -80,43 +81,60 @@ class VerifiedOtaInstaller(private val context: Context) {
                 }
             }
 
-            val part = File(dir, "${UUID.randomUUID()}.part.apk")
-            var committed = false
-            try {
-                executeFollowingValidatedRedirects(metadata, client, fallbackHttpsClient).use { response ->
-                    check(response.isSuccessful) { "APK 下载失败：HTTP ${response.code}" }
-                    val body = checkNotNull(response.body) { "APK 下载内容为空" }
-                    val length = body.contentLength()
-                    require(
-                        length <= VerifiedOtaPolicy.MAX_APK_BYTES &&
-                            (length < 0 || metadata.size == 0L || length == metadata.size)
-                    ) { "APK 下载长度与预期不符" }
-                    val effectiveTotal = if (metadata.size > 0L) metadata.size else length.coerceAtLeast(0L)
-                    var lastEmitMs = 0L
-                    var lastPct = -1
-                    body.byteStream().use { input ->
-                        FileOutputStream(part).use { output ->
-                            VerifiedOtaPolicy.copyAndVerify(input, output, metadata) { dl, _ ->
-                                val now = System.currentTimeMillis()
-                                val pct = if (effectiveTotal > 0L) ((dl * 100L) / effectiveTotal).toInt().coerceIn(0, 100) else 0
-                                if (dl == effectiveTotal || pct != lastPct || now - lastEmitMs >= 120L) {
-                                    lastEmitMs = now
-                                    lastPct = pct
-                                    onProgress(dl, effectiveTotal)
+            fun downloadOnce(primaryClient: OkHttpClient, httpsClient: OkHttpClient): File {
+                val part = File(dir, "${UUID.randomUUID()}.part.apk")
+                var committed = false
+                try {
+                    executeFollowingValidatedRedirects(metadata, primaryClient, httpsClient).use { response ->
+                        check(response.isSuccessful) { "APK 下载失败：HTTP ${response.code}" }
+                        val body = checkNotNull(response.body) { "APK 下载内容为空" }
+                        val length = body.contentLength()
+                        require(
+                            length <= VerifiedOtaPolicy.MAX_APK_BYTES &&
+                                (length < 0 || metadata.size == 0L || length == metadata.size)
+                        ) { "APK 下载长度与预期不符" }
+                        val effectiveTotal = if (metadata.size > 0L) metadata.size else length.coerceAtLeast(0L)
+                        var lastEmitMs = 0L
+                        var lastPct = -1
+                        body.byteStream().use { input ->
+                            FileOutputStream(part).use { output ->
+                                VerifiedOtaPolicy.copyAndVerify(input, output, metadata) { dl, _ ->
+                                    val now = System.currentTimeMillis()
+                                    val pct = if (effectiveTotal > 0L) ((dl * 100L) / effectiveTotal).toInt().coerceIn(0, 100) else 0
+                                    if (dl == effectiveTotal || pct != lastPct || now - lastEmitMs >= 120L) {
+                                        lastEmitMs = now
+                                        lastPct = pct
+                                        onProgress(dl, effectiveTotal)
+                                    }
                                 }
+                                output.fd.sync()
                             }
-                            output.fd.sync()
                         }
                     }
+                    verifyArchiveIdentity(part, metadata)
+                    if (target.exists()) target.delete()
+                    check(part.renameTo(target)) { "无法保存已验证 APK" }
+                    committed = true
+                    pruneOtherCachedApks(dir, keepName = target.name)
+                    return target
+                } finally {
+                    if (!committed) part.delete()
                 }
-                verifyArchiveIdentity(part, metadata)
-                if (target.exists()) target.delete()
-                check(part.renameTo(target)) { "无法保存已验证 APK" }
-                committed = true
-                pruneOtherCachedApks(dir, keepName = target.name)
-                target
-            } finally {
-                if (!committed) part.delete()
+            }
+
+            try {
+                downloadOnce(client, fallbackHttpsClient)
+            } catch (firstErr: Exception) {
+                if (directFallbackHttpsClient != null && directFallbackHttpsClient !== fallbackHttpsClient) {
+                    val retryInitial = if (metadata.url.startsWith("https://", ignoreCase = true)) {
+                        directFallbackHttpsClient
+                    } else {
+                        client
+                    }
+                    downloadOnce(retryInitial, directFallbackHttpsClient)
+                } else {
+                    throw firstErr
+                }
             }
         }
     }
@@ -139,9 +157,16 @@ class VerifiedOtaInstaller(private val context: Context) {
         metadata: VerifiedOtaPolicy.Metadata,
         client: OkHttpClient,
         fallbackHttpsClient: OkHttpClient = client,
+        directFallbackHttpsClient: OkHttpClient? = null,
         onProgress: (downloadedBytes: Long, totalBytes: Long) -> Unit = { _, _ -> }
     ) {
-        val verifiedApk = prepareVerifiedApk(metadata, client, fallbackHttpsClient, onProgress)
+        val verifiedApk = prepareVerifiedApk(
+            metadata = metadata,
+            client = client,
+            fallbackHttpsClient = fallbackHttpsClient,
+            directFallbackHttpsClient = directFallbackHttpsClient,
+            onProgress = onProgress
+        )
         check(launchSystemInstaller(verifiedApk)) {
             "安装包已下载并验签就绪；请在系统设置 → 安装未知应用中允许青简·咫尺后点击安装"
         }

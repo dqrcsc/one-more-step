@@ -85,7 +85,9 @@ class RuleMatcher(rawRules: List<String> = emptyList()) {
         ".google.com",
         ".gstatic.com",
         ".openrouter.ai",
-        ".anthropic.com"
+        ".anthropic.com",
+        ".github.com",
+        ".githubusercontent.com"
     )
     private val directKeywords = mutableListOf<String>()
     private val proxyKeywords = mutableListOf<String>()
@@ -111,7 +113,15 @@ class RuleMatcher(rawRules: List<String> = emptyList()) {
 
     init {
         directExact.addAll(listOf("weixin.qq.com", "ilinkai.weixin.qq.com", "mp.weixin.qq.com", "qq.com"))
-        proxyExact.addAll(listOf("openai.com", "api.openai.com", "generativelanguage.googleapis.com"))
+        proxyExact.addAll(
+            listOf(
+                "openai.com",
+                "api.openai.com",
+                "generativelanguage.googleapis.com",
+                "github.com",
+                "api.github.com"
+            )
+        )
 
         for (rule in rawRules) {
             val parts = rule.split(',').map { it.trim() }

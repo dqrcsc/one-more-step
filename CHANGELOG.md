@@ -1,5 +1,12 @@
 # Changelog · 更新日志
 
+## 3.6.7 - 2026-11-27 · OTA 更新进度条常驻显示与内置免 VPN 代理极速下载
+
+- **修复顶部 OTA 更新提示条点击后瞬间消失 (`CockpitShell`)**：`GlobalAmbientStatusBanner` 补齐 `OtaUiState.Downloading` 分支，点击「更新」后横幅保持常驻并实时显示下载百分比、按钮防重复点击，同时为 `OtaUiState.Error` 独立展示琥珀色失败原因与「重试」入口。
+- **GitHub Release OTA 接入内置免 VPN 代理与自动容灾回退 (`OmsTransportClient`、`VerifiedOtaInstaller` & `SmartRegionRouter`)**：
+  - 将 `github.com`、`api.github.com`、`*.githubusercontent.com` 纳入内置智能分流代理规则；当办公网 Wi-Fi 开启 AP 隔离无法走局域网 HTTP 直连 Mac 时，OTA 检查与 APK 下载自动优先通过内置免 VPN 代理 `OmsProxyManager` 拉取 GitHub Release（代理不可用时自动回退直连，局域网中断时自动无缝回退 GitHub 同 SHA-256 验签下载）。
+  - 修复 `triggerAutoOtaCheckIfEligible` 在前后台切换遇到瞬时网络超时（`!res.ok`）时误将已有 `UpdateAvailable` / `ReadyToInstall` 状态重置为 `Idle` 的问题。
+
 ## 3.6.6 - 2026-11-27 · 锁屏至解锁验证码双端防重推与近场蓝牙拥塞修复
 
 - **根治锁屏收码后延迟解锁二次触发推送 (`OtpExtractor`、`OmsNotificationListenerService`、`OmsAccessibilityService`、`SmsContentObserver`、`inbox-manager` & `oms-daemon`)**：

@@ -620,8 +620,15 @@ fun OmsCockpitRootScreen() {
                     },
                     onOpenApprovals = { currentTab = CockpitTab.MISSION_HUB },
                     onInstallOta = {
+                        val cur = otaState
+                        if (cur is OtaUiState.UpdateAvailable || cur is OtaUiState.Error) {
+                            val ver = (cur as? OtaUiState.UpdateAvailable)?.ota?.remoteVersionName
+                                ?: (cur as? OtaUiState.Error)?.ota?.remoteVersionName.orEmpty()
+                            OmsFeedbackController.show("开始下载新版本 v$ver…", OmsToastKind.INFO)
+                        }
                         app.transportClient.installOrResumeReadyOta { msg ->
-                            OmsFeedbackController.show(msg, OmsToastKind.INFO)
+                            val kind = if (msg.startsWith("更新未安装")) OmsToastKind.WARNING else OmsToastKind.INFO
+                            OmsFeedbackController.show(msg, kind)
                         }
                     }
                 )
@@ -1407,6 +1414,7 @@ private fun GlobalAmbientStatusBanner(
 ) {
     val palette = OmsTheme.colors
     val readyOta = when (otaState) {
+        is OtaUiState.Downloading -> otaState.ota
         is OtaUiState.ReadyToInstall -> otaState.ota
         is OtaUiState.InstallerLaunched -> otaState.ota
         is OtaUiState.NeedsInstallPermission -> otaState.ota
@@ -1470,33 +1478,45 @@ private fun GlobalAmbientStatusBanner(
             }
 
             readyOta != null -> {
+                val isDownloading = otaState is OtaUiState.Downloading
+                val isError = otaState is OtaUiState.Error
                 val (bannerTitle, actionLabel) = when (otaState) {
+                    is OtaUiState.Downloading -> {
+                        val pctSuffix = if (otaState.totalBytes > 0L) " ${otaState.percent}%" else "…"
+                        "正在下载新版本 v${readyOta.remoteVersionName}$pctSuffix" to
+                            (if (otaState.totalBytes > 0L) "${otaState.percent}%" else "下载中")
+                    }
                     is OtaUiState.ReadyToInstall, is OtaUiState.InstallerLaunched ->
                         "新版本 v${readyOta.remoteVersionName} 已就绪" to "安装"
                     is OtaUiState.NeedsInstallPermission ->
                         "新版本 v${readyOta.remoteVersionName} 待开启安装权限" to "去开启"
+                    is OtaUiState.Error ->
+                        "v${readyOta.remoteVersionName} 下载未完成：${otaState.message.take(18)}" to "重试"
                     else ->
                         "发现新版本 v${readyOta.remoteVersionName}" to "更新"
                 }
+                val accentColor = if (isError) palette.warning else palette.success
+                val bgColor = if (isError) palette.warningSoft else palette.successSoft
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 14.dp, vertical = 4.dp)
                         .clip(shape)
-                        .background(palette.successSoft)
-                        .border(0.7.dp, palette.success.copy(alpha = 0.45f), shape)
+                        .background(bgColor)
+                        .border(0.7.dp, accentColor.copy(alpha = 0.45f), shape)
                         .padding(horizontal = 14.dp, vertical = 8.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.weight(1f)) {
-                        Icon(OmsIcons.Bolt, null, tint = palette.success, modifier = Modifier.size(15.dp))
+                        Icon(OmsIcons.Bolt, null, tint = accentColor, modifier = Modifier.size(15.dp))
                         Text(bannerTitle, color = palette.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
                     }
                     OmsPrimaryButton(
                         label = actionLabel,
                         height = 29.dp,
-                        containerColor = palette.success,
+                        enabled = !isDownloading,
+                        containerColor = accentColor,
                         contentColor = Color.White,
                         onClick = onInstallOta
                     )

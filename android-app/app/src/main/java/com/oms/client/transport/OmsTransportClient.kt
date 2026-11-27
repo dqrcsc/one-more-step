@@ -2411,16 +2411,27 @@ class OmsTransportClient(
         )
     }
 
+    private fun resolveGithubHttpsClient(): OkHttpClient {
+        val pm = com.oms.client.OmsApplication.instance?.proxyManager
+        return if (pm != null && pm.hasAvailableNodes()) {
+            pm.getOrCreateOkHttpClient(connectTimeoutSec = 12, readTimeoutSec = 45, writeTimeoutSec = 30)
+        } else {
+            baseHttpClient
+        }
+    }
+
     private suspend fun prepareAndOptionallyLaunchOta(
         ota: OtaCheckResult,
         launchWhenReady: Boolean
     ): String {
         check(ota.ok && ota.hasUpdate) { ota.message.ifBlank { "当前没有可安装的更新" } }
         val metadata = toVerifiedMetadata(ota)
-        val initialClient = if (ota.downloadUrl.startsWith("http://", ignoreCase = true)) {
+        val githubHttpsClient = resolveGithubHttpsClient()
+        val isLanHttp = ota.downloadUrl.startsWith("http://", ignoreCase = true)
+        val initialClient = if (isLanHttp) {
             buildLanOkHttpClient()
         } else {
-            baseHttpClient
+            githubHttpsClient
         }
         _otaStateFlow.value = OtaUiState.Downloading(
             ota = ota,
@@ -2428,18 +2439,34 @@ class OmsTransportClient(
             totalBytes = ota.remoteSizeBytes,
             percent = 0
         )
+        val progressReporter: (Long, Long) -> Unit = { dl, total ->
+            val pct = if (total > 0L) ((dl * 100L) / total).toInt().coerceIn(0, 100) else 0
+            _otaStateFlow.value = OtaUiState.Downloading(
+                ota = ota,
+                downloadedBytes = dl,
+                totalBytes = total,
+                percent = pct
+            )
+        }
         val verifiedFile = try {
-            otaInstaller.prepareVerifiedApk(
-                metadata = metadata,
-                client = initialClient,
-                fallbackHttpsClient = baseHttpClient
-            ) { dl, total ->
-                val pct = if (total > 0L) ((dl * 100L) / total).toInt().coerceIn(0, 100) else 0
-                _otaStateFlow.value = OtaUiState.Downloading(
-                    ota = ota,
-                    downloadedBytes = dl,
-                    totalBytes = total,
-                    percent = pct
+            try {
+                otaInstaller.prepareVerifiedApk(
+                    metadata = metadata,
+                    client = initialClient,
+                    fallbackHttpsClient = githubHttpsClient,
+                    directFallbackHttpsClient = baseHttpClient.takeIf { it !== githubHttpsClient },
+                    onProgress = progressReporter
+                )
+            } catch (lanErr: Exception) {
+                if (!isLanHttp) throw lanErr
+                val ghFallbackUrl = "https://github.com/dqrcsc/one-more-step/releases/download/v${ota.remoteVersionName}/OneMoreStep-v${ota.remoteVersionName}.apk"
+                val ghMetadata = metadata.copy(url = ghFallbackUrl)
+                otaInstaller.prepareVerifiedApk(
+                    metadata = ghMetadata,
+                    client = githubHttpsClient,
+                    fallbackHttpsClient = githubHttpsClient,
+                    directFallbackHttpsClient = baseHttpClient.takeIf { it !== githubHttpsClient },
+                    onProgress = progressReporter
                 )
             }
         } catch (e: Exception) {
@@ -2592,7 +2619,10 @@ class OmsTransportClient(
 
         checkOtaUpdate { res ->
             autoOtaJobRunning.set(false)
-            if (!res.ok || !res.hasUpdate) {
+            if (!res.ok) {
+                return@checkOtaUpdate
+            }
+            if (!res.hasUpdate) {
                 if (_otaStateFlow.value !is OtaUiState.Downloading) {
                     _otaStateFlow.value = OtaUiState.Idle
                 }
@@ -2701,72 +2731,88 @@ class OmsTransportClient(
             // Plain HTTP /apk/version cannot authenticate a digest, even on a paired LAN.
             // 3. Priority 3: Fallback to GitHub Releases API when LAN HTTP is isolated/unreachable
             try {
-                val ghClient = baseHttpClient.newBuilder()
-                    .connectTimeout(5, TimeUnit.SECONDS)
-                    .readTimeout(6, TimeUnit.SECONDS)
-                    .followRedirects(false)
-                    .build()
-                val ghReq = Request.Builder()
-                    .url("https://api.github.com/repos/dqrcsc/one-more-step/releases/latest")
-                    .header("Accept", "application/vnd.github+json")
-                    .get()
-                    .build()
-                ghClient.newCall(ghReq).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val json = JSONObject(resp.body?.string() ?: "{}")
-                        val tagName = json.optString("tag_name", "").removePrefix("v").trim()
-                        if (tagName.isNotBlank()) {
-                            val assets = json.optJSONArray("assets")
-                            var assetUrl = "https://github.com/dqrcsc/one-more-step/releases/download/v$tagName/OneMoreStep-v$tagName.apk"
-                            var assetSize = 0L
-                            var assetUpdatedIso = json.optString("published_at", "")
-                            var assetSha256 = ""
-                            if (assets != null && assets.length() > 0) {
-                                val apkAsset = (0 until assets.length())
-                                    .map { assets.getJSONObject(it) }
-                                    .firstOrNull { it.optString("name", "").endsWith(".apk", ignoreCase = true) }
-                                    ?: throw IllegalStateException("GitHub Release 没有 APK")
-                                assetUrl = apkAsset.optString("browser_download_url", assetUrl)
-                                assetSize = apkAsset.optLong("size", 0L)
-                                assetUpdatedIso = apkAsset.optString("updated_at", assetUpdatedIso)
-                                val digest = apkAsset.optString("digest", "")
-                                if (digest.startsWith("sha256:", ignoreCase = true)) {
-                                    assetSha256 = digest.substringAfter(':').trim()
-                                }
-                            }
-                            VerifiedOtaPolicy.Metadata(assetUrl, assetSha256, assetSize, tagName, 0,
-                                VerifiedOtaPolicy.Source.GITHUB_HTTPS).validate()
-                            val hasUpdate = OtaVersionPolicy.hasGithubReleaseUpdate(
-                                localVersionName = localVerName,
-                                releaseTagName = tagName,
-                                localSha256 = localSha,
-                                assetSha256 = assetSha256
-                            )
-                            mainHandler.post {
-                                onResult(
-                                    OtaCheckResult(
-                                        ok = true,
-                                        hasUpdate = hasUpdate,
-                                        localVersionName = localVerName,
-                                        localVersionCode = localVerCode,
-                                        localSha256 = localSha,
-                                        remoteVersionName = tagName,
-                                        remoteVersionCode = 0,
-                                        remoteSha256 = assetSha256,
-                                        integritySource = VerifiedOtaPolicy.Source.GITHUB_HTTPS,
-                                        remoteSizeBytes = assetSize,
-                                        remoteUpdatedAtIso = assetUpdatedIso,
-                                        downloadUrl = assetUrl,
-                                        message = if (hasUpdate) {
-                                            "发现新版本 v$tagName (GitHub Release)"
-                                        } else {
-                                            "✅ 当前已是最新版本 (v$localVerName)"
-                                        }
-                                    )
-                                )
-                            }
-                            return@launch
+                val primaryGhClient = resolveGithubHttpsClient()
+                val ghClients = if (primaryGhClient !== baseHttpClient) {
+                    listOf(primaryGhClient, baseHttpClient)
+                } else {
+                    listOf(baseHttpClient)
+                }
+                var ghJsonText: String? = null
+                for (baseClient in ghClients) {
+                    val ghClient = baseClient.newBuilder()
+                        .connectTimeout(6, TimeUnit.SECONDS)
+                        .readTimeout(8, TimeUnit.SECONDS)
+                        .followRedirects(false)
+                        .build()
+                    val ghReq = Request.Builder()
+                        .url("https://api.github.com/repos/dqrcsc/one-more-step/releases/latest")
+                        .header("Accept", "application/vnd.github+json")
+                        .get()
+                        .build()
+                    val attemptBody = runCatching {
+                        ghClient.newCall(ghReq).execute().use { resp ->
+                            if (resp.isSuccessful) resp.body?.string() else null
                         }
+                    }.getOrNull()
+                    if (!attemptBody.isNullOrBlank()) {
+                        ghJsonText = attemptBody
+                        break
+                    }
+                }
+                if (!ghJsonText.isNullOrBlank()) {
+                    val json = JSONObject(ghJsonText)
+                    val tagName = json.optString("tag_name", "").removePrefix("v").trim()
+                    if (tagName.isNotBlank()) {
+                        val assets = json.optJSONArray("assets")
+                        var assetUrl = "https://github.com/dqrcsc/one-more-step/releases/download/v$tagName/OneMoreStep-v$tagName.apk"
+                        var assetSize = 0L
+                        var assetUpdatedIso = json.optString("published_at", "")
+                        var assetSha256 = ""
+                        if (assets != null && assets.length() > 0) {
+                            val apkAsset = (0 until assets.length())
+                                .map { assets.getJSONObject(it) }
+                                .firstOrNull { it.optString("name", "").endsWith(".apk", ignoreCase = true) }
+                                ?: throw IllegalStateException("GitHub Release 没有 APK")
+                            assetUrl = apkAsset.optString("browser_download_url", assetUrl)
+                            assetSize = apkAsset.optLong("size", 0L)
+                            assetUpdatedIso = apkAsset.optString("updated_at", assetUpdatedIso)
+                            val digest = apkAsset.optString("digest", "")
+                            if (digest.startsWith("sha256:", ignoreCase = true)) {
+                                assetSha256 = digest.substringAfter(':').trim()
+                            }
+                        }
+                        VerifiedOtaPolicy.Metadata(assetUrl, assetSha256, assetSize, tagName, 0,
+                            VerifiedOtaPolicy.Source.GITHUB_HTTPS).validate()
+                        val hasUpdate = OtaVersionPolicy.hasGithubReleaseUpdate(
+                            localVersionName = localVerName,
+                            releaseTagName = tagName,
+                            localSha256 = localSha,
+                            assetSha256 = assetSha256
+                        )
+                        mainHandler.post {
+                            onResult(
+                                OtaCheckResult(
+                                    ok = true,
+                                    hasUpdate = hasUpdate,
+                                    localVersionName = localVerName,
+                                    localVersionCode = localVerCode,
+                                    localSha256 = localSha,
+                                    remoteVersionName = tagName,
+                                    remoteVersionCode = 0,
+                                    remoteSha256 = assetSha256,
+                                    integritySource = VerifiedOtaPolicy.Source.GITHUB_HTTPS,
+                                    remoteSizeBytes = assetSize,
+                                    remoteUpdatedAtIso = assetUpdatedIso,
+                                    downloadUrl = assetUrl,
+                                    message = if (hasUpdate) {
+                                        "发现新版本 v$tagName (GitHub Release)"
+                                    } else {
+                                        "✅ 当前已是最新版本 (v$localVerName)"
+                                    }
+                                )
+                            )
+                        }
+                        return@launch
                     }
                 }
             } catch (_: Throwable) {
