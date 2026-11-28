@@ -4,6 +4,7 @@ import CoreGraphics
 import Darwin
 import Foundation
 import IOKit.pwr_mgt
+import QuartzCore
 
 @_silgen_name("CGSessionCopyCurrentDictionary")
 func CGSessionCopyCurrentDictionary() -> CFDictionary?
@@ -202,6 +203,413 @@ func openAccessibilitySettings() {
     }
 }
 
+// =============================================================================
+// High-Frequency Native HID Injector & Laser/Spotlight Coordinator (v3.7)
+// =============================================================================
+
+final class HidEventEngine {
+    static let shared = HidEventEngine()
+
+    private let lock = NSLock()
+    private let eventSource = CGEventSource(stateID: .hidSystemState)
+    private var virtualPos: CGPoint? = nil
+    private var lastPointerActivitySec: TimeInterval = 0
+    private var leftButtonDown: Bool = false
+    private var scrollRemX: CGFloat = 0
+    private var scrollRemY: CGFloat = 0
+    private var cachedDisplays: [CGRect] = []
+    private var lastDisplayRefreshSec: TimeInterval = 0
+
+    private static let allowedSystemKeys: Set<Int> = [0, 1, 2, 3, 7, 16, 17, 18]
+
+    private init() {}
+
+    private func getDisplayRectsLocked(now: TimeInterval) -> [CGRect] {
+        if cachedDisplays.isEmpty || (now - lastDisplayRefreshSec) > 0.5 {
+            cachedDisplays = LaserOverlayController.currentGlobalDisplayRects()
+            lastDisplayRefreshSec = now
+        }
+        return cachedDisplays
+    }
+
+    private func currentVirtualPosLocked(now: TimeInterval) -> CGPoint {
+        if let vp = virtualPos, (now - lastPointerActivitySec) <= 0.35 {
+            return vp
+        }
+        let livePos = CGEvent(source: nil)?.location ?? virtualPos ?? .zero
+        let clamped = HidMath.clampToDisplays(livePos, displays: getDisplayRectsLocked(now: now))
+        virtualPos = clamped
+        return clamped
+    }
+
+    private func advanceCursorLocked(dxRaw: Int, dyRaw: Int, now: TimeInterval) -> (pos: CGPoint, dxPt: CGFloat, dyPt: CGFloat) {
+        let dxPt = HidMath.quarterPxToPoints(dxRaw)
+        let dyPt = HidMath.quarterPxToPoints(dyRaw)
+        let base = currentVirtualPosLocked(now: now)
+        let target = CGPoint(x: base.x + dxPt, y: base.y + dyPt)
+        let clamped = HidMath.clampToDisplays(target, displays: getDisplayRectsLocked(now: now))
+        virtualPos = clamped
+        lastPointerActivitySec = now
+        return (clamped, dxPt, dyPt)
+    }
+
+    private func postPointerMoveEvent(pos: CGPoint, dxPt: CGFloat, dyPt: CGFloat, isDragging: Bool, flags: CGEventFlags = []) {
+        let evType: CGEventType = isDragging ? .leftMouseDragged : .mouseMoved
+        guard let ev = CGEvent(mouseEventSource: eventSource, mouseType: evType, mouseCursorPosition: pos, mouseButton: .left) else {
+            return
+        }
+        if !flags.isEmpty {
+            ev.flags = flags
+        }
+        ev.setDoubleValueField(.mouseEventDeltaX, value: Double(dxPt))
+        ev.setDoubleValueField(.mouseEventDeltaY, value: Double(dyPt))
+        ev.post(tap: .cghidEventTap)
+    }
+
+    private func postMouseButtonPair(buttonCode: Int, pos: CGPoint, isDown: Bool, clickState: Int64 = 1) {
+        let cgBtn: CGMouseButton
+        let cgType: CGEventType
+        switch buttonCode {
+        case 2:
+            cgBtn = .right
+            cgType = isDown ? .rightMouseDown : .rightMouseUp
+        case 3:
+            cgBtn = .center
+            cgType = isDown ? .otherMouseDown : .otherMouseUp
+        default:
+            cgBtn = .left
+            cgType = isDown ? .leftMouseDown : .leftMouseUp
+        }
+        guard let ev = CGEvent(mouseEventSource: eventSource, mouseType: cgType, mouseCursorPosition: pos, mouseButton: cgBtn) else {
+            return
+        }
+        ev.setIntegerValueField(.mouseEventClickState, value: clickState)
+        ev.post(tap: .cghidEventTap)
+    }
+
+    private func modifierFlags(from mask: Int) -> CGEventFlags {
+        var flags: CGEventFlags = []
+        if (mask & 0x01) != 0 { flags.insert(.maskCommand) }
+        if (mask & 0x02) != 0 { flags.insert(.maskShift) }
+        if (mask & 0x04) != 0 { flags.insert(.maskAlternate) }
+        if (mask & 0x08) != 0 { flags.insert(.maskControl) }
+        return flags
+    }
+
+    private func postModifierTransition(mask: Int, isDown: Bool) {
+        guard mask != 0 else { return }
+        let modSpecs: [(bit: Int, keyCode: CGKeyCode, flag: CGEventFlags)] = [
+            (0x08, 59, .maskControl),
+            (0x04, 58, .maskAlternate),
+            (0x02, 56, .maskShift),
+            (0x01, 55, .maskCommand),
+        ]
+        var active: CGEventFlags = isDown ? [] : modifierFlags(from: mask)
+        let sequence = isDown ? modSpecs : modSpecs.reversed()
+        for spec in sequence where (mask & spec.bit) != 0 {
+            if isDown {
+                active.insert(spec.flag)
+            } else {
+                active.remove(spec.flag)
+            }
+            if let ev = CGEvent(keyboardEventSource: eventSource, virtualKey: spec.keyCode, keyDown: isDown) {
+                ev.type = .flagsChanged
+                ev.flags = active
+                ev.post(tap: .cghidEventTap)
+            }
+        }
+    }
+
+    private func postKeyTap(keyCodeRaw: Int, modsMask: Int) {
+        guard !isScreenLocked() else { return }
+        guard keyCodeRaw >= 0 && keyCodeRaw <= 255 else { return }
+        let keyCode = CGKeyCode(keyCodeRaw)
+        let modFlags = modifierFlags(from: modsMask)
+
+        postModifierTransition(mask: modsMask, isDown: true)
+        if let down = CGEvent(keyboardEventSource: eventSource, virtualKey: keyCode, keyDown: true),
+           let up = CGEvent(keyboardEventSource: eventSource, virtualKey: keyCode, keyDown: false) {
+            let intrinsic = down.flags.intersection([.maskNumericPad, .maskSecondaryFn])
+            let combinedFlags = modFlags.union(intrinsic)
+            down.flags = combinedFlags
+            up.flags = combinedFlags
+            down.post(tap: .cghidEventTap)
+            usleep(2_000)
+            up.post(tap: .cghidEventTap)
+        }
+        postModifierTransition(mask: modsMask, isDown: false)
+    }
+
+    private func postSystemDefinedKey(_ keyType: Int) {
+        guard Self.allowedSystemKeys.contains(keyType) else { return }
+        let emitBlock = {
+            for down in [true, false] {
+                let flagsRaw: UInt = down ? 0x0a00 : 0x0b00
+                let data1 = (keyType << 16) | Int(flagsRaw)
+                if let nsEv = NSEvent.otherEvent(
+                    with: .systemDefined,
+                    location: .zero,
+                    modifierFlags: NSEvent.ModifierFlags(rawValue: flagsRaw),
+                    timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: 0,
+                    context: nil,
+                    subtype: 8,
+                    data1: data1,
+                    data2: -1
+                ), let cgEv = nsEv.cgEvent {
+                    cgEv.post(tap: .cghidEventTap)
+                }
+            }
+        }
+        if Thread.isMainThread {
+            emitBlock()
+        } else {
+            DispatchQueue.main.async(execute: emitBlock)
+        }
+    }
+
+    func handleHidPacket(op: Int, modsOrBtn: Int, dx: Int, dy: Int, aux: Int, flags: Int) {
+        switch op {
+        case 0x01: // POINTER_MOVE_REL
+            lock.lock()
+            let now = CACurrentMediaTime()
+            let step = advanceCursorLocked(dxRaw: dx, dyRaw: dy, now: now)
+            let dragging = leftButtonDown
+            let evFlags = modifierFlags(from: modsOrBtn)
+            lock.unlock()
+            postPointerMoveEvent(pos: step.pos, dxPt: step.dxPt, dyPt: step.dyPt, isDragging: dragging, flags: evFlags)
+
+        case 0x02: // MOUSE_BUTTON
+            let btn = (modsOrBtn >= 1 && modsOrBtn <= 3) ? modsOrBtn : 1
+            let action = dx
+            lock.lock()
+            let now = CACurrentMediaTime()
+            let pos = currentVirtualPosLocked(now: now)
+            lastPointerActivitySec = now
+            switch action {
+            case 1: // CLICK
+                if btn == 1 && leftButtonDown {
+                    leftButtonDown = false
+                    lock.unlock()
+                    postMouseButtonPair(buttonCode: 1, pos: pos, isDown: false, clickState: 1)
+                } else {
+                    lock.unlock()
+                    postMouseButtonPair(buttonCode: btn, pos: pos, isDown: true, clickState: 1)
+                    usleep(4_000)
+                    postMouseButtonPair(buttonCode: btn, pos: pos, isDown: false, clickState: 1)
+                }
+            case 2: // DOUBLE_CLICK
+                if btn == 1 { leftButtonDown = false }
+                lock.unlock()
+                postMouseButtonPair(buttonCode: btn, pos: pos, isDown: true, clickState: 1)
+                usleep(3_000)
+                postMouseButtonPair(buttonCode: btn, pos: pos, isDown: false, clickState: 1)
+                usleep(12_000)
+                postMouseButtonPair(buttonCode: btn, pos: pos, isDown: true, clickState: 2)
+                usleep(3_000)
+                postMouseButtonPair(buttonCode: btn, pos: pos, isDown: false, clickState: 2)
+            case 3: // DOWN
+                if btn == 1 { leftButtonDown = true }
+                lock.unlock()
+                postMouseButtonPair(buttonCode: btn, pos: pos, isDown: true, clickState: 1)
+            case 4: // UP
+                if btn == 1 { leftButtonDown = false }
+                lock.unlock()
+                postMouseButtonPair(buttonCode: btn, pos: pos, isDown: false, clickState: 1)
+            case 5: // DRAG_LOCK_TOGGLE
+                let nextHeld = !leftButtonDown
+                leftButtonDown = nextHeld
+                lock.unlock()
+                postMouseButtonPair(buttonCode: 1, pos: pos, isDown: nextHeld, clickState: 1)
+            default:
+                lock.unlock()
+            }
+
+        case 0x03: // SCROLL_PIXEL
+            lock.lock()
+            scrollRemX += HidMath.quarterPxToPoints(dx)
+            scrollRemY += HidMath.quarterPxToPoints(dy)
+            let dxPx = Int32(scrollRemX.rounded(.towardZero))
+            let dyPx = Int32(scrollRemY.rounded(.towardZero))
+            scrollRemX -= CGFloat(dxPx)
+            scrollRemY -= CGFloat(dyPx)
+            let evFlags = modifierFlags(from: modsOrBtn)
+            lock.unlock()
+            guard dxPx != 0 || dyPx != 0 else { return }
+            if let ev = CGEvent(
+                scrollWheelEvent2Source: eventSource,
+                units: .pixel,
+                wheelCount: 2,
+                wheel1: dyPx,
+                wheel2: dxPx,
+                wheel3: 0
+            ) {
+                ev.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+                if !evFlags.isEmpty {
+                    ev.flags = evFlags
+                }
+                ev.post(tap: .cghidEventTap)
+            }
+
+        case 0x04: // KEY_TAP
+            postKeyTap(keyCodeRaw: dx, modsMask: modsOrBtn)
+
+        case 0x05: // SYSTEM_DEFINED_KEY
+            let keyType = (dx > 0) ? dx : modsOrBtn
+            postSystemDefinedKey(keyType)
+
+        case 0x06: // LASER_STATE_AND_DELTA
+            lock.lock()
+            let now = CACurrentMediaTime()
+            let hasDelta = (dx != 0 || dy != 0)
+            let nextPos: CGPoint
+            let dxPt: CGFloat
+            let dyPt: CGFloat
+            let dragging = leftButtonDown
+            if hasDelta {
+                let step = advanceCursorLocked(dxRaw: dx, dyRaw: dy, now: now)
+                nextPos = step.pos
+                dxPt = step.dxPt
+                dyPt = step.dyPt
+            } else {
+                nextPos = currentVirtualPosLocked(now: now)
+                lastPointerActivitySec = now
+                dxPt = 0
+                dyPt = 0
+            }
+            lock.unlock()
+
+            if hasDelta {
+                postPointerMoveEvent(pos: nextPos, dxPt: dxPt, dyPt: dyPt, isDragging: dragging)
+            }
+            let mode = modsOrBtn
+            let radius = CGFloat(aux)
+            if Thread.isMainThread {
+                LaserOverlayController.shared.updateOnMain(mode: mode, globalCursor: nextPos, spotlightRadius: radius)
+            } else {
+                DispatchQueue.main.async {
+                    LaserOverlayController.shared.updateOnMain(mode: mode, globalCursor: nextPos, spotlightRadius: radius)
+                }
+            }
+
+        case 0x0f: // RESET_HID_STATE
+            resetState()
+
+        default:
+            break
+        }
+    }
+
+    func typeUnicodeText(_ text: String, submitReturn: Bool) -> [String: Any] {
+        guard !isScreenLocked() else {
+            return [
+                "ok": false,
+                "typedChars": 0,
+                "error": "ERR_SCREEN_LOCKED",
+                "message": "Mac 当前处于锁屏状态，请先点击「远程解锁」后再输入文字"
+            ]
+        }
+        guard checkAccessibilityTrusted(prompt: false) else {
+            return [
+                "ok": false,
+                "typedChars": 0,
+                "error": "ERR_AX_NOT_TRUSTED",
+                "message": "缺少 macOS 辅助功能权限"
+            ]
+        }
+
+        let utf16Units = Array(text.utf16)
+        var idx = 0
+        while idx < utf16Units.count {
+            var end = min(idx + 16, utf16Units.count)
+            if end < utf16Units.count && UTF16.isLeadSurrogate(utf16Units[end - 1]) {
+                end -= 1
+            }
+            if end <= idx {
+                end = min(idx + 1, utf16Units.count)
+            }
+            var chunk = Array(utf16Units[idx..<end])
+            let chunkLen = chunk.count
+            guard let down = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: false) else {
+                return [
+                    "ok": false,
+                    "typedChars": 0,
+                    "error": "ERR_CGEVENT_FAILED",
+                    "message": "CGEvent 创建失败"
+                ]
+            }
+            down.flags = []
+            up.flags = []
+            chunk.withUnsafeMutableBufferPointer { buf in
+                guard let base = buf.baseAddress else { return }
+                down.keyboardSetUnicodeString(stringLength: chunkLen, unicodeString: base)
+                up.keyboardSetUnicodeString(stringLength: chunkLen, unicodeString: base)
+            }
+            down.post(tap: .cghidEventTap)
+            usleep(3_000)
+            up.post(tap: .cghidEventTap)
+            usleep(3_000)
+            idx = end
+        }
+
+        if submitReturn {
+            if let down = CGEvent(keyboardEventSource: eventSource, virtualKey: 36, keyDown: true),
+               let up = CGEvent(keyboardEventSource: eventSource, virtualKey: 36, keyDown: false) {
+                down.flags = []
+                up.flags = []
+                down.post(tap: .cghidEventTap)
+                usleep(6_000)
+                up.post(tap: .cghidEventTap)
+            }
+        }
+
+        return [
+            "ok": true,
+            "typedChars": text.count
+        ]
+    }
+
+    func resetState() {
+        lock.lock()
+        scrollRemX = 0
+        scrollRemY = 0
+        let wasLeftDown = leftButtonDown
+        leftButtonDown = false
+        let releasePos = virtualPos ?? (CGEvent(source: nil)?.location ?? .zero)
+        virtualPos = nil
+        lock.unlock()
+
+        if wasLeftDown {
+            postMouseButtonPair(buttonCode: 1, pos: releasePos, isDown: false, clickState: 1)
+        }
+
+        if Thread.isMainThread {
+            LaserOverlayController.shared.hideImmediateOnMain()
+        } else {
+            DispatchQueue.main.async {
+                LaserOverlayController.shared.hideImmediateOnMain()
+            }
+        }
+    }
+}
+
+private func intField(_ dict: [String: Any], _ key: String, fallbackKey: String? = nil) -> Int {
+    if let num = dict[key] as? NSNumber { return num.intValue }
+    if let val = dict[key] as? Int { return val }
+    if let alt = fallbackKey {
+        if let num = dict[alt] as? NSNumber { return num.intValue }
+        if let val = dict[alt] as? Int { return val }
+    }
+    return 0
+}
+
+private func boolField(_ dict: [String: Any], _ key: String) -> Bool {
+    if let b = dict[key] as? Bool { return b }
+    if let num = dict[key] as? NSNumber { return num.boolValue }
+    return false
+}
+
 func jsonString(_ dict: [String: Any]) -> String {
     if let data = try? JSONSerialization.data(withJSONObject: dict),
        let s = String(data: data, encoding: .utf8) {
@@ -213,8 +621,24 @@ func jsonString(_ dict: [String: Any]) -> String {
 func handleCommandDict(_ req: [String: Any]) -> [String: Any] {
     let cmd = (req["cmd"] as? String) ?? "status"
     switch cmd {
+    case "hid":
+        let op = intField(req, "op", fallbackKey: "opcode")
+        let modsOrBtn = intField(req, "m", fallbackKey: "modsOrBtn")
+        let dx = intField(req, "dx")
+        let dy = intField(req, "dy")
+        let aux = intField(req, "aux")
+        let fl = intField(req, "fl", fallbackKey: "flags")
+        HidEventEngine.shared.handleHidPacket(op: op, modsOrBtn: modsOrBtn, dx: dx, dy: dy, aux: aux, flags: fl)
+        return ["ok": true]
+    case "type-text":
+        let text = (req["text"] as? String) ?? ""
+        let submitReturn = boolField(req, "submitReturn")
+        return HidEventEngine.shared.typeUnicodeText(text, submitReturn: submitReturn)
+    case "reset-hid":
+        HidEventEngine.shared.resetState()
+        return ["ok": true]
     case "status":
-        let prompt = (req["prompt"] as? Bool) ?? false
+        let prompt = boolField(req, "prompt")
         return [
             "ok": true,
             "screenLocked": isScreenLocked(),
@@ -252,7 +676,26 @@ func handleCommandDict(_ req: [String: Any]) -> [String: Any] {
     }
 }
 
+@discardableResult
+private func writeAllSocket(_ fd: Int32, _ text: String) -> Bool {
+    let bytes = Array(text.utf8)
+    var offset = 0
+    while offset < bytes.count {
+        let written = bytes.withUnsafeBufferPointer { buf -> Int in
+            guard let base = buf.baseAddress else { return -1 }
+            return Darwin.write(fd, base.advanced(by: offset), bytes.count - offset)
+        }
+        if written <= 0 {
+            if written < 0 && errno == EINTR { continue }
+            return false
+        }
+        offset += written
+    }
+    return true
+}
+
 func runUnixSocketDaemon(socketPath: String) -> Never {
+    signal(SIGPIPE, SIG_IGN)
     let fm = FileManager.default
     let dir = (socketPath as NSString).deletingLastPathComponent
     try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -291,29 +734,77 @@ func runUnixSocketDaemon(socketPath: String) -> Never {
     chmod(socketPath, 0o600)
     listen(serverFd, 16)
 
-    DispatchQueue.global(qos: .userInitiated).async {
+    DispatchQueue.global(qos: .userInteractive).async {
         while true {
             let clientFd = accept(serverFd, nil, nil)
             if clientFd < 0 { continue }
-            DispatchQueue.global(qos: .userInitiated).async {
+            var noSigPipe: Int32 = 1
+            _ = setsockopt(clientFd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+
+            DispatchQueue.global(qos: .userInteractive).async {
                 defer { close(clientFd) }
-                var data = Data()
-                var buf = [UInt8](repeating: 0, count: 4096)
+                var pending = Data()
+                var buf = [UInt8](repeating: 0, count: 8192)
+                let maxLineBytes = 256 * 1024
+
                 while true {
-                    let n = read(clientFd, &buf, buf.count)
-                    if n <= 0 { break }
-                    data.append(buf, count: n)
-                    if buf[0..<n].contains(0x0A) { break }
-                }
-                let line = (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                var resp: [String: Any] = ["ok": false, "error": "invalid_json"]
-                if let jsonData = line.data(using: .utf8),
-                   let obj = (try? JSONSerialization.jsonObject(with: jsonData)) as? [String: Any] {
-                    resp = handleCommandDict(obj)
-                }
-                let out = (jsonString(resp) + "\n")
-                out.withCString { cstr in
-                    _ = write(clientFd, cstr, strlen(cstr))
+                    let n = Darwin.read(clientFd, &buf, buf.count)
+                    if n < 0 {
+                        if errno == EINTR { continue }
+                        break
+                    }
+                    if n == 0 {
+                        // Process any trailing non-newline-terminated payload from legacy one-shot clients
+                        if !pending.isEmpty {
+                            let line = (String(data: pending, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                            pending.removeAll()
+                            if !line.isEmpty {
+                                if let jsonData = line.data(using: .utf8),
+                                   let obj = (try? JSONSerialization.jsonObject(with: jsonData)) as? [String: Any] {
+                                    let noReply = boolField(obj, "noreply")
+                                    let resp = handleCommandDict(obj)
+                                    if !noReply {
+                                        _ = writeAllSocket(clientFd, jsonString(resp) + "\n")
+                                    }
+                                } else {
+                                    _ = writeAllSocket(clientFd, "{\"ok\":false,\"error\":\"invalid_json\"}\n")
+                                }
+                            }
+                        }
+                        break
+                    }
+
+                    pending.append(buf, count: n)
+                    if pending.count > maxLineBytes && !pending.contains(0x0A) {
+                        _ = writeAllSocket(clientFd, "{\"ok\":false,\"error\":\"payload_too_large\"}\n")
+                        break
+                    }
+
+                    var writeFailed = false
+                    while let nlIndex = pending.firstIndex(of: 0x0A) {
+                        let lineData = pending.subdata(in: pending.startIndex..<nlIndex)
+                        pending.removeSubrange(pending.startIndex...nlIndex)
+                        let line = (String(data: lineData, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                        if line.isEmpty { continue }
+
+                        if let jsonData = line.data(using: .utf8),
+                           let obj = (try? JSONSerialization.jsonObject(with: jsonData)) as? [String: Any] {
+                            let noReply = boolField(obj, "noreply")
+                            let resp = handleCommandDict(obj)
+                            if !noReply {
+                                if !writeAllSocket(clientFd, jsonString(resp) + "\n") {
+                                    writeFailed = true
+                                    break
+                                }
+                            }
+                        } else {
+                            if !writeAllSocket(clientFd, "{\"ok\":false,\"error\":\"invalid_json\"}\n") {
+                                writeFailed = true
+                                break
+                            }
+                        }
+                    }
+                    if writeFailed { break }
                 }
             }
         }
@@ -338,6 +829,8 @@ case "request-accessibility":
     print(jsonString(handleCommandDict(["cmd": "request-accessibility"])))
 case "wake":
     print(jsonString(handleCommandDict(["cmd": "wake"])))
+case "reset-hid":
+    print(jsonString(handleCommandDict(["cmd": "reset-hid"])))
 case "lock":
     let res = handleCommandDict(["cmd": "lock"])
     print(jsonString(res))
