@@ -106,6 +106,7 @@ export class MacOsController {
   private fastSocket: net.Socket | null = null;
   private fastSocketConnected = false;
   private fastLaunching = false;
+  private helperBundleChecked = false;
   private readonly pendingFastLines: string[] = [];
 
   constructor(repoRoot: string, customOmsHomeDir?: string) {
@@ -186,10 +187,20 @@ export class MacOsController {
           stdio: "ignore",
           timeout: 1500,
         });
+        try {
+          if (fs.existsSync(this.helperSocketPath)) fs.unlinkSync(this.helperSocketPath);
+        } catch {}
       }
       return true;
     } catch {
       return false;
+    }
+  }
+
+  private ensureHelperUpToDateOnce(): void {
+    if (this.helperBundleChecked || this.isTestIsolation || process.platform !== "darwin") return;
+    if (this.ensureHelperAppBundleInstalled()) {
+      this.helperBundleChecked = true;
     }
   }
 
@@ -245,6 +256,7 @@ export class MacOsController {
     timeoutMs = 3500
   ): Promise<Record<string, any> | null> {
     if (this.isTestIsolation) return null;
+    this.ensureHelperUpToDateOnce();
     const firstTry = await this.callSocketOnce(payload, Math.min(1500, timeoutMs));
     if (firstTry) return firstTry;
 
@@ -381,6 +393,7 @@ export class MacOsController {
 
     void (async () => {
       try {
+        this.ensureHelperUpToDateOnce();
         if (await this.connectFastSocketOnce()) return;
         if (!this.ensureHelperAppBundleInstalled()) return;
         fs.mkdirSync(path.dirname(this.helperSocketPath), { recursive: true, mode: 0o700 });
