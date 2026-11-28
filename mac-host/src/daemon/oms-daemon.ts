@@ -25,10 +25,12 @@ import {
   Ed25519Identity,
   generateEd25519Identity,
   generateUuidV7,
+  HidInputPayload,
   InboxSubmitItemParams,
   IntentTag,
   JsonRpcRequest,
   MacControlExecuteParams,
+  MacHidTypeTextParams,
   MemoryPromoteVaultParams,
   MirrorStatusSnapshot,
   OMS_BLE_SERVICE_SHORT_UUID,
@@ -247,7 +249,7 @@ export class OmsDaemon {
       wechatEnvPath: path.join(this.wechat.wechatHomeDir, ".env"),
     });
     this.secretary = new SecretaryCore(this.homeDir);
-    this.macControl = new MacOsController(repoRoot);
+    this.macControl = new MacOsController(repoRoot, this.homeDir);
     this.agentHub = new AgentSessionHub({
       omsHomeDir: this.homeDir,
       defaultWorkspacePath: repoRoot,
@@ -278,6 +280,7 @@ export class OmsDaemon {
       for (const p of this.pendingApprovals.values()) { clearTimeout(p.timer); p.reject(new Error("Pairing session revoked")); }
       this.pendingApprovals.clear();
       this.settledApprovals.clear();
+      this.macControl.resetHidState();
     });
   }
 
@@ -888,6 +891,16 @@ export class OmsDaemon {
       this.saveTrustedDevices(devices);
     });
 
+    this.session.on("hidInput", (hid: HidInputPayload) => {
+      this.macControl.handleHidInputFrame(hid);
+    });
+
+    this.session.on("tierChanged", (evt: { previous: string; current: string }) => {
+      if (evt?.current === "DISCONNECTED") {
+        this.macControl.resetHidState();
+      }
+    });
+
     this.session.on("phoneAuthenticated", (evt: any) => {
       if (evt?.status) {
         this.ingestPhoneAirpodsSnapshot(evt.status);
@@ -1483,6 +1496,19 @@ export class OmsDaemon {
                 status: this.macControl.getStatusSnapshot(this.buildMacControlContext()),
               },
             });
+          } else if (req.method === "mac.hid.type_text") {
+            const p = (req.params || {}) as MacHidTypeTextParams;
+            void this.macControl
+              .typeText(p)
+              .then((res) => reply({ result: res }))
+              .catch((err: any) =>
+                reply({
+                  error: {
+                    code: -32000,
+                    message: err?.message || "Mac HID type_text failed",
+                  },
+                })
+              );
           } else if (req.method === "agent.sessions.list") {
             const p = (req.params || {}) as { limit?: number };
             reply({ result: { sessions: this.agentHub.listSessions(p.limit ?? 96) } });
@@ -3042,6 +3068,10 @@ export class OmsDaemon {
         return { ok, status: this.macControl.getStatusSnapshot(this.buildMacControlContext()) };
       }
 
+      case "mac.hid.type_text": {
+        return await this.macControl.typeText(params as unknown as MacHidTypeTextParams);
+      }
+
       case "memory.search_vault": {
         return this.memoryMirror.searchContext(String(params.query || ""), Number(params.limit) || 10);
       }
@@ -4190,7 +4220,9 @@ export class OmsDaemon {
     this.stopStayAwakeProcess();
     this.agentHub.stopAll();
     this.memoryMirror.close();
+    this.macControl.resetHidState();
     await this.session.stop();
+    this.macControl.closeFastHelperSocket();
   }
 
   private canonicalizeCurateUrl(rawUrl: string): string {

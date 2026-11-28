@@ -7,6 +7,7 @@ import { spawn, spawnSync, ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
   DecodedScreenFrame,
+  decodeHidInputPayload,
   decodeJsonRpcPayload,
   decodeScreenFramePayload,
   decodeStreamChunkPayload,
@@ -22,6 +23,7 @@ import {
   FrameStreamDecoder,
   FrameType,
   generateUuidV7,
+  HID_INPUT_PAYLOAD_BYTES,
   IntentTag,
   JsonRpcMessage,
   JsonRpcRequest,
@@ -1587,6 +1589,18 @@ export class PhoneSessionManager extends EventEmitter {
       }
       case FrameType.SCREEN_FRAME: {
         this.ingestScreenFrame(frame.payload);
+        break;
+      }
+      case FrameType.HID_INPUT: {
+        if (frame.payload.byteLength !== HID_INPUT_PAYLOAD_BYTES) {
+          throw new Error("Invalid HID_INPUT payload length");
+        }
+        const hid = decodeHidInputPayload(frame.payload);
+        this.emit("hidInput", hid, {
+          tier: pipe.tier,
+          connectionId: pipe.diagnosticId,
+          phoneId: pipe.phoneId,
+        });
         break;
       }
       default: throw new Error("Unsupported authenticated frame");

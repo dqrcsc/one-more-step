@@ -4,13 +4,38 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import type {
-  MacControlActionType,
-  MacControlExecuteParams,
-  MacControlExecuteResult,
-  MacControlStatusSnapshot,
-  MacInstalledAppItem,
+import {
+  HidOpcode,
+  HidSystemKey,
+  type HidInputPayload,
+  type MacControlActionType,
+  type MacControlExecuteParams,
+  type MacControlExecuteResult,
+  type MacControlStatusSnapshot,
+  type MacHidTypeTextParams,
+  type MacHidTypeTextResult,
+  type MacInstalledAppItem,
 } from "@oms/shared-protocol";
+
+export type TestRecordedHidEvent =
+  | {
+      type: "hid";
+      op: number;
+      m: number;
+      dx: number;
+      dy: number;
+      aux: number;
+      seq: number;
+      fl: number;
+    }
+  | {
+      type: "type-text";
+      text: string;
+      submitReturn: boolean;
+    }
+  | {
+      type: "reset-hid";
+    };
 
 const KEYCHAIN_SERVICE = "com.oms.mac-unlock";
 const HELPER_BUNDLE_ID = "com.oms.mac-control";
@@ -76,7 +101,12 @@ export class MacOsController {
   } | null = null;
   private testMockLocked = false;
   private testMockPassword = "";
+  private readonly testHidEvents: TestRecordedHidEvent[] = [];
   private readonly unlockChallenges = new Map<string, { token: string; expiresAt: number }>();
+  private fastSocket: net.Socket | null = null;
+  private fastSocketConnected = false;
+  private fastLaunching = false;
+  private readonly pendingFastLines: string[] = [];
 
   constructor(repoRoot: string, customOmsHomeDir?: string) {
     this.ctlBinaryPath = path.join(repoRoot, "mac-host", "bin", "oms-mac-ctl");
@@ -108,9 +138,16 @@ export class MacOsController {
 
       const srcStat = fs.statSync(this.ctlBinaryPath);
       const dstExists = fs.existsSync(dstBin) && fs.existsSync(infoPlistPath);
-      const needsUpdate = !dstExists || Math.abs(fs.statSync(dstBin).size - srcStat.size) > 0 || fs.statSync(dstBin).mtimeMs < srcStat.mtimeMs - 1000;
+      const plistMatchesVersion =
+        dstExists && fs.readFileSync(infoPlistPath, "utf8").includes("<string>66</string>");
+      const needsUpdate =
+        !dstExists ||
+        !plistMatchesVersion ||
+        Math.abs(fs.statSync(dstBin).size - srcStat.size) > 0 ||
+        fs.statSync(dstBin).mtimeMs < srcStat.mtimeMs - 1000;
 
       if (needsUpdate) {
+        this.destroyFastSocket();
         fs.mkdirSync(macOsDir, { recursive: true });
         fs.copyFileSync(this.ctlBinaryPath, dstBin);
         fs.chmodSync(dstBin, 0o755);
@@ -130,9 +167,9 @@ export class MacOsController {
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>3.6.2</string>
+    <string>3.6.8</string>
     <key>CFBundleVersion</key>
-    <string>65</string>
+    <string>66</string>
     <key>LSUIElement</key>
     <true/>
 </dict>
@@ -229,6 +266,296 @@ export class MacOsController {
       }
     }
     return null;
+  }
+
+  // =========================================================================
+  // Persistent Streaming AF_UNIX Pipe for 120Hz Binary HID & Laser Spotlight
+  // =========================================================================
+
+  private pushTestHidEvent(evt: TestRecordedHidEvent): void {
+    this.testHidEvents.push(evt);
+    if (this.testHidEvents.length > 256) {
+      this.testHidEvents.splice(0, this.testHidEvents.length - 256);
+    }
+  }
+
+  public getTestRecordedHidEvents(): TestRecordedHidEvent[] {
+    return [...this.testHidEvents];
+  }
+
+  private destroyFastSocket(sock?: net.Socket | null): void {
+    const target = sock ?? this.fastSocket;
+    if (target && target === this.fastSocket) {
+      this.fastSocket = null;
+      this.fastSocketConnected = false;
+    }
+    if (target && !target.destroyed) {
+      try {
+        target.destroy();
+      } catch {}
+    }
+  }
+
+  public closeFastHelperSocket(): void {
+    this.pendingFastLines.length = 0;
+    const sock = this.fastSocket;
+    this.fastSocket = null;
+    this.fastSocketConnected = false;
+    if (sock && !sock.destroyed) {
+      try {
+        sock.end();
+      } catch {
+        try {
+          sock.destroy();
+        } catch {}
+      }
+    }
+  }
+
+  private connectFastSocketOnce(timeoutMs = 1200): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (!fs.existsSync(this.helperSocketPath)) {
+        resolve(false);
+        return;
+      }
+      if (this.fastSocket && this.fastSocketConnected && !this.fastSocket.destroyed) {
+        resolve(true);
+        return;
+      }
+      let settled = false;
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        resolve(ok);
+      };
+
+      const sock = net.createConnection(this.helperSocketPath);
+      sock.setNoDelay?.(true);
+      (sock as any).unref?.();
+
+      const timer = setTimeout(() => {
+        this.destroyFastSocket(sock);
+        finish(false);
+      }, timeoutMs);
+      (timer as any).unref?.();
+
+      sock.on("data", () => {
+        // Drain any unexpected replies so the socket receive buffer never stalls
+      });
+      sock.on("connect", () => {
+        clearTimeout(timer);
+        if (this.fastSocket && this.fastSocket !== sock) {
+          this.destroyFastSocket(this.fastSocket);
+        }
+        this.fastSocket = sock;
+        this.fastSocketConnected = true;
+        if (this.pendingFastLines.length > 0 && !sock.destroyed && sock.writable) {
+          const batch = this.pendingFastLines.splice(0, this.pendingFastLines.length).join("");
+          try {
+            sock.write(batch);
+          } catch {
+            this.destroyFastSocket(sock);
+            finish(false);
+            return;
+          }
+        }
+        finish(true);
+      });
+      sock.on("error", () => {
+        clearTimeout(timer);
+        this.destroyFastSocket(sock);
+        finish(false);
+      });
+      sock.on("close", () => {
+        clearTimeout(timer);
+        this.destroyFastSocket(sock);
+        finish(false);
+      });
+    });
+  }
+
+  private ensureFastSocketConnected(): void {
+    if (this.fastLaunching || this.isTestIsolation || process.platform !== "darwin") return;
+    if (this.fastSocket && this.fastSocketConnected && !this.fastSocket.destroyed) return;
+    this.fastLaunching = true;
+
+    void (async () => {
+      try {
+        if (await this.connectFastSocketOnce()) return;
+        if (!this.ensureHelperAppBundleInstalled()) return;
+        fs.mkdirSync(path.dirname(this.helperSocketPath), { recursive: true, mode: 0o700 });
+
+        await new Promise<void>((resolve) => {
+          try {
+            const child = spawn(
+              "/usr/bin/open",
+              ["-g", "-a", this.helperAppDir, "--args", "--daemon", this.helperSocketPath],
+              { detached: true, stdio: "ignore" }
+            );
+            child.on("error", () => resolve());
+            child.on("close", () => resolve());
+            child.unref();
+          } catch {
+            resolve();
+          }
+        });
+
+        for (let i = 0; i < 10; i++) {
+          if (await this.connectFastSocketOnce()) return;
+          await new Promise((r) => setTimeout(r, 120));
+        }
+      } catch {
+        // Ignore transient launch failures; subsequent frames will retry
+      } finally {
+        this.fastLaunching = false;
+      }
+    })();
+  }
+
+  private writeFastHelperLine(payload: Record<string, unknown>): boolean {
+    if (this.isTestIsolation || process.platform !== "darwin") return false;
+    const line = `${JSON.stringify({ ...payload, noreply: true })}\n`;
+
+    if (
+      this.fastSocket &&
+      this.fastSocketConnected &&
+      !this.fastSocket.destroyed &&
+      this.fastSocket.writable
+    ) {
+      try {
+        this.fastSocket.write(line);
+        return true;
+      } catch {
+        this.destroyFastSocket(this.fastSocket);
+      }
+    }
+
+    const helperAvailable =
+      fs.existsSync(this.helperSocketPath) ||
+      fs.existsSync(this.ctlBinaryPath) ||
+      fs.existsSync(this.helperAppDir);
+    if (!helperAvailable) return false;
+
+    if (this.pendingFastLines.length >= 64) {
+      this.pendingFastLines.shift();
+    }
+    this.pendingFastLines.push(line);
+    this.ensureFastSocketConnected();
+    return true;
+  }
+
+  public handleHidInputFrame(hid: HidInputPayload): void {
+    if (this.isTestIsolation) {
+      if (this.testMockLocked && hid.opcode !== HidOpcode.RESET_HID_STATE) {
+        return;
+      }
+      this.pushTestHidEvent({
+        type: "hid",
+        op: hid.opcode,
+        m: hid.modsOrBtn,
+        dx: hid.dx,
+        dy: hid.dy,
+        aux: hid.aux,
+        seq: hid.seq,
+        fl: hid.flags,
+      });
+      return;
+    }
+
+    if (
+      this.lastKnownNativeStatus?.screenLocked &&
+      Date.now() - this.lastKnownNativeStatus.atMs < 8000 &&
+      hid.opcode !== HidOpcode.RESET_HID_STATE
+    ) {
+      return;
+    }
+
+    this.writeFastHelperLine({
+      cmd: "hid",
+      op: hid.opcode,
+      m: hid.modsOrBtn,
+      dx: hid.dx,
+      dy: hid.dy,
+      aux: hid.aux,
+      fl: hid.flags,
+    });
+  }
+
+  public async typeText(params: MacHidTypeTextParams): Promise<MacHidTypeTextResult> {
+    const text = String(params?.text ?? "");
+    if (!text) {
+      return { ok: false, typedChars: 0, message: "输入内容不能为空" };
+    }
+    const typedChars = Array.from(text).length;
+    if (typedChars > 8192 || text.length > 16384) {
+      return {
+        ok: false,
+        typedChars: 0,
+        message: "单次注入文本过长（上限 8192 个字符），请分段发送",
+      };
+    }
+
+    const native = await this.probeNativeStatusAsync();
+    if (native.screenLocked) {
+      return {
+        ok: false,
+        typedChars: 0,
+        message: "Mac 当前处于锁屏状态，请先点击「远程解锁」后再输入文字",
+      };
+    }
+
+    const submitReturn = Boolean(params?.submitReturn);
+    if (this.isTestIsolation) {
+      this.pushTestHidEvent({
+        type: "type-text",
+        text,
+        submitReturn,
+      });
+      return { ok: true, typedChars };
+    }
+
+    const res = await this.callHelperAppDaemon(
+      { cmd: "type-text", text, submitReturn },
+      8000
+    );
+    if (!res?.ok) {
+      const errCode = String(res?.error || "");
+      if (errCode === "ERR_AX_NOT_TRUSTED" || !native.accessibilityTrusted) {
+        await this.callHelperAppDaemon({ cmd: "request-accessibility" }, 3000).catch(() => null);
+        return {
+          ok: false,
+          typedChars: 0,
+          message:
+            "文字直输需辅助功能权限：已在 Mac 打开「隐私与安全性 -> 辅助功能」，请勾选开启「青简控机助手」后重试",
+        };
+      }
+      return {
+        ok: false,
+        typedChars: 0,
+        message: String(res?.message || res?.error || "Mac 文字注入失败，请检查青简控机助手状态"),
+      };
+    }
+
+    return {
+      ok: true,
+      typedChars: Number(res.typedChars) || typedChars,
+    };
+  }
+
+  public resetHidState(): void {
+    if (this.isTestIsolation) {
+      this.pushTestHidEvent({ type: "reset-hid" });
+      return;
+    }
+    if (
+      (this.fastSocket && this.fastSocketConnected) ||
+      this.fastLaunching ||
+      fs.existsSync(this.helperSocketPath)
+    ) {
+      this.writeFastHelperLine({ cmd: "reset-hid" });
+    } else {
+      this.pendingFastLines.length = 0;
+    }
   }
 
   // =========================================================================
@@ -865,14 +1192,25 @@ export class MacOsController {
 
       case "media_play_pause": {
         if (!this.isTestIsolation) {
-          spawnSync(
-            "/usr/bin/osascript",
-            [
-              "-e",
-              `if application "Music" is running then tell application "Music" to playpause\nif application "Spotify" is running then tell application "Spotify" to playpause`,
-            ],
-            { timeout: 2000 }
-          );
+          const sentViaHelper = this.writeFastHelperLine({
+            cmd: "hid",
+            op: HidOpcode.SYSTEM_DEFINED_KEY,
+            m: HidSystemKey.PLAY_PAUSE,
+            dx: 0,
+            dy: 0,
+            aux: 0,
+            fl: 0,
+          });
+          if (!sentViaHelper) {
+            spawnSync(
+              "/usr/bin/osascript",
+              [
+                "-e",
+                `if application "Music" is running then tell application "Music" to playpause\nif application "Spotify" is running then tell application "Spotify" to playpause`,
+              ],
+              { timeout: 2000 }
+            );
+          }
         }
         return {
           ok: true,
