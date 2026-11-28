@@ -914,4 +914,96 @@ object OmsIcons {
             }
         }
     }
+
+    // 6. Remote Wand, Trackpad, Laser & Keyboard
+    val ArrowRight: ImageVector by lazy {
+        strokeIcon("ArrowRight") {
+            linePath {
+                moveTo(5f, 12f); horizontalLineTo(19f)
+                moveTo(12.5f, 5.5f); lineTo(19f, 12f); lineTo(12.5f, 18.5f)
+            }
+        }
+    }
+
+    val Target: ImageVector by lazy {
+        strokeIcon("Target") {
+            linePath {
+                moveTo(19.5f, 12f)
+                arcTo(7.5f, 7.5f, 0f, true, true, 4.5f, 12f)
+                arcTo(7.5f, 7.5f, 0f, true, true, 19.5f, 12f)
+                close()
+                moveTo(14.5f, 12f)
+                arcTo(2.5f, 2.5f, 0f, true, true, 9.5f, 12f)
+                arcTo(2.5f, 2.5f, 0f, true, true, 14.5f, 12f)
+                close()
+                moveTo(12f, 2.5f); verticalLineTo(5.2f)
+                moveTo(12f, 18.8f); verticalLineTo(21.5f)
+                moveTo(2.5f, 12f); horizontalLineTo(5.2f)
+                moveTo(18.8f, 12f); horizontalLineTo(21.5f)
+            }
+        }
+    }
+
+    val Keyboard: ImageVector by lazy {
+        strokeIcon("Keyboard") {
+            linePath {
+                moveTo(4.5f, 6f)
+                horizontalLineTo(19.5f)
+                curveTo(20.6f, 6f, 21.5f, 6.9f, 21.5f, 8f)
+                verticalLineTo(16f)
+                curveTo(21.5f, 17.1f, 20.6f, 18f, 19.5f, 18f)
+                horizontalLineTo(4.5f)
+                curveTo(3.4f, 18f, 2.5f, 17.1f, 2.5f, 16f)
+                verticalLineTo(8f)
+                curveTo(2.5f, 6.9f, 3.4f, 6f, 4.5f, 6f)
+                close()
+                moveTo(6.5f, 10f); horizontalLineTo(7.5f)
+                moveTo(10.5f, 10f); horizontalLineTo(11.5f)
+                moveTo(13.5f, 10f); horizontalLineTo(14.5f)
+                moveTo(16.5f, 10f); horizontalLineTo(17.5f)
+                moveTo(6.5f, 14.2f); horizontalLineTo(7.5f)
+                moveTo(9.8f, 14.2f); horizontalLineTo(14.2f)
+                moveTo(16.5f, 14.2f); horizontalLineTo(17.5f)
+            }
+        }
+    }
+
+    val Mouse: ImageVector by lazy {
+        strokeIcon("Mouse") {
+            linePath {
+                moveTo(12f, 3.5f)
+                curveTo(14.76f, 3.5f, 17f, 5.74f, 17f, 8.5f)
+                verticalLineTo(15.5f)
+                curveTo(17f, 18.26f, 14.76f, 20.5f, 12f, 20.5f)
+                curveTo(9.24f, 20.5f, 7f, 18.26f, 7f, 15.5f)
+                verticalLineTo(8.5f)
+                curveTo(7f, 5.74f, 9.24f, 3.5f, 12f, 3.5f)
+                close()
+                moveTo(12f, 7.2f); verticalLineTo(10.6f)
+            }
+        }
+    }
+
+    val Lock: ImageVector by lazy {
+        strokeIcon("Lock") {
+            linePath {
+                moveTo(7f, 11f)
+                horizontalLineTo(17f)
+                curveTo(18.1f, 11f, 19f, 11.9f, 19f, 13f)
+                verticalLineTo(18.5f)
+                curveTo(19f, 19.6f, 18.1f, 20.5f, 17f, 20.5f)
+                horizontalLineTo(7f)
+                curveTo(5.9f, 20.5f, 5f, 19.6f, 5f, 18.5f)
+                verticalLineTo(13f)
+                curveTo(5f, 11.9f, 5.9f, 11f, 7f, 11f)
+                close()
+                moveTo(8.5f, 11f)
+                verticalLineTo(7.5f)
+                curveTo(8.5f, 5.57f, 10.07f, 4f, 12f, 4f)
+                curveTo(13.93f, 4f, 15.5f, 5.57f, 15.5f, 7.5f)
+                verticalLineTo(11f)
+                moveTo(12f, 15f); verticalLineTo(16.8f)
+            }
+        }
+    }
 }
