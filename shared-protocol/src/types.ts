@@ -17,6 +17,7 @@ export enum FrameType {
   PING = 0x05,
   PONG = 0x06,
   SCREEN_FRAME = 0x07,
+  HID_INPUT = 0x08,
   SECURE_RECORD = 0x7e,
 }
 
@@ -910,4 +911,84 @@ export interface CurateBrowserUrlResult {
   notePath?: string;
   relNotePath?: string;
   error?: string;
+}
+
+/**
+ * v3.7: High-Frequency Binary Mac HID Remote & Laser Spotlight Contracts (FrameType.HID_INPUT = 0x08)
+ */
+export enum HidOpcode {
+  POINTER_MOVE_REL = 0x01,
+  MOUSE_BUTTON = 0x02,
+  SCROLL_PIXEL = 0x03,
+  KEY_TAP = 0x04,
+  SYSTEM_DEFINED_KEY = 0x05,
+  LASER_STATE_AND_DELTA = 0x06,
+  RESET_HID_STATE = 0x0f,
+}
+
+export enum HidModifierMask {
+  NONE = 0x00,
+  COMMAND = 0x01,
+  SHIFT = 0x02,
+  OPTION = 0x04,
+  CONTROL = 0x08,
+}
+
+export enum HidButtonCode {
+  LEFT = 0x01,
+  RIGHT = 0x02,
+  MIDDLE = 0x03,
+}
+
+export enum HidButtonAction {
+  CLICK = 1,
+  DOUBLE_CLICK = 2,
+  DOWN = 3,
+  UP = 4,
+  DRAG_LOCK_TOGGLE = 5,
+}
+
+export enum HidLaserMode {
+  OFF = 0,
+  RED_LASER = 1,
+  SPOTLIGHT = 2,
+}
+
+export enum HidSystemKey {
+  SOUND_UP = 0,
+  SOUND_DOWN = 1,
+  BRIGHTNESS_UP = 2,
+  BRIGHTNESS_DOWN = 3,
+  MUTE = 7,
+  PLAY_PAUSE = 16,
+  NEXT_TRACK = 17,
+  PREV_TRACK = 18,
+}
+
+export enum HidInputFlags {
+  NONE = 0x0000,
+  MOMENTUM_SCROLL = 0x0001,
+  LASER_KEEPALIVE = 0x0002,
+  NATURAL_SCROLL = 0x0004,
+}
+
+export interface HidInputPayload {
+  opcode: HidOpcode | number;
+  modsOrBtn: number;
+  dx: number;
+  dy: number;
+  aux: number;
+  seq: number;
+  flags: number;
+}
+
+export interface MacHidTypeTextParams {
+  text: string;
+  submitReturn?: boolean;
+}
+
+export interface MacHidTypeTextResult {
+  ok: boolean;
+  typedChars: number;
+  message?: string;
 }

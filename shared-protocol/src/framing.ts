@@ -2,6 +2,8 @@ import {
   DecodedScreenFrame,
   FramePriority,
   FrameType,
+  HidInputPayload,
+  HidOpcode,
   JsonRpcMessage,
   OMS_MAGIC_BYTE,
   OMS_PROTOCOL_VERSION,
@@ -13,6 +15,7 @@ import {
 export const FRAME_HEADER_BYTES = 8;
 export const STREAM_CHUNK_PREFIX_BYTES = 20; // 16B UUID + 4B uint32 chunkIndex
 export const SCREEN_FRAME_HEADER_BYTES = 16; // [1B codec][1B flags][2B width][2B height][2B seq][8B timestampMs]
+export const HID_INPUT_PAYLOAD_BYTES = 12; // [1B opcode][1B modsOrBtn][2B int16 dx][2B int16 dy][2B int16 aux][2B uint16 seq][2B uint16 flags]
 
 export interface DecodedFrame {
   version: number;
@@ -186,6 +189,101 @@ export function decodeScreenFramePayload(payload: Uint8Array): DecodedScreenFram
   };
 }
 
+export function clampInt16(n: number): number {
+  const rounded = Math.round(Number.isFinite(n) ? n : 0);
+  const clamped = Math.max(-32768, Math.min(32767, rounded));
+  return clamped === 0 ? 0 : clamped;
+}
+
+export function pxToFixedQuarter(px: number): number {
+  return clampInt16((Number.isFinite(px) ? px : 0) * 4);
+}
+
+export function fixedQuarterToPx(raw: number): number {
+  if (!Number.isFinite(raw) || raw === 0) return 0;
+  return raw * 0.25;
+}
+
+/**
+ * Pack a 12-byte Big-Endian Mac HID input frame (FrameType.HID_INPUT = 0x08 -> 20B total):
+ * [1B opcode][1B modsOrBtn][2B int16 dx][2B int16 dy][2B int16 aux][2B uint16 seq][2B uint16 flags]
+ */
+export function encodeHidInputFrame(input: HidInputPayload): Uint8Array {
+  const payload = new Uint8Array(HID_INPUT_PAYLOAD_BYTES);
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  view.setUint8(0, input.opcode & 0xff);
+  view.setUint8(1, input.modsOrBtn & 0xff);
+  view.setInt16(2, clampInt16(input.dx), false);
+  view.setInt16(4, clampInt16(input.dy), false);
+  view.setInt16(6, clampInt16(input.aux), false);
+  view.setUint16(8, input.seq & 0xffff, false);
+  view.setUint16(10, input.flags & 0xffff, false);
+  return encodeFrame(FrameType.HID_INPUT, payload);
+}
+
+export function decodeHidInputPayload(payload: Uint8Array): HidInputPayload {
+  if (payload.byteLength < HID_INPUT_PAYLOAD_BYTES) {
+    throw new Error(`HID_INPUT payload too short: ${payload.byteLength}`);
+  }
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  return {
+    opcode: view.getUint8(0),
+    modsOrBtn: view.getUint8(1),
+    dx: view.getInt16(2, false),
+    dy: view.getInt16(4, false),
+    aux: view.getInt16(6, false),
+    seq: view.getUint16(8, false),
+    flags: view.getUint16(10, false),
+  };
+}
+
+const COALESCEABLE_HID_OPCODES = new Set<number>([
+  HidOpcode.POINTER_MOVE_REL,
+  HidOpcode.SCROLL_PIXEL,
+  HidOpcode.LASER_STATE_AND_DELTA,
+]);
+
+function isValidHidInputFrame(frame: Uint8Array): boolean {
+  const expectedTotal = FRAME_HEADER_BYTES + HID_INPUT_PAYLOAD_BYTES;
+  if (frame.byteLength !== expectedTotal) return false;
+  if (
+    frame[0] !== OMS_MAGIC_BYTE ||
+    frame[1] !== OMS_PROTOCOL_VERSION ||
+    frame[2] !== FrameType.HID_INPUT
+  ) {
+    return false;
+  }
+  const headerView = new DataView(frame.buffer, frame.byteOffset, FRAME_HEADER_BYTES);
+  return headerView.getUint32(4, false) === HID_INPUT_PAYLOAD_BYTES;
+}
+
+export function tryCoalesceHidFrames(
+  prevFrame: Uint8Array,
+  nextFrame: Uint8Array
+): Uint8Array | null {
+  if (!isValidHidInputFrame(prevFrame) || !isValidHidInputFrame(nextFrame)) {
+    return null;
+  }
+  const prev = decodeHidInputPayload(prevFrame.subarray(FRAME_HEADER_BYTES));
+  const next = decodeHidInputPayload(nextFrame.subarray(FRAME_HEADER_BYTES));
+  if (
+    !COALESCEABLE_HID_OPCODES.has(prev.opcode) ||
+    prev.opcode !== next.opcode ||
+    prev.modsOrBtn !== next.modsOrBtn
+  ) {
+    return null;
+  }
+  return encodeHidInputFrame({
+    opcode: next.opcode,
+    modsOrBtn: next.modsOrBtn,
+    dx: clampInt16(prev.dx + next.dx),
+    dy: clampInt16(prev.dy + next.dy),
+    aux: next.aux,
+    seq: next.seq,
+    flags: prev.flags | next.flags,
+  });
+}
+
 /**
  * Stateful streaming decoder for byte-oriented channels (Bluetooth RFCOMM / TCP)
  * as well as frame-oriented channels (WebSocket / WebRTC DataChannel).
@@ -273,6 +371,7 @@ export class PriorityFrameQueue {
       case FrameType.CONTROL_JSON_RPC:
       case FrameType.PING:
       case FrameType.PONG:
+      case FrameType.HID_INPUT:
         return FramePriority.P0_URGENT_CONTROL;
       case FrameType.STREAM_START:
       case FrameType.STREAM_ACK_RESUME:
@@ -286,6 +385,14 @@ export class PriorityFrameQueue {
   public enqueue(rawFrame: Uint8Array, frameType: FrameType): void {
     const priority = PriorityFrameQueue.priorityForType(frameType);
     const q = this.queues.get(priority)!;
+    // Barrier-safe delta coalescing for consecutive P0 HID_INPUT frames at the tail
+    if (frameType === FrameType.HID_INPUT && q.length > 0) {
+      const merged = tryCoalesceHidFrames(q[q.length - 1], rawFrame);
+      if (merged) {
+        q[q.length - 1] = merged;
+        return;
+      }
+    }
     // Latest-Frame-Wins for real-time SCREEN_FRAME: drop any queued stale SCREEN_FRAME
     if (frameType === FrameType.SCREEN_FRAME) {
       const existingIdx = q.findIndex(
