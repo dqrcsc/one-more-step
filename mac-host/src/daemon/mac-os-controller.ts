@@ -137,15 +137,12 @@ export class MacOsController {
       const dstBin = path.join(macOsDir, "oms-mac-ctl");
       const infoPlistPath = path.join(contentsDir, "Info.plist");
 
-      const srcStat = fs.statSync(this.ctlBinaryPath);
       const dstExists = fs.existsSync(dstBin) && fs.existsSync(infoPlistPath);
       const plistMatchesVersion =
-        dstExists && fs.readFileSync(infoPlistPath, "utf8").includes("<string>66</string>");
-      const needsUpdate =
-        !dstExists ||
-        !plistMatchesVersion ||
-        Math.abs(fs.statSync(dstBin).size - srcStat.size) > 0 ||
-        fs.statSync(dstBin).mtimeMs < srcStat.mtimeMs - 1000;
+        dstExists && fs.readFileSync(infoPlistPath, "utf8").includes("<string>67</string>");
+      // Strictly gate helper replacement on explicit CFBundleVersion changes so git pull / rebuilds
+      // NEVER needlessly re-sign the ad-hoc bundle and invalidate macOS TCC cdhash grants!
+      const needsUpdate = !dstExists || !plistMatchesVersion;
 
       if (needsUpdate) {
         this.destroyFastSocket();
@@ -170,7 +167,7 @@ export class MacOsController {
     <key>CFBundleShortVersionString</key>
     <string>3.7.0</string>
     <key>CFBundleVersion</key>
-    <string>66</string>
+    <string>67</string>
     <key>LSUIElement</key>
     <true/>
 </dict>
@@ -182,6 +179,12 @@ export class MacOsController {
           ["--force", "--deep", "--sign", "-", "--identifier", HELPER_BUNDLE_ID, this.helperAppDir],
           { stdio: "ignore", timeout: 5000 }
         );
+        // Clear stale ad-hoc cdhash entry in TCC when binary version changes so System Settings
+        // never shows a deceptive "already ON" switch while rejecting the new binary!
+        spawnSync("/usr/bin/tccutil", ["reset", "Accessibility", HELPER_BUNDLE_ID], {
+          stdio: "ignore",
+          timeout: 3000,
+        });
         // Restart existing helper daemon if binary was upgraded
         spawnSync("/usr/bin/pkill", ["-f", `${HELPER_APP_NAME}/Contents/MacOS/oms-mac-ctl`], {
           stdio: "ignore",
@@ -534,12 +537,11 @@ export class MacOsController {
     if (!res?.ok) {
       const errCode = String(res?.error || "");
       if (errCode === "ERR_AX_NOT_TRUSTED" || !native.accessibilityTrusted) {
-        await this.callHelperAppDaemon({ cmd: "request-accessibility" }, 3000).catch(() => null);
         return {
           ok: false,
           typedChars: 0,
           message:
-            "文字直输需辅助功能权限：已在 Mac 打开「隐私与安全性 -> 辅助功能」，请勾选开启「青简控机助手」后重试",
+            "「青简控机助手」辅助功能授权需刷新：请点面板顶部「电脑弹出授权」并在 Mac 重新开启一次开关",
         };
       }
       return {
@@ -957,14 +959,39 @@ export class MacOsController {
 
       case "request_accessibility": {
         this.wakeDisplayNow();
-        const res = await this.callHelperAppDaemon({ cmd: "request-accessibility" }, 3500);
+        const current = await this.probeNativeStatusAsync();
+        if (current.accessibilityTrusted) {
+          return {
+            ok: true,
+            action,
+            message: "「青简控机助手」已拥有辅助功能权限，触控板与文字直输可直接使用",
+            status: await this.getStatusSnapshotAsync(ctx),
+          };
+        }
+        if (!this.isTestIsolation && process.platform === "darwin") {
+          // Purge any stale previous-version ad-hoc cdhash record in macOS TCC so System Settings
+          // does not display a deceptive "already ON" switch that silently rejects the updated binary.
+          this.destroyFastSocket();
+          spawnSync("/usr/bin/tccutil", ["reset", "Accessibility", HELPER_BUNDLE_ID], {
+            stdio: "ignore",
+            timeout: 3000,
+          });
+          spawnSync("/usr/bin/pkill", ["-f", `${HELPER_APP_NAME}/Contents/MacOS/oms-mac-ctl`], {
+            stdio: "ignore",
+            timeout: 1500,
+          });
+          try {
+            if (fs.existsSync(this.helperSocketPath)) fs.unlinkSync(this.helperSocketPath);
+          } catch {}
+        }
+        const res = await this.callHelperAppDaemon({ cmd: "request-accessibility" }, 4000);
         const trusted = Boolean(res?.accessibilityTrusted);
         return {
           ok: true,
           action,
           message: trusted
-            ? "「青简控机助手」已拥有辅助功能权限，可直接远程解锁"
-            : "已在 Mac 弹出「青简控机助手」辅助功能授权设置，请在电脑上勾选开启一次即可永久生效",
+            ? "「青简控机助手」已拥有辅助功能权限，触控板与文字直输可直接使用"
+            : "已清除旧版残留签名记录并在 Mac 弹出最新授权提示，请开启一次「青简控机助手」开关即可恢复全部操控",
           status: await this.getStatusSnapshotAsync(ctx),
         };
       }

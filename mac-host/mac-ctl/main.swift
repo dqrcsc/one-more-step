@@ -211,7 +211,8 @@ final class HidEventEngine {
     static let shared = HidEventEngine()
 
     private let lock = NSLock()
-    private let eventSource = CGEventSource(stateID: .hidSystemState)
+    private var cachedEventSource: CGEventSource? = nil
+    private var eventSourceCreatedWhileTrusted: Bool = false
     private var virtualPos: CGPoint? = nil
     private var lastPointerActivitySec: TimeInterval = 0
     private var leftButtonDown: Bool = false
@@ -223,6 +224,17 @@ final class HidEventEngine {
     private static let allowedSystemKeys: Set<Int> = [0, 1, 2, 3, 7, 16, 17, 18]
 
     private init() {}
+
+    private var eventSource: CGEventSource? {
+        let nowTrusted = AXIsProcessTrusted()
+        if cachedEventSource == nil || (nowTrusted && !eventSourceCreatedWhileTrusted) {
+            let src = CGEventSource(stateID: .hidSystemState)
+            src?.localEventsSuppressionInterval = 0.0
+            cachedEventSource = src
+            eventSourceCreatedWhileTrusted = nowTrusted
+        }
+        return cachedEventSource
+    }
 
     private func getDisplayRectsLocked(now: TimeInterval) -> [CGRect] {
         if cachedDisplays.isEmpty || (now - lastDisplayRefreshSec) > 0.5 {
