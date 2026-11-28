@@ -1,5 +1,18 @@
 # Changelog · 更新日志
 
+## 3.7.1 - 2026-11-28 · 原生 Magic Trackpad 手势 1:1 对齐、纯 GPU 丝滑激光聚光灯与辅助功能自愈加固
+
+- **触控板手势与加速曲线 1:1 对齐 MacBook 原生触控板 (`MacTrackpadAndLaserViews`、`MacMotionAndTrackpadEngine`、`MacHidProtocolAndCoalescer` & `oms-mac-ctl`)**：
+  - **多指动态无缝切换**：消除多指加减手指时的锁死卡顿（双指滚完抬起一指可无缝继续单指移光标，落指 `18ms` 防抖消除双指落地首帧光标跳动）。
+  - **原生单/双/三连击与刻意双击拖移**：新增 `HidButtonAction.CLICK_WITH_COUNT (6)` 携带 `CGEvent` 原生 `clickState = 1/2/3`，精准支持单击、双击选词、三击选整段，彻底修复快速双击多发第 3 次点击及误触发拖拽的问题。
+  - **Apple 原生滚动阶段与缩放互斥**：注入完整 `kCGScrollPhaseBegan/Changed/Ended` 与 `kCGMomentumScrollPhaseBegin/Continue/End` 边界事件（屏障保护不吞帧），原生支持 Safari / Chrome 双指左右滑前进后退、边缘橡皮筋回弹、双指双击智能缩放（`⌘+` / `⌘0`）及滚轮与双指捏合缩放严格互斥。
+  - **三/四指全套桌面手势与指针提速**：同时支持三指与四指上滑调度中心、下滑应用窗口、左右切换全屏桌面空间，以及四指捏合启动台（Launchpad）、四指张开显示桌面；针对手机触控面驱动 Retina 大屏重调 `TrackpadPhysicsEngine` 加速增益（单拇指一划轻松跨满全屏，微移像素级稳定）。
+- **纯 GPU 零光栅化激光笔/聚光灯与 200Hz ➔ 120Hz 追随插值 (`LaserOverlayController`、`oms-mac-ctl` & `CockpitRuntimeCoordinator`)**：
+  - **根治 Retina 大屏聚光灯/激光卡顿**：移除全屏 CPU `NSView.draw(_:)` 重绘（原每帧 `32.1 MB` 像素光栅化），全面改为 `CALayer` / `CAShapeLayer` 纯 GPU 合成（预渲染红白光晕材质、二次贝塞尔平滑流光尾迹、`1.0x` 缓存超画幅聚光灯遮罩仅更新 `position` 坐标，每帧 CPU 像素绘制降为 `0`）。
+  - **Android 200Hz 陀螺仪采样与双通道精确节拍器**：新增 `HIGH_SAMPLING_RATE_SENSORS` 权限以 `5000μs (200Hz)` 采集姿态并采用自适应双斜率滤波；修复 `CockpitRuntimeCoordinator` 单通道冲突导致的提前唤醒抖动，配合 Mac 端 `120Hz (8.33ms)` 亚像素追随插值器（空闲自动停表 `0%` CPU，点击前微秒级对齐目标点），让原生飞鼠、红点激光与聚光灯全程丝滑跟手。
+- **macOS 辅助功能（TCC）升级自愈与免打扰加固 (`mac-os-controller` & `oms-mac-ctl`)**：
+  - 修复升级替换 `~/Applications/青简控机助手.app` 二进制后旧驻留进程未热重启及 macOS Ad-hoc 签名 `cdhash` 变更导致的“开关看似打开但实际无权限”假象；版本变更时自动清理陈旧 TCC 缓存并动态刷新 `CGEventSource`，同时移除文字/语音直输失败时反复强弹系统设置窗口的打扰行为。
+
 ## 3.7.0 - 2026-11-28 · 全场景四模态 Mac 遥控舱、体感飞鼠激光笔与无损语音直输
 
 - **手机端四模态单手遥控舱 (`MacRemoteControlModal`、`MacTrackpadAndLaserViews` & `MacKeyboardAndVoiceDeckView`)**：

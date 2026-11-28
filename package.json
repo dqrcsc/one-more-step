@@ -1,6 +1,6 @@
 {
   "name": "one-more-step",
-  "version": "3.7.0",
+  "version": "3.7.1",
   "private": true,
   "description": "青简·咫尺 (OneMoreStep) — Bidirectional interoperability bridge between macOS local AI Agents (Codex, Antigravity, OpenCode, Claude Code) and Xiaomi Android devices (HyperOS / MIUI).",
   "license": "MIT",
@@ -41,7 +41,8 @@
     "typecheck": "bun run --filter '*' build",
     "build:bt": "cd mac-host && bun run build:bt",
     "build:hud": "cd mac-host && bun run build:hud",
-    "build:native": "cd mac-host && bun run build:bt && bun run build:hud",
+    "build:ctl": "cd mac-host && bun run build:ctl",
+    "build:native": "cd mac-host && bun run build:bt && bun run build:hud && bun run build:ctl",
     "build:apk": "bun run scripts/run-gradle.ts assembleRelease",
     "build:apk:debug": "bun run scripts/run-gradle.ts assembleDebug",
     "test:android": "bun run scripts/run-gradle.ts :core:net-proxy:test :core:ai-engine:test :app:testDebugUnitTest --no-daemon",
