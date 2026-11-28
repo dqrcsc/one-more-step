@@ -32,6 +32,9 @@ object OmsFrameProtocol {
     const val TYPE_PING: Int = 0x05
     const val TYPE_PONG: Int = 0x06
     const val TYPE_SCREEN_FRAME: Int = 0x07
+    const val TYPE_HID_INPUT: Int = 0x08
+
+    const val HID_INPUT_PAYLOAD_BYTES: Int = 12
 
     const val SCREEN_FRAME_HEADER_BYTES = 16
     const val CODEC_STATUS_ONLY: Int = 0x00
@@ -156,6 +159,30 @@ object OmsFrameProtocol {
             payload.put(imageBytes)
         }
         return encodeFrame(TYPE_SCREEN_FRAME, payload.array())
+    }
+
+    /**
+     * Encode 12-byte Big-Endian Mac HID input frame (FrameType 0x08 -> 20B total OMS frame):
+     * [1B opcode][1B modsOrBtn][2B int16 dx][2B int16 dy][2B int16 aux][2B uint16 seq][2B uint16 flags]
+     */
+    fun encodeHidInput(
+        opcode: Int,
+        modsOrBtn: Int,
+        dx: Int,
+        dy: Int,
+        aux: Int = 0,
+        seq: Int = 0,
+        flags: Int = 0
+    ): ByteArray {
+        val payload = ByteBuffer.allocate(HID_INPUT_PAYLOAD_BYTES).order(ByteOrder.BIG_ENDIAN)
+        payload.put((opcode and 0xFF).toByte())
+        payload.put((modsOrBtn and 0xFF).toByte())
+        payload.putShort(dx.coerceIn(-32768, 32767).toShort())
+        payload.putShort(dy.coerceIn(-32768, 32767).toShort())
+        payload.putShort(aux.coerceIn(-32768, 32767).toShort())
+        payload.putShort((seq and 0xFFFF).toShort())
+        payload.putShort((flags and 0xFFFF).toShort())
+        return encodeFrame(TYPE_HID_INPUT, payload.array())
     }
 
     fun sha256Hex(data: ByteArray): String {

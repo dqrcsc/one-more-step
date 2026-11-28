@@ -1918,6 +1918,8 @@ class OmsTransportClient(
         }
     }
 
+    fun isBlePipelineBusy(): Boolean = isBleWriting.get() || bleWriteQueue.isNotEmpty()
+
     fun sendRawFrame(frameBytes: ByteArray): Boolean =
         runCatching { sendOnSource(frameBytes, activeSource()) }.getOrDefault(false)
 

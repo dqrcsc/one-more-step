@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -35,18 +36,22 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 data class StreamingTurnState(
     val isStreaming: Boolean = false,
@@ -397,7 +402,10 @@ class CockpitRuntimeCoordinator(
 
         scope.launch {
             transportClient.activeTierFlow.collect { tier ->
-                if (tier != "DISCONNECTED") {
+                if (tier == "DISCONNECTED") {
+                    trackpadMomentumScroller.stopImmediate()
+                    hidCoalescer.clear()
+                } else {
                     if (macScope.ticket().macId != currentMacId()) withContext(Dispatchers.Main.immediate) { loadCachedCatalogForMac(currentMacId()) }
                     flushPendingSyncToMac()
                     flushPendingBrowserCurates()
@@ -2355,6 +2363,139 @@ class CockpitRuntimeCoordinator(
         resp?.optBoolean("ok", false) == true
     }
 
+    // =========================================================================
+    // v3.7 Mac Multi-Modal Remote Wand (0x08 Binary HID Dispatcher & Type-Text)
+    // =========================================================================
+
+    val trackpadMomentumScroller: MomentumFlingScroller = MomentumFlingScroller()
+    private val hidCoalescer = MacHidCoalescingBuffer()
+    private val hidSeq = AtomicInteger(0)
+    private val hidWorkerRunning = AtomicBoolean(false)
+    private val hidFlushImmediate = AtomicBoolean(false)
+    private val hidFlushSignal = Channel<Unit>(Channel.CONFLATED)
+    private val lastLightTickElapsedMs = AtomicLong(0L)
+
+    fun sendMacHid(packet: MacHidPacket, flushImmediate: Boolean = false) {
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") {
+            hidCoalescer.clear()
+            return
+        }
+        hidCoalescer.offer(packet)
+        if (flushImmediate || packet.isBarrier) {
+            hidFlushImmediate.set(true)
+        }
+        hidFlushSignal.trySend(Unit)
+        ensureHidFlushWorker()
+    }
+
+    fun flushMacHidNow() {
+        if (hidCoalescer.isEmpty()) return
+        hidFlushImmediate.set(true)
+        hidFlushSignal.trySend(Unit)
+        ensureHidFlushWorker()
+    }
+
+    fun resetMacHidState() {
+        trackpadMomentumScroller.stopImmediate()
+        hidCoalescer.clear()
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") return
+        sendMacHid(MacHidPacket.resetAll(), flushImmediate = true)
+    }
+
+    suspend fun typeTextToMac(
+        text: String,
+        submitReturn: Boolean = false
+    ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        if (text.isEmpty()) {
+            return@withContext false to "请输入要发送到 Mac 的文字"
+        }
+        if (transportClient.activeTierFlow.value == "DISCONNECTED") {
+            return@withContext false to "当前未连通 Mac，请确认电脑在线"
+        }
+        val params = JSONObject()
+            .put("text", text)
+            .put("submitReturn", submitReturn)
+        val resp = transportClient.callHostRpc("mac.hid.type_text", params, 8_000L)
+            ?: return@withContext false to "Mac 响应超时，请检查连接状态"
+        val ok = resp.optBoolean("ok", false)
+        val typedChars = resp.optInt("typedChars", text.codePointCount(0, text.length))
+        val msg = resp.optString("message", "").ifBlank {
+            if (ok) {
+                if (submitReturn) "已注入 $typedChars 字并触发回车" else "已无损注入 $typedChars 字至 Mac"
+            } else {
+                "文字注入未完成，请确认 Mac 已解锁并开启辅助功能权限"
+            }
+        }
+        if (ok) vibrateConfirm()
+        ok to msg
+    }
+
+    private fun ensureHidFlushWorker() {
+        if (!hidWorkerRunning.compareAndSet(false, true)) return
+        scope.launch {
+            var lastFlushAtMs = 0L
+            try {
+                while (true) {
+                    if (hidCoalescer.isEmpty()) {
+                        val woke = withTimeoutOrNull(2_000L) {
+                            hidFlushSignal.receive()
+                        }
+                        if (woke == null && hidCoalescer.isEmpty()) {
+                            break
+                        }
+                    }
+                    val tier = transportClient.activeTierFlow.value
+                    if (tier == "DISCONNECTED") {
+                        hidCoalescer.clear()
+                        hidFlushImmediate.set(false)
+                        continue
+                    }
+
+                    val immediate = hidFlushImmediate.getAndSet(false) || hidCoalescer.hasBarrier()
+                    if (!immediate) {
+                        val intervalMs = MacHidCoalescingBuffer.flushIntervalMsForTier(tier)
+                        val remainMs = intervalMs - (SystemClock.elapsedRealtime() - lastFlushAtMs)
+                        if (remainMs > 1L) {
+                            withTimeoutOrNull(remainMs) {
+                                hidFlushSignal.receive()
+                            }
+                            hidFlushImmediate.set(false)
+                        }
+                        // Plaintext BLE backpressure coalescing (never mutates/drops already-sealed AEAD frames!)
+                        if (tier == "BT_RFCOMM" && !hidCoalescer.hasBarrier()) {
+                            val waitStart = SystemClock.elapsedRealtime()
+                            while (
+                                transportClient.isBlePipelineBusy() &&
+                                !hidCoalescer.hasBarrier() &&
+                                !hidFlushImmediate.get() &&
+                                SystemClock.elapsedRealtime() - waitStart < 60L
+                            ) {
+                                withTimeoutOrNull(6L) {
+                                    hidFlushSignal.receive()
+                                }
+                            }
+                            hidFlushImmediate.set(false)
+                        }
+                    }
+
+                    val batch = hidCoalescer.drainAll()
+                    if (batch.isNotEmpty()) {
+                        for (pkt in batch) {
+                            val seq = hidSeq.incrementAndGet() and 0xFFFF
+                            transportClient.sendRawFrame(pkt.toWireFrame(seq))
+                        }
+                        lastFlushAtMs = SystemClock.elapsedRealtime()
+                    }
+                }
+            } finally {
+                hidWorkerRunning.set(false)
+                if (!hidCoalescer.isEmpty()) {
+                    ensureHidFlushWorker()
+                }
+            }
+        }
+    }
+
     private fun parseStepJson(o: JSONObject) = RemoteAgentStepUi(
         stepIndex = o.optInt("stepIndex", 1),
         kind = o.optString("kind", "assistant"),
@@ -2362,6 +2503,18 @@ class CockpitRuntimeCoordinator(
         detail = o.optString("detail", ""),
         timestampMs = o.optLong("timestampMs", System.currentTimeMillis())
     )
+
+    fun vibrateLightTick(minIntervalMs: Long = 28L) {
+        val now = SystemClock.elapsedRealtime()
+        val minGap = minIntervalMs.coerceAtLeast(1L)
+        val prev = lastLightTickElapsedMs.get()
+        if (now - prev < minGap) return
+        if (!lastLightTickElapsedMs.compareAndSet(prev, now)) return
+        runCatching {
+            val vib = getVibrator() ?: return
+            vib.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK))
+        }
+    }
 
     fun vibrateTick() {
         runCatching {
