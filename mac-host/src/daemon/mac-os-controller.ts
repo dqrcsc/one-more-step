@@ -139,7 +139,7 @@ export class MacOsController {
 
       const dstExists = fs.existsSync(dstBin) && fs.existsSync(infoPlistPath);
       const plistMatchesVersion =
-        dstExists && fs.readFileSync(infoPlistPath, "utf8").includes("<string>67</string>");
+        dstExists && fs.readFileSync(infoPlistPath, "utf8").includes("<string>68</string>");
       // Strictly gate helper replacement on explicit CFBundleVersion changes so git pull / rebuilds
       // NEVER needlessly re-sign the ad-hoc bundle and invalidate macOS TCC cdhash grants!
       const needsUpdate = !dstExists || !plistMatchesVersion;
@@ -165,9 +165,9 @@ export class MacOsController {
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>3.7.0</string>
+    <string>3.7.1</string>
     <key>CFBundleVersion</key>
-    <string>67</string>
+    <string>68</string>
     <key>LSUIElement</key>
     <true/>
 </dict>

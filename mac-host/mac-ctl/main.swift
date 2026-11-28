@@ -204,22 +204,38 @@ func openAccessibilitySettings() {
 }
 
 // =============================================================================
-// High-Frequency Native HID Injector & Laser/Spotlight Coordinator (v3.7)
+// High-Frequency Native HID Injector, 120Hz Chase Interpolator & Laser/Spotlight Coordinator (v3.7.1)
 // =============================================================================
 
 final class HidEventEngine {
     static let shared = HidEventEngine()
 
-    private let lock = NSLock()
+    private let hidQueue = DispatchQueue(label: "com.oms.mac-ctl.hid-engine", qos: .userInteractive)
+    private var chaseTimer: DispatchSourceTimer? = nil
+
     private var cachedEventSource: CGEventSource? = nil
     private var eventSourceCreatedWhileTrusted: Bool = false
-    private var virtualPos: CGPoint? = nil
+
+    private var hasCursorPos: Bool = false
+    private var targetPos: CGPoint = .zero
+    private var renderedPos: CGPoint = .zero
     private var lastPointerActivitySec: TimeInterval = 0
+    private var smoothMode: Bool = false
+    private var latestMoveMods: Int = 0
+
+    private var activeLaserMode: Int = 0
+    private var activeSpotlightRadius: CGFloat = 140
+    private var lastLaserPacketSec: TimeInterval = 0
+
     private var leftButtonDown: Bool = false
     private var scrollRemX: CGFloat = 0
     private var scrollRemY: CGFloat = 0
     private var cachedDisplays: [CGRect] = []
     private var lastDisplayRefreshSec: TimeInterval = 0
+
+    private let overlayLock = NSLock()
+    private var pendingOverlayState: (mode: Int, pos: CGPoint, radius: CGFloat)? = nil
+    private var overlayFlushScheduled: Bool = false
 
     private static let allowedSystemKeys: Set<Int> = [0, 1, 2, 3, 7, 16, 17, 18]
 
@@ -236,7 +252,7 @@ final class HidEventEngine {
         return cachedEventSource
     }
 
-    private func getDisplayRectsLocked(now: TimeInterval) -> [CGRect] {
+    private func getDisplayRectsOnQueue(now: TimeInterval) -> [CGRect] {
         if cachedDisplays.isEmpty || (now - lastDisplayRefreshSec) > 0.5 {
             cachedDisplays = LaserOverlayController.currentGlobalDisplayRects()
             lastDisplayRefreshSec = now
@@ -244,25 +260,147 @@ final class HidEventEngine {
         return cachedDisplays
     }
 
-    private func currentVirtualPosLocked(now: TimeInterval) -> CGPoint {
-        if let vp = virtualPos, (now - lastPointerActivitySec) <= 0.35 {
-            return vp
+    private func ensurePositionsInitializedOnQueue(now: TimeInterval) {
+        let isIdle = (now - lastPointerActivitySec) > 0.35 && activeLaserMode == 0
+        if !hasCursorPos || isIdle {
+            let livePos = CGEvent(source: nil)?.location ?? (hasCursorPos ? targetPos : .zero)
+            let clamped = HidMath.clampToDisplays(livePos, displays: getDisplayRectsOnQueue(now: now))
+            targetPos = clamped
+            renderedPos = clamped
+            hasCursorPos = true
         }
-        let livePos = CGEvent(source: nil)?.location ?? virtualPos ?? .zero
-        let clamped = HidMath.clampToDisplays(livePos, displays: getDisplayRectsLocked(now: now))
-        virtualPos = clamped
-        return clamped
     }
 
-    private func advanceCursorLocked(dxRaw: Int, dyRaw: Int, now: TimeInterval) -> (pos: CGPoint, dxPt: CGFloat, dyPt: CGFloat) {
-        let dxPt = HidMath.quarterPxToPoints(dxRaw)
-        let dyPt = HidMath.quarterPxToPoints(dyRaw)
-        let base = currentVirtualPosLocked(now: now)
-        let target = CGPoint(x: base.x + dxPt, y: base.y + dyPt)
-        let clamped = HidMath.clampToDisplays(target, displays: getDisplayRectsLocked(now: now))
-        virtualPos = clamped
-        lastPointerActivitySec = now
-        return (clamped, dxPt, dyPt)
+    private func scheduleOverlayUpdate(mode: Int, pos: CGPoint, radius: CGFloat) {
+        if Thread.isMainThread {
+            overlayLock.lock()
+            pendingOverlayState = nil
+            overlayFlushScheduled = false
+            overlayLock.unlock()
+            if mode <= 0 {
+                LaserOverlayController.shared.hideImmediateOnMain()
+            } else {
+                LaserOverlayController.shared.updateOnMain(mode: mode, globalCursor: pos, spotlightRadius: radius)
+            }
+            return
+        }
+        overlayLock.lock()
+        pendingOverlayState = (mode: mode, pos: pos, radius: radius)
+        let shouldSchedule = !overlayFlushScheduled
+        if shouldSchedule {
+            overlayFlushScheduled = true
+        }
+        overlayLock.unlock()
+        if shouldSchedule {
+            DispatchQueue.main.async { [weak self] in
+                self?.flushOverlayOnMain()
+            }
+        }
+    }
+
+    private func flushOverlayOnMain() {
+        overlayLock.lock()
+        let state = pendingOverlayState
+        pendingOverlayState = nil
+        overlayFlushScheduled = false
+        overlayLock.unlock()
+
+        guard let s = state else { return }
+        if s.mode <= 0 {
+            LaserOverlayController.shared.hideImmediateOnMain()
+        } else {
+            LaserOverlayController.shared.updateOnMain(mode: s.mode, globalCursor: s.pos, spotlightRadius: s.radius)
+        }
+    }
+
+    private func ensureChaseTimerRunningOnQueue(fireImmediately: Bool) {
+        guard chaseTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: hidQueue)
+        let initialDelay: DispatchTimeInterval = fireImmediately ? .nanoseconds(0) : .microseconds(8333)
+        timer.schedule(deadline: .now() + initialDelay, repeating: .microseconds(8333), leeway: .microseconds(800))
+        timer.setEventHandler { [weak self] in
+            self?.onChaseTimerTick()
+        }
+        chaseTimer = timer
+        timer.resume()
+    }
+
+    private func stopChaseTimerOnQueue() {
+        guard let timer = chaseTimer else { return }
+        timer.setEventHandler {}
+        timer.cancel()
+        chaseTimer = nil
+    }
+
+    private func onChaseTimerTick() {
+        let now = CACurrentMediaTime()
+
+        if activeLaserMode > 0 && (now - lastLaserPacketSec) > 1.8 {
+            activeLaserMode = 0
+            scheduleOverlayUpdate(mode: 0, pos: .zero, radius: activeSpotlightRadius)
+        }
+
+        let errX = targetPos.x - renderedPos.x
+        let errY = targetPos.y - renderedPos.y
+        let dist = hypot(errX, errY)
+
+        if dist >= 0.08 {
+            let alpha: CGFloat = (activeLaserMode > 0 || smoothMode) ? 0.46 : 0.74
+            let stepX: CGFloat = (dist < 0.35) ? errX : (errX * alpha)
+            let stepY: CGFloat = (dist < 0.35) ? errY : (errY * alpha)
+            let prevPos = renderedPos
+            let nextPos: CGPoint
+            if dist < 0.35 {
+                nextPos = HidMath.clampToDisplays(targetPos, displays: getDisplayRectsOnQueue(now: now))
+                targetPos = nextPos
+            } else {
+                nextPos = HidMath.clampToDisplays(
+                    CGPoint(x: renderedPos.x + stepX, y: renderedPos.y + stepY),
+                    displays: getDisplayRectsOnQueue(now: now)
+                )
+            }
+            renderedPos = nextPos
+            let actualDx = nextPos.x - prevPos.x
+            let actualDy = nextPos.y - prevPos.y
+            let evFlags: CGEventFlags = (activeLaserMode > 0) ? [] : modifierFlags(from: latestMoveMods)
+            postPointerMoveEvent(
+                pos: nextPos,
+                dxPt: actualDx,
+                dyPt: actualDy,
+                isDragging: leftButtonDown,
+                flags: evFlags
+            )
+            if activeLaserMode > 0 {
+                scheduleOverlayUpdate(mode: activeLaserMode, pos: nextPos, radius: activeSpotlightRadius)
+            }
+        } else if (now - lastPointerActivitySec) > 0.14 && activeLaserMode == 0 {
+            renderedPos = targetPos
+            stopChaseTimerOnQueue()
+        }
+    }
+
+    private func snapRenderedToTargetImmediate(now: TimeInterval) {
+        let errX = targetPos.x - renderedPos.x
+        let errY = targetPos.y - renderedPos.y
+        let dist = hypot(errX, errY)
+        if dist > 0.05 {
+            let snapped = HidMath.clampToDisplays(targetPos, displays: getDisplayRectsOnQueue(now: now))
+            let actualDx = snapped.x - renderedPos.x
+            let actualDy = snapped.y - renderedPos.y
+            targetPos = snapped
+            renderedPos = snapped
+            let evFlags: CGEventFlags = (activeLaserMode > 0) ? [] : modifierFlags(from: latestMoveMods)
+            postPointerMoveEvent(
+                pos: snapped,
+                dxPt: actualDx,
+                dyPt: actualDy,
+                isDragging: leftButtonDown,
+                flags: evFlags
+            )
+            if activeLaserMode > 0 {
+                scheduleOverlayUpdate(mode: activeLaserMode, pos: snapped, radius: activeSpotlightRadius)
+            }
+        }
     }
 
     private func postPointerMoveEvent(pos: CGPoint, dxPt: CGFloat, dyPt: CGFloat, isDragging: Bool, flags: CGEventFlags = []) {
@@ -381,38 +519,46 @@ final class HidEventEngine {
     }
 
     func handleHidPacket(op: Int, modsOrBtn: Int, dx: Int, dy: Int, aux: Int, flags: Int) {
+        hidQueue.async { [weak self] in
+            self?.processHidPacketOnQueue(op: op, modsOrBtn: modsOrBtn, dx: dx, dy: dy, aux: aux, flags: flags)
+        }
+    }
+
+    private func processHidPacketOnQueue(op: Int, modsOrBtn: Int, dx: Int, dy: Int, aux: Int, flags: Int) {
         switch op {
         case 0x01: // POINTER_MOVE_REL
-            lock.lock()
             let now = CACurrentMediaTime()
-            let step = advanceCursorLocked(dxRaw: dx, dyRaw: dy, now: now)
-            let dragging = leftButtonDown
-            let evFlags = modifierFlags(from: modsOrBtn)
-            lock.unlock()
-            postPointerMoveEvent(pos: step.pos, dxPt: step.dxPt, dyPt: step.dyPt, isDragging: dragging, flags: evFlags)
+            ensurePositionsInitializedOnQueue(now: now)
+            smoothMode = (flags & 0x0008) != 0
+            latestMoveMods = modsOrBtn
+            let dxPt = HidMath.quarterPxToPoints(dx)
+            let dyPt = HidMath.quarterPxToPoints(dy)
+            let nextTarget = CGPoint(x: targetPos.x + dxPt, y: targetPos.y + dyPt)
+            targetPos = HidMath.clampToDisplays(nextTarget, displays: getDisplayRectsOnQueue(now: now))
+            lastPointerActivitySec = now
+            ensureChaseTimerRunningOnQueue(fireImmediately: true)
 
         case 0x02: // MOUSE_BUTTON
             let btn = (modsOrBtn >= 1 && modsOrBtn <= 3) ? modsOrBtn : 1
             let action = dx
-            lock.lock()
             let now = CACurrentMediaTime()
-            let pos = currentVirtualPosLocked(now: now)
+            ensurePositionsInitializedOnQueue(now: now)
+            snapRenderedToTargetImmediate(now: now)
+            let pos = renderedPos
             lastPointerActivitySec = now
+
             switch action {
             case 1: // CLICK
                 if btn == 1 && leftButtonDown {
                     leftButtonDown = false
-                    lock.unlock()
                     postMouseButtonPair(buttonCode: 1, pos: pos, isDown: false, clickState: 1)
                 } else {
-                    lock.unlock()
                     postMouseButtonPair(buttonCode: btn, pos: pos, isDown: true, clickState: 1)
                     usleep(4_000)
                     postMouseButtonPair(buttonCode: btn, pos: pos, isDown: false, clickState: 1)
                 }
-            case 2: // DOUBLE_CLICK
+            case 2: // DOUBLE_CLICK (legacy fallback)
                 if btn == 1 { leftButtonDown = false }
-                lock.unlock()
                 postMouseButtonPair(buttonCode: btn, pos: pos, isDown: true, clickState: 1)
                 usleep(3_000)
                 postMouseButtonPair(buttonCode: btn, pos: pos, isDown: false, clickState: 1)
@@ -422,32 +568,78 @@ final class HidEventEngine {
                 postMouseButtonPair(buttonCode: btn, pos: pos, isDown: false, clickState: 2)
             case 3: // DOWN
                 if btn == 1 { leftButtonDown = true }
-                lock.unlock()
                 postMouseButtonPair(buttonCode: btn, pos: pos, isDown: true, clickState: 1)
             case 4: // UP
                 if btn == 1 { leftButtonDown = false }
-                lock.unlock()
                 postMouseButtonPair(buttonCode: btn, pos: pos, isDown: false, clickState: 1)
             case 5: // DRAG_LOCK_TOGGLE
                 let nextHeld = !leftButtonDown
                 leftButtonDown = nextHeld
-                lock.unlock()
                 postMouseButtonPair(buttonCode: 1, pos: pos, isDown: nextHeld, clickState: 1)
+            case 6: // CLICK_WITH_COUNT (native single/double/triple click via CGEvent clickState)
+                let count = Int64(max(1, min(3, aux > 0 ? aux : 1)))
+                if btn == 1 && leftButtonDown && count == 1 {
+                    leftButtonDown = false
+                    postMouseButtonPair(buttonCode: 1, pos: pos, isDown: false, clickState: 1)
+                } else {
+                    if btn == 1 { leftButtonDown = false }
+                    postMouseButtonPair(buttonCode: btn, pos: pos, isDown: true, clickState: count)
+                    usleep(3_000)
+                    postMouseButtonPair(buttonCode: btn, pos: pos, isDown: false, clickState: count)
+                }
             default:
-                lock.unlock()
+                break
             }
 
-        case 0x03: // SCROLL_PIXEL
-            lock.lock()
+        case 0x03: // SCROLL_PIXEL (with native CGScrollPhase & CGMomentumScrollPhase)
+            let phaseCode = aux
+            if phaseCode == 1 {
+                scrollRemX = 0
+                scrollRemY = 0
+            }
             scrollRemX += HidMath.quarterPxToPoints(dx)
             scrollRemY += HidMath.quarterPxToPoints(dy)
             let dxPx = Int32(scrollRemX.rounded(.towardZero))
             let dyPx = Int32(scrollRemY.rounded(.towardZero))
             scrollRemX -= CGFloat(dxPx)
             scrollRemY -= CGFloat(dyPx)
+            if phaseCode == 3 || phaseCode == 6 {
+                scrollRemX = 0
+                scrollRemY = 0
+            }
+
+            let isPhaseBoundary = (phaseCode == 1 || phaseCode == 3 || phaseCode == 4 || phaseCode == 6)
+            if !isPhaseBoundary && dxPx == 0 && dyPx == 0 {
+                return
+            }
+
+            let scrollPhase: Int64
+            let momentumPhase: Int64
+            switch phaseCode {
+            case 1: // BEGAN -> kCGScrollPhaseBegan (1)
+                scrollPhase = 1
+                momentumPhase = 0
+            case 2: // CHANGED -> kCGScrollPhaseChanged (2)
+                scrollPhase = 2
+                momentumPhase = 0
+            case 3: // ENDED -> kCGScrollPhaseEnded (4)
+                scrollPhase = 4
+                momentumPhase = 0
+            case 4: // MOMENTUM_BEGIN -> kCGMomentumScrollPhaseBegin (1)
+                scrollPhase = 0
+                momentumPhase = 1
+            case 5: // MOMENTUM_CONTINUE -> kCGMomentumScrollPhaseContinue (2)
+                scrollPhase = 0
+                momentumPhase = 2
+            case 6: // MOMENTUM_END -> kCGMomentumScrollPhaseEnd (3)
+                scrollPhase = 0
+                momentumPhase = 3
+            default:
+                scrollPhase = 0
+                momentumPhase = 0
+            }
+
             let evFlags = modifierFlags(from: modsOrBtn)
-            lock.unlock()
-            guard dxPx != 0 || dyPx != 0 else { return }
             if let ev = CGEvent(
                 scrollWheelEvent2Source: eventSource,
                 units: .pixel,
@@ -457,6 +649,8 @@ final class HidEventEngine {
                 wheel3: 0
             ) {
                 ev.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+                ev.setIntegerValueField(.scrollWheelEventScrollPhase, value: scrollPhase)
+                ev.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentumPhase)
                 if !evFlags.isEmpty {
                     ev.flags = evFlags
                 }
@@ -471,41 +665,37 @@ final class HidEventEngine {
             postSystemDefinedKey(keyType)
 
         case 0x06: // LASER_STATE_AND_DELTA
-            lock.lock()
             let now = CACurrentMediaTime()
-            let hasDelta = (dx != 0 || dy != 0)
-            let nextPos: CGPoint
-            let dxPt: CGFloat
-            let dyPt: CGFloat
-            let dragging = leftButtonDown
-            if hasDelta {
-                let step = advanceCursorLocked(dxRaw: dx, dyRaw: dy, now: now)
-                nextPos = step.pos
-                dxPt = step.dxPt
-                dyPt = step.dyPt
+            if modsOrBtn <= 0 {
+                activeLaserMode = 0
+                if hasCursorPos {
+                    snapRenderedToTargetImmediate(now: now)
+                }
+                scheduleOverlayUpdate(mode: 0, pos: .zero, radius: activeSpotlightRadius)
             } else {
-                nextPos = currentVirtualPosLocked(now: now)
+                ensurePositionsInitializedOnQueue(now: now)
+                let wasLaserOff = (activeLaserMode <= 0)
+                let prevRadius = activeSpotlightRadius
+                activeLaserMode = modsOrBtn
+                activeSpotlightRadius = CGFloat(aux > 0 ? aux : 140)
+                lastLaserPacketSec = now
                 lastPointerActivitySec = now
-                dxPt = 0
-                dyPt = 0
-            }
-            lock.unlock()
 
-            if hasDelta {
-                postPointerMoveEvent(pos: nextPos, dxPt: dxPt, dyPt: dyPt, isDragging: dragging)
-            }
-            let mode = modsOrBtn
-            let radius = CGFloat(aux)
-            if Thread.isMainThread {
-                LaserOverlayController.shared.updateOnMain(mode: mode, globalCursor: nextPos, spotlightRadius: radius)
-            } else {
-                DispatchQueue.main.async {
-                    LaserOverlayController.shared.updateOnMain(mode: mode, globalCursor: nextPos, spotlightRadius: radius)
+                let hasDelta = (dx != 0 || dy != 0)
+                if hasDelta {
+                    let dxPt = HidMath.quarterPxToPoints(dx)
+                    let dyPt = HidMath.quarterPxToPoints(dy)
+                    let nextTarget = CGPoint(x: targetPos.x + dxPt, y: targetPos.y + dyPt)
+                    targetPos = HidMath.clampToDisplays(nextTarget, displays: getDisplayRectsOnQueue(now: now))
+                }
+                ensureChaseTimerRunningOnQueue(fireImmediately: hasDelta)
+                if !hasDelta || wasLaserOff || abs(activeSpotlightRadius - prevRadius) >= 1.0 {
+                    scheduleOverlayUpdate(mode: activeLaserMode, pos: renderedPos, radius: activeSpotlightRadius)
                 }
             }
 
         case 0x0f: // RESET_HID_STATE
-            resetState()
+            resetStateOnQueue()
 
         default:
             break
@@ -513,6 +703,12 @@ final class HidEventEngine {
     }
 
     func typeUnicodeText(_ text: String, submitReturn: Bool) -> [String: Any] {
+        return hidQueue.sync {
+            typeUnicodeTextOnQueue(text, submitReturn: submitReturn)
+        }
+    }
+
+    private func typeUnicodeTextOnQueue(_ text: String, submitReturn: Bool) -> [String: Any] {
         guard !isScreenLocked() else {
             return [
                 "ok": false,
@@ -583,26 +779,30 @@ final class HidEventEngine {
     }
 
     func resetState() {
-        lock.lock()
+        hidQueue.sync {
+            resetStateOnQueue()
+        }
+    }
+
+    private func resetStateOnQueue() {
+        stopChaseTimerOnQueue()
         scrollRemX = 0
         scrollRemY = 0
+        smoothMode = false
+        latestMoveMods = 0
+        activeLaserMode = 0
+
         let wasLeftDown = leftButtonDown
         leftButtonDown = false
-        let releasePos = virtualPos ?? (CGEvent(source: nil)?.location ?? .zero)
-        virtualPos = nil
-        lock.unlock()
+        let releasePos = hasCursorPos ? renderedPos : (CGEvent(source: nil)?.location ?? .zero)
+        hasCursorPos = false
+        targetPos = .zero
+        renderedPos = .zero
 
         if wasLeftDown {
             postMouseButtonPair(buttonCode: 1, pos: releasePos, isDown: false, clickState: 1)
         }
-
-        if Thread.isMainThread {
-            LaserOverlayController.shared.hideImmediateOnMain()
-        } else {
-            DispatchQueue.main.async {
-                LaserOverlayController.shared.hideImmediateOnMain()
-            }
-        }
+        scheduleOverlayUpdate(mode: 0, pos: .zero, radius: activeSpotlightRadius)
     }
 }
 

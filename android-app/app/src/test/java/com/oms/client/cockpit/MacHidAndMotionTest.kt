@@ -12,14 +12,13 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.abs
 import kotlin.math.cos
-import kotlin.math.hypot
 import kotlin.math.sin
 import kotlin.math.sqrt
 
 class MacHidAndMotionTest {
 
     @Test
-    fun `encodes exact 20-byte Big-Endian 0x08 HID frame and clamps quarter-pixel bounds`() {
+    fun `encodes exact 20-byte Big-Endian 0x08 HID frame click counts and smooth flags`() {
         val raw = OmsFrameProtocol.encodeHidInput(
             opcode = MacHidOpcode.POINTER_MOVE_REL,
             modsOrBtn = MacHidModMask.COMMAND or MacHidModMask.SHIFT,
@@ -27,7 +26,7 @@ class MacHidAndMotionTest {
             dy = MacHidFixedPoint.pxToQuarter(-2.25f),
             aux = 140,
             seq = 65535,
-            flags = MacHidFlags.LASER_KEEPALIVE
+            flags = MacHidFlags.LASER_KEEPALIVE or MacHidFlags.SMOOTH_INTERPOLATE
         )
         assertEquals(20, raw.size)
         // OMS 8-byte header check: 'O' (0x4F), v1 (0x01), type 0x08, flags 0x00, len 12
@@ -48,7 +47,33 @@ class MacHidAndMotionTest {
         assertEquals(-9, buf.short.toInt())   // -2.25 * 4 = -9
         assertEquals(140, buf.short.toInt())
         assertEquals(65535, buf.short.toInt() and 0xFFFF)
-        assertEquals(MacHidFlags.LASER_KEEPALIVE, buf.short.toInt() and 0xFFFF)
+        assertEquals(
+            MacHidFlags.LASER_KEEPALIVE or MacHidFlags.SMOOTH_INTERPOLATE,
+            buf.short.toInt() and 0xFFFF
+        )
+
+        // mouseClickWithCount (action = 6, aux = 1 / 2 / 3 with clamping)
+        val c1 = MacHidPacket.mouseClickWithCount(MacHidButton.LEFT, clickCount = 1)
+        val c2 = MacHidPacket.mouseClickWithCount(MacHidButton.LEFT, clickCount = 2)
+        val c3 = MacHidPacket.mouseClickWithCount(MacHidButton.LEFT, clickCount = 3, modifiers = MacHidModMask.COMMAND)
+        val cClampedHigh = MacHidPacket.mouseClickWithCount(MacHidButton.LEFT, clickCount = 9)
+        val cClampedLow = MacHidPacket.mouseClickWithCount(MacHidButton.LEFT, clickCount = 0)
+
+        assertEquals(MacHidOpcode.MOUSE_BUTTON, c1.opcode)
+        assertEquals(MacHidButtonAction.CLICK_WITH_COUNT, c1.dx)
+        assertEquals(6, c1.dx)
+        assertEquals(1, c1.aux)
+        assertTrue(c1.isBarrier)
+
+        assertEquals(2, c2.aux)
+        assertEquals(3, c3.aux)
+        assertEquals(MacHidModMask.COMMAND, c3.dy)
+        assertEquals(3, cClampedHigh.aux)
+        assertEquals(1, cClampedLow.aux)
+
+        // Desktop/Launchpad keycodes
+        assertEquals(103, MacKeyCodes.F11_SHOW_DESKTOP)
+        assertEquals(131, MacKeyCodes.LAUNCHPAD)
 
         // Quarter-pixel fixed-point precision and int16 clamping
         assertEquals(10.5f, MacHidFixedPoint.quarterToPx(42), 0.0001f)
@@ -61,74 +86,108 @@ class MacHidAndMotionTest {
     }
 
     @Test
-    fun `coalescing buffer merges consecutive moves scrolls and same-mode lasers while preserving all barriers`() {
+    fun `coalescing buffer merges CHANGED and MOMENTUM_CONTINUE scrolls while preserving BEGAN ENDED and barriers`() {
         val buffer = MacHidCoalescingBuffer()
 
-        // 1. Consecutive pointer moves merge, followed by CLICK barrier, followed by post-click move
-        buffer.offer(MacHidPacket.moveRel(4f, -2f))
-        buffer.offer(MacHidPacket.moveRel(6f, 5f))
-        buffer.offer(MacHidPacket.mouseButton(MacHidButton.LEFT, MacHidButtonAction.CLICK))
+        // 1. Consecutive pointer moves (with SMOOTH_INTERPOLATE) merge, followed by CLICK_WITH_COUNT barrier, then move
+        buffer.offer(MacHidPacket.moveRel(4f, -2f, flags = MacHidFlags.SMOOTH_INTERPOLATE))
+        buffer.offer(MacHidPacket.moveRel(6f, 5f, flags = MacHidFlags.SMOOTH_INTERPOLATE))
+        buffer.offer(MacHidPacket.mouseClickWithCount(MacHidButton.LEFT, clickCount = 2))
         buffer.offer(MacHidPacket.moveRel(2f, 2f))
 
-        // 2. KEY_TAP and SYSTEM_DEFINED_KEY barriers between scrolls
-        buffer.offer(MacHidPacket.scrollPixel(0f, -12f, phase = MacHidScrollPhase.BEGAN))
-        buffer.offer(MacHidPacket.scrollPixel(3f, -8f, phase = MacHidScrollPhase.MOMENTUM, momentum = true))
-        buffer.offer(MacHidPacket.keyTap(MacKeyCodes.ANSI_C, MacHidModMask.COMMAND))
-        buffer.offer(MacHidPacket.systemKey(MacHidSystemKey.SOUND_UP))
+        // 2. Native scroll lifecycle: BEGAN(1) -> CHANGED(2)+CHANGED(2) -> ENDED(3)
+        val sBegan = MacHidPacket.scrollPixel(0f, -4f, phase = MacHidScrollPhase.BEGAN)
+        val sChanged1 = MacHidPacket.scrollPixel(1f, -10f, phase = MacHidScrollPhase.CHANGED)
+        val sChanged2 = MacHidPacket.scrollPixel(2f, -6f, phase = MacHidScrollPhase.CHANGED)
+        val sEnded = MacHidPacket.scrollPixel(0f, 0f, phase = MacHidScrollPhase.ENDED)
+        assertTrue("BEGAN must be urgent/barrier", sBegan.isBarrier)
+        assertFalse("CHANGED must be coalesceable", sChanged1.isBarrier)
+        assertTrue("ENDED must be urgent/barrier", sEnded.isBarrier)
+        buffer.offer(sBegan)
+        buffer.offer(sChanged1)
+        buffer.offer(sChanged2)
+        buffer.offer(sEnded)
 
-        // 3. Laser same-mode merges, laser mode change acts as barrier, RESET_HID_STATE acts as barrier
+        // 3. Momentum lifecycle: MOMENTUM_BEGIN(4) -> MOMENTUM_CONTINUE(5)+MOMENTUM_CONTINUE(5) -> MOMENTUM_END(6)
+        val mBegin = MacHidPacket.scrollPixel(0f, -14f, phase = MacHidScrollPhase.MOMENTUM_BEGIN, momentum = true)
+        val mCont1 = MacHidPacket.scrollPixel(0f, -12f, phase = MacHidScrollPhase.MOMENTUM_CONTINUE, momentum = true)
+        val mCont2 = MacHidPacket.scrollPixel(0f, -9f, phase = MacHidScrollPhase.MOMENTUM_CONTINUE, momentum = true)
+        val mEnd = MacHidPacket.scrollPixel(0f, 0f, phase = MacHidScrollPhase.MOMENTUM_END, momentum = true)
+        assertTrue("MOMENTUM_BEGIN must be urgent/barrier", mBegin.isBarrier)
+        assertFalse("MOMENTUM_CONTINUE must be coalesceable", mCont1.isBarrier)
+        assertTrue("MOMENTUM_END must be urgent/barrier", mEnd.isBarrier)
+        buffer.offer(mBegin)
+        buffer.offer(mCont1)
+        buffer.offer(mCont2)
+        buffer.offer(mEnd)
+
+        // 4. Laser same-mode merges, mode switch and OFF act as barriers
         buffer.offer(MacHidPacket.laserUpdate(MacHidLaserMode.RED_LASER, dxPx = 5f, dyPx = -3f))
         buffer.offer(MacHidPacket.laserUpdate(MacHidLaserMode.RED_LASER, dxPx = 7f, dyPx = 1f, keepalive = true))
         buffer.offer(MacHidPacket.laserUpdate(MacHidLaserMode.SPOTLIGHT, dxPx = 4f, dyPx = 4f, spotlightRadiusPx = 180))
+        val laserOff = MacHidPacket.laserUpdate(MacHidLaserMode.OFF, dxPx = 0f, dyPx = 0f)
+        assertTrue("LASER OFF must flush immediately as barrier", laserOff.isBarrier)
+        buffer.offer(laserOff)
         buffer.offer(MacHidPacket.resetAll())
-        buffer.offer(MacHidPacket.moveRel(1f, 1f))
 
         assertTrue(buffer.hasBarrier())
         val drained = buffer.drainAll()
         assertTrue(buffer.isEmpty())
-        assertEquals(10, drained.size)
+        assertEquals(13, drained.size)
 
-        // Merged pre-click move: (4+6, -2+5) = (10px, 3px)
+        // [0] Merged pre-click move: (4+6, -2+5) = (10px, 3px) with SMOOTH_INTERPOLATE preserved
         assertEquals(MacHidOpcode.POINTER_MOVE_REL, drained[0].opcode)
         assertEquals(MacHidFixedPoint.pxToQuarter(10f), drained[0].dx)
         assertEquals(MacHidFixedPoint.pxToQuarter(3f), drained[0].dy)
+        assertEquals(MacHidFlags.SMOOTH_INTERPOLATE, drained[0].flags)
 
-        // Barrier: Left Click
+        // [1] Barrier: Double Click via CLICK_WITH_COUNT
         assertEquals(MacHidOpcode.MOUSE_BUTTON, drained[1].opcode)
-        assertEquals(MacHidButton.LEFT, drained[1].modsOrBtn)
-        assertEquals(MacHidButtonAction.CLICK, drained[1].dx)
+        assertEquals(MacHidButtonAction.CLICK_WITH_COUNT, drained[1].dx)
+        assertEquals(2, drained[1].aux)
 
-        // Post-click move preserved separately
+        // [2] Post-click move preserved separately
         assertEquals(MacHidOpcode.POINTER_MOVE_REL, drained[2].opcode)
         assertEquals(MacHidFixedPoint.pxToQuarter(2f), drained[2].dx)
 
-        // Merged scroll: (0+3, -12-8) = (3px, -20px), latest phase = MOMENTUM, flags OR'd
-        assertEquals(MacHidOpcode.SCROLL_PIXEL, drained[3].opcode)
-        assertEquals(MacHidFixedPoint.pxToQuarter(3f), drained[3].dx)
-        assertEquals(MacHidFixedPoint.pxToQuarter(-20f), drained[3].dy)
-        assertEquals(MacHidScrollPhase.MOMENTUM, drained[3].aux)
-        assertTrue((drained[3].flags and MacHidFlags.MOMENTUM_SCROLL) != 0)
+        // [3] BEGAN (1) NOT swallowed into CHANGED!
+        assertEquals(MacHidScrollPhase.BEGAN, drained[3].aux)
+        assertEquals(MacHidFixedPoint.pxToQuarter(-4f), drained[3].dy)
 
-        // Barriers: KEY_TAP & SYSTEM_DEFINED_KEY
-        assertEquals(MacHidOpcode.KEY_TAP, drained[4].opcode)
-        assertEquals(MacHidOpcode.SYSTEM_DEFINED_KEY, drained[5].opcode)
+        // [4] Merged CHANGED + CHANGED (aux = 2): (1+2, -10-6) = (3px, -16px)
+        assertEquals(MacHidScrollPhase.CHANGED, drained[4].aux)
+        assertEquals(MacHidFixedPoint.pxToQuarter(3f), drained[4].dx)
+        assertEquals(MacHidFixedPoint.pxToQuarter(-16f), drained[4].dy)
 
-        // Merged RED_LASER: (5+7, -3+1) = (12px, -2px) + keepalive flag preserved
-        assertEquals(MacHidOpcode.LASER_STATE_AND_DELTA, drained[6].opcode)
-        assertEquals(MacHidLaserMode.RED_LASER, drained[6].modsOrBtn)
-        assertEquals(MacHidFixedPoint.pxToQuarter(12f), drained[6].dx)
-        assertEquals(MacHidFixedPoint.pxToQuarter(-2f), drained[6].dy)
-        assertEquals(MacHidFlags.LASER_KEEPALIVE, drained[6].flags)
+        // [5] ENDED (3) NOT swallowed into CHANGED!
+        assertEquals(MacHidScrollPhase.ENDED, drained[5].aux)
+        assertEquals(0, drained[5].dx)
+        assertEquals(0, drained[5].dy)
 
-        // Barrier on mode switch to SPOTLIGHT
-        assertEquals(MacHidOpcode.LASER_STATE_AND_DELTA, drained[7].opcode)
-        assertEquals(MacHidLaserMode.SPOTLIGHT, drained[7].modsOrBtn)
-        assertEquals(180, drained[7].aux)
+        // [6] MOMENTUM_BEGIN (4) preserved
+        assertEquals(MacHidScrollPhase.MOMENTUM_BEGIN, drained[6].aux)
+        assertEquals(MacHidFixedPoint.pxToQuarter(-14f), drained[6].dy)
 
-        // Barrier: RESET_HID_STATE followed by unmerged move
-        assertEquals(MacHidOpcode.RESET_HID_STATE, drained[8].opcode)
-        assertEquals(MacHidOpcode.POINTER_MOVE_REL, drained[9].opcode)
-        assertEquals(MacHidFixedPoint.pxToQuarter(1f), drained[9].dx)
+        // [7] Merged MOMENTUM_CONTINUE + MOMENTUM_CONTINUE (aux = 5): -12 + -9 = -21px
+        assertEquals(MacHidScrollPhase.MOMENTUM_CONTINUE, drained[7].aux)
+        assertEquals(MacHidFixedPoint.pxToQuarter(-21f), drained[7].dy)
+        assertTrue((drained[7].flags and MacHidFlags.MOMENTUM_SCROLL) != 0)
+
+        // [8] MOMENTUM_END (6) preserved
+        assertEquals(MacHidScrollPhase.MOMENTUM_END, drained[8].aux)
+        assertEquals(0, drained[8].dy)
+
+        // [9] Merged RED_LASER: (5+7, -3+1) = (12px, -2px) + keepalive flag preserved
+        assertEquals(MacHidLaserMode.RED_LASER, drained[9].modsOrBtn)
+        assertEquals(MacHidFixedPoint.pxToQuarter(12f), drained[9].dx)
+        assertEquals(MacHidFixedPoint.pxToQuarter(-2f), drained[9].dy)
+        assertEquals(MacHidFlags.LASER_KEEPALIVE, drained[9].flags)
+
+        // [10] SPOTLIGHT, [11] LASER OFF, [12] RESET_HID_STATE
+        assertEquals(MacHidLaserMode.SPOTLIGHT, drained[10].modsOrBtn)
+        assertEquals(180, drained[10].aux)
+        assertEquals(MacHidLaserMode.OFF, drained[11].modsOrBtn)
+        assertEquals(MacHidOpcode.RESET_HID_STATE, drained[12].opcode)
 
         // Saturation test on coalesced huge deltas
         buffer.offer(MacHidPacket.moveRel(6000f, -6000f))
@@ -140,22 +199,40 @@ class MacHidAndMotionTest {
         // Tier cadence check
         assertEquals(8L, MacHidCoalescingBuffer.flushIntervalMsForTier("LAN_WS"))
         assertEquals(16L, MacHidCoalescingBuffer.flushIntervalMsForTier("WAN_WEBRTC"))
-        assertEquals(32L, MacHidCoalescingBuffer.flushIntervalMsForTier("BT_RFCOMM"))
+        assertEquals(28L, MacHidCoalescingBuffer.flushIntervalMsForTier("BT_RFCOMM"))
     }
 
     @Test
-    fun `trackpad acceleration scales gently for sub-pixel micro-motion and rapidly for fast flicks`() {
+    fun `trackpad acceleration tapers toward 1_05x for steady aiming and reaches 2_8x to 8_5x on thumb flicks`() {
+        // Ultra-slow (< 0.08 dp/ms) tapers gently toward 1.05x
+        assertEquals(1.05f, TrackpadPhysicsEngine.computeGain(0f), 0.01f)
+        val microGain = TrackpadPhysicsEngine.computeGain(0.02f)
+        assertTrue("Micro gain should taper near 1.05..1.25, got $microGain", microGain in 1.05f..1.25f)
+
+        // Mid-to-fast thumb swipes (0.8..2.5 dp/ms -> ~2.8x..7.5x) and max clamp (8.50x)
+        val midSwipeGain = TrackpadPhysicsEngine.computeGain(0.8f)
+        val fastSwipeGain = TrackpadPhysicsEngine.computeGain(2.5f)
+        val maxGain = TrackpadPhysicsEngine.computeGain(5.0f)
+        assertTrue("0.8 dp/ms gain expected ~2.8x, got $midSwipeGain", midSwipeGain in 2.65f..3.05f)
+        assertTrue("2.5 dp/ms gain expected ~7.4x, got $fastSwipeGain", fastSwipeGain in 7.10f..7.75f)
+        assertEquals(8.50f, maxGain, 0.001f)
+
         val micro = TrackpadPhysicsEngine.accelerateDelta(dxDp = 0.3f, dyDp = 0f, dtMs = 16L)
         val slow = TrackpadPhysicsEngine.accelerateDelta(dxDp = 0.8f, dyDp = 0f, dtMs = 16L)
         val fast = TrackpadPhysicsEngine.accelerateDelta(dxDp = 24f, dyDp = 0f, dtMs = 8L)
+        assertTrue("Micro motion stays sub-pixel (< 0.45px), got ${micro.first}", micro.first in 0.30f..0.45f)
+        assertTrue("Slow motion stays ~1px, got ${slow.first}", slow.first in 0.80f..1.35f)
+        assertTrue("Fast flick crosses Retina screen effortlessly, got ${fast.first}", fast.first > 180f)
 
-        assertTrue("Micro motion supports sub-pixel precision (< 0.5px), got ${micro.first}", micro.first in 0.1f..0.45f)
-        assertTrue("Slow motion stays fine-grained, got ${slow.first}", slow.first in 0.5f..2.5f)
-        assertTrue("Fast flick crosses screen rapidly, got ${fast.first}", fast.first > 45f)
-
-        // Diagonal movement preserves vector direction ratio
+        // Diagonal movement preserves exact vector direction ratio
         val diag = TrackpadPhysicsEngine.accelerateDelta(dxDp = 12f, dyDp = -6f, dtMs = 8L)
         assertEquals(-0.5f, diag.second / diag.first, 0.001f)
+
+        // Recalibrated scroll acceleration curve (1.2x..5.4x)
+        val slowScroll = TrackpadPhysicsEngine.accelerateScrollDelta(dxDp = 0f, dyDp = -1.0f, dtMs = 16L)
+        val fastScroll = TrackpadPhysicsEngine.accelerateScrollDelta(dxDp = 0f, dyDp = -20.0f, dtMs = 8L)
+        assertTrue(abs(slowScroll.second) in 1.2f..1.8f)
+        assertTrue(abs(fastScroll.second) > 65f)
     }
 
     @Test
@@ -196,54 +273,53 @@ class MacHidAndMotionTest {
     }
 
     @Test
-    fun `gyro integrator auto-zeros filters hand tremor and obeys right-hand rule for yaw and pitch`() {
+    fun `gyro integrator runs cleanly at 200Hz filters micro-tremor and uses dual-slope alpha`() {
         val gyro = AirWandGyroIntegrator()
+        assertEquals(0.014f, gyro.deadzoneRadPerSec, 0.0001f)
+        assertEquals(1850f, gyro.basePixelsPerRad, 0.01f)
 
         // 1. Identity quaternion at t=0 (trigger pressed -> auto zero baseline)
-        val q0 = floatArrayOf(0f, 0f, 0f, 1f) // [x, y, z, w]
+        val q0 = floatArrayOf(0f, 0f, 0f, 1f)
         assertEquals(0f to 0f, gyro.onRotationSample(q0, timestampNs = 1_000_000_000L))
 
-        // 2. Tiny physiological micro-tremor (< 0.018 rad/s over 10ms -> angle ~0.0001 rad) -> filtered to exact 0f!
-        val qTiny = floatArrayOf(0.00004f, 0f, -0.00004f, 1f)
-        val tremorOut = gyro.onRotationSample(qTiny, timestampNs = 1_010_000_000L)
+        // 2. Tiny physiological micro-tremor (< 0.014 rad/s over 5ms at 200Hz -> angle ~0.00004 rad) -> exact 0f!
+        val qTiny = floatArrayOf(0.00002f, 0f, -0.00002f, 1f)
+        val tremorOut = gyro.onRotationSample(qTiny, timestampNs = 1_005_000_000L)
         assertEquals(0f, tremorOut.first, 0.0001f)
         assertEquals(0f, tremorOut.second, 0.0001f)
 
-        // 3. Right-hand rule check A: Wrist YAW RIGHT around +Z (clockwise looking down +Z -> wz < 0 -> dx > 0)
-        val halfYawRight = -0.025f // ~ -0.05 rad over 10ms = -5 rad/s around +Z
+        // 3. 200Hz (5ms) Right-hand rule check A: Active Wrist YAW RIGHT around +Z (wz = -2.0 rad/s -> alpha = 0.90!)
+        // Over 5ms, angle = -0.01 rad -> halfAngle = -0.005 rad
+        val halfYawRight = -0.005f
         val qYawRight = floatArrayOf(0f, 0f, sin(halfYawRight), cos(halfYawRight))
-        val yawRightOut = gyro.onRotationSample(qYawRight, timestampNs = 1_020_000_000L)
-        assertTrue("Yaw right (wz < 0) must move cursor right (dx > 0), got ${yawRightOut.first}", yawRightOut.first > 5f)
+        val yawRightOut = gyro.onRotationSample(qYawRight, timestampNs = 1_010_000_000L)
+        // Expected excess ~ (2.0 - 0.014) = 1.986 rad/s, alpha = 0.90 -> smoothed = 1.787 rad/s -> * 0.005 * 1850 = ~16.5px!
+        assertTrue(
+            "200Hz active yaw right must respond immediately with ~0.90 alpha, got ${yawRightOut.first}",
+            yawRightOut.first in 15.5f..17.5f
+        )
         assertEquals(0f, yawRightOut.second, 0.1f)
 
-        // 4. Right-hand rule check B: Reset calibration, then Wrist PITCH UP around +X
-        // Thumb right (+X): fingers curl from +Y (forward towards Mac) UP towards +Z (sky) -> wx > 0!
-        // On macOS CoreGraphics (top-left origin), moving cursor UP means dy < 0!
+        // 4. Right-hand rule check B: Reset calibration, then 200Hz Wrist PITCH UP around +X (wx > 0 -> dy < 0)
         gyro.resetCalibration()
         assertEquals(0f to 0f, gyro.onRotationSample(q0, timestampNs = 2_000_000_000L))
 
-        val halfPitchUp = +0.025f // +0.05 rad over 10ms = +5 rad/s around +X
+        val halfPitchUp = +0.005f // +0.01 rad over 5ms = +2.0 rad/s around +X
         val qPitchUp = floatArrayOf(sin(halfPitchUp), 0f, 0f, cos(halfPitchUp))
-        val pitchUpOut = gyro.onRotationSample(qPitchUp, timestampNs = 2_010_000_000L)
+        val pitchUpOut = gyro.onRotationSample(qPitchUp, timestampNs = 2_005_000_000L)
         assertEquals(0f, pitchUpOut.first, 0.001f)
-        assertTrue("Pitch up (wx > 0) must move Mac cursor UP (dy < 0), got ${pitchUpOut.second}", pitchUpOut.second < -5f)
+        assertTrue("Pitch up (wx > 0) must move Mac cursor UP (dy < 0), got ${pitchUpOut.second}", pitchUpOut.second < -15f)
 
         // 5. Body-frame invariance: starting rotated 90 deg around world Z (pointing West), pitching nose UP
         gyro.resetCalibration()
         val s = sqrt(0.5f)
-        val qFacingWest = floatArrayOf(0f, 0f, s, s) // 90 deg CCW around world +Z
+        val qFacingWest = floatArrayOf(0f, 0f, s, s)
         assertEquals(0f to 0f, gyro.onRotationSample(qFacingWest, timestampNs = 3_000_000_000L))
-        // Apply body-frame pitch up: qNext = qFacingWest * [sin(halfPitchUp), 0, 0, cos(halfPitchUp)]
         val sx = sin(halfPitchUp)
         val cw = cos(halfPitchUp)
-        val qWestPitchedUp = floatArrayOf(
-            s * sx,  // w1*x2 + z1*y2 = s*sx + 0
-            s * sx,  // w1*y2 + x1*z2 - z1*x2... wait: (0,0,s,s)*(sx,0,0,cw) -> x=s*sx, y=s*sx, z=s*cw, w=s*cw
-            s * cw,
-            s * cw
-        )
-        val westPitchOut = gyro.onRotationSample(qWestPitchedUp, timestampNs = 3_010_000_000L)
+        val qWestPitchedUp = floatArrayOf(s * sx, s * sx, s * cw, s * cw)
+        val westPitchOut = gyro.onRotationSample(qWestPitchedUp, timestampNs = 3_005_000_000L)
         assertEquals(0f, westPitchOut.first, 0.01f)
-        assertTrue("Body-frame pitch up while facing West must still produce dy < 0, got ${westPitchOut.second}", westPitchOut.second < -5f)
+        assertTrue("Body-frame pitch up while facing West must still produce dy < 0, got ${westPitchOut.second}", westPitchOut.second < -15f)
     }
 }

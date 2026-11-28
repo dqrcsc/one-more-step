@@ -33,6 +33,7 @@ object MacHidButtonAction {
     const val DOWN: Int = 3
     const val UP: Int = 4
     const val DRAG_LOCK_TOGGLE: Int = 5
+    const val CLICK_WITH_COUNT: Int = 6
 }
 
 object MacHidLaserMode {
@@ -57,6 +58,7 @@ object MacHidFlags {
     const val MOMENTUM_SCROLL: Int = 0x0001
     const val LASER_KEEPALIVE: Int = 0x0002
     const val NATURAL_SCROLL: Int = 0x0004
+    const val SMOOTH_INTERPOLATE: Int = 0x0008
 }
 
 object MacHidScrollPhase {
@@ -64,7 +66,9 @@ object MacHidScrollPhase {
     const val BEGAN: Int = 1
     const val CHANGED: Int = 2
     const val ENDED: Int = 3
-    const val MOMENTUM: Int = 4
+    const val MOMENTUM_BEGIN: Int = 4
+    const val MOMENTUM_CONTINUE: Int = 5
+    const val MOMENTUM_END: Int = 6
 }
 
 /**
@@ -97,12 +101,14 @@ object MacKeyCodes {
     const val SPACE: Int = 49
     const val DELETE: Int = 51
     const val ESCAPE: Int = 53
+    const val F11_SHOW_DESKTOP: Int = 103
     const val FORWARD_DELETE: Int = 117
 
     const val LEFT: Int = 123
     const val RIGHT: Int = 124
     const val DOWN: Int = 125
     const val UP: Int = 126
+    const val LAUNCHPAD: Int = 131
 }
 
 typealias HidOpcode = MacHidOpcode
@@ -134,8 +140,20 @@ data class MacHidPacket(
     val aux: Int = 0,
     val flags: Int = MacHidFlags.NONE
 ) {
+    /**
+     * Urgent/barrier packets flush immediately without waiting for the 8ms/16ms/28ms pacer window
+     * and are never swallowed into continuous delta packets.
+     */
     val isBarrier: Boolean
-        get() = !MacHidCoalescingBuffer.isCoalesceableOpcode(opcode)
+        get() = when (opcode) {
+            MacHidOpcode.POINTER_MOVE_REL -> false
+            MacHidOpcode.SCROLL_PIXEL ->
+                aux != MacHidScrollPhase.CHANGED &&
+                    aux != MacHidScrollPhase.MOMENTUM_CONTINUE &&
+                    aux != MacHidScrollPhase.NONE
+            MacHidOpcode.LASER_STATE_AND_DELTA -> modsOrBtn == MacHidLaserMode.OFF
+            else -> true
+        }
 
     fun toWireFrame(seq: Int): ByteArray = OmsFrameProtocol.encodeHidInput(
         opcode = opcode,
@@ -172,6 +190,19 @@ data class MacHidPacket(
             dx = MacHidFixedPoint.clampInt16(action),
             dy = modifiers and 0xFF,
             aux = 0,
+            flags = MacHidFlags.NONE
+        )
+
+        fun mouseClickWithCount(
+            button: Int = MacHidButton.LEFT,
+            clickCount: Int = 1,
+            modifiers: Int = MacHidModMask.NONE
+        ): MacHidPacket = MacHidPacket(
+            opcode = MacHidOpcode.MOUSE_BUTTON,
+            modsOrBtn = button and 0xFF,
+            dx = MacHidButtonAction.CLICK_WITH_COUNT,
+            dy = modifiers and 0xFF,
+            aux = clickCount.coerceIn(1, 3),
             flags = MacHidFlags.NONE
         )
 
@@ -247,10 +278,10 @@ data class MacHidPacket(
 /**
  * Barrier-safe plaintext HID coalescing buffer.
  *
- * Merges consecutive delta packets of the same opcode (`POINTER_MOVE_REL`, `SCROLL_PIXEL`,
- * or `LASER_STATE_AND_DELTA` with identical `modsOrBtn` mode) BEFORE AEAD sealing,
- * while strictly preserving causal ordering across clicks, key taps, system keys,
- * mode switches, and `RESET_HID_STATE`.
+ * Merges consecutive delta packets of the same opcode (`POINTER_MOVE_REL`, same-phase continuous
+ * `SCROLL_PIXEL`, or `LASER_STATE_AND_DELTA` with identical active `modsOrBtn` mode) BEFORE AEAD sealing,
+ * while strictly preserving causal ordering across clicks, key taps, system keys, scroll phase
+ * boundaries (`BEGAN`, `ENDED`, `MOMENTUM_BEGIN`, `MOMENTUM_END`), laser mode switches, and `RESET_HID_STATE`.
  */
 class MacHidCoalescingBuffer(
     private val maxEntries: Int = 256
@@ -313,15 +344,18 @@ class MacHidCoalescingBuffer(
                 opcode == MacHidOpcode.SCROLL_PIXEL ||
                 opcode == MacHidOpcode.LASER_STATE_AND_DELTA
 
-        fun canCoalesce(prev: MacHidPacket, next: MacHidPacket): Boolean =
-            isCoalesceableOpcode(prev.opcode) &&
-                prev.opcode == next.opcode &&
-                prev.modsOrBtn == next.modsOrBtn
+        fun canCoalesce(prev: MacHidPacket, next: MacHidPacket): Boolean {
+            if (prev.isBarrier || next.isBarrier) return false
+            if (!isCoalesceableOpcode(prev.opcode) || prev.opcode != next.opcode) return false
+            if (prev.modsOrBtn != next.modsOrBtn) return false
+            if (prev.opcode == MacHidOpcode.SCROLL_PIXEL && prev.aux != next.aux) return false
+            return true
+        }
 
         fun flushIntervalMsForTier(tier: String): Long = when (tier) {
             "LAN_WS" -> 8L       // 120Hz frame-aligned LAN fast path
             "WAN_WEBRTC" -> 16L  // 60Hz WAN relay path
-            "BT_RFCOMM" -> 32L   // ~30Hz BLE GATT coalesced path
+            "BT_RFCOMM" -> 28L   // ~35Hz BLE GATT coalesced path
             else -> 16L
         }
     }

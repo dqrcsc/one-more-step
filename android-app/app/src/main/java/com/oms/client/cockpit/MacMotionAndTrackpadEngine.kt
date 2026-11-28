@@ -4,6 +4,7 @@ import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.hypot
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.sign
 import kotlin.math.sqrt
@@ -11,23 +12,31 @@ import kotlin.math.sqrt
 private fun cleanZero(v: Float): Float = if (v == 0f) 0f else v
 
 /**
- * Magic Trackpad-grade non-linear pointer and two-finger scroll acceleration curve.
+ * Magic Trackpad-grade non-linear pointer and two-finger scroll acceleration curve,
+ * calibrated for a `~390dp` phone surface driving a `1792x1120`+ Retina Mac display.
  *
- * `gain(v) = clamp(base + k * v^1.35, minGain, maxGain) * sensitivity`
- * - Sub-1x fine gain (`~0.85x`) on slow micro-adjustments for effortless sub-pixel aiming;
- * - Rapid power-law boost (up to `6.0x`) on fast flicks to traverse multi-monitor setups in one swipe.
+ * - Below `0.08 dp/ms`, gently tapers down toward `1.05x` so slow pixel-by-pixel aiming is rock-steady;
+ * - Across `0.8..2.5 dp/ms`, scales smoothly across `~2.8x..7.5x` (up to `8.50x`) so a single thumb swipe
+ *   effortlessly crosses the entire Mac screen.
  */
 object TrackpadPhysicsEngine {
-    private const val BASE_GAIN = 0.85f
-    private const val ACCEL_K = 0.65f
-    private const val ACCEL_EXPONENT = 1.35f
-    private const val MIN_GAIN = 0.80f
-    private const val MAX_GAIN = 6.00f
+    private const val BASE_GAIN = 1.45f
+    private const val ACCEL_K = 1.85f
+    private const val ACCEL_EXPONENT = 1.28f
+    private const val MIN_GAIN = 1.05f
+    private const val MAX_GAIN = 8.50f
+    private const val PRECISION_TAPER_SPEED = 0.08f
 
     fun computeGain(speedDpPerMs: Float, sensitivity: Float = 1.0f): Float {
         val safeSpeed = if (speedDpPerMs.isFinite() && speedDpPerMs > 0f) speedDpPerMs else 0f
         val safeSens = if (sensitivity.isFinite()) sensitivity.coerceIn(0.25f, 3.0f) else 1.0f
-        val curve = (BASE_GAIN + ACCEL_K * safeSpeed.pow(ACCEL_EXPONENT)).coerceIn(MIN_GAIN, MAX_GAIN)
+        val curve = if (safeSpeed < PRECISION_TAPER_SPEED) {
+            val boundaryGain = BASE_GAIN + ACCEL_K * PRECISION_TAPER_SPEED.pow(ACCEL_EXPONENT)
+            val t = (safeSpeed / PRECISION_TAPER_SPEED).coerceIn(0f, 1f)
+            MIN_GAIN + (boundaryGain - MIN_GAIN) * t
+        } else {
+            BASE_GAIN + ACCEL_K * safeSpeed.pow(ACCEL_EXPONENT)
+        }.coerceIn(MIN_GAIN, MAX_GAIN)
         return curve * safeSens
     }
 
@@ -58,7 +67,7 @@ object TrackpadPhysicsEngine {
         val safeDtMs = dtMs.coerceIn(2L, 100L).toFloat()
         val speedDpPerMs = distDp / safeDtMs
         val safeSens = if (sensitivity.isFinite()) sensitivity.coerceIn(0.25f, 3.0f) else 1.0f
-        val gain = (1.15f + 0.45f * speedDpPerMs.pow(1.15f)).coerceIn(1.0f, 4.2f) * safeSens
+        val gain = (1.45f + 0.72f * speedDpPerMs.pow(1.15f)).coerceIn(1.2f, 5.4f) * safeSens
         return cleanZero(dxDp * gain) to cleanZero(dyDp * gain)
     }
 }
@@ -156,7 +165,7 @@ class MomentumFlingScroller {
 typealias MomentumFlingState = MomentumFlingScroller
 
 /**
- * Hold-to-Point gyroscope Air-Wand integrator driven by `Sensor.TYPE_GAME_ROTATION_VECTOR`.
+ * 200Hz+ Hold-to-Point gyroscope Air-Wand integrator driven by `Sensor.TYPE_GAME_ROTATION_VECTOR`.
  *
  * Coordinate & Right-Hand Rule Mapping (Android portrait device body frame):
  * - `+X` points right out the phone's right edge;
@@ -171,12 +180,15 @@ typealias MomentumFlingState = MomentumFlingScroller
 class AirWandGyroIntegrator(
     val deadzoneRadPerSec: Float = DEFAULT_DEADZONE_RAD_PER_SEC,
     val basePixelsPerRad: Float = DEFAULT_PIXELS_PER_RAD,
-    private val smoothingAlpha: Float = 0.78f
+    private val smoothingAlpha: Float = MAX_SMOOTHING_ALPHA
 ) {
     companion object {
-        const val DEFAULT_DEADZONE_RAD_PER_SEC: Float = 0.018f
-        const val DEFAULT_PIXELS_PER_RAD: Float = 1750f
-        private const val MIN_DT_SEC: Float = 0.002f
+        const val DEFAULT_DEADZONE_RAD_PER_SEC: Float = 0.014f
+        const val DEFAULT_PIXELS_PER_RAD: Float = 1850f
+        private const val ACTIVE_OMEGA_RAD_PER_SEC: Float = 0.14f
+        private const val MIN_SMOOTHING_ALPHA: Float = 0.48f
+        private const val MAX_SMOOTHING_ALPHA: Float = 0.90f
+        private const val MIN_DT_SEC: Float = 0.001f
         private const val MAX_DT_SEC: Float = 0.060f
         private const val STALE_GAP_NS: Long = 250_000_000L
     }
@@ -286,9 +298,10 @@ class AirWandGyroIntegrator(
         val rawWx = (dqX * axisAngleScale) / dtSec
         val rawWz = (dqZ * axisAngleScale) / dtSec
 
-        val alpha = smoothingAlpha.coerceIn(0.15f, 1.0f)
-        smoothedWx = applyDeadzoneAndSmooth(rawWx, smoothedWx, alpha)
-        smoothedWz = applyDeadzoneAndSmooth(rawWz, smoothedWz, alpha)
+        val highAlpha = smoothingAlpha.coerceIn(0.15f, 1.0f)
+        val lowAlpha = min(MIN_SMOOTHING_ALPHA, highAlpha)
+        smoothedWx = applyDeadzoneAndSmooth(rawWx, smoothedWx, lowAlpha, highAlpha)
+        smoothedWz = applyDeadzoneAndSmooth(rawWz, smoothedWz, lowAlpha, highAlpha)
 
         if (smoothedWx == 0f && smoothedWz == 0f) {
             return 0f to 0f
@@ -303,11 +316,19 @@ class AirWandGyroIntegrator(
         return dxPx to dyPx
     }
 
-    private fun applyDeadzoneAndSmooth(rawOmega: Float, prevSmoothed: Float, alpha: Float): Float {
+    private fun applyDeadzoneAndSmooth(
+        rawOmega: Float,
+        prevSmoothed: Float,
+        lowAlpha: Float,
+        highAlpha: Float
+    ): Float {
         val mag = abs(rawOmega)
         if (mag <= deadzoneRadPerSec) {
             return 0f
         }
+        val activeSpan = max(1e-4f, ACTIVE_OMEGA_RAD_PER_SEC - deadzoneRadPerSec)
+        val blend = ((mag - deadzoneRadPerSec) / activeSpan).coerceIn(0f, 1f)
+        val alpha = lowAlpha + blend * (highAlpha - lowAlpha)
         val excess = sign(rawOmega) * (mag - deadzoneRadPerSec)
         return prevSmoothed + alpha * (excess - prevSmoothed)
     }

@@ -946,6 +946,17 @@ export enum HidButtonAction {
   DOWN = 3,
   UP = 4,
   DRAG_LOCK_TOGGLE = 5,
+  CLICK_WITH_COUNT = 6,
+}
+
+export enum HidScrollPhase {
+  NONE = 0,
+  BEGAN = 1,
+  CHANGED = 2,
+  ENDED = 3,
+  MOMENTUM_BEGIN = 4,
+  MOMENTUM_CONTINUE = 5,
+  MOMENTUM_END = 6,
 }
 
 export enum HidLaserMode {
@@ -970,6 +981,7 @@ export enum HidInputFlags {
   MOMENTUM_SCROLL = 0x0001,
   LASER_KEEPALIVE = 0x0002,
   NATURAL_SCROLL = 0x0004,
+  SMOOTH_INTERPOLATE = 0x0008,
 }
 
 export interface HidInputPayload {

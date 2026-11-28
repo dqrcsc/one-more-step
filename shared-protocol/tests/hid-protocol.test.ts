@@ -12,6 +12,7 @@ import {
   HidLaserMode,
   HidModifierMask,
   HidOpcode,
+  HidScrollPhase,
   HidSystemKey,
   type MacHidTypeTextParams,
   type MacHidTypeTextResult,
@@ -106,6 +107,15 @@ describe("HID_INPUT (0x08) Binary Framing & Coalescing", () => {
     expect(HidButtonAction.DOWN).toBe(3);
     expect(HidButtonAction.UP).toBe(4);
     expect(HidButtonAction.DRAG_LOCK_TOGGLE).toBe(5);
+    expect(HidButtonAction.CLICK_WITH_COUNT).toBe(6);
+
+    expect(HidScrollPhase.NONE).toBe(0);
+    expect(HidScrollPhase.BEGAN).toBe(1);
+    expect(HidScrollPhase.CHANGED).toBe(2);
+    expect(HidScrollPhase.ENDED).toBe(3);
+    expect(HidScrollPhase.MOMENTUM_BEGIN).toBe(4);
+    expect(HidScrollPhase.MOMENTUM_CONTINUE).toBe(5);
+    expect(HidScrollPhase.MOMENTUM_END).toBe(6);
 
     expect(HidLaserMode.OFF).toBe(0);
     expect(HidLaserMode.RED_LASER).toBe(1);
@@ -124,6 +134,7 @@ describe("HID_INPUT (0x08) Binary Framing & Coalescing", () => {
     expect(HidInputFlags.MOMENTUM_SCROLL).toBe(0x0001);
     expect(HidInputFlags.LASER_KEEPALIVE).toBe(0x0002);
     expect(HidInputFlags.NATURAL_SCROLL).toBe(0x0004);
+    expect(HidInputFlags.SMOOTH_INTERPOLATE).toBe(0x0008);
 
     const params: MacHidTypeTextParams = { text: "你好 🚀", submitReturn: true };
     const result: MacHidTypeTextResult = { ok: true, typedChars: 4, message: "ok" };
@@ -186,13 +197,22 @@ describe("HID_INPUT (0x08) Binary Framing & Coalescing", () => {
     expect(mergedMove.seq).toBe(101);
     expect(mergedMove.flags).toBe(HidInputFlags.NATURAL_SCROLL | HidInputFlags.MOMENTUM_SCROLL);
 
-    // 2. SCROLL_PIXEL merges when modsOrBtn matches
+    // 2. SCROLL_PIXEL merges ONLY when modsOrBtn AND scroll phase (aux) match
+    const scrollBegan = encodeHidInputFrame({
+      opcode: HidOpcode.SCROLL_PIXEL,
+      modsOrBtn: 0,
+      dx: 0,
+      dy: 0,
+      aux: HidScrollPhase.BEGAN,
+      seq: 9,
+      flags: HidInputFlags.NATURAL_SCROLL,
+    });
     const scrollA = encodeHidInputFrame({
       opcode: HidOpcode.SCROLL_PIXEL,
       modsOrBtn: 0,
       dx: -12,
       dy: 40,
-      aux: 1,
+      aux: HidScrollPhase.CHANGED,
       seq: 10,
       flags: HidInputFlags.NATURAL_SCROLL,
     });
@@ -201,18 +221,97 @@ describe("HID_INPUT (0x08) Binary Framing & Coalescing", () => {
       modsOrBtn: 0,
       dx: -8,
       dy: 60,
-      aux: 2,
+      aux: HidScrollPhase.CHANGED,
       seq: 11,
-      flags: HidInputFlags.MOMENTUM_SCROLL,
+      flags: HidInputFlags.NATURAL_SCROLL,
     });
+    const scrollEnded = encodeHidInputFrame({
+      opcode: HidOpcode.SCROLL_PIXEL,
+      modsOrBtn: 0,
+      dx: 0,
+      dy: 0,
+      aux: HidScrollPhase.ENDED,
+      seq: 12,
+      flags: HidInputFlags.NATURAL_SCROLL,
+    });
+    const scrollMomBegin = encodeHidInputFrame({
+      opcode: HidOpcode.SCROLL_PIXEL,
+      modsOrBtn: 0,
+      dx: 0,
+      dy: 32,
+      aux: HidScrollPhase.MOMENTUM_BEGIN,
+      seq: 13,
+      flags: HidInputFlags.MOMENTUM_SCROLL | HidInputFlags.NATURAL_SCROLL,
+    });
+    const scrollMomCont1 = encodeHidInputFrame({
+      opcode: HidOpcode.SCROLL_PIXEL,
+      modsOrBtn: 0,
+      dx: 0,
+      dy: 24,
+      aux: HidScrollPhase.MOMENTUM_CONTINUE,
+      seq: 14,
+      flags: HidInputFlags.MOMENTUM_SCROLL | HidInputFlags.NATURAL_SCROLL,
+    });
+    const scrollMomCont2 = encodeHidInputFrame({
+      opcode: HidOpcode.SCROLL_PIXEL,
+      modsOrBtn: 0,
+      dx: -4,
+      dy: 16,
+      aux: HidScrollPhase.MOMENTUM_CONTINUE,
+      seq: 15,
+      flags: HidInputFlags.MOMENTUM_SCROLL | HidInputFlags.NATURAL_SCROLL,
+    });
+    const scrollMomEnd = encodeHidInputFrame({
+      opcode: HidOpcode.SCROLL_PIXEL,
+      modsOrBtn: 0,
+      dx: 0,
+      dy: 0,
+      aux: HidScrollPhase.MOMENTUM_END,
+      seq: 16,
+      flags: HidInputFlags.MOMENTUM_SCROLL | HidInputFlags.NATURAL_SCROLL,
+    });
+
+    // CHANGED + CHANGED (aux=2) merges
     const mergedScrollRaw = tryCoalesceHidFrames(scrollA, scrollB);
     expect(mergedScrollRaw).not.toBeNull();
     const mergedScroll = decodeHidInputPayload(mergedScrollRaw!.subarray(FRAME_HEADER_BYTES));
     expect(mergedScroll.dx).toBe(-20);
     expect(mergedScroll.dy).toBe(100);
-    expect(mergedScroll.aux).toBe(2);
+    expect(mergedScroll.aux).toBe(HidScrollPhase.CHANGED);
     expect(mergedScroll.seq).toBe(11);
-    expect(mergedScroll.flags).toBe(HidInputFlags.NATURAL_SCROLL | HidInputFlags.MOMENTUM_SCROLL);
+    expect(mergedScroll.flags).toBe(HidInputFlags.NATURAL_SCROLL);
+
+    // MOMENTUM_CONTINUE + MOMENTUM_CONTINUE (aux=5) merges
+    const mergedMomRaw = tryCoalesceHidFrames(scrollMomCont1, scrollMomCont2);
+    expect(mergedMomRaw).not.toBeNull();
+    const mergedMom = decodeHidInputPayload(mergedMomRaw!.subarray(FRAME_HEADER_BYTES));
+    expect(mergedMom.dx).toBe(-4);
+    expect(mergedMom.dy).toBe(40);
+    expect(mergedMom.aux).toBe(HidScrollPhase.MOMENTUM_CONTINUE);
+    expect(mergedMom.seq).toBe(15);
+
+    // Phase boundary transitions NEVER coalesce (BEGAN -> CHANGED -> ENDED -> MOMENTUM_BEGIN -> MOMENTUM_CONTINUE -> MOMENTUM_END)
+    expect(tryCoalesceHidFrames(scrollBegan, scrollA)).toBeNull();
+    expect(tryCoalesceHidFrames(scrollB, scrollEnded)).toBeNull();
+    expect(tryCoalesceHidFrames(scrollEnded, scrollMomBegin)).toBeNull();
+    expect(tryCoalesceHidFrames(scrollMomBegin, scrollMomCont1)).toBeNull();
+    expect(tryCoalesceHidFrames(scrollMomCont2, scrollMomEnd)).toBeNull();
+
+    // Verify PriorityFrameQueue preserves BEGAN -> merged CHANGED -> ENDED as 3 distinct frames
+    const scrollQueue = new PriorityFrameQueue();
+    scrollQueue.enqueue(scrollBegan, FrameType.HID_INPUT);
+    scrollQueue.enqueue(scrollA, FrameType.HID_INPUT);
+    scrollQueue.enqueue(scrollB, FrameType.HID_INPUT);
+    scrollQueue.enqueue(scrollEnded, FrameType.HID_INPUT);
+    expect(scrollQueue.size).toBe(3);
+    const dq1 = decodeHidInputPayload(scrollQueue.dequeue()!.subarray(FRAME_HEADER_BYTES));
+    const dq2 = decodeHidInputPayload(scrollQueue.dequeue()!.subarray(FRAME_HEADER_BYTES));
+    const dq3 = decodeHidInputPayload(scrollQueue.dequeue()!.subarray(FRAME_HEADER_BYTES));
+    expect(dq1.aux).toBe(HidScrollPhase.BEGAN);
+    expect(dq2.aux).toBe(HidScrollPhase.CHANGED);
+    expect(dq2.dx).toBe(-20);
+    expect(dq2.dy).toBe(100);
+    expect(dq3.aux).toBe(HidScrollPhase.ENDED);
 
     // 3. LASER_STATE_AND_DELTA merges when mode (modsOrBtn) stays identical, rejects when mode changes
     const laserSpot1 = encodeHidInputFrame({

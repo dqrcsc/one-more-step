@@ -273,6 +273,9 @@ export function tryCoalesceHidFrames(
   ) {
     return null;
   }
+  if (prev.opcode === HidOpcode.SCROLL_PIXEL && prev.aux !== next.aux) {
+    return null;
+  }
   return encodeHidInputFrame({
     opcode: next.opcode,
     modsOrBtn: next.modsOrBtn,

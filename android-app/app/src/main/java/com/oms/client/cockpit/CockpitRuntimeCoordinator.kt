@@ -2372,7 +2372,8 @@ class CockpitRuntimeCoordinator(
     private val hidSeq = AtomicInteger(0)
     private val hidWorkerRunning = AtomicBoolean(false)
     private val hidFlushImmediate = AtomicBoolean(false)
-    private val hidFlushSignal = Channel<Unit>(Channel.CONFLATED)
+    private val hidIdleWakeSignal = Channel<Unit>(Channel.CONFLATED)
+    private val hidUrgentWakeSignal = Channel<Unit>(Channel.CONFLATED)
     private val lastLightTickElapsedMs = AtomicLong(0L)
 
     fun sendMacHid(packet: MacHidPacket, flushImmediate: Boolean = false) {
@@ -2383,15 +2384,17 @@ class CockpitRuntimeCoordinator(
         hidCoalescer.offer(packet)
         if (flushImmediate || packet.isBarrier) {
             hidFlushImmediate.set(true)
+            hidUrgentWakeSignal.trySend(Unit)
         }
-        hidFlushSignal.trySend(Unit)
+        hidIdleWakeSignal.trySend(Unit)
         ensureHidFlushWorker()
     }
 
     fun flushMacHidNow() {
         if (hidCoalescer.isEmpty()) return
         hidFlushImmediate.set(true)
-        hidFlushSignal.trySend(Unit)
+        hidUrgentWakeSignal.trySend(Unit)
+        hidIdleWakeSignal.trySend(Unit)
         ensureHidFlushWorker()
     }
 
@@ -2432,16 +2435,19 @@ class CockpitRuntimeCoordinator(
 
     private fun ensureHidFlushWorker() {
         if (!hidWorkerRunning.compareAndSet(false, true)) return
-        scope.launch {
+        scope.launch(Dispatchers.Default) {
             var lastFlushAtMs = 0L
             try {
                 while (true) {
                     if (hidCoalescer.isEmpty()) {
                         val woke = withTimeoutOrNull(2_000L) {
-                            hidFlushSignal.receive()
+                            hidIdleWakeSignal.receive()
                         }
                         if (woke == null && hidCoalescer.isEmpty()) {
                             break
+                        }
+                        if (hidCoalescer.isEmpty()) {
+                            continue
                         }
                     }
                     val tier = transportClient.activeTierFlow.value
@@ -2452,12 +2458,14 @@ class CockpitRuntimeCoordinator(
                     }
 
                     val immediate = hidFlushImmediate.getAndSet(false) || hidCoalescer.hasBarrier()
-                    if (!immediate) {
+                    if (immediate) {
+                        hidUrgentWakeSignal.tryReceive()
+                    } else {
                         val intervalMs = MacHidCoalescingBuffer.flushIntervalMsForTier(tier)
                         val remainMs = intervalMs - (SystemClock.elapsedRealtime() - lastFlushAtMs)
                         if (remainMs > 1L) {
                             withTimeoutOrNull(remainMs) {
-                                hidFlushSignal.receive()
+                                hidUrgentWakeSignal.receive()
                             }
                             hidFlushImmediate.set(false)
                         }
@@ -2471,7 +2479,7 @@ class CockpitRuntimeCoordinator(
                                 SystemClock.elapsedRealtime() - waitStart < 60L
                             ) {
                                 withTimeoutOrNull(6L) {
-                                    hidFlushSignal.receive()
+                                    hidUrgentWakeSignal.receive()
                                 }
                             }
                             hidFlushImmediate.set(false)

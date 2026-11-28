@@ -29,7 +29,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -74,6 +73,7 @@ import com.oms.client.cockpit.AirWandGyroIntegrator
 import com.oms.client.cockpit.CockpitRuntimeCoordinator
 import com.oms.client.cockpit.MacHidButton
 import com.oms.client.cockpit.MacHidButtonAction
+import com.oms.client.cockpit.MacHidFlags
 import com.oms.client.cockpit.MacHidLaserMode
 import com.oms.client.cockpit.MacHidModMask
 import com.oms.client.cockpit.MacHidPacket
@@ -94,8 +94,15 @@ import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.hypot
 
+private enum class TwoFingerMode {
+    UNDECIDED,
+    SCROLLING,
+    PINCHING
+}
+
 /**
- * 120Hz Multi-Touch Magic Trackpad View (`单指微操拖拽 · 双指惯性滚轮与缩放 · 三指调度中心与桌面空间`).
+ * 120Hz 1:1 Native Magic Trackpad View
+ * (`单指连击与双击拖移 · 双指惯性滚轮与互斥缩放 · 三/四指调度中心与启动台/显示桌面`).
  */
 @Composable
 fun MacTrackpadModeView(
@@ -159,40 +166,104 @@ fun MacTrackpadModeView(
                 .border(0.85.dp, borderHighlight, padShape)
                 .pointerInput(Unit) {
                     val densityPx = densityObj.density.coerceAtLeast(1f)
-                    var lastSingleTapUpMs = 0L
-                    var lastSingleTapPos = Offset.Zero
+
+                    // Native 1-finger click-count chain (1 -> 2 -> 3) & deliberate double-tap-drag state
+                    var tapChainCount = 0
+                    var lastTapUpMs = 0L
+                    var lastTapPos = Offset.Zero
+
+                    // 2-finger single-tap Right-Click vs 2-finger double-tap Smart Zoom state
+                    var lastTwoFingerTapUpMs = 0L
+                    var pendingRightClickJob: Job? = null
+                    var hasSmartZoomedIn = false
+
+                    // Tracks whether an inertial momentum stream is currently open on macOS
+                    var isMomentumPhaseActive = false
+
+                    fun flushPendingRightClickImmediately() {
+                        val pending = pendingRightClickJob
+                        if (pending != null && pending.isActive) {
+                            pending.cancel()
+                            pendingRightClickJob = null
+                            lastTwoFingerTapUpMs = 0L
+                            if (currentMacConnected) {
+                                coordinator.sendMacHid(
+                                    MacHidPacket.mouseButton(MacHidButton.RIGHT, MacHidButtonAction.CLICK),
+                                    flushImmediate = true
+                                )
+                                coordinator.vibrateConfirm()
+                            }
+                        }
+                    }
 
                     awaitEachGesture {
                         val firstDown = awaitFirstDown(requireUnconsumed = false)
                         firstDown.consume()
 
-                        // Instant brake on any active inertial scroll fling
+                        // Instant touch-down brake on any active inertial scroll fling
+                        val wasFlingActive = coordinator.trackpadMomentumScroller.isActive || isMomentumPhaseActive
+                        isMomentumPhaseActive = false
                         flingJob?.cancel()
+                        flingJob = null
                         coordinator.trackpadMomentumScroller.stopImmediate()
+                        if (wasFlingActive && currentMacConnected) {
+                            coordinator.sendMacHid(
+                                MacHidPacket.scrollPixel(
+                                    dxPx = 0f,
+                                    dyPx = 0f,
+                                    phase = MacHidScrollPhase.MOMENTUM_END,
+                                    momentum = true,
+                                    naturalScroll = naturalScroll
+                                ),
+                                flushImmediate = true
+                            )
+                        }
                         if (liveGestureBadge == "双指惯性滚动" || liveGestureBadge == "双指右键") {
                             liveGestureBadge = if (currentDragLock) "拖拽锁定中" else null
                         }
 
                         val gestureStartMs = SystemClock.uptimeMillis()
+                        val tapStartMs = gestureStartMs
                         var lastEventMs = gestureStartMs
+                        var prevPointerCount = 1
                         var maxPointerCount = 1
+                        var hadMultiTouch = false
                         val firstDownPos = firstDown.position
                         var maxSingleTravelPx = 0f
                         var maxTwoFingerTravelPx = 0f
 
-                        val dtSincePrevTap = gestureStartMs - lastSingleTapUpMs
-                        val distFromPrevTapDp = (firstDownPos - lastSingleTapPos).getDistance() / densityPx
-                        val isDoubleTapCandidate = !currentDragLock &&
-                            dtSincePrevTap in 1L..270L &&
-                            distFromPrevTapDp <= 18f
+                        // 18ms initial two-finger landing anti-jerk buffer
+                        var pendingInitialDxPx = 0f
+                        var pendingInitialDyPx = 0f
+                        var initialBufferFlushed = false
+
+                        val canHoldToDrag = !currentDragLock &&
+                            lastTapUpMs > 0L &&
+                            (tapStartMs - lastTapUpMs) in 1L..300L &&
+                            ((firstDownPos - lastTapPos).getDistance() / densityPx) <= 20f
                         var isDoubleTapDragging = false
 
+                        // Per-frame pointer position map for seamless multi-finger transitions (1<->2<->3<->4)
+                        val prevPointerPositions = HashMap<PointerId, Offset>(8)
+                        prevPointerPositions[firstDown.id] = firstDown.position
+
+                        // 2-finger scroll & pinch mutual-exclusion state
+                        var twoFingerMode = TwoFingerMode.UNDECIDED
+                        var isScrollPhaseActive = false
+                        var hadScrollInGesture = false
+                        var twoFingerScrollEndedAtMs = 0L
+                        var postScrollSingleTravelPx = 0f
+                        var initialTwoCentroid: Offset? = null
                         var prevTwoCentroid: Offset? = null
+                        var initialSpanPx = 0f
                         var pinchBaselineDistPx = 0f
+                        var twoFingerPanDp = 0f
                         val twoFingerStarts = HashMap<PointerId, Offset>(4)
 
-                        var threeFingerStartCentroid: Offset? = null
-                        var threeFingerTriggered = false
+                        // 3-finger & 4-finger macOS desktop/Spaces/Launchpad state
+                        var multiFingerStartCentroid: Offset? = null
+                        var initialAvgRadiusDp = 0f
+                        var multiFingerTriggered = false
 
                         touchPointVisual = firstDownPos
                         activeFingerCount = 1
@@ -213,38 +284,177 @@ fun MacTrackpadModeView(
                                 if (pointerCount > maxPointerCount) {
                                     maxPointerCount = pointerCount
                                 }
+                                if (maxPointerCount > 1) {
+                                    hadMultiTouch = true
+                                }
 
-                                if (pointerCount >= 3) {
-                                    if (isDoubleTapDragging) {
-                                        isDoubleTapDragging = false
+                                // Dynamic multi-finger transition handler (zero freeze when adding/lifting fingers!)
+                                if (pointerCount != prevPointerCount) {
+                                    if (isScrollPhaseActive && pointerCount != 2) {
+                                        isScrollPhaseActive = false
+                                        twoFingerScrollEndedAtMs = nowMs
+                                        postScrollSingleTravelPx = 0f
                                         if (currentMacConnected) {
                                             coordinator.sendMacHid(
-                                                MacHidPacket.mouseButton(MacHidButton.LEFT, MacHidButtonAction.UP),
+                                                MacHidPacket.scrollPixel(
+                                                    dxPx = 0f,
+                                                    dyPx = 0f,
+                                                    phase = MacHidScrollPhase.ENDED,
+                                                    naturalScroll = naturalScroll
+                                                ),
                                                 flushImmediate = true
                                             )
                                         }
                                     }
+
+                                    if (pointerCount >= 2) {
+                                        // Discard buffered 1-finger landing micro-delta so 2-finger landing never jerks cursor
+                                        pendingInitialDxPx = 0f
+                                        pendingInitialDyPx = 0f
+                                        initialBufferFlushed = true
+
+                                        if (isDoubleTapDragging) {
+                                            isDoubleTapDragging = false
+                                            if (currentMacConnected) {
+                                                coordinator.sendMacHid(
+                                                    MacHidPacket.mouseButton(MacHidButton.LEFT, MacHidButtonAction.UP),
+                                                    flushImmediate = true
+                                                )
+                                            }
+                                        }
+                                    }
+
+                                    if (pointerCount == 2) {
+                                        // If a 2nd two-finger touch arrives within Smart Zoom window, hold off pending Right-Click
+                                        if (pendingRightClickJob?.isActive == true && (nowMs - lastTwoFingerTapUpMs) <= 280L) {
+                                            pendingRightClickJob?.cancel()
+                                            pendingRightClickJob = null
+                                        }
+                                        val p0 = pressed[0]
+                                        val p1 = pressed[1]
+                                        twoFingerStarts.clear()
+                                        twoFingerStarts[p0.id] = p0.position
+                                        twoFingerStarts[p1.id] = p1.position
+                                        val c = Offset(
+                                            (p0.position.x + p1.position.x) * 0.5f,
+                                            (p0.position.y + p1.position.y) * 0.5f
+                                        )
+                                        val span = (p0.position - p1.position).getDistance()
+                                        initialTwoCentroid = c
+                                        prevTwoCentroid = c
+                                        initialSpanPx = span
+                                        pinchBaselineDistPx = span
+                                        twoFingerPanDp = 0f
+                                        twoFingerMode = TwoFingerMode.UNDECIDED
+                                        touchPointVisual = c
+                                    } else if (pointerCount >= 3) {
+                                        flushPendingRightClickImmediately()
+                                        val cx = pressed.map { it.position.x }.average().toFloat()
+                                        val cy = pressed.map { it.position.y }.average().toFloat()
+                                        val centroid = Offset(cx, cy)
+                                        touchPointVisual = centroid
+                                        if (!multiFingerTriggered) {
+                                            multiFingerStartCentroid = centroid
+                                            if (pointerCount >= 4) {
+                                                initialAvgRadiusDp = pressed
+                                                    .map { (it.position - centroid).getDistance() / densityPx }
+                                                    .average()
+                                                    .toFloat()
+                                                liveGestureBadge = "四指桌面手势"
+                                            } else {
+                                                liveGestureBadge = "三指桌面手势"
+                                            }
+                                        }
+                                    } else if (pointerCount == 1) {
+                                        touchPointVisual = pressed[0].position
+                                    }
+
+                                    prevPointerPositions.clear()
+                                    for (p in pressed) {
+                                        prevPointerPositions[p.id] = p.position
+                                    }
+                                    prevPointerCount = pointerCount
+                                    continue
+                                }
+
+                                if (pointerCount >= 3) {
                                     val cx = pressed.map { it.position.x }.average().toFloat()
                                     val cy = pressed.map { it.position.y }.average().toFloat()
                                     val centroid = Offset(cx, cy)
                                     touchPointVisual = centroid
+                                    for (p in pressed) {
+                                        prevPointerPositions[p.id] = p.position
+                                    }
 
-                                    if (threeFingerStartCentroid == null) {
-                                        threeFingerStartCentroid = centroid
-                                        liveGestureBadge = "三指桌面手势"
-                                    } else if (!threeFingerTriggered) {
-                                        val disp = centroid - threeFingerStartCentroid
+                                    val startCentroid = multiFingerStartCentroid
+                                    if (startCentroid == null) {
+                                        multiFingerStartCentroid = centroid
+                                        if (pointerCount >= 4) {
+                                            initialAvgRadiusDp = pressed
+                                                .map { (it.position - centroid).getDistance() / densityPx }
+                                                .average()
+                                                .toFloat()
+                                            liveGestureBadge = "四指桌面手势"
+                                        } else {
+                                            liveGestureBadge = "三指桌面手势"
+                                        }
+                                    } else if (!multiFingerTriggered) {
+                                        val disp = centroid - startCentroid
                                         val dxDp = disp.x / densityPx
                                         val dyDp = disp.y / densityPx
-                                        val travelDp = hypot(dxDp, dyDp)
-                                        if (travelDp > 40f) {
-                                            threeFingerTriggered = true
+                                        val centroidDispDp = hypot(dxDp, dyDp)
+
+                                        var radialChangeDp = 0f
+                                        var avgRadiusDp = 0f
+                                        if (pointerCount >= 4) {
+                                            avgRadiusDp = pressed
+                                                .map { (it.position - centroid).getDistance() / densityPx }
+                                                .average()
+                                                .toFloat()
+                                            if (initialAvgRadiusDp <= 1f) {
+                                                initialAvgRadiusDp = avgRadiusDp
+                                            }
+                                            radialChangeDp = abs(avgRadiusDp - initialAvgRadiusDp)
+                                        }
+
+                                        // 4-Finger Radial Pinch (Launchpad) / Spread (Show Desktop)
+                                        if (
+                                            pointerCount >= 4 &&
+                                            initialAvgRadiusDp > 12f &&
+                                            radialChangeDp > 16f &&
+                                            radialChangeDp > 1.5f * centroidDispDp
+                                        ) {
+                                            if (avgRadiusDp < initialAvgRadiusDp * 0.78f) {
+                                                multiFingerTriggered = true
+                                                liveGestureBadge = "四指捏合 · 启动台"
+                                                if (currentMacConnected) {
+                                                    coordinator.sendMacHid(
+                                                        MacHidPacket.keyTap(MacKeyCodes.LAUNCHPAD),
+                                                        flushImmediate = true
+                                                    )
+                                                    coordinator.vibrateConfirm()
+                                                }
+                                            } else if (avgRadiusDp > initialAvgRadiusDp * 1.25f) {
+                                                multiFingerTriggered = true
+                                                liveGestureBadge = "四指张开 · 显示桌面"
+                                                if (currentMacConnected) {
+                                                    coordinator.sendMacHid(
+                                                        MacHidPacket.keyTap(MacKeyCodes.F11_SHOW_DESKTOP),
+                                                        flushImmediate = true
+                                                    )
+                                                    coordinator.vibrateConfirm()
+                                                }
+                                            }
+                                        } else if (centroidDispDp > 36f) {
+                                            // 3-Finger AND 4-Finger Parallel Swipes (Mission Control / Exposé / Spaces)
+                                            multiFingerTriggered = true
+                                            val prefix = if (pointerCount >= 4) "四指" else "三指"
                                             if (currentMacConnected) {
                                                 val (keyCode, badgeText) = when {
-                                                    dyDp < -abs(dxDp) -> MacKeyCodes.UP to "三指调度中心"
-                                                    dyDp > abs(dxDp) -> MacKeyCodes.DOWN to "三指应用窗口"
-                                                    dxDp < -abs(dyDp) -> MacKeyCodes.RIGHT to "三指下一桌面"
-                                                    else -> MacKeyCodes.LEFT to "三指上一桌面"
+                                                    dyDp < -abs(dxDp) -> MacKeyCodes.UP to "${prefix}调度中心"
+                                                    dyDp > abs(dxDp) -> MacKeyCodes.DOWN to "${prefix}应用窗口"
+                                                    dxDp < -abs(dyDp) -> MacKeyCodes.RIGHT to "${prefix}下一桌面"
+                                                    else -> MacKeyCodes.LEFT to "${prefix}上一桌面"
                                                 }
                                                 liveGestureBadge = badgeText
                                                 coordinator.sendMacHid(
@@ -255,18 +465,12 @@ fun MacTrackpadModeView(
                                             }
                                         }
                                     }
-                                } else if (pointerCount == 2 && maxPointerCount == 2) {
-                                    if (isDoubleTapDragging) {
-                                        isDoubleTapDragging = false
-                                        if (currentMacConnected) {
-                                            coordinator.sendMacHid(
-                                                MacHidPacket.mouseButton(MacHidButton.LEFT, MacHidButtonAction.UP),
-                                                flushImmediate = true
-                                            )
-                                        }
-                                    }
+                                } else if (pointerCount == 2) {
                                     val p0 = pressed[0]
                                     val p1 = pressed[1]
+                                    prevPointerPositions[p0.id] = p0.position
+                                    prevPointerPositions[p1.id] = p1.position
+
                                     val s0 = twoFingerStarts.getOrPut(p0.id) { p0.position }
                                     val s1 = twoFingerStarts.getOrPut(p1.id) { p1.position }
                                     maxTwoFingerTravelPx = maxOf(
@@ -282,83 +486,160 @@ fun MacTrackpadModeView(
                                     touchPointVisual = centroid
                                     val distPx = (p0.position - p1.position).getDistance()
 
+                                    if (initialTwoCentroid == null) {
+                                        initialTwoCentroid = centroid
+                                    }
                                     if (prevTwoCentroid == null) {
                                         prevTwoCentroid = centroid
                                     }
-                                    if (pinchBaselineDistPx <= 1f && distPx > 12f) {
+                                    if (initialSpanPx <= 1f && distPx > 8f) {
+                                        initialSpanPx = distPx
                                         pinchBaselineDistPx = distPx
                                     }
 
-                                    // 2-Finger Pinch Zoom (`> 1.15f` -> Cmd+, `< 0.87f` -> Cmd-)
-                                    var pinchedThisFrame = false
-                                    if (pinchBaselineDistPx > 14f && distPx > 14f) {
-                                        val ratio = distPx / pinchBaselineDistPx
-                                        if (ratio > 1.15f) {
-                                            pinchedThisFrame = true
-                                            pinchBaselineDistPx = distPx
-                                            liveGestureBadge = "双指放大 ⌘+"
-                                            if (currentMacConnected) {
-                                                coordinator.sendMacHid(
-                                                    MacHidPacket.keyTap(MacKeyCodes.ANSI_PLUS, MacHidModMask.COMMAND),
-                                                    flushImmediate = true
-                                                )
-                                                coordinator.vibrateLightTick()
-                                            }
-                                        } else if (ratio < 0.87f) {
-                                            pinchedThisFrame = true
-                                            pinchBaselineDistPx = distPx
-                                            liveGestureBadge = "双指缩小 ⌘-"
-                                            if (currentMacConnected) {
-                                                coordinator.sendMacHid(
-                                                    MacHidPacket.keyTap(MacKeyCodes.ANSI_MINUS, MacHidModMask.COMMAND),
-                                                    flushImmediate = true
-                                                )
-                                                coordinator.vibrateLightTick()
-                                            }
-                                        }
+                                    val panFromStartDp = (centroid - initialTwoCentroid).getDistance() / densityPx
+                                    if (panFromStartDp > twoFingerPanDp) {
+                                        twoFingerPanDp = panFromStartDp
+                                    }
+                                    val initialSpanDp = initialSpanPx / densityPx
+                                    val spanDeltaDp = if (initialSpanPx > 8f) {
+                                        abs(distPx - initialSpanPx) / densityPx
+                                    } else {
+                                        0f
                                     }
 
-                                    // 2-Finger Pixel Scroll + Momentum Velocity Tracking
                                     val panDeltaPx = centroid - prevTwoCentroid
                                     prevTwoCentroid = centroid
-                                    val dxDp = panDeltaPx.x / densityPx
-                                    val dyDp = panDeltaPx.y / densityPx
-                                    if (!pinchedThisFrame && (maxTwoFingerTravelPx / densityPx) >= 2.2f && hypot(dxDp, dyDp) >= 0.18f) {
-                                        val (scrollDxPx, scrollDyPx) = TrackpadPhysicsEngine.accelerateScrollDelta(
-                                            dxDp = dxDp,
-                                            dyDp = dyDp,
-                                            dtMs = dtMs,
-                                            sensitivity = currentSensitivity
-                                        )
-                                        if ((scrollDxPx != 0f || scrollDyPx != 0f) && currentMacConnected) {
-                                            coordinator.sendMacHid(
-                                                MacHidPacket.scrollPixel(
-                                                    dxPx = scrollDxPx,
-                                                    dyPx = scrollDyPx,
-                                                    phase = MacHidScrollPhase.CHANGED,
-                                                    naturalScroll = naturalScroll
+
+                                    if (twoFingerMode == TwoFingerMode.UNDECIDED) {
+                                        if (
+                                            initialSpanDp >= 36f &&
+                                            spanDeltaDp >= 14f &&
+                                            spanDeltaDp > 1.8f * twoFingerPanDp
+                                        ) {
+                                            twoFingerMode = TwoFingerMode.PINCHING
+                                            lastTwoFingerTapUpMs = 0L
+                                        } else if (twoFingerPanDp >= 2.8f) {
+                                            twoFingerMode = TwoFingerMode.SCROLLING
+                                            lastTwoFingerTapUpMs = 0L
+                                        }
+                                    }
+
+                                    when (twoFingerMode) {
+                                        TwoFingerMode.PINCHING -> {
+                                            if (pinchBaselineDistPx > 14f && distPx > 14f) {
+                                                val ratio = distPx / pinchBaselineDistPx
+                                                if (ratio > 1.15f) {
+                                                    pinchBaselineDistPx = distPx
+                                                    hasSmartZoomedIn = true
+                                                    liveGestureBadge = "双指放大 ⌘+"
+                                                    if (currentMacConnected) {
+                                                        coordinator.sendMacHid(
+                                                            MacHidPacket.keyTap(MacKeyCodes.ANSI_PLUS, MacHidModMask.COMMAND),
+                                                            flushImmediate = true
+                                                        )
+                                                        coordinator.vibrateLightTick()
+                                                    }
+                                                } else if (ratio < 0.87f) {
+                                                    pinchBaselineDistPx = distPx
+                                                    hasSmartZoomedIn = true
+                                                    liveGestureBadge = "双指缩小 ⌘-"
+                                                    if (currentMacConnected) {
+                                                        coordinator.sendMacHid(
+                                                            MacHidPacket.keyTap(MacKeyCodes.ANSI_MINUS, MacHidModMask.COMMAND),
+                                                            flushImmediate = true
+                                                        )
+                                                        coordinator.vibrateLightTick()
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        TwoFingerMode.SCROLLING -> {
+                                            val dxDp = panDeltaPx.x / densityPx
+                                            val dyDp = panDeltaPx.y / densityPx
+                                            if (hypot(dxDp, dyDp) >= 0.12f) {
+                                                val (scrollDxPx, scrollDyPx) = TrackpadPhysicsEngine.accelerateScrollDelta(
+                                                    dxDp = dxDp,
+                                                    dyDp = dyDp,
+                                                    dtMs = dtMs,
+                                                    sensitivity = currentSensitivity
                                                 )
-                                            )
-                                            coordinator.trackpadMomentumScroller.recordScrollSample(scrollDxPx, scrollDyPx, dtMs)
-                                            coordinator.vibrateLightTick(45L)
-                                            if (liveGestureBadge != "双指放大 ⌘+" && liveGestureBadge != "双指缩小 ⌘-") {
-                                                liveGestureBadge = "双指平滑滚动"
+                                                if ((scrollDxPx != 0f || scrollDyPx != 0f) && currentMacConnected) {
+                                                    val phase = if (!isScrollPhaseActive) {
+                                                        isScrollPhaseActive = true
+                                                        hadScrollInGesture = true
+                                                        MacHidScrollPhase.BEGAN
+                                                    } else {
+                                                        MacHidScrollPhase.CHANGED
+                                                    }
+                                                    coordinator.sendMacHid(
+                                                        MacHidPacket.scrollPixel(
+                                                            dxPx = scrollDxPx,
+                                                            dyPx = scrollDyPx,
+                                                            phase = phase,
+                                                            naturalScroll = naturalScroll
+                                                        ),
+                                                        flushImmediate = (phase == MacHidScrollPhase.BEGAN)
+                                                    )
+                                                    coordinator.trackpadMomentumScroller.recordScrollSample(
+                                                        scrollDxPx,
+                                                        scrollDyPx,
+                                                        dtMs
+                                                    )
+                                                    coordinator.vibrateLightTick(45L)
+                                                    liveGestureBadge = "双指平滑滚动"
+                                                }
+                                            }
+                                        }
+
+                                        TwoFingerMode.UNDECIDED -> Unit
+                                    }
+                                } else if (pointerCount == 1) {
+                                    val change = pressed[0]
+                                    touchPointVisual = change.position
+                                    val prevPos = prevPointerPositions[change.id] ?: change.position
+                                    prevPointerPositions[change.id] = change.position
+
+                                    val stepPx = change.position - prevPos
+                                    if (!hadMultiTouch) {
+                                        val distFromDownPx = (change.position - firstDownPos).getDistance()
+                                        if (distFromDownPx > maxSingleTravelPx) {
+                                            maxSingleTravelPx = distFromDownPx
+                                        }
+                                    } else if (hadScrollInGesture) {
+                                        postScrollSingleTravelPx += stepPx.getDistance()
+                                        if (
+                                            (nowMs - twoFingerScrollEndedAtMs) > 55L ||
+                                            (postScrollSingleTravelPx / densityPx) > 3.5f
+                                        ) {
+                                            // User intentionally kept 1 finger down to steer cursor; cancel scroll fling
+                                            coordinator.trackpadMomentumScroller.stopImmediate()
+                                            hadScrollInGesture = false
+                                            if (!currentDragLock) {
+                                                liveGestureBadge = null
                                             }
                                         }
                                     }
-                                } else if (pointerCount == 1 && maxPointerCount == 1) {
-                                    val change = pressed[0]
-                                    touchPointVisual = change.position
-                                    val distFromDownPx = (change.position - firstDownPos).getDistance()
-                                    if (distFromDownPx > maxSingleTravelPx) {
-                                        maxSingleTravelPx = distFromDownPx
-                                    }
-                                    val travelDp = maxSingleTravelPx / densityPx
 
-                                    if (isDoubleTapCandidate && !isDoubleTapDragging && travelDp > 5f) {
+                                    val travelDp = maxSingleTravelPx / densityPx
+                                    val elapsedMs = nowMs - gestureStartMs
+
+                                    // Deliberate Double-Tap Hold-to-Drag (never misfires on fast double-clicks!)
+                                    if (
+                                        !hadMultiTouch &&
+                                        canHoldToDrag &&
+                                        !isDoubleTapDragging &&
+                                        ((elapsedMs >= 115L && travelDp > 4.5f) || travelDp > 11.5f)
+                                    ) {
+                                        flushPendingRightClickImmediately()
                                         isDoubleTapDragging = true
-                                        lastSingleTapUpMs = 0L
-                                        liveGestureBadge = "拖拽锁定中"
+                                        initialBufferFlushed = true
+                                        pendingInitialDxPx = 0f
+                                        pendingInitialDyPx = 0f
+                                        tapChainCount = 0
+                                        lastTapUpMs = 0L
+                                        liveGestureBadge = "双击拖移中"
                                         if (currentMacConnected) {
                                             coordinator.sendMacHid(
                                                 MacHidPacket.mouseButton(MacHidButton.LEFT, MacHidButtonAction.DOWN),
@@ -368,7 +649,6 @@ fun MacTrackpadModeView(
                                         }
                                     }
 
-                                    val stepPx = change.position - change.previousPosition
                                     val dxDp = stepPx.x / densityPx
                                     val dyDp = stepPx.y / densityPx
                                     if (dxDp != 0f || dyDp != 0f) {
@@ -378,18 +658,63 @@ fun MacTrackpadModeView(
                                             dtMs = dtMs,
                                             sensitivity = currentSensitivity
                                         )
-                                        if ((dxOutPx != 0f || dyOutPx != 0f) && currentMacConnected) {
+                                        if (!hadMultiTouch && !initialBufferFlushed) {
+                                            if (elapsedMs <= 18L && travelDp < 3.5f) {
+                                                pendingInitialDxPx += dxOutPx
+                                                pendingInitialDyPx += dyOutPx
+                                            } else {
+                                                initialBufferFlushed = true
+                                                flushPendingRightClickImmediately()
+                                                val totalDx = pendingInitialDxPx + dxOutPx
+                                                val totalDy = pendingInitialDyPx + dyOutPx
+                                                pendingInitialDxPx = 0f
+                                                pendingInitialDyPx = 0f
+                                                if ((totalDx != 0f || totalDy != 0f) && currentMacConnected) {
+                                                    coordinator.sendMacHid(MacHidPacket.moveRel(totalDx, totalDy))
+                                                }
+                                            }
+                                        } else if ((dxOutPx != 0f || dyOutPx != 0f) && currentMacConnected) {
                                             coordinator.sendMacHid(MacHidPacket.moveRel(dxOutPx, dyOutPx))
                                         }
                                         if (currentDragLock) {
                                             liveGestureBadge = "拖拽锁定中"
+                                        }
+                                    } else if (!hadMultiTouch && !initialBufferFlushed && elapsedMs > 18L) {
+                                        initialBufferFlushed = true
+                                        if (pendingInitialDxPx != 0f || pendingInitialDyPx != 0f) {
+                                            flushPendingRightClickImmediately()
+                                            if (currentMacConnected) {
+                                                coordinator.sendMacHid(
+                                                    MacHidPacket.moveRel(pendingInitialDxPx, pendingInitialDyPx)
+                                                )
+                                            }
+                                            pendingInitialDxPx = 0f
+                                            pendingInitialDyPx = 0f
                                         }
                                     }
                                 }
                             }
 
                             // All fingers lifted cleanly
-                            val totalDurationMs = SystemClock.uptimeMillis() - gestureStartMs
+                            val upMs = SystemClock.uptimeMillis()
+                            val totalDurationMs = upMs - gestureStartMs
+
+                            // Always close active 2-finger scroll phase on release
+                            if (isScrollPhaseActive) {
+                                isScrollPhaseActive = false
+                                if (currentMacConnected) {
+                                    coordinator.sendMacHid(
+                                        MacHidPacket.scrollPixel(
+                                            dxPx = 0f,
+                                            dyPx = 0f,
+                                            phase = MacHidScrollPhase.ENDED,
+                                            naturalScroll = naturalScroll
+                                        ),
+                                        flushImmediate = true
+                                    )
+                                }
+                            }
+
                             when {
                                 isDoubleTapDragging -> {
                                     isDoubleTapDragging = false
@@ -403,86 +728,196 @@ fun MacTrackpadModeView(
                                     liveGestureBadge = if (currentDragLock) "拖拽锁定中" else null
                                 }
 
-                                maxPointerCount == 1 -> {
+                                !hadMultiTouch -> {
                                     val maxTravelDp = maxSingleTravelPx / densityPx
-                                    if (totalDurationMs <= 210L && maxTravelDp < 10f) {
-                                        if (currentMacConnected) {
-                                            if (currentDragLock) {
-                                                isDragLockActive = false
-                                                liveGestureBadge = null
+                                    if (totalDurationMs <= 220L && maxTravelDp < 10f) {
+                                        flushPendingRightClickImmediately()
+                                        if (currentDragLock) {
+                                            isDragLockActive = false
+                                            liveGestureBadge = null
+                                            tapChainCount = 0
+                                            lastTapUpMs = 0L
+                                            if (currentMacConnected) {
                                                 coordinator.sendMacHid(
                                                     MacHidPacket.mouseButton(MacHidButton.LEFT, MacHidButtonAction.UP),
                                                     flushImmediate = true
                                                 )
                                                 coordinator.vibrateTick()
-                                            } else if (isDoubleTapCandidate) {
-                                                lastSingleTapUpMs = 0L
-                                                coordinator.sendMacHid(
-                                                    MacHidPacket.mouseButton(MacHidButton.LEFT, MacHidButtonAction.DOUBLE_CLICK),
-                                                    flushImmediate = true
-                                                )
-                                                coordinator.vibrateConfirm()
+                                            }
+                                        } else {
+                                            val withinChain = lastTapUpMs > 0L &&
+                                                (tapStartMs - lastTapUpMs) <= 310L &&
+                                                ((firstDownPos - lastTapPos).getDistance() / densityPx) <= 20f
+                                            tapChainCount = if (withinChain) {
+                                                (tapChainCount % 3) + 1
                                             } else {
-                                                lastSingleTapUpMs = SystemClock.uptimeMillis()
-                                                lastSingleTapPos = firstDownPos
+                                                1
+                                            }
+                                            lastTapUpMs = upMs
+                                            lastTapPos = firstDownPos
+                                            if (currentMacConnected) {
                                                 coordinator.sendMacHid(
-                                                    MacHidPacket.mouseButton(MacHidButton.LEFT, MacHidButtonAction.CLICK),
+                                                    MacHidPacket.mouseClickWithCount(
+                                                        button = MacHidButton.LEFT,
+                                                        clickCount = tapChainCount
+                                                    ),
                                                     flushImmediate = true
                                                 )
-                                                coordinator.vibrateTick()
+                                                if (tapChainCount >= 2) {
+                                                    coordinator.vibrateConfirm()
+                                                } else {
+                                                    coordinator.vibrateTick()
+                                                }
+                                            }
+                                            if (tapChainCount >= 2) {
+                                                val badge = if (tapChainCount == 2) "双击选中" else "三击整段"
+                                                liveGestureBadge = badge
+                                                scope.launch {
+                                                    delay(380L)
+                                                    if (liveGestureBadge == badge && !currentDragLock) {
+                                                        liveGestureBadge = null
+                                                    }
+                                                }
+                                            } else if (!currentDragLock) {
+                                                liveGestureBadge = null
                                             }
                                         }
                                     } else {
-                                        lastSingleTapUpMs = 0L
+                                        tapChainCount = 0
+                                        lastTapUpMs = 0L
                                         if (!currentDragLock) liveGestureBadge = null
                                     }
                                 }
 
                                 maxPointerCount == 2 -> {
-                                    lastSingleTapUpMs = 0L
+                                    tapChainCount = 0
+                                    lastTapUpMs = 0L
                                     val maxTwoDp = maxTwoFingerTravelPx / densityPx
-                                    if (totalDurationMs <= 230L && maxTwoDp < 12f) {
+                                    if (
+                                        twoFingerMode == TwoFingerMode.UNDECIDED &&
+                                        !hadScrollInGesture &&
+                                        totalDurationMs <= 230L &&
+                                        maxTwoDp < 12f
+                                    ) {
                                         coordinator.trackpadMomentumScroller.stopImmediate()
-                                        if (currentMacConnected) {
-                                            coordinator.sendMacHid(
-                                                MacHidPacket.mouseButton(MacHidButton.RIGHT, MacHidButtonAction.CLICK),
-                                                flushImmediate = true
-                                            )
-                                            coordinator.vibrateConfirm()
+                                        if (lastTwoFingerTapUpMs > 0L && (tapStartMs - lastTwoFingerTapUpMs) <= 280L) {
+                                            // 2-Finger Double-Tap Smart Zoom (`⌘+` <-> `⌘0`)
+                                            pendingRightClickJob?.cancel()
+                                            pendingRightClickJob = null
+                                            lastTwoFingerTapUpMs = 0L
+                                            val zoomKey = if (hasSmartZoomedIn) {
+                                                hasSmartZoomedIn = false
+                                                MacKeyCodes.ANSI_0
+                                            } else {
+                                                hasSmartZoomedIn = true
+                                                MacKeyCodes.ANSI_PLUS
+                                            }
+                                            val zoomBadge = if (zoomKey == MacKeyCodes.ANSI_0) {
+                                                "双指双击 · 还原缩放"
+                                            } else {
+                                                "双指双击 · 智能放大"
+                                            }
+                                            liveGestureBadge = zoomBadge
+                                            if (currentMacConnected) {
+                                                coordinator.sendMacHid(
+                                                    MacHidPacket.keyTap(zoomKey, MacHidModMask.COMMAND),
+                                                    flushImmediate = true
+                                                )
+                                                coordinator.vibrateConfirm()
+                                            }
+                                            scope.launch {
+                                                delay(420L)
+                                                if (liveGestureBadge == zoomBadge && !currentDragLock) {
+                                                    liveGestureBadge = null
+                                                }
+                                            }
+                                        } else {
+                                            lastTwoFingerTapUpMs = upMs
+                                            pendingRightClickJob?.cancel()
+                                            pendingRightClickJob = scope.launch {
+                                                delay(175L)
+                                                lastTwoFingerTapUpMs = 0L
+                                                pendingRightClickJob = null
+                                                if (currentMacConnected) {
+                                                    coordinator.sendMacHid(
+                                                        MacHidPacket.mouseButton(
+                                                            MacHidButton.RIGHT,
+                                                            MacHidButtonAction.CLICK
+                                                        ),
+                                                        flushImmediate = true
+                                                    )
+                                                    coordinator.vibrateConfirm()
+                                                }
+                                                liveGestureBadge = if (currentDragLock) "拖拽锁定中" else null
+                                            }
                                         }
-                                        liveGestureBadge = if (currentDragLock) "拖拽锁定中" else null
-                                    } else if (currentMacConnected && coordinator.trackpadMomentumScroller.startFromTrackedVelocity()) {
+                                    } else if (
+                                        hadScrollInGesture &&
+                                        currentMacConnected &&
+                                        coordinator.trackpadMomentumScroller.startFromTrackedVelocity()
+                                    ) {
+                                        lastTwoFingerTapUpMs = 0L
                                         liveGestureBadge = "双指惯性滚动"
+                                        isMomentumPhaseActive = true
                                         flingJob?.cancel()
                                         flingJob = scope.launch {
+                                            var emittedMomentumBegin = false
                                             try {
+                                                var isFrameZero = true
                                                 while (coordinator.trackpadMomentumScroller.isActive) {
                                                     delay(16L)
                                                     val step = coordinator.trackpadMomentumScroller.stepFrame() ?: break
+                                                    val phase = if (isFrameZero) {
+                                                        isFrameZero = false
+                                                        emittedMomentumBegin = true
+                                                        MacHidScrollPhase.MOMENTUM_BEGIN
+                                                    } else {
+                                                        MacHidScrollPhase.MOMENTUM_CONTINUE
+                                                    }
                                                     coordinator.sendMacHid(
                                                         MacHidPacket.scrollPixel(
                                                             dxPx = step.first,
                                                             dyPx = step.second,
-                                                            phase = MacHidScrollPhase.MOMENTUM,
+                                                            phase = phase,
                                                             momentum = true,
                                                             naturalScroll = naturalScroll
-                                                        )
+                                                        ),
+                                                        flushImmediate = (phase == MacHidScrollPhase.MOMENTUM_BEGIN)
                                                     )
                                                 }
                                             } finally {
+                                                if (isMomentumPhaseActive) {
+                                                    isMomentumPhaseActive = false
+                                                    if (emittedMomentumBegin && currentMacConnected) {
+                                                        coordinator.sendMacHid(
+                                                            MacHidPacket.scrollPixel(
+                                                                dxPx = 0f,
+                                                                dyPx = 0f,
+                                                                phase = MacHidScrollPhase.MOMENTUM_END,
+                                                                momentum = true,
+                                                                naturalScroll = naturalScroll
+                                                            ),
+                                                            flushImmediate = true
+                                                        )
+                                                    }
+                                                }
                                                 if (liveGestureBadge == "双指惯性滚动") {
                                                     liveGestureBadge = if (currentDragLock) "拖拽锁定中" else null
                                                 }
                                             }
                                         }
                                     } else {
+                                        lastTwoFingerTapUpMs = 0L
                                         coordinator.trackpadMomentumScroller.stopImmediate()
                                         if (!currentDragLock) liveGestureBadge = null
                                     }
                                 }
 
                                 else -> {
-                                    lastSingleTapUpMs = 0L
+                                    tapChainCount = 0
+                                    lastTapUpMs = 0L
+                                    lastTwoFingerTapUpMs = 0L
+                                    coordinator.trackpadMomentumScroller.stopImmediate()
                                     scope.launch {
                                         delay(420L)
                                         if (activeFingerCount == 0 && !currentDragLock) {
@@ -494,6 +929,17 @@ fun MacTrackpadModeView(
                         } finally {
                             touchPointVisual = null
                             activeFingerCount = 0
+                            if (isScrollPhaseActive && currentMacConnected) {
+                                coordinator.sendMacHid(
+                                    MacHidPacket.scrollPixel(
+                                        dxPx = 0f,
+                                        dyPx = 0f,
+                                        phase = MacHidScrollPhase.ENDED,
+                                        naturalScroll = naturalScroll
+                                    ),
+                                    flushImmediate = true
+                                )
+                            }
                             if (isDoubleTapDragging && currentMacConnected) {
                                 coordinator.sendMacHid(
                                     MacHidPacket.mouseButton(MacHidButton.LEFT, MacHidButtonAction.UP),
@@ -585,7 +1031,7 @@ fun MacTrackpadModeView(
                         modifier = Modifier.size(14.5.dp)
                     )
                     Text(
-                        text = if (macConnected) "120Hz 触控板 · 双击拖移 / 双指滚轮缩放 / 三指空间" else "未连接 Mac",
+                        text = if (macConnected) "120Hz 触控板 · 连击拖移 / 双指滚轮缩放 / 三四指桌面" else "未连接 Mac",
                         color = palette.textTertiary,
                         fontSize = 11.2.sp,
                         maxLines = 1,
@@ -624,7 +1070,7 @@ fun MacTrackpadModeView(
             // Bottom subtle watermark hint when idle
             if (activeFingerCount == 0 && !isDragLockActive && liveGestureBadge == null) {
                 Text(
-                    text = "单指轻点左键 · 双指轻点右键 · 侧边音量键盲调 Mac 音量",
+                    text = "单指连击 · 双指右键/双击缩放 · 四指捏合启动台/张开桌面",
                     color = palette.textTertiary.copy(alpha = 0.62f),
                     fontSize = 11.sp,
                     modifier = Modifier
@@ -651,7 +1097,7 @@ fun MacTrackpadModeView(
                         liveGestureBadge = null
                     }
                     coordinator.sendMacHid(
-                        MacHidPacket.mouseButton(MacHidButton.LEFT, MacHidButtonAction.CLICK),
+                        MacHidPacket.mouseClickWithCount(MacHidButton.LEFT, clickCount = 1),
                         flushImmediate = true
                     )
                     coordinator.vibrateTick()
@@ -815,10 +1261,10 @@ private fun TrackpadMicroSwitchButton(
 }
 
 /**
- * Ergonomic Gyroscope Air-Mouse & Fullscreen Click-Through Red Laser / Spotlight Wand (`MacLaserAirWandView`).
+ * 200Hz Ergonomic Gyroscope Air-Mouse & Fullscreen Click-Through Red Laser / Spotlight Wand (`MacLaserAirWandView`).
  *
  * Zero idle battery drain: registers `Sensor.TYPE_GAME_ROTATION_VECTOR` (with fallback to `TYPE_ROTATION_VECTOR`)
- * ONLY while the thumb trigger is held or double-tap locked!
+ * at `5_000us` (`200Hz`) ONLY while the thumb trigger is held or double-tap locked!
  */
 @Composable
 fun MacLaserAirWandView(
@@ -838,6 +1284,7 @@ fun MacLaserAirWandView(
     val gyroIntegrator = remember { AirWandGyroIntegrator() }
 
     val sensorActive = macConnected && (isTriggerHeld || isTriggerLocked)
+    val quantizedSpotlightRadius = (spotlightRadius.toInt() / 4) * 4
 
     val currentLaserEffect by rememberUpdatedState(laserEffect)
     val currentSpotlightRadius by rememberUpdatedState(spotlightRadius)
@@ -862,7 +1309,7 @@ fun MacLaserAirWandView(
         }
     }
 
-    // Strict Zero-Drain Sensor Lifecycle: registered ONLY when `sensorActive == true`
+    // Strict Zero-Drain 200Hz Sensor Lifecycle: registered ONLY when `sensorActive == true`
     DisposableEffect(sensorActive) {
         if (!sensorActive) {
             return@DisposableEffect onDispose {}
@@ -890,14 +1337,21 @@ fun MacLaserAirWandView(
                 if (dxPx != 0f || dyPx != 0f) {
                     val mode = currentLaserEffect
                     if (mode == MacHidLaserMode.OFF) {
-                        coordinator.sendMacHid(MacHidPacket.moveRel(dxPx, dyPx))
+                        coordinator.sendMacHid(
+                            MacHidPacket.moveRel(
+                                dxPx = dxPx,
+                                dyPx = dyPx,
+                                flags = MacHidFlags.SMOOTH_INTERPOLATE
+                            )
+                        )
                     } else {
+                        val radiusStepPx = (currentSpotlightRadius.toInt() / 4) * 4
                         coordinator.sendMacHid(
                             MacHidPacket.laserUpdate(
                                 mode = mode,
                                 dxPx = dxPx,
                                 dyPx = dyPx,
-                                spotlightRadiusPx = currentSpotlightRadius.toInt()
+                                spotlightRadiusPx = radiusStepPx
                             )
                         )
                     }
@@ -907,7 +1361,7 @@ fun MacLaserAirWandView(
             override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
         }
 
-        sensorManager.registerListener(listener, rotationSensor, SensorManager.SENSOR_DELAY_GAME)
+        sensorManager.registerListener(listener, rotationSensor, 5_000)
 
         onDispose {
             runCatching { sensorManager.unregisterListener(listener) }
@@ -921,8 +1375,8 @@ fun MacLaserAirWandView(
         }
     }
 
-    // 450ms Heartbeat Keepalive for Mac 1.8s Dead-Man Watchdog (keeps beam steady when hand is still!)
-    LaunchedEffect(sensorActive, laserEffect, spotlightRadius) {
+    // 450ms Heartbeat Keepalive for Mac 1.8s Dead-Man Watchdog + quantized live spotlight radius sync
+    LaunchedEffect(sensorActive, laserEffect, quantizedSpotlightRadius) {
         if (!sensorActive || laserEffect == MacHidLaserMode.OFF) return@LaunchedEffect
         while (true) {
             coordinator.sendMacHid(
@@ -930,7 +1384,7 @@ fun MacLaserAirWandView(
                     mode = laserEffect,
                     dxPx = 0f,
                     dyPx = 0f,
-                    spotlightRadiusPx = spotlightRadius.toInt(),
+                    spotlightRadiusPx = quantizedSpotlightRadius,
                     keepalive = true
                 )
             )
@@ -1020,7 +1474,7 @@ fun MacLaserAirWandView(
                         fontWeight = FontWeight.Medium
                     )
                     Text(
-                        text = "${spotlightRadius.toInt()} px",
+                        text = "$quantizedSpotlightRadius px",
                         color = palette.accent,
                         fontSize = 12.2.sp,
                         fontWeight = FontWeight.SemiBold
@@ -1177,9 +1631,9 @@ fun MacLaserAirWandView(
 
                 Text(
                     text = if (isTriggerLocked) {
-                        "陀螺仪已启用生理微颤滤波 · 轻触扳机任意处立即关闭"
+                        "200Hz 陀螺仪双斜率微颤滤波 · 轻触扳机任意处立即关闭"
                     } else {
-                        "每次按下自动归零防漂移 · 双击扳机可开启常驻锁定 · 闲置零耗电"
+                        "200Hz 按下自动归零防漂移 · 双击扳机开启常驻锁定 · 闲置零耗电"
                     },
                     color = palette.textTertiary,
                     fontSize = 11.5.sp,
@@ -1214,7 +1668,7 @@ fun MacLaserAirWandView(
                 accent = true,
                 onClick = {
                     coordinator.sendMacHid(
-                        MacHidPacket.mouseButton(MacHidButton.LEFT, MacHidButtonAction.CLICK),
+                        MacHidPacket.mouseClickWithCount(MacHidButton.LEFT, clickCount = 1),
                         flushImmediate = true
                     )
                     coordinator.vibrateTick()
