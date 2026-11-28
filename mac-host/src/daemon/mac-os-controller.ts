@@ -167,7 +167,7 @@ export class MacOsController {
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>3.6.8</string>
+    <string>3.7.0</string>
     <key>CFBundleVersion</key>
     <string>66</string>
     <key>LSUIElement</key>
